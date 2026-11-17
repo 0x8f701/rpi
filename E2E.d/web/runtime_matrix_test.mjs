@@ -13,6 +13,7 @@ import {
   loadedIdsFromList,
 } from './lib/p0_resource_driver.mjs';
 import { createFreshSessionViaManage } from './lib/session-lifecycle.mjs';
+import { clickFeature } from './lib/feature-menu.mjs';
 import {
   captureResourceSnapshot,
   connectionFdSocketCount,
@@ -640,7 +641,7 @@ async function main() {
     }
     record('RM2.2');
     await clickRow(page, pGoal, 'RM2.3: switch to the goal-protected session');
-    await page.click('#goal-panel-btn');
+    await clickFeature(page, '#goal-panel-btn');
     await waitFor(page, () => document.getElementById('goal-panel') !== null, 'RM2.3: goal panel did not open');
     await waitFor(
       page,
@@ -717,7 +718,7 @@ async function main() {
     if (vTodo.phases?.[0]?.tasks?.find((task) => task.content === V_TODO_DONE)?.status !== 'completed') {
       fail(`RM3 setup: victim completed todo did not install: ${JSON.stringify(vTodo)}`);
     }
-    await page.click('#goal-panel-btn');
+    await clickFeature(page, '#goal-panel-btn');
     await waitFor(page, () => document.getElementById('goal-panel') !== null, 'RM3 setup: goal panel did not open on victim');
     await waitFor(
       page,
@@ -1008,13 +1009,13 @@ async function main() {
     if (JSON.stringify(postState.goal) !== JSON.stringify(preState.goal)) {
       fail(`RM4.2: Goal state not restored exactly: ${JSON.stringify({ pre: preState.goal, post: postState.goal })}`);
     }
-    await page.click('#todo-toggle-btn');
+    await clickFeature(page, '#todo-toggle-btn');
     await waitFor(page, () => document.getElementById('todo-panel') !== null, 'RM4.2: todo panel did not open on the reopened victim');
     if (!(await page.evaluate(() => document.getElementById('todo-panel')?.textContent || '')).includes(V_TODO_DONE)) {
       fail('RM4.2: restored Todo panel is missing the victim task');
     }
     await page.click('#todo-close-btn');
-    await page.click('#goal-panel-btn');
+    await clickFeature(page, '#goal-panel-btn');
     await waitFor(page, () => document.getElementById('goal-panel') !== null, 'RM4.2: goal panel did not reopen');
     const goalLifecycle = await page.evaluate(() => ({
       has: document.getElementById('goal-panel')?.getAttribute('data-has-goal'),

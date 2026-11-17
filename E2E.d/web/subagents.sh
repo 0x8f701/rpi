@@ -73,7 +73,7 @@ main() {
     case "${1:-run}" in
         list|--list|--dry-run)
             printf '%s\n' \
-                'web-subagents - Subagents panel: spawn/live-activity/detail-modal(accessibility+history+refresh+close)/hub-send/output-view/cancel (playwright, skip-guarded)'
+                'web-subagents - Subagents panel: spawn/live-activity/detail-modal(accessibility+structured history: thinking/markdown/read-text+image/grep/bash tool cards/byte-truncation child)/hub-send/output-view/cancel (playwright, skip-guarded)'
             return 0
             ;;
         run|all) ;;
@@ -103,6 +103,13 @@ main() {
       printf 'detail-read-line-%02d\n' 1 2 3 4 5 6 7
       printf 'DETAILSOUTTAIL\n'
     } >"$root/workspace/fixtures/subagent-details/workspace-relative/long-read-target-for-subagent-details-readability/long-relative-read-target.txt"
+    python3 - "$root/workspace/fixtures/subagent-details/detail-image.png" <<'PY'
+import base64, pathlib, sys
+png = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+)
+pathlib.Path(sys.argv[1]).write_bytes(base64.b64decode(png))
+PY
     cat >"$root/home/.rpi/models.json" <<EOF
 {
   "providers": {
@@ -110,7 +117,7 @@ main() {
       "baseUrl": "http://127.0.0.1:$port",
       "api": "openai-completions",
       "models": [
-        { "id": "mock", "name": "Steering Mock", "contextWindow": 32768, "maxTokens": 2048 }
+        { "id": "mock", "name": "Steering Mock", "contextWindow": 32768, "maxTokens": 524288, "reasoning": true }
       ]
     }
   }
@@ -132,10 +139,12 @@ EOF
 ---
 name: writer
 description: Write assigned content
+thinkingLevel: medium
 tools:
   - read
   - grep
   - write
+  - bash
   - hub
 ---
 You are the writer agent for deterministic web e2e coverage.

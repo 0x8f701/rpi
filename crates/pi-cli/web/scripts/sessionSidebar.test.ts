@@ -94,17 +94,6 @@ const sidebarSource = readFileSync(join(here, '../src/panels/SessionSidebar.tsx'
 const sidebarCss = readFileSync(join(here, '../src/styles.css'), 'utf8');
 const appSource = readFileSync(join(here, '../src/App.tsx'), 'utf8');
 check(appSource.includes('id="todo-toggle-btn"'), 'App still mounts the Todo panel toggle');
-check(
-  appSource.includes('id="chat-console-link"')
-    && appSource.includes('href="/chat"')
-    && appSource.includes('aria-label="Open chat"')
-    && />\s*Chat\s*</.test(appSource),
-  'right-side menu links to same-host /chat',
-);
-check(
-  /\.session-sidebar__nav\s*>\s*:last-child:nth-child\(odd\)\s*\{[^}]*grid-column:\s*1\s*\/\s*-1/.test(sidebarCss),
-  'odd last feature-nav item spans both columns',
-);
 check(sidebarSource.includes('session-sidebar__name'), 'row JSX still renders the session title');
 check(sidebarSource.includes('session-sidebar__meta'), 'row JSX still renders the compact meta line');
 check(sidebarSource.includes('sessionRowMeta(row)'), 'row JSX uses sessionRowMeta for time and message count');
@@ -316,19 +305,19 @@ check(visibleSidebarSessions([loadedBootstrapRow], '', null)[0]?.sessionId === '
 
 const agentKey = 'provider::rpi::special::agent-sessions';
 const defaultAgentRows = visibleSidebarSessions([normalRow, agentRow], '', null);
-check(collapsedSidebarGroupKeys(defaultAgentRows, new Map()).has(agentKey), 'Agent sessions defaults collapsed');
-check(!collapsedSidebarGroupKeys(defaultAgentRows, new Map([[agentKey, false]])).has(agentKey), 'explicit Agent sessions expansion overrides default');
-check(!collapsedSidebarGroupKeys(defaultAgentRows, new Map(), true).has(agentKey), 'search opens Agent sessions subgroups');
-check(collapsedSidebarGroupKeys([{ ...agentRow, loaded: true }], new Map([[agentKey, true]])).has(agentKey),
+check(collapsedSidebarGroupKeys(defaultAgentRows, new Map(), false, null).has(agentKey), 'Agent sessions defaults collapsed');
+check(!collapsedSidebarGroupKeys(defaultAgentRows, new Map([[agentKey, false]]), false, null).has(agentKey), 'explicit Agent sessions expansion overrides default');
+check(!collapsedSidebarGroupKeys(defaultAgentRows, new Map(), true, null).has(agentKey), 'search opens Agent sessions subgroups');
+check(collapsedSidebarGroupKeys([{ ...agentRow, loaded: true }], new Map([[agentKey, true]]), false, null).has(agentKey),
   'user collapse intent wins over a loaded Agent session (toggle never wedges)');
-check(collapsedSidebarGroupKeys([agentRow], new Map([[agentKey, true]])).has(agentKey),
+check(collapsedSidebarGroupKeys([agentRow], new Map([[agentKey, true]]), false, 'agent-1').has(agentKey),
   'user collapse intent wins over the active Agent session');
-check(collapsedSidebarGroupKeys([{ ...agentRow, loaded: true }], new Map([['provider::rpi', true]])).has('provider::rpi'), 'provider collapse remains absolute above Agent sessions');
+check(collapsedSidebarGroupKeys([{ ...agentRow, loaded: true }], new Map([['provider::rpi', true]]), false, null).has('provider::rpi'), 'provider collapse remains absolute above Agent sessions');
 
 /* ---------- collapsed groups hide every descendant, including the active session ---------- */
 
 const agentCollapseItems: SessionTreeItem[] = [];
-flattenTree([normalRow, agentRow], collapsedSidebarGroupKeys([normalRow, agentRow], new Map([[agentKey, true]])), agentCollapseItems, groupSessions([normalRow, agentRow]));
+flattenTree([normalRow, agentRow], collapsedSidebarGroupKeys([normalRow, agentRow], new Map([[agentKey, true]]), false, 'agent-1'), agentCollapseItems, groupSessions([normalRow, agentRow]));
 const agentCollapseKeys = agentCollapseItems.map((item) => item.kind === 'group' ? item.node.key : sessionRowKey(item.row));
 check(agentCollapseKeys.includes(agentKey) && !agentCollapseKeys.includes(sessionRowKey(agentRow)),
   'a collapsed group hides the active session row');
@@ -432,9 +421,8 @@ check(appendedRefresh.map((entry) => entry.sessionId).join('|') === 'b|c', 'remo
 const sessionIds = (rows: SessionRowWire[]): string => rows.map((entry) => entry.sessionId).join('|');
 const identityKeys = (rows: SessionRowWire[]): string => rows.map(sessionRowKey).join('|');
 
-/** DOM-order walker: the exact `treeItems` sequence `SessionSidebar` maps to
- *  `<li>` nodes. Group headers emit on first occurrence; session rows keep
- *  reconciled catalog order and are keyed by `sessionRowKey`. */
+/** DOM-order walker for parent-contiguous subtrees with stable group-local
+ * catalog order and full sessionRowKey identities. */
 const flattenItems = (rows: SessionRowWire[], collapsed: readonly string[] = []): SessionTreeItem[] => {
   const items: SessionTreeItem[] = [];
   flattenTree(rows, new Set(collapsed), items);
@@ -638,9 +626,7 @@ check(sessionIds(identitySwap) === 'b|c|a', 'path identity replacement drops the
 check(identitySwap[2]?.path === '<workspace>/session-store/a-renamed.jsonl', 'replaced A identity is the incoming row at the append position');
 
 
-/* 9. Flattened DOM preserves reconciled physical row order even across
- *    provider/project grouping. Headers emit on first occurrence; the active
- *    row is never hoisted. */
+/* Flattened DOM keeps stable group-local order without hoisting active rows. */
 
 const promotedProof = reconcileSessionRowOrder(initial, [
   { ...srvB, cwd: '<workspace>/app', loaded: true, modifiedEpoch: 70 },
@@ -666,14 +652,16 @@ const y1 = row({ sessionId: 'y1', cwd: '<workspace>/y', path: '<workspace>/sessi
 const x2 = row({ sessionId: 'x2', cwd: '<workspace>/x', path: '<workspace>/session-store/x2.jsonl' });
 const interleavedProjects = reconcileSessionRowOrder([], [x1, y1, x2]);
 const interleavedBefore = rowDomIndices(interleavedProjects);
-check(domOrder(interleavedProjects).join('|') === `provider::rpi|provider::rpi::project::x|${sessionRowKey(x1)}|provider::rpi::project::y|${sessionRowKey(y1)}|${sessionRowKey(x2)}`, 'project headers emit on first occurrence; X2 stays after Y1');
-check(interleavedBefore.get(sessionRowKey(x1)) === 2 && interleavedBefore.get(sessionRowKey(y1)) === 4 && interleavedBefore.get(sessionRowKey(x2)) === 5, 'full-key DOM indices keep X1 before Y1 before X2');
+check(domOrder(interleavedProjects).join('|') === `provider::rpi|provider::rpi::project::x|${sessionRowKey(x1)}|${sessionRowKey(x2)}|provider::rpi::project::y|${sessionRowKey(y1)}`, 'each project header owns one contiguous subtree even when catalog rows interleave');
+check(interleavedBefore.get(sessionRowKey(x1)) === 2 && interleavedBefore.get(sessionRowKey(x2)) === 3 && interleavedBefore.get(sessionRowKey(y1)) === 5, 'project-local row order is retained inside its parent subtree');
 
 const ompFirst = row({ sessionId: 'omp-first', source: 'omp', cwd: '<workspace>/a', path: '<workspace>/foreign/omp-first.jsonl' });
 const rpiLater = row({ sessionId: 'rpi-later', cwd: '<workspace>/a', path: '<workspace>/session-store/rpi-later.jsonl' });
 const crossProvider = reconcileSessionRowOrder([], [ompFirst, rpiLater]);
 check(domOrder(crossProvider).join('|') === `provider::OMP|provider::OMP::project::a|${sessionRowKey(ompFirst)}|provider::rpi|provider::rpi::project::a|${sessionRowKey(rpiLater)}`, 'PROVIDER_ORDER does not hoist rpi ahead of an earlier OMP row');
 check(rowDomIndices(crossProvider).get(sessionRowKey(ompFirst))! < rowDomIndices(crossProvider).get(sessionRowKey(rpiLater))!, 'full-key DOM index of retained OMP stays before later native rpi');
+const returningProvider = [ompFirst, rpiLater, { ...ompFirst, sessionId: 'omp-last', path: '<workspace>/foreign/omp-last.jsonl' }];
+check(domOrder(returningProvider).join('|') === `provider::OMP|provider::OMP::project::a|${sessionRowKey(ompFirst)}|${sessionRowKey(returningProvider[2]!)}|provider::rpi|provider::rpi::project::a|${sessionRowKey(rpiLater)}`, 'a returning provider row stays beneath its own provider header, never another provider');
 check(
   flattenItems(crossProvider).filter((item) => item.kind === 'group').map((item) => item.node.key).join('|') ===
     'provider::OMP|provider::OMP::project::a|provider::rpi|provider::rpi::project::a',
@@ -682,7 +670,7 @@ check(
 
 const mixedBefore = flattenItems([keepA, foreignRow, keepC]);
 const mixedAfter = flattenItems(nativeAfterForeign);
-check(mixedBefore.filter((item) => item.kind === 'row').map((item) => sessionRowKey(item.row)).join('|') === identityKeys([keepA, foreignRow, keepC]), 'pre-import DOM rows follow physical catalog keys');
+check(mixedBefore.filter((item) => item.kind === 'row').map((item) => sessionRowKey(item.row)).join('|') === identityKeys([keepA, keepC, foreignRow]), 'pre-import DOM keeps native rows together beneath their provider');
 check(mixedAfter.filter((item) => item.kind === 'row').map((item) => sessionRowKey(item.row)).join('|') === identityKeys(nativeAfterForeign), 'post-import DOM keeps foreign before appended native');
 check(rowDomIndices(nativeAfterForeign).get(sessionRowKey(foreignRow))! < rowDomIndices(nativeAfterForeign).get(sessionRowKey(nativeRow))!, 'full-key DOM index of retained foreign stays before new native');
 
@@ -785,6 +773,40 @@ check(
   'collapsed OMP emits only its header; rpi block is unchanged after it',
 );
 check(!collapsedOmp.includes(sessionRowKey(ompFirst)) && !collapsedOmp.includes('provider::OMP::project::a'), 'collapsed provider never emits nested project headers');
+
+/* ---------- default focus: only the selected session's ancestors expand ----------
+ * With no explicit intent, the resolved active session row's provider root
+ * and its own subgroup are the only expanded nodes; every other root and
+ * subgroup defaults closed. With NO active session every root defaults
+ * closed. Explicit intent true/false wins over the default at every node.
+ * An active search opens every node without an explicit `true` so matches
+ * render; because search never writes intent, clearing the query restores
+ * the prior tree. The expanded path follows resolveActiveSessionRow —
+ * alias/loaded-twin resolution decides WHICH same-sessionId row owns it. */
+const noActiveFocus = collapsedSidebarGroupKeys(crossProvider, new Map(), false, null);
+check(noActiveFocus.has('provider::OMP') && noActiveFocus.has('provider::rpi'), 'no selected session: both provider roots default closed');
+check(noActiveFocus.has('provider::OMP::project::a') && noActiveFocus.has('provider::rpi::project::a'), 'no selected session: both project subgroups default closed');
+const rpiFocused = collapsedSidebarGroupKeys(crossProvider, new Map(), false, 'rpi-later');
+check(!rpiFocused.has('provider::rpi') && !rpiFocused.has('provider::rpi::project::a'), 'the selected rpi session expands exactly its ancestor path');
+check(rpiFocused.has('provider::OMP') && rpiFocused.has('provider::OMP::project::a'), 'the non-selected OMP root and subgroup stay closed under an rpi focus');
+const ompFocused = collapsedSidebarGroupKeys(crossProvider, new Map(), false, 'omp-first');
+check(!ompFocused.has('provider::OMP') && ompFocused.has('provider::rpi'), 'switching focus to the OMP row opens OMP and closes rpi (cross-provider)');
+const focusedProjects = collapsedSidebarGroupKeys(interleavedProjects, new Map(), false, 'x1');
+check(!focusedProjects.has('provider::rpi::project::x') && focusedProjects.has('provider::rpi::project::y'), 'only the selected project subgroup expands; the sibling project stays closed');
+check(collapsedSidebarGroupKeys(interleavedProjects, new Map([['provider::rpi::project::x', true]]), false, 'x1').has('provider::rpi::project::x'),
+  'explicit true collapses even the selected project path');
+check(!collapsedSidebarGroupKeys(interleavedProjects, new Map([['provider::rpi::project::y', false]]), false, 'x1').has('provider::rpi::project::y'),
+  'explicit false expands a non-selected project subgroup');
+check(!collapsedSidebarGroupKeys(interleavedProjects, new Map([['provider::rpi', false]]), false, null).has('provider::rpi'),
+  'explicit false expands a root that defaults closed with no selection');
+check(collapsedSidebarGroupKeys(crossProvider, new Map(), true, null).size === 0,
+  'an active search opens every group so matches render');
+check(collapsedSidebarGroupKeys(crossProvider, new Map([['provider::OMP', true]]), true, null).has('provider::OMP'),
+  'search never overrides an explicit collapse intent');
+const aliasFocused = collapsedSidebarGroupKeys([foreignRow, nativeRow], new Map(), false, 'codex-sess');
+check(!aliasFocused.has('provider::Codex') && aliasFocused.has('provider::rpi'), 'the resolved foreign row expands its own provider path, not the native alias twin');
+const loadedTwinFocused = collapsedSidebarGroupKeys([foreignRow, loadedNativeTwin], new Map(), false, 'codex-sess');
+check(!loadedTwinFocused.has('provider::rpi') && loadedTwinFocused.has('provider::Codex'), 'a loaded native twin wins resolution and expands the rpi path instead');
 
 /* T7. Unmatched search with a loaded native twin shows only that full-key identity. */
 const foreignTwin = row({ sessionId: 'shared-sess', source: 'codex', status: 'foreign', path: '<workspace>/foreign/shared-sess.jsonl' });
@@ -1397,6 +1419,26 @@ function createBackend(mode: 'catalog' | 'failing', catalogFailure?: () => Error
     sendCommand(command, undefined, { auxiliary: true });
   return { commands, sendCommand, sendCatalogCommand };
 }
+
+/** Catalog fixture wrapper that PREPENDS one extra switchable row to every
+ * session_list. Blocks that mount with `activeSessionId: 'srv-a'` (needed to
+ * expand the selected path under the focus default) use it to click a
+ * NON-active row: clicking the active row is a deliberate no-op guard in
+ * the component, so a same-identity click can no longer exercise the
+ * negotiated-switch flow. */
+const withRowFirst = (base: SidebarBackend, extra: SessionRowWire): SidebarBackend => {
+  const wrapped: SidebarBackend = {
+    commands: base.commands,
+    sendCommand: async (command, bubbleId, opts) => {
+      if (command.type !== 'session_list') return base.sendCommand(command, bubbleId, opts);
+      const result = await base.sendCommand(command, bubbleId, opts) as { sessions: SessionRowWire[] };
+      return { sessions: [{ ...extra }, ...result.sessions.map((entry) => ({ ...entry }))] };
+    },
+    sendCatalogCommand: (command) => wrapped.sendCommand(command, undefined, { auxiliary: true }),
+  };
+  return wrapped;
+};
+const srvBFixtureRow = row({ sessionId: 'srv-b', name: 'Beta session', cwd: '<workspace>/app', path: '<workspace>/session-store/srv-b.jsonl', modifiedEpoch: 29 });
 const sidebarProps = (
   backend: SidebarBackend,
   toasts: RecordedToast[],
@@ -1477,21 +1519,21 @@ async function mountSidebar(
    * centralized error toast. */
   const toasts: RecordedToast[] = [];
   const backend = createBackend('catalog');
-  const mounted = await mountSidebar(doc, sidebarProps(backend, toasts, 1));
+  const mounted = await mountSidebar(doc, sidebarProps(backend, toasts, 1, 'srv-a'));
   check(listCount(backend) === 1, 'mount performs exactly one session_list');
   check(doc.body.textContent.includes('Alpha session'), 'mounted sidebar lists the catalog row');
   assertNoErrorPresentation(doc, 'boot');
 
-  await mounted.rerender(sidebarProps(backend, toasts, 2));
+  await mounted.rerender(sidebarProps(backend, toasts, 2, 'srv-a'));
   check(listCount(backend) === 2, 'revision 1→2 triggers exactly one background session_list');
   check(doc.body.textContent.includes('Alpha session'), 'revision refresh retains the listed row');
   assertNoErrorPresentation(doc, 'revision bump');
 
-  await mounted.rerender(sidebarProps(backend, toasts, 2));
+  await mounted.rerender(sidebarProps(backend, toasts, 2, 'srv-a'));
   check(listCount(backend) === 2, 'same-revision rerender sends no session_list');
 
   const failing = createBackend('failing');
-  await mounted.rerender(sidebarProps(failing, toasts, 3));
+  await mounted.rerender(sidebarProps(failing, toasts, 3, 'srv-a'));
   check(listCount(failing) === 1, 'revision 2→3 attempts exactly one background session_list');
   check(doc.body.textContent.includes('Alpha session'), 'injected RPC-limit session_list failure retains the last catalog rows');
   check(toasts.length === 0, 'background catalog failure stays silent (last-good rows persist; toast is user-initiated/first-load only)');
@@ -1566,18 +1608,19 @@ async function mountSidebar(
    * session_fork_latest command and its App-owned revision bump refreshes
    * the catalog exactly once (run no longer issues its own refresh). */
   const toasts3: RecordedToast[] = [];
-  const backend3 = createBackend('catalog');
-  const mounted3 = await mountSidebar(doc, sidebarProps(backend3, toasts3, 10, null));
+  const backend3 = withRowFirst(createBackend('catalog'), srvBFixtureRow);
+  const mounted3 = await mountSidebar(doc, sidebarProps(backend3, toasts3, 10, 'srv-a'));
   check(listCount(backend3) === 1, 'third mount performs exactly one session_list');
-  const row3 = doc.body.querySelector('.session-sidebar__switch');
-  check(row3 !== null, 'switch row rendered for the request-count flows');
+  const rowSwitch3 = doc.body.querySelectorAll('.session-sidebar__switch').find((node) => node.getAttribute('data-session-id') === 'srv-b') ?? null;
+  const row3 = doc.body.querySelectorAll('.session-sidebar__switch').find((node) => node.getAttribute('data-session-id') === 'srv-a') ?? null;
+  check(rowSwitch3 !== null, 'switch row rendered for the request-count flows');
   await act(async () => {
-    row3.dispatchEvent({ type: 'click', target: row3 });
+    rowSwitch3.dispatchEvent({ type: 'click', target: rowSwitch3 });
     await realTick();
     await realTick();
   });
   check(listCount(backend3) === 2, 'negotiated switch triggers exactly one session_list');
-  await mounted3.rerender(sidebarProps(backend3, toasts3, 10, 'srv-a'));
+  await mounted3.rerender(sidebarProps(backend3, toasts3, 10, 'srv-b'));
   check(listCount(backend3) === 2, 'active-id prop change alone never triggers a catalog load');
   await act(async () => {
     row3.dispatchEvent({
@@ -1853,25 +1896,25 @@ check(appSource.includes('onOpenManage={openNewSession}')
    * intents send ZERO session_list; the settle flushes exactly one. */
   const toastsP: RecordedToast[] = [];
   const backendP = createBackend('catalog');
-  const mountedP = await mountSidebar(doc, sidebarProps(backendP, toastsP, 1, null, true));
+  const mountedP = await mountSidebar(doc, sidebarProps(backendP, toastsP, 1, 'srv-a', true));
   check(listCount(backendP) === 0, 'mount during switchPending sends zero session_list');
   check(doc.body.textContent.includes('No saved sessions.'), 'pending mount renders the ordinary empty state (no error surface)');
   assertNoErrorPresentation(doc, 'pending mount');
   for (let revision = 2; revision <= 11; revision += 1) {
-    await mountedP.rerender(sidebarProps(backendP, toastsP, revision, null, true));
+    await mountedP.rerender(sidebarProps(backendP, toastsP, revision, 'srv-a', true));
   }
   for (let poll = 0; poll < 10; poll += 1) await firePolls();
   check(listCount(backendP) === 0, '20 poll/revision intents during switchPending send zero session_list');
   check(toastsP.length === 0, 'pending window emits zero toasts');
 
-  await mountedP.rerender(sidebarProps(backendP, toastsP, 11, null, false));
+  await mountedP.rerender(sidebarProps(backendP, toastsP, 11, 'srv-a', false));
   check(listCount(backendP) === 1, 'switchPending false flushes exactly ONE deferred session_list');
   check(backendP.commands.filter((command) => command.type === 'session_list')
     .every((command) => command.__auxiliary === true), 'the flushed catalog load carries auxiliary opts');
   check(doc.body.textContent.includes('Alpha session'), 'deferred flush refreshes the catalog rows');
   assertNoErrorPresentation(doc, 'pending flush');
   check(toastsP.length === 0, 'deferred flush toasts nothing');
-  await mountedP.rerender(sidebarProps(backendP, toastsP, 11, null, false));
+  await mountedP.rerender(sidebarProps(backendP, toastsP, 11, 'srv-a', false));
   check(listCount(backendP) === 1, 'same switchPending=false rerender sends zero additional session_list');
   await act(async () => {
     mountedP.root.unmount();
@@ -1882,10 +1925,10 @@ check(appSource.includes('onOpenManage={openNewSession}')
    * The gate clearing in the SAME commit as a revision bump must not
    * double-send (requestCatalogLoad clears the flag before the flush). */
   const toastsQ: RecordedToast[] = [];
-  const backendQ = createBackend('catalog');
-  const mountedQ = await mountSidebar(doc, sidebarProps(backendQ, toastsQ, 20, null, false));
+  const backendQ = withRowFirst(createBackend('catalog'), srvBFixtureRow);
+  const mountedQ = await mountSidebar(doc, sidebarProps(backendQ, toastsQ, 20, 'srv-a', false));
   check(listCount(backendQ) === 1, 'second sidebar mounts with exactly one session_list');
-  await mountedQ.rerender(sidebarProps(backendQ, toastsQ, 21, null, true));
+  await mountedQ.rerender(sidebarProps(backendQ, toastsQ, 21, 'srv-a', true));
   check(listCount(backendQ) === 1, 'pending begin with a revision intent sends zero catalog loads');
   for (let poll = 0; poll < 8; poll += 1) await firePolls();
   const rowQ = doc.body.querySelector('.session-sidebar__switch');
@@ -1897,7 +1940,7 @@ check(appSource.includes('onOpenManage={openNewSession}')
   });
   check(listCount(backendQ) === 1, 'poll intents plus a user switch action during pending send zero session_list');
   check(toastsQ.length === 0, 'pending cycle with rows emits zero toasts');
-  await mountedQ.rerender(sidebarProps(backendQ, toastsQ, 22, null, false));
+  await mountedQ.rerender(sidebarProps(backendQ, toastsQ, 22, 'srv-a', false));
   check(listCount(backendQ) === 2, 'gate clearing with a same-commit revision intent flushes exactly ONE session_list');
   assertNoErrorPresentation(doc, 'second pending cycle');
   await act(async () => {
@@ -1911,7 +1954,7 @@ check(appSource.includes('onOpenManage={openNewSession}')
   const toastsR: RecordedToast[] = [];
   const docR = installGlobals();
   const goodR = createBackend('catalog');
-  const mountedR = await mountSidebar(docR, sidebarProps(goodR, toastsR, 1));
+  const mountedR = await mountSidebar(docR, sidebarProps(goodR, toastsR, 1, 'srv-a'));
   check(listCount(goodR) === 1, 'rejection-cycle mount loads the catalog once');
   check(docR.body.textContent.includes('Alpha session'), 'rejection-cycle rows listed before the failures');
   const rejectionCases: Array<[string, () => Error]> = [
@@ -1924,7 +1967,7 @@ check(appSource.includes('onOpenManage={openNewSession}')
   for (const [label, failure] of rejectionCases) {
     const failingR = createBackend('catalog', failure);
     revisionR += 1;
-    await mountedR.rerender(sidebarProps(failingR, toastsR, revisionR));
+    await mountedR.rerender(sidebarProps(failingR, toastsR, revisionR, 'srv-a'));
     check(listCount(failingR) === 1, `${label}: the refresh attempts exactly one session_list`);
     check(failingR.commands.every((command) => command.type !== 'session_list' || command.__auxiliary === true),
       `${label}: the rejected catalog load was auxiliary`);
@@ -1951,7 +1994,7 @@ check(appSource.includes('onOpenManage={openNewSession}')
    * would complete the parked loads instead of racing them). */
   const { promise: gatePromise, resolve: gateResolve } = Promise.withResolvers<void>();
   const gateProps = (revision: number, pending?: boolean): Record<string, unknown> => {
-    const next = sidebarProps(backendG, toastsG, revision, null, pending);
+    const next = sidebarProps(backendG, toastsG, revision, 'srv-a', pending);
     next.waitForReady = (): Promise<void> => gatePromise;
     return next;
   };
@@ -2002,15 +2045,15 @@ check(appSource.includes('onOpenManage={openNewSession}')
 {
   const doc = installGlobals();
   const toasts: RecordedToast[] = [];
-  const backend = createBackend('catalog');
-  const mounted = await mountSidebar(doc, sidebarProps(backend, toasts, 1));
+  const backend = withRowFirst(createBackend('catalog'), srvBFixtureRow);
+  const mounted = await mountSidebar(doc, sidebarProps(backend, toasts, 1, 'srv-a'));
   check(doc.body.textContent.includes('Alpha session'), 'deferred-marker fixture lists the catalog row');
 
   /* (1) Immediate settlement: the resolved promise settles in the same
    * microtask turn, so the queued frame is cancelled before it can run. The
    * class spy proves the marker is never applied, even transiently between
    * a (regressed) immediate paint and the settle cleanup. */
-  const propsFast = sidebarProps(backend, toasts, 1);
+  const propsFast = sidebarProps(backend, toasts, 1, 'srv-a');
   let fastCalls = 0;
   propsFast.onSwitchSession = async (): Promise<boolean> => {
     fastCalls += 1;
@@ -2040,7 +2083,7 @@ check(appSource.includes('onOpenManage={openNewSession}')
    * still pending and paints the marker/aria-busy on the target row; the
    * later settle clears both. */
   const { promise: slowPromise, resolve: slowResolve } = Promise.withResolvers<boolean>();
-  const propsSlow = sidebarProps(backend, toasts, 1);
+  const propsSlow = sidebarProps(backend, toasts, 1, 'srv-a');
   propsSlow.onSwitchSession = (): Promise<boolean> => slowPromise;
   await mounted.rerender(propsSlow);
   const slowBtn = doc.body.querySelector('.session-sidebar__switch');
@@ -2096,7 +2139,7 @@ check(appSource.includes('onOpenManage={openNewSession}')
     },
     sendCatalogCommand: (command) => parkedBackend.sendCommand(command, undefined, { auxiliary: true }),
   };
-  const propsL = sidebarProps(parkedBackend, toastsL, 1);
+  const propsL = sidebarProps(parkedBackend, toastsL, 1, 'srv-a');
   propsL.onSwitchSession = async (): Promise<boolean> => true;
   const mountedL = await mountSidebar(docL, propsL);
   const skeletonRowsL = (): MiniNode[] => docL.body.querySelectorAll('.session-sidebar__catalog-skeleton');
@@ -2167,7 +2210,7 @@ check(appSource.includes('onOpenManage={openNewSession}')
     },
     sendCatalogCommand: (command) => backendR.sendCommand(command, undefined, { auxiliary: true }),
   };
-  const propsR = sidebarProps(backendR, toastsR, 1);
+  const propsR = sidebarProps(backendR, toastsR, 1, 'srv-a');
   propsR.onSwitchSession = async (): Promise<boolean> => true;
   const mountedR = await mountSidebar(docR, propsR);
   const refreshBarR = (): MiniNode | null => docR.body.querySelector('.session-sidebar__refresh-bar');
@@ -2211,7 +2254,7 @@ check(appSource.includes('onOpenManage={openNewSession}')
     },
     sendCatalogCommand: (command) => backendS.sendCommand(command, undefined, { auxiliary: true }),
   };
-  const propsS = sidebarProps(backendS, toastsS, 1);
+  const propsS = sidebarProps(backendS, toastsS, 1, 'srv-a');
   propsS.onSwitchSession = async (): Promise<boolean> => true;
   const mountedS = await mountSidebar(docS, propsS);
   const refreshBarS = (): MiniNode | null => docS.body.querySelector('.session-sidebar__refresh-bar');
@@ -2242,7 +2285,7 @@ check(appSource.includes('onOpenManage={openNewSession}')
   const docF = installGlobals();
   const toastsF: RecordedToast[] = [];
   const backendF = createBackend('catalog');
-  const mountedF = await mountSidebar(docF, sidebarProps(backendF, toastsF, 1));
+  const mountedF = await mountSidebar(docF, sidebarProps(backendF, toastsF, 1, 'srv-a'));
   const skeletonRowsF = (): MiniNode[] => docF.body.querySelectorAll('.session-sidebar__catalog-skeleton');
   check(skeletonRowsF().length === 0, 'an instant catalog load never flashes the skeleton');
   check(docF.body.textContent.includes('Alpha session'), 'instant load renders rows directly');
@@ -2621,8 +2664,8 @@ check(appSource.includes('onOpenManage={openNewSession}')
 {
   const docO = installGlobals();
   const toastsO: RecordedToast[] = [];
-  const backendO = createBackend('catalog');
-  const propsO = sidebarProps(backendO, toastsO, 1);
+  const backendO = withRowFirst(createBackend('catalog'), srvBFixtureRow);
+  const propsO = sidebarProps(backendO, toastsO, 1, 'srv-a');
   propsO.onSwitchSession = (): Promise<boolean> => Promise.reject(new Error('unexpected switch crash'));
   const mountedO = await mountSidebar(docO, propsO);
   const rowButtonO = docO.body.querySelector('.session-sidebar__switch')!;
@@ -2642,8 +2685,8 @@ check(appSource.includes('onOpenManage={openNewSession}')
 {
   const docP = installGlobals();
   const toastsP: RecordedToast[] = [];
-  const backendP = createBackend('catalog');
-  const propsP = sidebarProps(backendP, toastsP, 1);
+  const backendP = withRowFirst(createBackend('catalog'), srvBFixtureRow);
+  const propsP = sidebarProps(backendP, toastsP, 1, 'srv-a');
   propsP.onSwitchSession = (): Promise<boolean> =>
     Promise.reject(Object.assign(new Error('already surfaced'), { toastOwned: true }));
   const mountedP = await mountSidebar(docP, propsP);
@@ -2657,6 +2700,125 @@ check(appSource.includes('onOpenManage={openNewSession}')
   await act(async () => {
     mountedP.root.unmount();
   });
+}
+
+{
+  const doc = installGlobals();
+  const toasts: RecordedToast[] = [];
+  const catalog = [
+    row({ sessionId: 'tree-native-first', cwd: '<workspace>/same', path: '<workspace>/native-first.jsonl' }),
+    row({ sessionId: 'tree-foreign', source: 'omp', status: 'foreign', cwd: '<workspace>/same', path: '<workspace>/foreign.jsonl' }),
+    row({ sessionId: 'tree-native-last', cwd: '<workspace>/same', path: '<workspace>/native-last.jsonl', loaded: true }),
+  ];
+  const backend: SidebarBackend = {
+    commands: [],
+    sendCommand: async (command) => command.type === 'session_list' ? { sessions: catalog } : {},
+    sendCatalogCommand: (command) => backend.sendCommand(command, undefined, { auxiliary: true }),
+  };
+  const mounted = await mountSidebar(doc, sidebarProps(backend, toasts, 1, 'tree-native-last'));
+  const items = doc.body.querySelectorAll('li').filter(item =>
+    item.querySelector('.session-sidebar__group-head') || item.querySelector('.session-sidebar__switch'));
+  let precedingProvider: string | null = null;
+  for (const item of items) {
+    const head = item.querySelector('.session-sidebar__group-head');
+    if (head?.getAttribute('data-group-kind') === 'provider') precedingProvider = head.getAttribute('data-provider');
+    const button = item.querySelector('.session-sidebar__switch');
+    if (button) check(button.getAttribute('data-session-source') === precedingProvider?.toLowerCase(), 'mounted rows belong to their nearest preceding provider header');
+  }
+  /* Under the selected-path default the non-focus OMP root starts closed:
+   * expand it (root, then its project subgroup) so the native-collapse
+   * assertion below can prove the OMP row survives the rpi collapse. */
+  const headAt = (match: (h: MiniNode) => boolean): MiniNode | undefined =>
+    doc.body.querySelectorAll('.session-sidebar__group-head').find(match);
+  const clickHead = async (head: MiniNode | undefined): Promise<void> => {
+    await act(async () => { head!.dispatchEvent({ type: 'click', target: head }); });
+  };
+  await clickHead(headAt((h) => h.getAttribute('data-group-kind') === 'provider' && h.getAttribute('data-provider') === 'OMP'));
+  await clickHead(headAt((h) => h.getAttribute('data-provider') === 'OMP' && h.getAttribute('data-group-kind') === 'project'));
+  const nativeHead = doc.body.querySelectorAll('.session-sidebar__group-head').find(head =>
+    head.getAttribute('data-group-kind') === 'provider' && head.getAttribute('data-provider') === 'rpi');
+  check(nativeHead !== undefined, 'mounted tree exposes the apparent native parent');
+  await act(async () => { nativeHead!.dispatchEvent({ type: 'click', target: nativeHead }); });
+  const remaining = doc.body.querySelectorAll('.session-sidebar__switch');
+  check(remaining.length === 1 && remaining[0]?.getAttribute('data-session-source') === 'omp', 'collapsing the visible native parent hides both native descendants including its active loaded row');
+  await act(async () => { mounted.root.unmount(); });
+}
+
+/* ---------- real mount: selected-path focus, manual-collapse persistence, switch reset ----------
+ * The mounted default tree expands ONLY the active session's ancestor path;
+ * every other root/subgroup is closed. A manual collapse of the selected
+ * path survives an authoritative refresh (refresh never re-expands), a
+ * manual expansion of a non-selected group is retired when the active
+ * identity switches, and returning A→B→A WITHOUT toggling under B must keep
+ * the retired A-map retired — a real state reset, never a render-time mask
+ * that resurrects on return. ---------- */
+{
+  const docF2 = installGlobals();
+  const toastsF2: RecordedToast[] = [];
+  const catalogF2 = [
+    row({ sessionId: 'srv-a', name: 'Alpha session', cwd: '<workspace>/app', path: '<workspace>/session-store/srv-a.jsonl', modifiedEpoch: 30 }),
+    row({ sessionId: 'srv-b', name: 'Beta session', cwd: '<workspace>/lab', path: '<workspace>/session-store/srv-b.jsonl', modifiedEpoch: 29 }),
+    row({ sessionId: 'srv-c', name: 'Gamma session', cwd: '<workspace>/zoo', path: '<workspace>/session-store/srv-c.jsonl', modifiedEpoch: 28 }),
+    row({ sessionId: 'omp-x', source: 'omp', status: 'foreign', name: 'OMP session', cwd: '<workspace>/a', path: '<workspace>/foreign/omp-x.jsonl', modifiedEpoch: 27 }),
+  ];
+  const backendF2: SidebarBackend = {
+    commands: [],
+    sendCommand: async (command) => command.type === 'session_list' ? { sessions: catalogF2.map((entry) => ({ ...entry })) } : {},
+    sendCatalogCommand: (command) => backendF2.sendCommand(command, undefined, { auxiliary: true }),
+  };
+  const propsF2 = sidebarProps(backendF2, toastsF2, 1, 'srv-a');
+  propsF2.onSwitchSession = async (): Promise<boolean> => true;
+  const mountedF2 = await mountSidebar(docF2, propsF2);
+  const rowVisibleF2 = (sessionId: string): boolean =>
+    docF2.body.querySelectorAll(`[data-session-id="${sessionId}"]`).length > 0;
+  const headF2 = (match: (h: MiniNode) => boolean): MiniNode | undefined =>
+    docF2.body.querySelectorAll('.session-sidebar__group-head').find(match);
+  const clickHeadF2 = async (head: MiniNode | undefined): Promise<void> => {
+    await act(async () => {
+      head!.dispatchEvent({ type: 'click', target: head });
+      await realTick();
+      await realTick();
+    });
+  };
+  const appHeadF2 = (): MiniNode | undefined =>
+    headF2((h) => h.getAttribute('data-provider') === 'rpi' && h.getAttribute('data-group-kind') === 'project' && h.textContent.includes('app'));
+
+  check(rowVisibleF2('srv-a'), 'the selected session renders inside its expanded ancestor path');
+  check(!rowVisibleF2('srv-b') && !rowVisibleF2('srv-c') && !rowVisibleF2('omp-x'), 'every non-selected group stays closed by default (cross-provider included)');
+  check(appHeadF2()!.getAttribute('aria-expanded') === 'true', 'the selected project subgroup reports expanded');
+
+  /* Manual collapse of the SELECTED path survives an authoritative refresh. */
+  await clickHeadF2(appHeadF2());
+  check(!rowVisibleF2('srv-a'), 'manual collapse of the selected path hides even the active row');
+  await mountedF2.rerender(sidebarProps(backendF2, toastsF2, 2, 'srv-a'));
+  await act(async () => { await realTick(); await realTick(); });
+  check(!rowVisibleF2('srv-a'), 'a refresh does not re-expand the manually collapsed selected path');
+  await clickHeadF2(appHeadF2());
+  check(rowVisibleF2('srv-a'), 're-expanding the selected path shows the active row again');
+
+  /* Manual expansion of NON-selected groups is retired by an identity switch. */
+  await clickHeadF2(headF2((h) => h.getAttribute('data-provider') === 'rpi' && h.getAttribute('data-group-kind') === 'project' && h.textContent.includes('zoo')));
+  check(rowVisibleF2('srv-c'), 'a manually expanded non-selected group shows its row');
+  await mountedF2.rerender(sidebarProps(backendF2, toastsF2, 3, 'srv-b'));
+  await act(async () => { await realTick(); await realTick(); });
+  check(rowVisibleF2('srv-b'), 'switching identity expands the NEW selected path');
+  check(!rowVisibleF2('srv-a'), 'switching identity closes the old selected path');
+  check(!rowVisibleF2('srv-c'), 'the previous identity’s manual expansion is retired on switch');
+
+  /* A→B→A with ZERO toggles under B: the retired A-map must stay retired —
+   * the identity switch is a real state reset, not a render-time mask that
+   * resurrects the old intent on return (RED until state sync lands). */
+  await mountedF2.rerender(sidebarProps(backendF2, toastsF2, 3, 'srv-a'));
+  await act(async () => { await realTick(); await realTick(); });
+  check(!rowVisibleF2('srv-c'), 'A→B→A without toggling B keeps the retired expansion retired');
+  check(rowVisibleF2('srv-a') && !rowVisibleF2('srv-b'), 'the returned-to identity re-derives exactly its own selected path');
+
+  /* Cross-provider switch: the OMP root opens, the rpi root closes. */
+  await mountedF2.rerender(sidebarProps(backendF2, toastsF2, 4, 'omp-x'));
+  await act(async () => { await realTick(); await realTick(); });
+  check(rowVisibleF2('omp-x') && !rowVisibleF2('srv-b'), 'a cross-provider switch opens only the new provider path');
+  assertNoErrorPresentation(docF2, 'selected-path focus flows');
+  await act(async () => { mountedF2.root.unmount(); });
 }
 
 /* ---------- real mount: OMP group collapse with duplicate labels ----------
@@ -2683,14 +2845,30 @@ check(appSource.includes('onOpenManage={openNewSession}')
     },
     sendCatalogCommand: (command) => backendTwoC.sendCommand(command, undefined, { auxiliary: true }),
   };
-  const propsC = sidebarProps(backendTwoC, toastsC, 1);
+  const propsC = sidebarProps(backendTwoC, toastsC, 1, 'o1');
   propsC.onSwitchSession = async (): Promise<boolean> => true;
   const mountedC = await mountSidebar(docC, propsC);
   const renderedRowsC = (): number => docC.body.querySelectorAll('.session-sidebar__switch').length;
   const ompHeadsC = (): MiniNode[] => docC.body.querySelectorAll('.session-sidebar__group-head')
     .filter((h) => h.getAttribute('data-provider') === 'OMP');
   check(ompHeadsC().length === 3, 'the OMP fixture renders a provider head and its two project subgroup heads');
-  check(renderedRowsC() === 4, 'the fixture lists all four rows expanded');
+  check(renderedRowsC() === 2, 'the fixture starts with the selected lab-node path expanded (dotfiles and rpi default closed)');
+
+  /* Reach the fully expanded fixture: open the remaining default-closed
+   * groups by hand (the same clicks a user makes after focusing o1). */
+  const clickHeadC = async (head: MiniNode | undefined): Promise<void> => {
+    await act(async () => {
+      head!.dispatchEvent({ type: 'click', target: head });
+      await realTick();
+      await realTick();
+    });
+  };
+  const headC = (match: (h: MiniNode) => boolean): MiniNode | undefined =>
+    docC.body.querySelectorAll('.session-sidebar__group-head').find(match);
+  await clickHeadC(headC((h) => h.getAttribute('data-provider') === 'OMP' && h.getAttribute('data-group-kind') === 'project' && h.textContent.includes('dotfiles')));
+  await clickHeadC(headC((h) => h.getAttribute('data-provider') === 'rpi' && h.getAttribute('data-group-kind') === 'provider'));
+  await clickHeadC(headC((h) => h.getAttribute('data-provider') === 'rpi' && h.getAttribute('data-group-kind') === 'project'));
+  check(renderedRowsC() === 4, 'manual expansion reaches the fully expanded fixture');
 
   /* Provider head: one toggle collapses ALL OMP rows. */
   const providerHeadC = docC.body.querySelectorAll('.session-sidebar__group-head')
@@ -2701,7 +2879,7 @@ check(appSource.includes('onOpenManage={openNewSession}')
     await realTick();
   });
   /* Persist across the virtualized re-render (a fresh catalog load). */
-  await mountedC.rerender(sidebarProps(backendTwoC, toastsC, 2));
+  await mountedC.rerender(sidebarProps(backendTwoC, toastsC, 2, 'o1'));
   await act(async () => { await realTick(); await realTick(); });
   check(renderedRowsC() === 1, 'the OMP provider collapse persists across the catalog re-render');
   await act(async () => {
@@ -2727,7 +2905,7 @@ check(appSource.includes('onOpenManage={openNewSession}')
     .find((h) => h.getAttribute('data-provider') === 'rpi' && h.textContent.includes('lab-node'))
     ?.getAttribute('aria-expanded');
   check(rpiLabExpanded === 'true', 'the rpi lab-node sibling stays expanded (no label-keyed intent collision)');
-  await act(async () => { await mountedC.rerender(sidebarProps(backendTwoC, toastsC, 3)); await realTick(); await realTick(); });
+  await act(async () => { await mountedC.rerender(sidebarProps(backendTwoC, toastsC, 3, 'o1')); await realTick(); await realTick(); });
   check(renderedRowsC() === 2, 'the duplicate-labelled subgroup collapse persists across the catalog re-render');
   await act(async () => { mountedC.root.unmount(); });
 }
@@ -2753,7 +2931,7 @@ check(appSource.includes('onOpenManage={openNewSession}')
     },
     sendCatalogCommand: (command) => backendTwoG3.sendCommand(command, undefined, { auxiliary: true }),
   };
-  const propsG3 = { ...sidebarProps(backendTwoG3, toastsG3, 1), activeSessionId: 'agent-live' };
+  const propsG3 = { ...sidebarProps(backendTwoG3, toastsG3, 1), activeSessionId: 'omp-user' };
   propsG3.onSwitchSession = async (): Promise<boolean> => true;
   const mountedG3 = await mountSidebar(docG3, propsG3);
   const renderedRowsG3 = (): number => docG3.body.querySelectorAll('.session-sidebar__switch').length;
@@ -2785,7 +2963,7 @@ check(appSource.includes('onOpenManage={openNewSession}')
     await realTick();
   });
   check(renderedRowsG3() === 0, `the OMP provider head collapses its subgroups including the active row (got ${renderedRowsG3()})`);
-  await mountedG3.rerender({ ...sidebarProps(backendTwoG3, toastsG3, 2), activeSessionId: 'agent-live' });
+  await mountedG3.rerender({ ...sidebarProps(backendTwoG3, toastsG3, 2), activeSessionId: 'omp-user' });
   await act(async () => { await realTick(); await realTick(); });
   check(renderedRowsG3() === 0, 'the provider collapse with hidden active row persists across the catalog re-render');
   await act(async () => { mountedG3.root.unmount(); });
@@ -2816,27 +2994,32 @@ check(appSource.includes('onOpenManage={openNewSession}')
     },
     sendCatalogCommand: (command) => backendTwoCx.sendCommand(command, undefined, { auxiliary: true }),
   };
-  const propsCx = sidebarProps(backendTwoCx, toastsCx, 1);
+  const propsCx = sidebarProps(backendTwoCx, toastsCx, 1, 'cx-a1');
   propsCx.onSwitchSession = async (): Promise<boolean> => true;
   const mountedCx = await mountSidebar(docCx, propsCx);
   const totalRows = (): number => docCx.body.querySelectorAll('.session-sidebar__switch').length;
   const renderedCodexRows = (): number =>
-    [...docCx.body.querySelectorAll('.session-sidebar__row')].filter(
-      (node) => (node.getAttribute('data-provider') ?? '') === 'Codex'
+    docCx.body.querySelectorAll('.session-sidebar__switch').filter(
+      (node) => node.getAttribute('data-session-source') === 'codex'
     ).length;
   const providerHeadCx = docCx.body.querySelectorAll('.session-sidebar__group-head')
     .find((h) => h.getAttribute('data-provider') === 'Codex' && h.getAttribute('data-group-kind') === 'provider');
   check(providerHeadCx !== undefined, 'the codex provider head renders');
-  check(totalRows() === 4, `the multi-level catalog lists four rows (the loaded codex agent row sits inside its default-collapsed Agent subgroup; got ${totalRows()})`);
+  check(totalRows() === 2, `the multi-level catalog starts with the selected proj-a path expanded (proj-b, Agent, rpi default closed; got ${totalRows()})`);
+  check(renderedCodexRows() === 2, 'the root-collapse fixture starts with two visible Codex rows');
   await act(async () => {
     providerHeadCx!.dispatchEvent({ type: 'click', target: providerHeadCx });
     await realTick();
     await realTick();
   });
   check(renderedCodexRows() === 0, `collapsing the codex root hides every descendant row, agent subgroup included (got ${renderedCodexRows()})`);
+  check(providerHeadCx!.getAttribute('aria-expanded') === 'false', 'the clicked Codex provider reports collapsed');
+  check(!docCx.body.querySelectorAll('.session-sidebar__group-head').some((head) =>
+    head.getAttribute('data-provider') === 'Codex' && head.getAttribute('data-group-kind') === 'project'),
+    'the collapsed Codex provider renders no project or Agent subgroup headers');
   /* The authoritative refresh (identical rows, NEW objects) must never
    * resurrect collapsed rows — the collapse intent survives reconcile. */
-  await mountedCx.rerender(sidebarProps(backendTwoCx, toastsCx, 2));
+  await mountedCx.rerender(sidebarProps(backendTwoCx, toastsCx, 2, 'cx-a1'));
   await act(async () => { await realTick(); await realTick(); });
   check(renderedCodexRows() === 0, `the codex root collapse persists across an authoritative refresh (got ${renderedCodexRows()})`);
   /* Active-row change (switch away): the forced-open agent rule must not
@@ -2877,15 +3060,20 @@ check(appSource.includes('onOpenManage={openNewSession}')
     },
     sendCatalogCommand: (command) => backendTwoRace.sendCommand(command, undefined, { auxiliary: true }),
   };
-  const propsRace = sidebarProps(backendTwoRace, toastsRace, 1);
+  const propsRace = sidebarProps(backendTwoRace, toastsRace, 1, 'cx-a1');
   propsRace.onSwitchSession = async (): Promise<boolean> => true;
   const mountedRace = await mountSidebar(docRace, propsRace);
   const providerHeadRace = docRace.body.querySelectorAll('.session-sidebar__group-head')
     .find((h) => h.getAttribute('data-provider') === 'Codex' && h.getAttribute('data-group-kind') === 'provider');
   check(providerHeadRace !== undefined, 'the race fixture renders the codex provider head');
+  const raceCodexRows = (): number =>
+    docRace.body.querySelectorAll('.session-sidebar__switch').filter(
+      (node) => node.getAttribute('data-session-source') === 'codex'
+    ).length;
+  check(raceCodexRows() === 1, 'the refresh-race fixture starts with one visible Codex row');
   /* Trigger the second (background) refresh, then collapse while its
    * authoritative session_list is still parked. */
-  await mountedRace.rerender(sidebarProps(backendTwoRace, toastsRace, 2));
+  await mountedRace.rerender(sidebarProps(backendTwoRace, toastsRace, 2, 'cx-a1'));
   await act(async () => { await realTick(); });
   check(deferSecondList !== null, 'the second authoritative list is in flight');
   await act(async () => {
@@ -2897,11 +3085,11 @@ check(appSource.includes('onOpenManage={openNewSession}')
     await realTick();
     await realTick();
   });
-  const raceCodexRows = (): number =>
-    [...docRace.body.querySelectorAll('.session-sidebar__row')].filter(
-      (node) => (node.getAttribute('data-provider') ?? '') === 'Codex'
-    ).length;
   check(raceCodexRows() === 0, `a collapse click landing before the in-flight catalog commit stays collapsed (got ${raceCodexRows()} codex rows)`);
+  check(providerHeadRace!.getAttribute('aria-expanded') === 'false', 'the refresh-race provider retains collapsed aria state');
+  check(!docRace.body.querySelectorAll('.session-sidebar__group-head').some((head) =>
+    head.getAttribute('data-provider') === 'Codex' && head.getAttribute('data-group-kind') === 'project'),
+    'the refresh-race provider renders no descendant subgroup headers');
   await act(async () => { mountedRace.root.unmount(); });
 }
 
@@ -3155,7 +3343,7 @@ check(appSource.includes('onOpenManage={openNewSession}')
     },
     sendCatalogCommand: (command) => backendWithCopy.sendCommand(command, undefined, { auxiliary: true }),
   };
-  const propsM2 = sidebarProps(backendWithCopy, toastsM, 1);
+  const propsM2 = sidebarProps(backendWithCopy, toastsM, 1, 'srv-a');
   let summaryForSession: string | null = 'newest compact summary';
   propsM2.getCompactionSummary = (): string | null => summaryForSession;
   const mountedM2 = await mountSidebar(docM, propsM2);
@@ -3259,6 +3447,7 @@ check(appSource.includes('onOpenManage={openNewSession}')
       path: '<workspace>/session-store/codex/codex-pure.jsonl',
       modifiedEpoch: 29,
     }),
+    row({ sessionId: 'codex-keep', source: 'codex', status: 'foreign', name: 'Codex session (focus)', cwd: '<workspace>/app', path: '<workspace>/session-store/codex/codex-keep.jsonl', modifiedEpoch: 28 }),
   ];
   const backendTwoI: SidebarBackend = {
     commands: backendI.commands,
@@ -3269,7 +3458,7 @@ check(appSource.includes('onOpenManage={openNewSession}')
     sendCatalogCommand: (command) => backendTwoI.sendCommand(command, undefined, { auxiliary: true }),
   };
   const switchTargetsI: Array<Record<string, unknown>> = [];
-  const propsI = sidebarProps(backendTwoI, toastsI, 1);
+  const propsI = sidebarProps(backendTwoI, toastsI, 1, 'codex-keep');
   propsI.onSwitchSession = (target): Promise<boolean> => {
     switchTargetsI.push(target as Record<string, unknown>);
     return true;
@@ -3434,7 +3623,7 @@ check(appSource.includes('onOpenManage={openNewSession}')
     },
     sendCatalogCommand: (command) => backendF.sendCommand(command, undefined, { auxiliary: true }),
   };
-  const mountedF = await mountSidebar(docF, sidebarProps(backendF, toastsF, 1));
+  const mountedF = await mountSidebar(docF, sidebarProps(backendF, toastsF, 1, 'srv-a'));
   check(listCount(backendF) === 1, 'fork mount performs exactly one session_list');
 
   /* The mini DOM supports only single simple selectors — no descendant
@@ -3652,6 +3841,17 @@ check(appSource.includes('onOpenManage={openNewSession}')
      * both outcomes converge on. For moved=false it is identical to the
      * captured row, so the refresh is the SAME catalog before and after. */
     const residentRow = { ...capturedRow, cwd: TARGET, path: DEST_PATH };
+    /* The FOCUS row: the mounted activeSessionId — it only expands the
+     * selected path so the TESTED row stays non-active (an active-row click
+     * is a deliberate no-op guard, which would kill the switch-forward
+     * proof below). It shares the tested row's CURRENT project per leg. */
+    const focusRowMv = row({
+      sessionId: 'mv-focus',
+      name: 'Focus row',
+      cwd: moved ? '<workspace>/app' : TARGET,
+      path: moved ? '<workspace>/session-store/mv-focus.jsonl' : '<workspace>/session-store/projects-beta/mv-focus.jsonl',
+      modifiedEpoch: 26,
+    });
     const commandsMv: CatalogCommand[] = [];
     let moveCommitted = false;
     const backendMv: SidebarBackend = {
@@ -3697,7 +3897,7 @@ check(appSource.includes('onOpenManage={openNewSession}')
           // source row, after it the resident-at-target row. moved=false:
           // BOTH branches yield the same resident row — the refresh is
           // identical to the pre-command catalog.
-          return { sessions: [{ ...(moveCommitted ? residentRow : capturedRow) }] };
+          return { sessions: [{ ...(moveCommitted ? residentRow : capturedRow) }, { ...focusRowMv }] };
         }
         return {};
       },
@@ -3706,7 +3906,7 @@ check(appSource.includes('onOpenManage={openNewSession}')
     /* The switch-target capture observes the REFRESHED row identity after
      * the move: clicking the row forwards the catalog path to App. */
     let switchTargetMv: Record<string, unknown> | null = null;
-    const propsMv = sidebarProps(backendMv, toastsMv, 1);
+    const propsMv = sidebarProps(backendMv, toastsMv, 1, 'mv-focus');
     propsMv.onSwitchSession = async (target: unknown): Promise<boolean> => {
       switchTargetMv = target as Record<string, unknown>;
       return true;
@@ -3723,8 +3923,8 @@ check(appSource.includes('onOpenManage={openNewSession}')
         head.getAttribute('data-subgroup-kind') === 'project'
         && head.querySelector('.session-sidebar__group-label')?.textContent === 'beta');
       check(preBetaHead !== undefined, `${label}: the pre-command catalog already groups the resident row under the target project`);
-      check(doc.body.querySelectorAll('.session-sidebar__switch').length === 1,
-        `${label}: the pre-command catalog lists exactly the single resident row`);
+      check(doc.body.querySelectorAll('.session-sidebar__switch').length === 2,
+        `${label}: the pre-command catalog lists exactly the resident row and its focus row`);
     }
     await act(async () => {
       rowBtn!.dispatchEvent({
@@ -3804,6 +4004,18 @@ check(appSource.includes('onOpenManage={openNewSession}')
     check(toastsMv[0]?.message === 'Session moved' && !toastsMv[0]?.error, `${label}: the single toast is the bounded success message`);
     check(doc.body.querySelector('#session-move-cwd-input') === null, `${label}: the move form closed`);
     check(doc.body.querySelector('.session-sidebar__menu') === null, `${label}: the menu closed`);
+    if (moved) {
+      /* The moved row regroups under 'beta', which defaults closed under
+       * the focus-row identity — expand it before the refresh assertions. */
+      const betaHeadPre = doc.body.querySelectorAll('.session-sidebar__group-head').find((head) =>
+        head.getAttribute('data-subgroup-kind') === 'project'
+        && head.querySelector('.session-sidebar__group-label')?.textContent === 'beta');
+      await act(async () => {
+        betaHeadPre!.dispatchEvent({ type: 'click', target: betaHeadPre });
+        await realTick();
+        await realTick();
+      });
+    }
     /* The refreshed catalog is asserted beyond the name: the row sits
      * under the cwd-derived target project group ('beta'), and clicking the
      * refreshed row forwards the DESTINATION catalog path to App — the
@@ -3842,10 +4054,10 @@ check(appSource.includes('onOpenManage={openNewSession}')
        * carried the DEST path (asserted on the frame above), and production
        * validation binds the response `from` to that captured path and `to`
        * to the listed row path — from = to = DEST_PATH. The refresh is
-       * identical: still exactly one row, still under the target group,
+       * identical: still exactly the resident row plus its focus row, still under the target group,
        * still forwarding DEST — no duplicate source row ever appears. */
-      check(doc.body.querySelectorAll('.session-sidebar__switch').length === 1,
-        `${label}: the identical refresh still lists exactly the single resident row (no duplicate source row)`);
+      check(doc.body.querySelectorAll('.session-sidebar__switch').length === 2,
+        `${label}: the identical refresh still lists exactly the resident row plus the focus row (no duplicate source row)`);
     }
     assertNoErrorPresentation(doc, label);
     await act(async () => {
@@ -3914,7 +4126,7 @@ check(appSource.includes('onOpenManage={openNewSession}')
     },
     sendCatalogCommand: (command) => backendD.sendCommand(command, undefined, { auxiliary: true }),
   };
-  const propsD = sidebarProps(backendD, toastsD, 1);
+  const propsD = sidebarProps(backendD, toastsD, 1, 'srv-a');
   propsD.onSwitchSession = async (): Promise<boolean> => true;
   const mountedD = await mountSidebar(docD, propsD);
   const openMoveDialog = async (): Promise<MiniNode | null> => {
@@ -4025,6 +4237,7 @@ check(appSource.includes('onOpenManage={openNewSession}')
     row({ sessionId: 'valid-a', name: 'Valid row', cwd: '<workspace>/app', path: '<workspace>/session-store/valid-a.jsonl' }),
     row({ sessionId: 'alias-row', name: 'Alias row', cwd: '<workspace>/app', path: '<workspace>/session-store/alias.jsonl', source: 'native', status: 'native' }),
     row({ sessionId: 'bad-status', cwd: '<workspace>/app', path: '<workspace>/session-store/bad-status.jsonl', status: 'imported' }),
+    row({ sessionId: 'valid-b', name: 'Focus row', cwd: '<workspace>/app', path: '<workspace>/session-store/valid-b.jsonl' }),
   ];
   const commandsM: CatalogCommand[] = [];
   const backendM: SidebarBackend = {
@@ -4037,7 +4250,7 @@ check(appSource.includes('onOpenManage={openNewSession}')
     sendCatalogCommand: (command) => backendM.sendCommand(command, undefined, { auxiliary: true }),
   };
   let switchRequestsM = 0;
-  const propsM = sidebarProps(backendM, toastsM, 1);
+  const propsM = sidebarProps(backendM, toastsM, 1, 'valid-b');
   propsM.onSwitchSession = async (): Promise<boolean> => {
     switchRequestsM += 1;
     return true;
@@ -4048,7 +4261,7 @@ check(appSource.includes('onOpenManage={openNewSession}')
 
   check(rowButton('valid-a') !== null && rowButton('alias-row') !== null && rowButton('bad-status') !== null,
     'canonical and malformed rows both list in the sidebar');
-  check(docM.body.querySelectorAll('.session-sidebar__switch').length === 3, 'all three catalog rows render');
+  check(docM.body.querySelectorAll('.session-sidebar__switch').length === 4, 'all four catalog rows render');
 
   /* Malformed alias row: context menu never opens (no native authority). */
   const aliasBtn = rowButton('alias-row');
@@ -4118,18 +4331,19 @@ check(appSource.includes('onOpenManage={openNewSession}')
     path: '<workspace>/session-store/agent-1.jsonl',
     agentSession: true,
   });
+  const userRowG2 = row({ sessionId: 'user-live', name: 'User session', cwd: '<workspace>/agents', path: '<workspace>/session-store/user-live.jsonl' });
   let agentLoaded = true;
   const backendG2: SidebarBackend = {
     commands: [],
     sendCommand: async (command) => {
       if (command.type === 'session_list') {
-        return { sessions: [{ ...agentCatalogRow, loaded: agentLoaded }] };
+        return { sessions: [{ ...agentCatalogRow, loaded: agentLoaded }, { ...userRowG2 }] };
       }
       return {};
     },
     sendCatalogCommand: (command) => backendG2.sendCommand(command, undefined, { auxiliary: true }),
   };
-  const mountedG2 = await mountSidebar(docG2, sidebarProps(backendG2, toastsG2, 1));
+  const mountedG2 = await mountSidebar(docG2, sidebarProps(backendG2, toastsG2, 1, 'user-live'));
   /* The mini DOM supports no compound tag+attribute selectors, and BOTH the
    * group <li> and its heading <button> carry data-subgroup-kind — select
    * attribute-only, then assert the heading tag. */

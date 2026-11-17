@@ -241,6 +241,7 @@ export const styles = StyleSheet.create({
     maxWidth: 240,
   },
   attachmentThumb: { width: 32, height: 32, marginLeft: 6 },
+  transcriptImage: { width: 240, height: 240, borderRadius: 8, marginTop: 4 },
   attachmentChipIcon: { width: 32, alignItems: 'center', justifyContent: 'center', marginLeft: 6 },
   attachmentChipBody: { flexShrink: 1, minWidth: 0, marginLeft: 6 },
   attachmentChipName: { fontSize: 13, fontWeight: '600' },

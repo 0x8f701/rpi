@@ -1568,8 +1568,9 @@ impl Settings {
 
     pub fn runtime_settings(&self) -> Result<RuntimeSettingsSnapshot> {
         validate_operational_settings(self)?;
+        // Snapshot-only options: no turn runs from here, so no model is selected.
         let mut session_options = crate::SessionOptions {
-            model: pi_ai::Model::default(),
+            model: None,
             cwd: PathBuf::new(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,

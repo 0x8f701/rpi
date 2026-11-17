@@ -39,7 +39,7 @@ async fn run_turn_to_completed_run_writes_stream_and_trailing_newline() {
 
     let cwd = tempfile::tempdir().expect("tempdir");
     let session = Session::new(SessionOptions {
-        model,
+        model: Some(model),
         cwd: cwd.path().to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,

@@ -42,7 +42,7 @@ import {
   modelIdFromOptionValue,
   navigateReviewFinding,
   normalizeAvailableModels,
-  normalizeCodeReviewSnapshot,
+  parseCodeReviewSnapshot,
   normalizeThreads,
   orderReviewFindings,
   parseCodeReviewSetModelAck,
@@ -82,9 +82,19 @@ function check(name: string, cond: unknown, detail = ''): void {
   if (!cond) failures.push(`${name}${detail ? `: ${detail}` : ''}`);
 }
 
+/** Frozen wire requires `repo` on every snapshot projection. These parity
+ *  fixtures are not about repo authority, so they stamp the explicit
+ *  session-cwd null; a structural rejection aborts instead of reading a
+ *  repaired shape. */
+const fixtureSnapshot = (data: Record<string, unknown>) => {
+  const parsed = parseCodeReviewSnapshot({ repo: null, ...data });
+  if (!parsed.ok) throw new Error(`fixture rejected: ${parsed.error}`);
+  return parsed.snapshot;
+};
+
 // ---- snapshot wire defaults: reviewLanguageDefault / autoReviewError / triaging ----
 {
-  const absent = normalizeCodeReviewSnapshot({});
+  const absent = fixtureSnapshot({});
   check('absent reviewLanguageDefault normalizes to null', absent.reviewLanguageDefault === null);
   check('absent autoReviewError normalizes to null', absent.autoReviewError === null);
   check('absent autoReviewState falls back to idle', absent.autoReviewState === 'idle');
@@ -94,24 +104,24 @@ function check(name: string, cond: unknown, detail = ''): void {
       && emptyCodeReviewSnapshot().autoReviewError === null
       && emptyCodeReviewSnapshot().autoReviewState === 'idle',
   );
-  const tagged = normalizeCodeReviewSnapshot({ reviewLanguageDefault: 'de' });
+  const tagged = fixtureSnapshot({ reviewLanguageDefault: 'de' });
   check('string reviewLanguageDefault passes through', tagged.reviewLanguageDefault === 'de');
   check(
     'non-string reviewLanguageDefault nulls',
-    normalizeCodeReviewSnapshot({ reviewLanguageDefault: 42 }).reviewLanguageDefault === null,
+    fixtureSnapshot({ reviewLanguageDefault: 42 }).reviewLanguageDefault === null,
   );
   check(
     'triaging is a recognized batch state',
-    normalizeCodeReviewSnapshot({ autoReviewState: 'triaging' }).autoReviewState === 'triaging',
+    fixtureSnapshot({ autoReviewState: 'triaging' }).autoReviewState === 'triaging',
   );
   check(
     'unknown batch states fall back to idle',
-    normalizeCodeReviewSnapshot({ autoReviewState: 'paused' }).autoReviewState === 'idle',
+    fixtureSnapshot({ autoReviewState: 'paused' }).autoReviewState === 'idle',
   );
   check(
     'typed autoReviewError passes through',
     (() => {
-      const error = normalizeCodeReviewSnapshot({
+      const error = fixtureSnapshot({
         autoReviewError: { message: 'triage failed', code: 'invalid-triage' },
       }).autoReviewError;
       return error !== null && error.message === 'triage failed' && error.code === 'invalid-triage';
@@ -119,9 +129,9 @@ function check(name: string, cond: unknown, detail = ''): void {
   );
   check(
     'malformed autoReviewError nulls whole (retired plain strings included)',
-    normalizeCodeReviewSnapshot({ autoReviewError: 'triage failed' }).autoReviewError === null
-      && normalizeCodeReviewSnapshot({ autoReviewError: 7 }).autoReviewError === null
-      && normalizeCodeReviewSnapshot({ autoReviewError: { message: 'm' } }).autoReviewError === null,
+    fixtureSnapshot({ autoReviewError: 'triage failed' }).autoReviewError === null
+      && fixtureSnapshot({ autoReviewError: 7 }).autoReviewError === null
+      && fixtureSnapshot({ autoReviewError: { message: 'm' } }).autoReviewError === null,
   );
 }
 

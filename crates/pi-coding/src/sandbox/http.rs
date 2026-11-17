@@ -677,6 +677,30 @@ pub struct BuiltinHttpEndpoints {
     pub plugin_marketplace_url: Option<String>,
 }
 
+/// The provider execution authority a generation's HTTP requirements are
+/// derived from: the selected model together with the request auth resolved for
+/// exactly that model.
+///
+/// An absent model is a real application state — a listener starts before the
+/// operator configures a provider — so the authority is optional *as a whole*.
+/// Two independent `Option`s would admit the illegal combinations "model
+/// without auth" and "auth without model"; this borrows both or neither.
+///
+/// Absence removes only what genuinely needs a provider: the provider API
+/// endpoint and the stored-OAuth refresh destination. Image generation, the
+/// built-in product destinations, credential validation, and trust derivation
+/// are independent of it and stay staged.
+pub(crate) struct ProviderAuthority<'a> {
+    pub(crate) model: &'a pi_ai::Model,
+    pub(crate) request_auth: &'a RequestAuth,
+}
+
+impl<'a> ProviderAuthority<'a> {
+    pub(crate) const fn new(model: &'a pi_ai::Model, request_auth: &'a RequestAuth) -> Self {
+        Self { model, request_auth }
+    }
+}
+
 pub struct SessionHttpRequirements {
     destinations: BTreeMap<HostHttpDestinationKey, HostHttpDestination>,
 }
@@ -687,12 +711,15 @@ impl SessionHttpRequirements {
         request_auth: &RequestAuth,
         stream: &pi_ai::StreamOptions,
     ) -> Result<Self, SessionHttpError> {
-        Self::derive_with_image_generation(model, request_auth, stream, None)
+        Self::derive_with_image_generation(
+            Some(ProviderAuthority::new(model, request_auth)),
+            stream,
+            None,
+        )
     }
 
     pub(crate) fn derive_with_image_generation(
-        model: &pi_ai::Model,
-        request_auth: &RequestAuth,
+        provider_authority: Option<ProviderAuthority<'_>>,
         stream: &pi_ai::StreamOptions,
         image_generation: Option<(
             &pi_ai::Model,
@@ -701,7 +728,7 @@ impl SessionHttpRequirements {
         )>,
     ) -> Result<Self, SessionHttpError> {
         Ok(Self {
-            destinations: derive_core_destinations(model, request_auth, stream, image_generation)?,
+            destinations: derive_core_destinations(provider_authority, stream, image_generation)?,
         })
     }
 
@@ -713,9 +740,12 @@ impl SessionHttpRequirements {
     /// so a confined `workspace-write` session can authorize each built-in
     /// tool out of the box; an explicit operator `hostHttp` policy is still
     /// never widened — it must independently satisfy the derived requirements.
+    ///
+    /// `provider_authority` is optional so a model-less generation (a listener
+    /// opened before any provider is configured) still enumerates every
+    /// built-in destination instead of failing or skipping derivation.
     pub(crate) fn derive_with_builtins(
-        model: &pi_ai::Model,
-        request_auth: &RequestAuth,
+        provider_authority: Option<ProviderAuthority<'_>>,
         stream: &pi_ai::StreamOptions,
         image_generation: Option<(
             &pi_ai::Model,
@@ -725,7 +755,7 @@ impl SessionHttpRequirements {
         builtins: &BuiltinHttpEndpoints,
     ) -> Result<Self, SessionHttpError> {
         let mut destinations =
-            derive_core_destinations(model, request_auth, stream, image_generation)?;
+            derive_core_destinations(provider_authority, stream, image_generation)?;
         for (class, host, port) in STATIC_BUILTIN_HOSTS.iter().copied() {
             let destination = dns_global_destination(class, host, port)?;
             destinations.insert(destination.canonical_key(), destination);
@@ -778,9 +808,13 @@ const DEFAULT_HUGGING_FACE_URL: &str = "https://huggingface.co";
 /// provider API endpoint(s), the optional image-generation endpoint, and the
 /// OAuth refresh endpoint when stored OAuth is in use. Built-in product
 /// destinations are layered on top by [`SessionHttpRequirements::derive_with_builtins`].
+///
+/// A missing [`ProviderAuthority`] drops only the provider API and OAuth
+/// refresh destinations; the independent image-generation endpoint is still
+/// derived, and derivation itself never becomes a failure just because no
+/// provider is configured yet.
 fn derive_core_destinations(
-    model: &pi_ai::Model,
-    request_auth: &RequestAuth,
+    provider_authority: Option<ProviderAuthority<'_>>,
     stream: &pi_ai::StreamOptions,
     image_generation: Option<(
         &pi_ai::Model,
@@ -789,15 +823,22 @@ fn derive_core_destinations(
     )>,
 ) -> Result<BTreeMap<HostHttpDestinationKey, HostHttpDestination>, SessionHttpError> {
     let mut destinations = BTreeMap::new();
-    for authority in pi_ai::resolve_provider_http_authorities(model, stream)
-        .map_err(|_| SessionHttpError::InvalidRequest)?
-    {
-        if let Some(destination) = destination_from_resolved(
-            HostHttpClass::ProviderApi,
-            &authority,
-            model_endpoint_is_operator_owned(model),
-        )? {
-            destinations.insert(destination.canonical_key(), destination);
+    if let Some(ProviderAuthority { model, request_auth }) = provider_authority {
+        for authority in pi_ai::resolve_provider_http_authorities(model, stream)
+            .map_err(|_| SessionHttpError::InvalidRequest)?
+        {
+            if let Some(destination) = destination_from_resolved(
+                HostHttpClass::ProviderApi,
+                &authority,
+                model_endpoint_is_operator_owned(model),
+            )? {
+                destinations.insert(destination.canonical_key(), destination);
+            }
+        }
+        if request_auth.uses_stored_oauth() {
+            if let Some(destination) = oauth_refresh_destination(&model.provider)? {
+                destinations.insert(destination.canonical_key(), destination);
+            }
         }
     }
     if let Some((image_model, base_url, env)) = image_generation {
@@ -809,11 +850,6 @@ fn derive_core_destinations(
             &authority,
             image_endpoint_is_operator_owned(image_model, base_url),
         )? {
-            destinations.insert(destination.canonical_key(), destination);
-        }
-    }
-    if request_auth.uses_stored_oauth() {
-        if let Some(destination) = oauth_refresh_destination(&model.provider)? {
             destinations.insert(destination.canonical_key(), destination);
         }
     }
@@ -1392,8 +1428,7 @@ mod tests {
     fn derive_enumerates_exact_static_builtin_destinations() {
         let model = openai_model();
         let requirements = SessionHttpRequirements::derive_with_builtins(
-            &model,
-            &crate::RequestAuth::default(),
+            Some(ProviderAuthority::new(&model, &crate::RequestAuth::default())),
             &StreamOptions::default(),
             None,
             &BuiltinHttpEndpoints::default(),
@@ -1479,8 +1514,7 @@ mod tests {
         // forces an operator to authorize an endpoint they did not configure.
         let model = openai_model();
         let requirements = SessionHttpRequirements::derive_with_builtins(
-            &model,
-            &crate::RequestAuth::default(),
+            Some(ProviderAuthority::new(&model, &crate::RequestAuth::default())),
             &StreamOptions::default(),
             None,
             &BuiltinHttpEndpoints::default(),
@@ -1512,8 +1546,7 @@ mod tests {
             ..BuiltinHttpEndpoints::default()
         };
         let requirements = SessionHttpRequirements::derive_with_builtins(
-            &model,
-            &crate::RequestAuth::default(),
+            Some(ProviderAuthority::new(&model, &crate::RequestAuth::default())),
             &StreamOptions::default(),
             None,
             &builtins,
@@ -1579,8 +1612,7 @@ mod tests {
         // production derive_with_builtins path.
         let model = openai_model();
         let requirements = SessionHttpRequirements::derive_with_image_generation(
-            &model,
-            &crate::RequestAuth::default(),
+            Some(ProviderAuthority::new(&model, &crate::RequestAuth::default())),
             &StreamOptions::default(),
             None,
         )
@@ -1592,6 +1624,81 @@ mod tests {
             "minimal derive is provider-only"
         );
         assert_eq!(policy.destinations()[0].class(), HostHttpClass::ProviderApi);
+    }
+
+    #[test]
+    fn absent_provider_authority_keeps_builtins_and_image_without_provider() {
+        // A listener opens before the operator configures a provider, so
+        // model-less derivation is a real state: it must succeed and must not
+        // short-circuit. Absence drops only the provider API and the
+        // stored-OAuth refresh destination; the static and configured built-in
+        // destinations plus the independent image-generation endpoint stay.
+        let image = Model {
+            id: "gpt-image-1".to_owned(),
+            name: "gpt-image-1".to_owned(),
+            api: pi_ai::API_IMAGE_GEN.to_owned(),
+            provider: "openai".to_owned(),
+            base_url: "https://api.openai.com/v1".to_owned(),
+            image_generation: true,
+            ..Model::default()
+        };
+        let env = std::collections::HashMap::new();
+        let builtins = BuiltinHttpEndpoints {
+            memory_api_url: Some("https://memory.example.test/api".to_owned()),
+            ..BuiltinHttpEndpoints::default()
+        };
+        let requirements = SessionHttpRequirements::derive_with_builtins(
+            None,
+            &StreamOptions::default(),
+            Some((&image, None, &env)),
+            &builtins,
+        )
+        .expect("model-less derive still succeeds");
+        let policy =
+            resolve_session_http_policy(None, &requirements).expect("model-less default policy");
+        let destinations = policy.destinations();
+        assert!(
+            !destinations
+                .iter()
+                .any(|row| row.class() == HostHttpClass::ProviderApi),
+            "absent provider authority must not derive a provider API destination"
+        );
+        assert!(
+            !destinations.iter().any(|row| row.class() == HostHttpClass::AuthOauth),
+            "absent provider authority must not derive an OAuth refresh destination"
+        );
+        assert_destination(
+            destinations,
+            HostHttpClass::WebSearch,
+            HostHttpScheme::Https,
+            "api.exa.ai",
+            443,
+            IpScope::Global,
+        );
+        assert_destination(
+            destinations,
+            HostHttpClass::NpmTarball,
+            HostHttpScheme::Https,
+            "registry.npmjs.org",
+            443,
+            IpScope::Global,
+        );
+        assert_destination(
+            destinations,
+            HostHttpClass::MemoryApi,
+            HostHttpScheme::Https,
+            "memory.example.test",
+            443,
+            IpScope::Global,
+        );
+        assert_destination(
+            destinations,
+            HostHttpClass::ImageGeneration,
+            HostHttpScheme::Https,
+            "api.openai.com",
+            443,
+            IpScope::Global,
+        );
     }
 
     #[test]
@@ -1892,8 +1999,10 @@ mod tests {
         };
         let env = std::collections::HashMap::new();
         let requirements = SessionHttpRequirements::derive_with_image_generation(
-            &model,
-            &crate::RequestAuth::default(),
+            Some(ProviderAuthority::new(
+                &model,
+                &crate::RequestAuth::default(),
+            )),
             &StreamOptions::default(),
             Some((&image, Some("http://172.16.2.9:8080/v1"), &env)),
         )

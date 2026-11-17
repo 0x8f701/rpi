@@ -170,7 +170,7 @@ fn session_with_responses(
     // selection_recommendations into provider contexts under test.
     let session = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model,
+            model: Some(model),
             cwd: fixture.workspace().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -223,7 +223,7 @@ fn session_with_context_capture(
     let fixture = HermeticApplicationFixture::new(compaction);
     let session = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model,
+            model: Some(model),
             cwd: fixture.workspace().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -1130,7 +1130,7 @@ async fn application_is_compacting_only_while_manual_summary_runs() {
     let fixture = HermeticApplicationFixture::new(Some(settings));
     let session = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model: model.clone(),
+            model: Some(model.clone()),
             cwd: fixture.workspace().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,

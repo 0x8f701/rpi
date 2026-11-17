@@ -1357,8 +1357,43 @@ fn invalid_stored_credential(provider: &str, path: &Path, reason: &str) -> anyho
     )
 }
 
-fn strip_json_comments(input: &str) -> String {
+/// Comment-stripping behavior for JSONC inputs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JsonCommentMode {
+    /// Drop comments entirely; the models.json loader behavior, unchanged.
+    Remove,
+    /// Replace every comment byte with one space while preserving newlines, so
+    /// token separation and byte offsets survive (`1/*c*/2` keeps `1` and `2`
+    /// as separate tokens, never merging them into the number `12`).
+    Pad,
+}
+
+/// Why padded stripping refused the input.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum JsonCommentError {
+    /// A `/* … */` comment was never closed.
+    UnterminatedBlock,
+}
+
+/// Models.json keeps its exact historical stripping behavior.
+pub(crate) fn strip_json_comments(input: &str) -> String {
+    strip_json_comments_mode(input, JsonCommentMode::Remove)
+        .unwrap_or_else(|_| input.to_owned())
+}
+
+/// Padded stripping for config dialects where adjacent tokens must stay
+/// separated. An unterminated block comment is reported instead of being
+/// silently dropped with the rest of the input.
+pub(crate) fn strip_json_comments_padded(input: &str) -> Result<String, JsonCommentError> {
+    strip_json_comments_mode(input, JsonCommentMode::Pad)
+}
+
+fn strip_json_comments_mode(
+    input: &str,
+    mode: JsonCommentMode,
+) -> Result<String, JsonCommentError> {
     let bytes = input.as_bytes();
+    let pad = mode == JsonCommentMode::Pad;
     let mut output = Vec::with_capacity(input.len());
     let mut index = 0;
     let mut in_string = false;
@@ -1384,24 +1419,51 @@ fn strip_json_comments(input: &str) -> String {
             continue;
         }
         if current == b'/' && bytes.get(index + 1) == Some(&b'/') {
+            if pad {
+                output.extend_from_slice(b"  ");
+            }
             index += 2;
             while index < bytes.len() && bytes[index] != b'\n' {
+                if pad {
+                    output.push(if bytes[index] == b'\r' { b'\r' } else { b' ' });
+                }
                 index += 1;
             }
             continue;
         }
         if current == b'/' && bytes.get(index + 1) == Some(&b'*') {
+            if pad {
+                output.extend_from_slice(b"  ");
+            }
             index += 2;
-            while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/') {
+            let mut closed = false;
+            while index < bytes.len() {
+                if bytes[index] == b'*' && bytes.get(index + 1) == Some(&b'/') {
+                    closed = true;
+                    if pad {
+                        output.extend_from_slice(b"  ");
+                    }
+                    index += 2;
+                    break;
+                }
+                if pad {
+                    output.push(if matches!(bytes[index], b'\r' | b'\n') {
+                        bytes[index]
+                    } else {
+                        b' '
+                    });
+                }
                 index += 1;
             }
-            index = (index + 2).min(bytes.len());
+            if pad && !closed {
+                return Err(JsonCommentError::UnterminatedBlock);
+            }
             continue;
         }
         output.push(current);
         index += 1;
     }
-    String::from_utf8(output).unwrap_or_else(|_| input.to_owned())
+    Ok(String::from_utf8(output).unwrap_or_else(|_| input.to_owned()))
 }
 
 #[cfg(test)]
@@ -1668,5 +1730,83 @@ mod tests {
         let error = resolve_model_request_auth(&model, None, None)
             .expect_err("after unregister the key gate must apply again");
         assert!(format!("{error:#}").contains("no API key found"));
+    }
+
+    #[test]
+    fn remove_strip_keeps_bytes_directly_after_a_closed_block_comment() {
+        let input = r#"/*x*/{"a":1}"#;
+        assert_eq!(strip_json_comments(input), r#"{"a":1}"#);
+        let parsed: serde_json::Value = serde_json::from_str(&strip_json_comments(input))
+            .expect("bytes right after the comment must survive stripping");
+        assert_eq!(parsed["a"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn padded_strip_keeps_offsets_newlines_and_comment_adjacent_bytes() {
+        let input = r#"/*x*/{"a":1}"#;
+        let padded = strip_json_comments_padded(input).expect("closed block comment strips");
+        assert_eq!(
+            padded.len(),
+            input.len(),
+            "padding keeps one output byte per input byte"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&padded).expect("padded output is valid JSON");
+        assert_eq!(parsed["a"], serde_json::json!(1));
+
+        // A line comment's own terminator survives, so following bytes keep
+        // their exact offsets and line structure.
+        let commented = "// note\r\n{\"a\":1}";
+        let padded = strip_json_comments_padded(commented).expect("line comment strips");
+        assert_eq!(
+            padded,
+            format!("{}\r\n{}", " ".repeat("// note".len()), r#"{"a":1}"#),
+            "a line comment's terminator must survive padding",
+        );
+        assert_eq!(padded.len(), commented.len());
+    }
+
+    #[test]
+    fn padded_strip_separates_tokens_an_empty_comment_would_merge() {
+        let padded = strip_json_comments_padded("1/*c*/2").expect("closed block comment strips");
+        assert_eq!(padded, format!("1{}2", " ".repeat("/*c*/".len())));
+        assert_eq!(
+            padded.split_whitespace().collect::<Vec<_>>(),
+            ["1", "2"],
+            "stripping the comment must not merge 1/*c*/2 into 12",
+        );
+
+        let padded =
+            strip_json_comments_padded("true/*c*/false").expect("closed block comment strips");
+        assert_eq!(
+            padded.split_whitespace().collect::<Vec<_>>(),
+            ["true", "false"],
+            "stripping the comment must not merge true/*c*/false into truefalse",
+        );
+    }
+
+    #[test]
+    fn comment_markers_inside_string_literals_are_preserved() {
+        let input = r#"{"a":"http://x/*y*/","b":"quote \"//\" then /*","c":2}"#;
+        assert_eq!(strip_json_comments(input), input);
+        let padded = strip_json_comments_padded(input).expect("no block comment outside strings");
+        assert_eq!(padded, input);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&padded).expect("string contents stay valid JSON");
+        assert_eq!(parsed["a"], serde_json::json!("http://x/*y*/"));
+        assert_eq!(parsed["b"], serde_json::json!("quote \"//\" then /*"));
+    }
+
+    #[test]
+    fn padded_strip_rejects_unterminated_block_comment_and_remove_stays_lenient() {
+        let input = "{\"a\":1} /*never closed";
+        assert_eq!(
+            strip_json_comments_padded(input),
+            Err(JsonCommentError::UnterminatedBlock),
+        );
+        assert_eq!(strip_json_comments(input), "{\"a\":1} ");
+        let parsed: serde_json::Value = serde_json::from_str(&strip_json_comments(input))
+            .expect("models.json keeps its historical lenient stripping");
+        assert_eq!(parsed["a"], serde_json::json!(1));
     }
 }

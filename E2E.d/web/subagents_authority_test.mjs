@@ -1,6 +1,7 @@
 // Additive Web orchestration projection authority verification. The baseline
 // D93 lane remains in subagents_test.mjs and runs first.
 import { chromium } from 'playwright';
+import { clickFeature } from './lib/feature-menu.mjs';
 
 const url = process.env.RPI_URL;
 const token = process.env.RPI_TOKEN || '';
@@ -66,6 +67,55 @@ async function projection(page) {
   };
 }
 
+// Frontend-only fault injection on the REAL app socket: never fakes the backend.
+async function installJobOutputSeam(page) {
+  await page.addInitScript(() => {
+    const Native = window.WebSocket;
+    class S extends Native { constructor(...a) { super(...a); (window.__seamSockets ??= []).push(this); } }
+    for (const k of ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED']) Object.defineProperty(S, k, { value: Native[k] });
+    window.WebSocket = S;
+  });
+}
+async function armJobOutputSeam(page) {
+  await page.evaluate(() => {
+    const socket = (window.__seamSockets || []).find((s) => s.readyState === 1 && typeof s.onmessage === 'function');
+    if (!socket || socket.readyState !== 1 || typeof socket.onmessage !== 'function') throw new Error('no live app socket');
+    const modes = new Map(), requestJobs = new Map(), state = { held: new Map(), released: [] };
+    const deliver = socket.onmessage, send = socket.send.bind(socket);
+    const emit = (data) => deliver.call(socket, new MessageEvent('message', { data }));
+    socket.send = (data) => {
+      try {
+        const frame = JSON.parse(data);
+        if (frame.type === 'job_output') { modes.get(frame.jobId)?.ids.push(frame.id); requestJobs.set(frame.id, frame.jobId); }
+      } catch { /* not JSON */ }
+      return send(data);
+    };
+    socket.onmessage = (event) => {
+      let frame; try { frame = JSON.parse(event.data); } catch { /* pass */ }
+      const mode = frame?.type === 'response' ? modes.get(requestJobs.get(frame.id)) : null;
+      if (!mode?.ids.includes(frame.id)) { deliver.call(socket, event); return; }
+      if (mode.kind === 'hold') { state.held.set(frame.id, { raw: event.data, jobId: requestJobs.get(frame.id) }); return; }
+      emit(JSON.stringify(mode.kind === 'fail' ? { ...frame, success: false, error: mode.message, data: null }
+        : { ...frame, data: { ...frame.data, assignment: { status: 'unavailable', reason: mode.reason } } }));
+    };
+    window.__jobOutputSeam = {
+      hold: (id) => modes.set(id, { kind: 'hold', ids: [] }),
+      fail: (id, message) => modes.set(id, { kind: 'fail', ids: [], message }),
+      unavailable: (id, reason) => modes.set(id, { kind: 'unavailable', ids: [], reason }),
+      clear: (id) => modes.delete(id),
+      release: (id) => [...state.held].forEach(([rid, e]) => { if (e.jobId !== id) return; state.held.delete(rid); state.released.push(rid); emit(e.raw); }),
+      sent: (id) => (modes.get(id)?.ids.length || 0) > 0,
+      held: () => [...state.held.keys()],
+      released: () => state.released.length,
+      snap: () => {
+        const d = document.querySelector('[data-details-dialog]'), b = document.querySelector('[data-details-description]');
+        return { id: d?.getAttribute('data-job-id') || '', status: b?.getAttribute('data-assignment-status') || '',
+          text: (b?.textContent || '').trim(), error: (document.querySelector('[data-details-assignment-error]')?.textContent || '').trim() };
+      },
+    };
+  });
+}
+
 async function main() {
   if (!url) fail('RPI_URL is required');
   const browser = await chromium.launch(chromePath ? { executablePath: chromePath } : {});
@@ -80,9 +130,11 @@ async function main() {
     if (token) {
       await page.addInitScript((value) => window.localStorage.setItem('rpi-web-token', value), token);
     }
+    await installJobOutputSeam(page);
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
     await waitFor(page, () => document.getElementById('send-btn')?.hasAttribute('disabled') !== true, 'WebSocket never connected');
-    await page.click('#subagents-toggle-btn');
+    await armJobOutputSeam(page);
+    await clickFeature(page, '#subagents-toggle-btn');
     await waitFor(page, () => document.querySelector('#subagents-panel #subagents-spawn-btn') !== null,
       'Subagents spawn form unavailable', 15000);
 
@@ -118,6 +170,49 @@ async function main() {
     if (first.backendAgents.join(',') !== expectedAgents.join(',') || first.domAgents.join(',') !== expectedAgents.join(',')) {
       fail(`exact GPT+GLM agents missing: ${JSON.stringify(first)}`);
     }
+
+    const liveJobs = (await rpc(page, { type: 'job_list' })).jobs.filter((job) => first.backendIds.includes(job.id));
+    const [jobA, jobB] = ['gpt', 'glm'].map((agent) => liveJobs.find((job) => job.agent === agent)?.id);
+    if (!jobA || !jobB) fail(`cannot map live agents to IDs: ${JSON.stringify(liveJobs)}`);
+    const seam = (name, ...args) => page.evaluate(({ name, args }) => window.__jobOutputSeam[name](...args), { name, args });
+
+    // A held → B available → stale A release must not repaint B.
+    await seam('hold', jobA);
+    await page.click(`.subagent-job[data-job-id="${jobA}"] [data-details-trigger]`);
+    await waitFor(page, (id) => window.__jobOutputSeam.sent(id) && window.__jobOutputSeam.held().length > 0 && window.__jobOutputSeam.snap().status === 'loading', 'A response was not withheld while loading', 15000, jobA);
+    await page.click('[data-details-close]');
+    await page.click(`.subagent-job[data-job-id="${jobB}"] [data-details-trigger]`);
+    await waitFor(page, (id) => { const s = window.__jobOutputSeam.snap(); return s.id === id && s.status === 'available' && s.text.includes('glm inspect seed.txt'); }, 'B assignment never became available', 15000, jobB);
+    const bBefore = await seam('snap');
+    await seam('release', jobA);
+    await waitFor(page, () => window.__jobOutputSeam.released() > 0 && window.__jobOutputSeam.held().length === 0, 'A release never happened', 5000);
+    const bAfter = await seam('snap');
+    if (bAfter.id !== jobB || bAfter.status !== bBefore.status || bAfter.text !== bBefore.text || bAfter.error !== '') fail(`stale A changed B: ${JSON.stringify({ bBefore, bAfter })}`);
+
+    // Same B refresh: precise RPC failure keeps last-good, then success clears it.
+    await seam('fail', jobB, 'injected refresh job_output failure');
+    await page.click('[data-details-refresh]');
+    await waitFor(page, (id) => { const s = window.__jobOutputSeam.snap(); return s.id === id && s.error.includes(`job_output failed for ${id}:`) && s.error.includes('injected refresh job_output failure'); }, 'RPC failure never surfaced with job id', 15000, jobB);
+    const afterFailure = await seam('snap');
+    if (afterFailure.status !== 'available' || afterFailure.text !== bBefore.text) fail(`refresh failure lost last-good: ${JSON.stringify({ bBefore, afterFailure })}`);
+    await seam('clear', jobB);
+    await page.click('[data-details-refresh]');
+    await waitFor(page, ({ id, text }) => { const s = window.__jobOutputSeam.snap(); return s.id === id && s.status === 'available' && s.text === text && s.error === ''; }, 'successful refresh did not clear the error', 15000, { id: jobB, text: bBefore.text });
+
+    // Typed unavailable is a successful payload, never an RPC failure.
+    await seam('unavailable', jobB, 'request_unavailable');
+    await page.click('[data-details-refresh]');
+    await waitFor(page, (id) => { const s = window.__jobOutputSeam.snap(); return s.id === id && s.status === 'unavailable' && s.error === '' && s.text.includes('Full task unavailable (request_unavailable)'); }, 'typed unavailable was conflated with an RPC failure', 15000, jobB);
+    await seam('clear', jobB);
+    await page.click('[data-details-close]');
+
+    // First-ever failure has no last-good: error state, still with the job id.
+    await seam('fail', jobA, 'injected first job_output failure');
+    await page.click(`.subagent-job[data-job-id="${jobA}"] [data-details-trigger]`);
+    await waitFor(page, (id) => { const s = window.__jobOutputSeam.snap(); return s.id === id && s.error.includes(`job_output failed for ${id}:`) && s.error.includes('injected first job_output failure') && s.text.includes('Full task not loaded. Refresh to retry.'); }, 'first failure never rendered an error state', 15000, jobA);
+    if ((await seam('snap')).status !== 'error') fail('first failure was not typed as error');
+    await seam('clear', jobA);
+    await page.click('[data-details-close]');
 
     await page.fill('#prompt-input', 'presentation hub wait typed');
     await page.press('#prompt-input', 'Enter');

@@ -67,7 +67,6 @@ pub fn offline() -> bool {
 pub struct RunSession {
     pub application: Application,
     pub extension_ui: Option<ExtensionUiAdapter>,
-    pub model: pi_ai::Model,
     pub scoped_models: Option<Vec<pi_ai::Model>>,
     /// Non-fatal startup warnings (settings deprecations, resource diagnostics)
     /// collected for interactive TUI display. Empty for non-interactive modes
@@ -270,7 +269,7 @@ impl RunSessionSpawner {
             let candidate = blueprint
                 .build(&target_cwd, options.clone())
                 .await
-                .context("building resumed session runtime")?;
+                .context(ResumeStage::BuildBlueprint)?;
             rollback.adopt_extension_runtime(candidate.extension_runtime.clone());
             let retry_model = context
                 .provider
@@ -291,7 +290,7 @@ impl RunSessionSpawner {
                     retry_model.clone(),
                     retry_thinking,
                 )
-                .await?;
+                .await.context(ResumeStage::RestoreResume)?;
             let retry_session_name = candidate.session.session_name();
             let (application, resume_notice) =
                 match application_from_session_candidate(candidate).await {
@@ -311,21 +310,24 @@ impl RunSessionSpawner {
                                 retry_model,
                                 retry_thinking,
                             )
-                            .await?;
+                            .await.context(ResumeStage::RestoreResume)?;
                         (
-                            application_from_session_candidate(retry).await?.0,
+                            application_from_session_candidate(retry)
+                                .await
+                                .context(ResumeStage::ApplicationFromCandidate)?.0,
                             Some(warning),
                         )
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => return Err(error.context(ResumeStage::ApplicationFromCandidate)),
                 };
             rollback.adopt_application(application.clone());
             if let Some(notice) = resume_notice.as_deref() {
                 warn_line(&format!("switch_session degraded: {notice}"));
             }
             let initialized = async {
-                self.attach_host_todo(&application, &blueprint)?;
-                application.prepare_resumed_goal(false)?;
+                self.attach_host_todo(&application, &blueprint)
+                    .context(ResumeStage::AttachHostTodo)?;
+                application.prepare_resumed_goal(false).context(ResumeStage::PrepareResumedGoal)?;
                 let (session_id, session_file) = application
                     .session()
                     .recorder_info()
@@ -334,7 +336,9 @@ impl RunSessionSpawner {
                     .session()
                     .session_file_identity()
                     .ok_or_else(|| anyhow!("resumed session has no durable file identity"))?;
-                setup_child_workflows(&application, &target_cwd, &session_id).await?;
+                setup_child_workflows(&application, &target_cwd, &session_id)
+                    .await
+                    .context(ResumeStage::SetupChildWorkflows)?;
                 Ok::<_, anyhow::Error>((session_id, session_file, file_identity))
             }
             .await;
@@ -408,6 +412,7 @@ impl RunSessionSpawner {
                 extension_runtime,
                 extension_permissions,
                 orchestration,
+                orchestration_explicit,
                 goal_tool,
                 todo_child_tool,
             } = candidate;
@@ -423,7 +428,7 @@ impl RunSessionSpawner {
             let mut runtime = pi_coding::ApplicationRuntimeCandidate::new(session)
                 .with_extensions(extension_runtime, extension_permissions);
             if let Some(orchestration) = orchestration {
-                runtime = runtime.with_orchestration(orchestration);
+                runtime = runtime.with_orchestration_override(orchestration, orchestration_explicit);
             }
             if let Some(goal_tool) = goal_tool {
                 runtime = runtime.with_goal_tool(goal_tool);
@@ -589,6 +594,7 @@ impl PreparedFreshSession {
             extension_runtime,
             extension_permissions,
             orchestration,
+            orchestration_explicit,
             goal_tool,
             todo_child_tool,
         } = candidate;
@@ -623,7 +629,7 @@ impl PreparedFreshSession {
         let mut runtime = pi_coding::ApplicationRuntimeCandidate::new(session)
             .with_extensions(extension_runtime, extension_permissions);
         if let Some(orchestration) = orchestration {
-            runtime = runtime.with_orchestration(orchestration);
+            runtime = runtime.with_orchestration_override(orchestration, orchestration_explicit);
         }
         if let Some(goal_tool) = goal_tool {
             runtime = runtime.with_goal_tool(goal_tool);
@@ -822,6 +828,33 @@ impl Drop for SpawnFinishRollback {
         }
     }
 }
+
+/// Typed recovery stage of an `open_resumed` failure, attached as anyhow typed context for
+/// `downcast_ref::<ResumeStage>()`; Display names the fixed stage only, the chain is preserved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResumeStage {
+    BuildBlueprint,
+    RestoreResume,
+    ApplicationFromCandidate,
+    AttachHostTodo,
+    PrepareResumedGoal,
+    SetupChildWorkflows,
+}
+
+impl std::fmt::Display for ResumeStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::BuildBlueprint => "building resumed session runtime",
+            Self::RestoreResume => "restoring resumed session",
+            Self::ApplicationFromCandidate => "building application from session candidate",
+            Self::AttachHostTodo => "attaching host todo",
+            Self::PrepareResumedGoal => "preparing resumed goal",
+            Self::SetupChildWorkflows => "setting up child workflows",
+        })
+    }
+}
+
+impl std::error::Error for ResumeStage {}
 
 fn spawn_rollback_error(
     error: anyhow::Error,
@@ -1259,29 +1292,81 @@ async fn first_authenticated_model(
     Ok(None)
 }
 
+/// Typed result of initial-model resolution.
+///
+/// Provider execution requires [`InitialModel::Resolved`]. A valid spec whose
+/// provider has no usable credentials is a recoverable configuration state:
+/// only the Web listener may start without a model, while every other mode
+/// keeps its historical fail-fast behavior via [`InitialModel::into_resolved`].
+pub(crate) enum InitialModel {
+    /// Model plus resolved request auth: provider execution is authorized.
+    Resolved {
+        model: pi_ai::Model,
+        api_key: String,
+        thinking_level: String,
+    },
+    /// The spec/catalog selection is valid, but the provider has no usable
+    /// credentials (or none is configured at all). `model` is retained for
+    /// diagnostics only and is never executed; `message` is the exact
+    /// fail-fast error the non-listener modes report.
+    MissingAuth {
+        model: Option<pi_ai::Model>,
+        message: String,
+        thinking_level: String,
+    },
+}
+
+impl InitialModel {
+    /// Non-listener fail-fast view: the historical messages, unchanged.
+    fn into_resolved(self) -> Result<(pi_ai::Model, String, String)> {
+        match self {
+            Self::Resolved {
+                model,
+                api_key,
+                thinking_level,
+            } => Ok((model, api_key, thinking_level)),
+            Self::MissingAuth { message, .. } => bail!("{message}"),
+        }
+    }
+
+    /// Listener-only view: a valid but unauthenticated (or entirely
+    /// unconfigured) selection starts the service without a model instead of
+    /// failing the bind. No model, auth, or default is synthesized.
+    fn into_listener_start(self) -> (Option<pi_ai::Model>, String, String) {
+        match self {
+            Self::Resolved {
+                model,
+                api_key,
+                thinking_level,
+            } => (Some(model), api_key, thinking_level),
+            Self::MissingAuth { thinking_level, .. } => (None, String::new(), thinking_level),
+        }
+    }
+}
+
 /// Resolve the initial model for a session: explicit CLI spec, an
 /// authenticated resumed model, the authenticated settings default, then the
 /// first authenticated model (only when no settings default is configured).
-/// Returns `(model, api_key, parsed_think)` where `parsed_think` is the
-/// reasoning-level suffix extracted from an explicit model spec or the
-/// settings default spec (empty when none was present).
+/// `thinking_level` is the reasoning-level suffix extracted from an explicit
+/// model spec or the settings default spec (empty when none was present).
 ///
 /// Settings defaults are interpreted exclusively by the shared pi-coding
 /// authority [`pi_coding::resolve_default_model_pair`] in catalog-ready mode,
 /// so validation and startup agree on trimmed views, provider/model slash
 /// semantics, case-insensitive provider matching, and `:level` suffixes. A
 /// configured default that resolves but cannot authenticate (or is
-/// unavailable for the resolved credential) fails startup with an error
-/// naming the configured model — it never silently falls through to another
-/// authenticated model.
+/// unavailable for the resolved credential) is reported as
+/// [`InitialModel::MissingAuth`] — it never silently falls through to another
+/// authenticated model. An invalid explicit spec, an unresolvable settings
+/// default, or a real auth-resolver/IO error still propagates as `Err`.
 ///
 /// Shared by [`build_session`] and the ACP agent mode so both entrypoints
 /// resolve models with identical precedence.
-pub(crate) async fn resolve_initial_model(
+async fn resolve_initial_model_typed(
     cli: &Cli,
     settings: &pi_coding::Settings,
     resume_ctx: Option<&BranchContext>,
-) -> Result<(pi_ai::Model, String, String)> {
+) -> Result<InitialModel> {
     let explicit_model = cli.model.as_deref().filter(|spec| !spec.is_empty());
     let explicit_key = cli.api_key.as_deref();
     let mut parsed_think = String::new();
@@ -1303,20 +1388,30 @@ pub(crate) async fn resolve_initial_model(
     if let Some(spec) = explicit_model_spec.as_deref() {
         let (model, level) = resolve_model_spec(spec)?;
         parsed_think = level;
-        selected = authenticated_model(model, explicit_key).await?;
+        selected = authenticated_model(model.clone(), explicit_key).await?;
         if selected.is_none() {
-            bail!("Model {spec:?} is not available for the resolved credential");
+            return Ok(InitialModel::MissingAuth {
+                model: Some(model),
+                message: format!("Model {spec:?} is not available for the resolved credential"),
+                thinking_level: parsed_think,
+            });
         }
     } else if let Some(ctx) = resume_ctx
         && let (Some(provider), Some(id)) = (ctx.provider.as_ref(), ctx.model_id.as_ref())
     {
         match pi_ai::get_model(provider, id) {
-            Some(model) => match authenticated_model(model, explicit_key).await? {
-                Some(resolved) => selected = Some(resolved),
-                None => warn_line(&format!(
-                    "Warning: Could not restore model {provider}/{id} (no auth configured)"
-                )),
-            },
+            Some(model) => {
+                selected = authenticated_model(model.clone(), explicit_key).await?;
+                if selected.is_none() {
+                    return Ok(InitialModel::MissingAuth {
+                        model: Some(model),
+                        message: format!(
+                            "Could not restore model {provider}/{id} (no auth configured)"
+                        ),
+                        thinking_level: parsed_think,
+                    });
+                }
+            }
             None => warn_line(&format!("Warning: Could not restore model {provider}/{id}")),
         }
     }
@@ -1345,11 +1440,16 @@ pub(crate) async fn resolve_initial_model(
                     parsed_think = resolved.thinking_level;
                 }
                 let configured = format!("{}/{}", resolved.model.provider, resolved.model.id);
-                selected = authenticated_model(resolved.model, explicit_key).await?;
+                let model = resolved.model;
+                selected = authenticated_model(model.clone(), explicit_key).await?;
                 if selected.is_none() {
-                    bail!(
-                        "Configured settings default model {configured:?} is not available for the resolved credential; configure authentication for it or clear the settings default"
-                    );
+                    return Ok(InitialModel::MissingAuth {
+                        model: Some(model),
+                        message: format!(
+                            "Configured settings default model {configured:?} is not available for the resolved credential; configure authentication for it or clear the settings default"
+                        ),
+                        thinking_level: parsed_think,
+                    });
                 }
             }
             Err(error) => return Err(error),
@@ -1358,16 +1458,35 @@ pub(crate) async fn resolve_initial_model(
     if selected.is_none() {
         selected = first_authenticated_model(explicit_key).await?;
     }
-    let (model, auth) = selected.ok_or_else(|| {
-        anyhow!(
-            "No authenticated models available. Configure auth.json, models.json, a provider API-key environment variable, or pass --model with --api-key."
-        )
-    })?;
+    let Some((model, auth)) = selected else {
+        return Ok(InitialModel::MissingAuth {
+            model: None,
+            message: "No authenticated models available. Configure auth.json, models.json, a provider API-key environment variable, or pass --model with --api-key.".to_owned(),
+            thinking_level: parsed_think,
+        });
+    };
     #[cfg(not(test))]
     if let Some(key) = explicit_key.filter(|key| !key.trim().is_empty()) {
         crate::models_config::set_runtime_api_key(&model.provider, key);
     }
-    Ok((model, auth.api_key, parsed_think))
+    Ok(InitialModel::Resolved {
+        model,
+        api_key: auth.api_key,
+        thinking_level: parsed_think,
+    })
+}
+
+/// Fail-fast wrapper for callers that require an executable model (ACP and
+/// the non-listener startup path). Invalid specs/configuration never reach
+/// [`InitialModel::MissingAuth`]; they are already `Err` from the typed path.
+pub(crate) async fn resolve_initial_model(
+    cli: &Cli,
+    settings: &pi_coding::Settings,
+    resume_ctx: Option<&BranchContext>,
+) -> Result<(pi_ai::Model, String, String)> {
+    resolve_initial_model_typed(cli, settings, resume_ctx)
+        .await?
+        .into_resolved()
 }
 
 pub(crate) fn resolve_initial_thinking_level(
@@ -1919,8 +2038,26 @@ pub async fn build_session(cli: &Cli) -> Result<RunSession> {
 
     // 3. Resolve the initial model: explicit CLI, authenticated resumed model,
     //    authenticated settings default, then the first authenticated model.
-    let (model, api_key, parsed_think) =
-        resolve_initial_model(cli, &settings, resume_ctx.as_ref()).await?;
+    //    Only the Web listener may start without an executable model: a valid
+    //    spec whose provider has no credentials yet is recoverable there.
+    //    Every other mode keeps the historical fail-fast error, and invalid
+    //    specs/settings/auth-resolver errors already propagated as `Err`.
+    let initial_model =
+        resolve_initial_model_typed(cli, &settings, resume_ctx.as_ref()).await?;
+    let (model, api_key, parsed_think) = if cli.listen.is_some() {
+        // The listener starts without a model, but the diagnosis must survive:
+        // an actionable warning distinguishes "valid spec, no credentials" (and
+        // a fully unconfigured host) from a silently model-less service. Both
+        // are equally actionable, so both warn. `MissingAuth.model` is never
+        // executed here.
+        if let InitialModel::MissingAuth { message, .. } = &initial_model {
+            warn_line(&format!("Warning: {message}"));
+        }
+        initial_model.into_listener_start()
+    } else {
+        let (model, api_key, thinking_level) = initial_model.into_resolved()?;
+        (Some(model), api_key, thinking_level)
+    };
 
     // 4. Thinking priority: --think, model suffix, resumed recorded thinking,
     //    settings default, then the existing medium default.
@@ -1997,7 +2134,7 @@ pub async fn build_session(cli: &Cli) -> Result<RunSession> {
         } else if !cli.no_session {
             let recorder = pi_coding::start_session_in(
                 &cwd,
-                Some(&model),
+                model.as_ref(),
                 Some(thinking_level_str(thinking_level)),
                 Some(&session_dir),
                 cli.session_id.as_deref(),
@@ -2149,7 +2286,6 @@ pub async fn build_session(cli: &Cli) -> Result<RunSession> {
     Ok(RunSession {
         application,
         extension_ui: blueprint.extension_ui(),
-        model,
         scoped_models,
         startup_warnings,
         resume_notice,
@@ -2175,6 +2311,7 @@ pub(crate) async fn application_from_session_candidate(
         extension_runtime,
         extension_permissions,
         orchestration,
+        orchestration_explicit,
         goal_tool,
         todo_child_tool,
     } = candidate;
@@ -2184,7 +2321,7 @@ pub(crate) async fn application_from_session_candidate(
     let mut runtime = ApplicationRuntimeCandidate::new(session)
         .with_extensions(extension_runtime, extension_permissions);
     if let Some(orchestration) = orchestration {
-        runtime = runtime.with_orchestration(orchestration);
+        runtime = runtime.with_orchestration_override(orchestration, orchestration_explicit);
     }
     if let Some(goal_tool) = goal_tool {
         runtime = runtime.with_goal_tool(goal_tool);
@@ -2299,7 +2436,7 @@ async fn build_operator_application_from_options(
     operator_model.provider = "faux".to_owned();
     operator_model.base_url = "http://localhost:0".to_owned();
     let options = SessionOptions {
-        model: operator_model,
+        model: Some(operator_model),
         cwd: cwd.clone(),
         system_prompt: String::new(),
         thinking_level: pi_agent::ThinkingLevel::Off,
@@ -2752,7 +2889,7 @@ mod tests {
         let (model, faux) = registered_faux_model("session-application");
         let application = hermetic_application(
             SessionOptions {
-                model,
+                model: Some(model),
                 cwd: cwd.to_path_buf(),
                 system_prompt: String::new(),
                 thinking_level: ThinkingLevel::Off,
@@ -3135,7 +3272,7 @@ mod tests {
         let (model, _faux) = registered_faux_model("manager-open-resumed");
         let source = hermetic_application(
             SessionOptions {
-                model: model.clone(),
+                model: Some(model.clone()),
                 cwd: project.path().to_path_buf(),
                 system_prompt: String::new(),
                 thinking_level: ThinkingLevel::Off,
@@ -3235,7 +3372,7 @@ mod tests {
         });
         let source = hermetic_application(
             SessionOptions {
-                model: model.clone(),
+                model: Some(model.clone()),
                 cwd: project.path().to_path_buf(),
                 system_prompt: String::new(),
                 thinking_level: ThinkingLevel::Medium,
@@ -3339,7 +3476,7 @@ mod tests {
         });
         let source = hermetic_application(
             SessionOptions {
-                model: model.clone(),
+                model: Some(model.clone()),
                 cwd: project.path().to_path_buf(),
                 system_prompt: String::new(),
                 thinking_level: ThinkingLevel::Off,
@@ -3448,7 +3585,7 @@ mod tests {
         let (model, _faux) = registered_faux_model("open-heal-deleted-cwd");
         let source = hermetic_application(
             SessionOptions {
-                model: model.clone(),
+                model: Some(model.clone()),
                 cwd: source_project.clone(),
                 system_prompt: String::new(),
                 thinking_level: ThinkingLevel::Off,
@@ -3549,7 +3686,7 @@ mod tests {
         let (model, _faux) = registered_faux_model("open-heal-orphan-cwd");
         let source = hermetic_application(
             SessionOptions {
-                model: model.clone(),
+                model: Some(model.clone()),
                 cwd: source_project.clone(),
                 system_prompt: String::new(),
                 thinking_level: ThinkingLevel::Off,
@@ -3717,7 +3854,7 @@ mod tests {
         let (model, _faux) = registered_faux_model("manager-restart-writer");
         let source = hermetic_application(
             SessionOptions {
-                model: model.clone(),
+                model: Some(model.clone()),
                 cwd: project.path().to_path_buf(),
                 system_prompt: String::new(),
                 thinking_level: ThinkingLevel::Off,
@@ -4027,7 +4164,7 @@ mod tests {
     fn goal_catalog_defaults_on_but_no_tools_and_explicit_exclude_win() {
         let cwd = tempfile::tempdir().expect("cwd");
         let options = || SessionOptions {
-            model: Model::default(),
+            model: Some(Model::default()),
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -4294,6 +4431,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn initial_model_typed_separates_missing_auth_and_listener_start() {
+        let (unauthenticated, _faux) = registered_faux_model("typed-missing-auth");
+        let cli = Cli::try_parse_from(["rpi"]).expect("cli");
+        let settings = settings_default(Some(&unauthenticated.provider), Some(&unauthenticated.id));
+
+        // A valid configured spec whose provider has no credentials is typed,
+        // never an error, and keeps the resolved model for diagnostics only.
+        let initial = resolve_initial_model_typed(&cli, &settings, None)
+            .await
+            .expect("valid but unauthenticated default");
+        let InitialModel::MissingAuth { model, message, .. } = initial else {
+            panic!("unauthenticated configured default must not resolve");
+        };
+        assert_eq!(
+            model.as_ref().map(|model| model.id.as_str()),
+            Some(unauthenticated.id.as_str())
+        );
+        assert!(
+            message.contains("not available for the resolved credential"),
+            "{message}"
+        );
+
+        // Only the listener may continue: no model and no synthesized auth.
+        let initial = resolve_initial_model_typed(&cli, &settings, None)
+            .await
+            .expect("valid but unauthenticated default again");
+        let (model, api_key, _level) = initial.into_listener_start();
+        assert!(model.is_none(), "listener start must not synthesize a model");
+        assert!(api_key.is_empty(), "listener start must not synthesize auth");
+
+        // Every other mode keeps the historical fail-fast error.
+        let error = resolve_initial_model(&cli, &settings, None)
+            .await
+            .expect_err("non-listener fail-fast");
+        assert!(
+            format!("{error:#}").contains("not available for the resolved credential"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
     async fn settings_default_surrounding_whitespace_resolves_equivalently() {
         let (model, _faux) = registered_faux_model("settings-spaced");
         let cli = settings_default_cli();
@@ -4368,8 +4546,14 @@ mod tests {
             &settings,
             &parent_model,
         );
-        assert_eq!(config.parent_model.provider, parent_model.provider);
-        assert_eq!(config.parent_model.id, parent_model.id);
+        assert_eq!(
+            config.parent_model.as_ref().expect("parent model").provider,
+            parent_model.provider
+        );
+        assert_eq!(
+            config.parent_model.as_ref().expect("parent model").id,
+            parent_model.id
+        );
 
         let seen = Arc::new(Mutex::new(None::<Model>));
         let seen_factory = seen.clone();
@@ -4386,7 +4570,7 @@ mod tests {
                     "ChildSessionRequest debug leaked secrets: {debug}"
                 );
                 Ok(hermetic_session(SessionOptions {
-                    model: request.model,
+                    model: Some(request.model),
                     cwd: child_cwd,
                     system_prompt: request.system_prompt,
                     thinking_level: request.thinking_level.unwrap_or(ThinkingLevel::Off),
@@ -4449,7 +4633,7 @@ mod tests {
         )
         .expect("parent recorder");
         let parent = hermetic_session(pi_coding::SessionOptions {
-            model: test_model.clone(),
+            model: Some(test_model.clone()),
             cwd: artifacts.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -4506,7 +4690,7 @@ mod tests {
             }]),
             artifacts.path(),
         );
-        config.parent_model = test_model;
+        config.parent_model = Some(test_model);
         config.idle_ttl = None;
         let runtime = OrchestrationRuntime::new(config, factory).expect("runtime");
         let bootstrap_root = tempfile::tempdir().expect("bootstrap root");
@@ -4523,7 +4707,7 @@ mod tests {
         .expect("bootstrap sandbox settings");
         let (bootstrap_model, _bootstrap_faux) = registered_faux_model("durable-bootstrap");
         let bootstrap = hermetic_session(SessionOptions {
-            model: bootstrap_model,
+            model: Some(bootstrap_model),
             cwd: bootstrap_cwd.clone(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -4572,7 +4756,7 @@ mod tests {
         let artifacts = tempfile::tempdir().expect("artifacts");
         let (parent_model, _faux) = registered_faux_model("recorderless-parent");
         let parent = hermetic_session(pi_coding::SessionOptions {
-            model: parent_model,
+            model: Some(parent_model),
             cwd: artifacts.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -4735,7 +4919,7 @@ mod tests {
             }]),
             artifacts,
         );
-        config.parent_model = parent_model;
+        config.parent_model = Some(parent_model);
         config.idle_ttl = None;
         OrchestrationRuntime::new(config, factory).expect("runtime")
     }
@@ -4747,7 +4931,7 @@ mod tests {
         let agent = tempfile::tempdir().expect("agent dir");
         let (test_model, _faux) = registered_faux_model("orchestration-owner-transfer");
         let session = hermetic_session(SessionOptions {
-            model: test_model.clone(),
+            model: Some(test_model.clone()),
             cwd: artifacts.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -4783,6 +4967,7 @@ mod tests {
             ),
             extension_permissions: pi_coding::ExtensionPermissionSet::deny_all(),
             orchestration: Some(orchestration),
+            orchestration_explicit: false,
             goal_tool: None,
             todo_child_tool: None,
         };
@@ -4835,7 +5020,7 @@ mod tests {
         let parent_id = recorder.id();
         let parent_path = recorder.path();
         let parent = hermetic_session(SessionOptions {
-            model: test_model.clone(),
+            model: Some(test_model.clone()),
             cwd: artifacts.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -4934,7 +5119,7 @@ mod tests {
         resource_options.disable_context_files = true;
         let retry_blueprint = RunSessionBlueprint::from_cli(&cli, resource_options, None);
         let options = SessionOptions {
-            model: test_model.clone(),
+            model: Some(test_model.clone()),
             cwd: artifacts.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -5060,7 +5245,7 @@ mod tests {
         let agent = tempfile::tempdir().expect("agent dir");
         let application = hermetic_application(
             SessionOptions {
-                model: model.clone(),
+                model: Some(model.clone()),
                 cwd: project.to_path_buf(),
                 system_prompt: String::new(),
                 thinking_level: ThinkingLevel::Off,
@@ -5567,26 +5752,23 @@ mod tests {
             .await
             .expect("fallback tracked by the pre-build tracker")
             .expect("tracker a channel");
-        drop(handle);
         assert!(
             tracker_b_rx.try_recv().is_err(),
             "the post-capture manager registration must not capture a prepare-time rollback"
         );
         gate.release_rollback();
         let journal = gate.journal_path().expect("journal path recorded");
-        for _ in 0..200 {
-            if !journal.exists() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        assert!(
-            !journal.exists(),
-            "the prepare-time tracked fallback rolled the created journal back"
-        );
+        tokio::time::timeout(std::time::Duration::from_secs(30), handle)
+            .await
+            .expect("the tracked detached fallback settles after release")
+            .expect("the tracked detached fallback did not panic");
         assert!(
             gate.rollback_settled(),
             "the detached fallback settled every rollback leg"
+        );
+        assert!(
+            !journal.exists(),
+            "the prepare-time tracked fallback rolled the created journal back"
         );
         source.cleanup().await;
     }
@@ -5718,26 +5900,23 @@ mod tests {
             .await
             .expect("fallback tracked by the prepare-time tracker")
             .expect("tracker a channel");
-        drop(handle);
         assert!(
             tracker_b_rx.try_recv().is_err(),
             "the later manager registration must not capture a prepare-time rollback"
         );
         gate.release_rollback();
         let journal = gate.journal_path().expect("journal path recorded");
-        for _ in 0..200 {
-            if !journal.exists() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        assert!(
-            !journal.exists(),
-            "the prepare-time tracked fallback rolled the created journal back"
-        );
+        tokio::time::timeout(std::time::Duration::from_secs(30), handle)
+            .await
+            .expect("the tracked detached fallback settles after release")
+            .expect("the tracked detached fallback did not panic");
         assert!(
             gate.rollback_settled(),
             "the detached fallback settled every rollback leg"
+        );
+        assert!(
+            !journal.exists(),
+            "the prepare-time tracked fallback rolled the created journal back"
         );
         source.cleanup().await;
     }

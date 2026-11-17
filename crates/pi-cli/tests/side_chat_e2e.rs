@@ -261,7 +261,7 @@ fn gated_reply_stream(
 
 fn session_options(model: Model, cwd: &Path, stream_fn: Option<StreamFn>) -> SessionOptions {
     SessionOptions {
-        model,
+        model: Some(model),
         cwd: cwd.to_path_buf(),
         system_prompt: "main system prompt".to_owned(),
         thinking_level: ThinkingLevel::Off,
@@ -1709,7 +1709,7 @@ async fn side_fork_refreshes_auth_and_keeps_independent_provider_session() {
     let model = test_model("auth-side");
     let (_agent_dir, session) = hermetic_session(
         SessionOptions {
-            model: model.clone(),
+            model: Some(model.clone()),
             cwd: cwd.path().to_path_buf(),
             system_prompt: "main system prompt".to_owned(),
             thinking_level: ThinkingLevel::Off,

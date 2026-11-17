@@ -604,9 +604,12 @@ async fn execute_hub(
                 if cancelled.is_empty() {
                     "No running child tasks matched.".to_owned()
                 } else {
-                    format!("Cancelled: {}", cancelled.join(", "))
+                    format!(
+                        "Cancellation requested: {}",
+                        cancelled.join(", ")
+                    )
                 },
-                json!({ "op": "cancel", "cancelled": cancelled }),
+                json!({ "op": "cancel", "cancellationRequested": cancelled }),
             ))
         }
         "read_history" => {
@@ -662,6 +665,7 @@ fn jobs_text(jobs: &[JobSnapshot], empty: &str) -> String {
             let status = match job.status {
                 JobStatus::Queued => "queued",
                 JobStatus::Running => "running",
+                JobStatus::Cancelling => "cancelling",
                 JobStatus::Completed => "completed",
                 JobStatus::Failed => "failed",
                 JobStatus::Cancelled => "cancelled",
@@ -1414,6 +1418,13 @@ mod task_parameters_tests {
     use pi_agent::ThinkingLevel;
     use std::sync::Arc;
 
+    /// Explicit, registered parent model for spawn fixtures: the config no
+    /// longer defaults to a placeholder model.
+    fn fixture_parent_model() -> pi_ai::Model {
+        pi_ai::providers::register_default_faux();
+        pi_ai::get_model("faux", "faux-1").expect("registered faux model")
+    }
+
     fn def(name: &str) -> AgentDefinition {
         AgentDefinition {
             name: name.to_owned(),
@@ -1481,7 +1492,8 @@ mod task_parameters_tests {
             OrchestrationConfig::new(
                 AgentCatalog::from_agents(vec![def("task"), reviewer_def()]),
                 artifact_dir,
-            ),
+            )
+            .with_parent_model(Some(fixture_parent_model())),
             Arc::new(move |request| {
                 *captured.lock() = Some((
                     request.system_prompt.clone(),
@@ -1522,7 +1534,7 @@ mod task_parameters_tests {
                         })
                     });
                     crate::Session::new(crate::SessionOptions {
-                        model: request.model,
+                        model: Some(request.model),
                         cwd: std::env::current_dir().expect("cwd"),
                         system_prompt: request.system_prompt,
                         thinking_level: pi_agent::ThinkingLevel::Off,

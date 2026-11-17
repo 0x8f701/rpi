@@ -61,7 +61,7 @@ impl TodoDagCoordinator {
         let (mut status, mut failure_reason) = session.todo_execution();
         if jobs.iter().any(|job| {
             job.todo_task_id.is_some()
-                && matches!(job.status, JobStatus::Queued | JobStatus::Running)
+                && matches!(job.status, JobStatus::Queued | JobStatus::Running | JobStatus::Cancelling)
         }) {
             status = TodoDagExecutionStatus::Active;
             failure_reason = None;
@@ -293,7 +293,7 @@ impl ApplicationInner {
             if reset_attempts {
                 let active_job_ids = jobs
                     .iter()
-                    .filter(|job| matches!(job.status, JobStatus::Queued | JobStatus::Running))
+                    .filter(|job| matches!(job.status, JobStatus::Queued | JobStatus::Running | JobStatus::Cancelling))
                     .map(|job| job.id.as_str())
                     .collect::<HashSet<_>>();
                 coordinator.attempted_task_ids.clear();
@@ -345,7 +345,7 @@ impl ApplicationInner {
             .filter_map(|(job_id, owned)| {
                 (owned.generation == generation
                     && active_status.get(job_id).is_some_and(|status| {
-                        matches!(status, JobStatus::Queued | JobStatus::Running)
+                        matches!(status, JobStatus::Queued | JobStatus::Running | JobStatus::Cancelling)
                     }))
                 .then(|| job_id.clone())
             })
@@ -509,7 +509,7 @@ impl ApplicationInner {
         }
         for job in jobs
             .iter()
-            .filter(|job| matches!(job.status, JobStatus::Queued | JobStatus::Running))
+            .filter(|job| matches!(job.status, JobStatus::Queued | JobStatus::Running | JobStatus::Cancelling))
         {
             if let Some(task_id) = &job.todo_task_id {
                 coordinator.attempted_task_ids.insert(task_id.clone());
@@ -557,7 +557,7 @@ impl ApplicationInner {
             .collect::<Vec<_>>();
         let active_job_count = jobs
             .iter()
-            .filter(|job| matches!(job.status, JobStatus::Queued | JobStatus::Running))
+            .filter(|job| matches!(job.status, JobStatus::Queued | JobStatus::Running | JobStatus::Cancelling))
             .count();
         let slots = runtime.max_concurrency().saturating_sub(active_job_count);
         let selected = if allow_spawn {
@@ -681,7 +681,7 @@ impl ApplicationInner {
         }
 
         let active_owned = jobs.iter().any(|job| {
-            matches!(job.status, JobStatus::Queued | JobStatus::Running)
+            matches!(job.status, JobStatus::Queued | JobStatus::Running | JobStatus::Cancelling)
                 && job
                     .todo_task_id
                     .as_ref()
@@ -812,11 +812,10 @@ mod restart_persistence_tests {
     use super::*;
     use crate::todo::TodoItem;
     use pi_agent::ThinkingLevel;
-    use pi_ai::Model;
 
     fn recorded_session(cwd: &std::path::Path, session_id: &str) -> crate::Session {
         let session = crate::Session::new(crate::SessionOptions {
-            model: Model::default(),
+            model: None,
             cwd: cwd.to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -875,7 +874,7 @@ mod restart_persistence_tests {
         let path = session.recorder_info().expect("recorder path").1;
         drop(session);
         let restored = crate::Session::new(crate::SessionOptions {
-            model: Model::default(),
+            model: None,
             cwd: cwd.to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -964,7 +963,7 @@ mod restart_persistence_tests {
         drop(session);
 
         let restored = crate::Session::new(crate::SessionOptions {
-            model: Model::default(),
+            model: None,
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -1007,6 +1006,8 @@ mod restart_persistence_tests {
             created_at: 1,
             started_at: None,
             finished_at: None,
+            cancellation_cause: matches!(status, JobStatus::Cancelling | JobStatus::Cancelled)
+                .then_some(crate::CancellationCause::Task),
             result: None,
             soft_budget_exhausted: false,
         }

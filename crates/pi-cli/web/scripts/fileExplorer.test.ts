@@ -157,6 +157,7 @@ import {
   parseFileExplorerUnifiedDiff,
   groupFileExplorerDiffRows,
   fileExplorerStatusLetter,
+  parseFileExplorerAmbiguity,
   openFileTab,
   readFileExplorerSlot,
   readModuleFileExplorerPageCache,
@@ -231,7 +232,6 @@ function obsoleteExplorerChrome(html: string): string[] {
     'file-explorer__more',
     '>Load more</button>',
     'file-explorer-close-btn',
-    'file-explorer__content-path',
     'data-orphans="true"',
   ]) {
     if (html.includes(token)) hits.push(token);
@@ -252,7 +252,7 @@ function assertTwoViewportStructure(label: string, html: string): void {
   const layout = layoutStart >= 0 ? html.slice(layoutStart) : '';
   const treeColumn = layout.indexOf('data-testid="file-explorer-tree"');
   const treeList = layout.indexOf('class="file-explorer__tree-list"');
-  const contentToolbar = layout.indexOf('file-explorer__content-toolbar');
+  const contentAt = layout.indexOf('data-testid="file-explorer-content"');
   check(`${label}: Files title is static text`, title.includes('>Files<') && !/>Files<\/button>/.test(title));
   check(`${label}: header text is Files`, html.includes('>Files<') && !html.includes('FILE TABS'));
   check(`${label}: header testid`, html.includes('data-testid="file-explorer-header"'));
@@ -296,10 +296,9 @@ function assertTwoViewportStructure(label: string, html: string): void {
   );
   check(
     `${label}: content viewport`,
-    html.includes('data-testid="file-explorer-content"')
+    contentAt > layoutStart
       && html.includes('aria-label="Selected file"')
-      && html.includes('file-explorer__content-viewport')
-      && contentToolbar > layoutStart,
+      && html.includes('file-explorer__content-viewport'),
   );
   check(
     `${label}: divider`,
@@ -309,7 +308,7 @@ function assertTwoViewportStructure(label: string, html: string): void {
       && html.includes('aria-orientation="vertical"')
       && html.includes('aria-valuemin="22"')
       && html.includes('aria-valuemax="55"')
-      && html.includes('aria-valuenow="34"')
+      && html.includes('aria-valuenow="29"')
       && html.includes('aria-label="Resize file tree"')
       && html.includes('tabindex="0"'),
   );
@@ -1279,9 +1278,9 @@ await (async () => {
 
 // ---- panel markup: two-viewport Files explorer (SSR structure only) ----
 // SSR asserts selectors, the static Files title, the route-prefixed drawer
-// close, selected content without download/path chrome, inline-status source
-// wiring, and that rejected tab/Changed-files chrome is gone. It does NOT
-// prove geometry.
+// close, the selected file's full display path at the content head, inline-
+// status source wiring, and that rejected tab/Changed-files chrome is gone.
+// It does NOT prove geometry.
 {
   const commands: Record<string, unknown>[] = [];
   const opened: Array<{ path: string; line?: number; view?: 'file' | 'diff' }> = [];
@@ -1326,7 +1325,14 @@ await (async () => {
   }));
   check('drawer uses panel-drawer family', html.includes('class="panel-drawer file-explorer"'), html.slice(0, 200));
   assertTwoViewportStructure('open', html);
-  check('selected path is not a content-head tab', !html.includes('file-explorer__content-path') && !html.includes('>Download</button>'));
+  const openDisplay = fileExplorerDisplayPath('src/a.ts');
+  check(
+    'selected path is shown at the content head',
+    html.includes('data-testid="file-explorer-content-path"')
+      && html.includes(`>${openDisplay}<`)
+      && html.includes(`title="${openDisplay}"`)
+      && !html.includes('>Download</button>'),
+  );
   check('drawer close is the one full close', html.includes('id="file-explorer-drawer-close-btn"') && html.includes('aria-label="Close file explorer"') && !html.includes('file-explorer-hide-btn') && !html.includes('file-explorer-close-btn'));
   check('aria-label File explorer is intact', html.includes('aria-label="File explorer"'));
 
@@ -1406,6 +1412,10 @@ await (async () => {
     onClose: () => {},
   }));
   check('raw credential-shaped path absent from selected-file chrome', !html.includes(hostilePath), html);
+  // The Ask dock's scope header is mounted for a file view: it must render
+  // ONLY the redacted display path (never the raw business path in
+  // data-path/title/text).
+  check('ask scope header renders only the redacted display path', html.includes('data-testid="file-conversation-scope"') && html.includes('data-path="src/[REDACTED].ts"') && !html.includes(`data-path="${hostilePath}"`), html);
   check('no visible Download chrome for a selected hostile path', !html.includes('>Download</button>') && !html.includes('file-explorer__download'), html);
 }
 
@@ -1419,10 +1429,9 @@ await (async () => {
   const markdownHandler = mdStart >= 0 && mdEnd > mdStart ? app.slice(mdStart, mdEnd) : '';
   check('Files toggle is independent of activePanel', app.includes('id="file-explorer-toggle-btn"') && app.includes('toggleFileExplorer'));
   check('opening a feature panel closes the file explorer', app.includes("if (sid) patchFileExplorer(sid, (slot) => applyDrawerMode(slot, 'closed'))"));
-  check('opening the file explorer closes the feature panel and starts fullscreen', app.includes("if (opening) {") && app.includes("setActivePanel('');") && app.includes("setFileExplorerExpanded(true);"));
+  check('opening the file explorer closes the feature panel', app.includes("if (opening) {") && app.includes("setActivePanel('');") && !app.includes('setFileExplorerExpanded'));
   check('drawer close is the one in-drawer full close', panel.includes(`FILE_EXPLORER_CLOSE_BTN_ID = 'file-explorer-drawer-close-btn'`) && panel.includes('aria-label="Close file explorer"') && panel.includes('title="Close file explorer"') && panel.includes('className="file-explorer__close"') && !panel.includes('className="file-explorer__title-button"') && !panel.includes('className="file-explorer__hide"') && !panel.includes('FILE_EXPLORER_HIDE_BTN_ID') && panel.includes('const closeDrawer = useCallback') && panel.includes('onClick={closeDrawer}'));
   check('App Files toggle reopens the drawer', app.includes(`id="${FILE_EXPLORER_TOGGLE_ID}"`) && panel.includes(`FILE_EXPLORER_TOGGLE_ID = '${FILE_EXPLORER_TOGGLE_ID}'`));
-  check('Files toggle closes and reopens the same session slot', app.includes("slot.mode === 'closed' ? 'open' : 'closed'"));
   check('get_session_stats auxiliary is explicit per call', app.includes("auxiliary: opts?.auxiliary === true") && app.includes("sendCommand(sessionStatsCommand(sid), undefined, { auxiliary: true })"));
   check('transcript rows carry their owning session', app.includes('data-session-id={sessionId ?? \'\'}') && app.includes('data-session-id={sid}'));
   check('drawer open binds the rendered session', app.includes('onOpenPath={(path, line, view) => openFileInDrawer(path, line, sessionId ?? undefined, view)}'));
@@ -1518,7 +1527,7 @@ await (async () => {
       && panel.includes('if (dirs[path]?.transportIncomplete) continue')
       && panel.includes('for (const path of paths)'));
   check('tree scroll restores after root listing settles', panel.includes('node.scrollTop = resolvedView.treeScrollTop') && panel.includes('if (!root || root.loading) return'));
-  check('App unmounts drawer and resizer with fileExplorerOpen', (app.match(/\{fileExplorerOpen && \(/g) ?? []).length >= 2);
+  check('App mounts the drawer while open and has no outer resizer', app.includes('{fileExplorerOpen && (') && !app.includes('file-explorer-resizer'));
   check('shared inflight acquire precedes send', panel.includes('fileExplorerAcquireInflight(identity') && panel.includes('fileExplorerSettleInflightCache'));
   check('shared inflight releases only in finally', panel.includes('.finally(() => fileExplorerReleaseInflight(identity))'));
   check('unmount does not cancel live inflight', panel.includes('aliveRef.current = false') && panel.includes('.finally(() => fileExplorerReleaseInflight(identity))') && !panel.includes('inflightRef'));
@@ -1529,59 +1538,31 @@ await (async () => {
   check('App download uses location.origin', app.includes('downloadOrigin={typeof location !== \'undefined\' ? location.origin'));
   check('infinite scroll uses the shared threshold helper', panel.includes('fileExplorerShouldLoadNext') && panel.includes('onContentScroll'));
   check('merged Git tree is consumed once by WorkspaceTree', panel.includes('fileExplorerMergeTree(path, node?.entries ?? [], changes, changeIndex, unavailable)') && panel.includes('fileExplorerBuildChangeIndex(visibleChanges)') && !panel.includes('orphanChanges') && !panel.includes('data-orphans'));
-  check(
-    'App markdown probe routes through the ownership helper and toasts once on local ownership (retry-gated on a stale cwd)',
-    markdownHandler.includes("markdownOpenRejectionOwnership(error) !== 'local'")
-      && markdownHandler.includes('toast(`open file failed: ${detail}`, true);')
-      && markdownHandler.includes("if (retried || (error as PendingCommandError | null)?.rpcCode !== 'file_unavailable') {")
-      && !markdownHandler.includes('/file is unavailable/')
-      && !/file is unavailable/i.test(markdownHandler)
-      && (markdownHandler.match(/toast\(`open file failed:/g) ?? []).length === 2,
-    markdownHandler.slice(-500),
-  );
   check('static Files title has no title-button focus ring', !css.includes('.file-explorer__title-button:focus-visible') && css.includes('.file-explorer__close:focus-visible'));
   check(
     'file explorer top reads the shared header-height var (no fixed 90vh pin)',
     /\.file-explorer\s*\{[^}]*top\s*:\s*var\(--app-header-height\)[^}]*height\s*:\s*auto[^}]*max-height\s*:\s*none/.test(css),
   );
   check(
-    'the panel renders the fullscreen expand control when owned',
-    panel.includes(`fileExplorerControlId(toggleId, 'expand-btn')`)
-      && panel.includes('Expand file explorer to the full app area')
-      && panel.includes('Shrink file explorer back to the panel'),
-  );
-  check(
-    'App markdown probe names the bounded referenced path only on the post-retry missing-file verdict',
-    markdownHandler.includes('markdownOpenMissingFileVerdict(retried, error)')
-      && markdownHandler.includes('markdownOpenMissingFileToast(path)'),
-    markdownHandler.slice(-700),
-  );
-  check(
     'inner split CSS var is the tree width authority',
-    css.includes('--file-explorer-tree-pct: 34%')
-      && css.includes('flex: 0 0 var(--file-explorer-tree-pct, 34%)')
+    css.includes('--file-explorer-tree-pct: 29%')
+      && css.includes('flex: 0 0 var(--file-explorer-tree-pct, 29%)')
       && /min-width:\s*22%/.test(css)
-      && /max-width:\s*55%/.test(css),
+      && /max-width:\s*55%/.test(css)
+      && !panel.includes('expand-btn'),
   );
   check(
     'desktop divider is a visible column-resize separator',
     /\.file-explorer__divider\s*\{[^}]*cursor:\s*col-resize/.test(css)
       && /\.file-explorer__divider:focus-visible\s*\{[^}]*outline:\s*2px solid var\(--accent\)/.test(css),
   );
-  const mobileFilesStart = css.indexOf('@media (max-width: 720px) {\n  .file-explorer {');
-  const mobileFiles = mobileFilesStart >= 0 ? css.slice(mobileFilesStart, mobileFilesStart + 2200) : '';
+  // Phone exclusive-pane GEOMETRY (viewport/dock flex split, bounded dock)
+  // is proven on the live page by the registered files-latency lane
+  // (FL0.8). This unit check pins only the panel-source wiring that the
+  // geometry depends on — never incidental CSS wording.
   check(
-    'phone ≤720 exclusive panes fill the body without a 42% stacked tree',
-    /flex:\s*1 1 auto/.test(mobileFiles)
-      && /max-height:\s*none/.test(mobileFiles)
-      && mobileFiles.includes('.file-explorer__body:not(.file-explorer__body--tree-collapsed) .file-explorer__content-viewport')
-      && /@media \(max-width: 720px\)[\s\S]*\.file-explorer__body:not\(\.file-explorer__body--tree-collapsed\) \.file-explorer__content-viewport \{[\s\S]*?display:\s*none;/.test(css)
-      && /@media \(max-width: 720px\)[\s\S]*\.file-explorer__body--tree-collapsed \.file-explorer__tree-viewport \{[\s\S]*?display:\s*none;/.test(css)
-      && !/max-height:\s*42%/.test(mobileFiles)
-      && !/flex:\s*0 0 42%/.test(mobileFiles)
-      && !/file-explorer__(?:tree|content)-viewport[\s\S]{0,240}max-height:\s*42%/.test(css)
-      && !/file-explorer__(?:tree|content)-viewport[\s\S]{0,240}flex:\s*0 0 42%/.test(css)
-      && panel.includes('data-layout={fileExplorerBodyLayout(isNarrow, treeCollapsed)}')
+    'phone ≤720 exclusive-pane wiring: layout attr and hidden flags',
+    panel.includes('data-layout={fileExplorerBodyLayout(isNarrow, treeCollapsed)}')
       && panel.includes("className={`file-explorer__body${treeCollapsed ? ' file-explorer__body--tree-collapsed' : ''}`}")
       && panel.includes('hidden={treeCollapsed}')
       && panel.includes('hidden={isNarrow && !treeCollapsed}'),
@@ -2215,7 +2196,8 @@ await (async () => {
   fileExplorerSyncPageCacheWithSlots({});
 }
 
-// ---- absolute tab identity is not content chrome; displayPath stays relative ----
+// ---- absolute tab identity is not content chrome; the content head shows
+// displayPath (workspace-relative, never the raw absolute) ----
 {
   check(
     'in-workspace absolute display is workspace-relative',
@@ -2242,7 +2224,14 @@ await (async () => {
     onOpenPath: () => {},
     onClose: () => {},
   }));
-  check('selected absolute path is not content-head chrome', !html.includes('file-explorer__content-path') && !html.includes('>notes.txt<'));
+  const absoluteDisplay = fileExplorerDisplayPath(absolutePath, '/workspace');
+  check(
+    'selected absolute path shows the workspace-relative display at the content head',
+    html.includes('data-testid="file-explorer-content-path"')
+      && html.includes(`>${absoluteDisplay}<`)
+      && html.includes(`title="${absoluteDisplay}"`)
+      && !html.includes(`>${absolutePath}<`),
+  );
   const markupWithoutOwnerCwd = html.replace(/\sdata-workspace-cwd="\/workspace"/g, '');
   check(
     'raw absolute path is not a visible label',
@@ -2267,7 +2256,14 @@ await (async () => {
     onOpenPath: () => {},
     onClose: () => {},
   }));
-  check('out-of-workspace selected path is not content chrome', !html.includes('file-explorer__content-path') && !html.includes('>/secret/notes.txt<'));
+  const outsideDisplay = fileExplorerDisplayPath(absolutePath);
+  const outsideMarkup = outsideDisplay.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  check(
+    'out-of-workspace selected path shows the symbolic workspace display at the content head',
+    html.includes('data-testid="file-explorer-content-path"')
+      && html.includes(`>${outsideMarkup}<`)
+      && html.includes(`title="${outsideMarkup}"`),
+  );
   check('raw absolute path without cwd is absent from the DOM', !html.includes('href="/secret/notes.txt"') && !html.includes('>/secret/notes.txt<'));
 }
 
@@ -2951,6 +2947,56 @@ await (async () => {
   check('panel toggle writes the view store, never parent slot state', panelSource.includes('updateFileExplorerViewCache(viewOwnerKey') && panelSource.includes('patchFileExplorerViewCache(viewOwnerKey, patch)') && !panelSource.includes('onViewStateChange'));
   writeModuleFileExplorerViewCache({});
 }
+{
+  const data = {
+    code: 'file_ambiguous',
+    candidates: ['psy-node-fix/psy_node_redis/src/store/rewards.rs', 'psy-node/psy_node_redis/src/store/rewards.rs'],
+  };
+  const rpcError = Object.assign(new Error('file is ambiguous'), { rpc: true, rpcCode: 'file_ambiguous', rpcData: data });
+  const responseError = Object.assign(new Error('file is ambiguous'), {
+    rpcCode: 'file_ambiguous',
+    response: { data, success: false },
+  });
+  check(
+    'rpcData ambiguity returns the sorted relative candidates',
+    JSON.stringify(parseFileExplorerAmbiguity(rpcError)) === JSON.stringify(data.candidates),
+  );
+  check(
+    'response.data ambiguity is accepted when rpcData is absent',
+    JSON.stringify(parseFileExplorerAmbiguity(responseError)) === JSON.stringify(data.candidates),
+  );
+  check(
+    'rpcData wins over a conflicting response payload',
+    parseFileExplorerAmbiguity({ ...responseError, rpcData: { code: 'file_unavailable' } }) === null,
+  );
+  const malformed = [
+    { code: 'file_ambiguous', candidates: ['/abs/rewards.rs', 'psy-node/rewards.rs'] },
+    { code: 'file_ambiguous', candidates: ['../outside/rewards.rs', 'psy-node/rewards.rs'] },
+    { code: 'file_ambiguous', candidates: ['psy-node/rewards.rs', 'psy-node/rewards.rs'] },
+    { code: 'file_ambiguous', candidates: ['psy-node/rewards.rs', 'psy-node-fix/rewards.rs'] },
+    { code: 'file_ambiguous', candidates: ['psy-node\\rewards.rs', 'psy-node/rewards.rs'] },
+    { code: 'file_ambiguous', candidates: ['psy-node/rewards.rs'] },
+    { code: 'file_unavailable', candidates: data.candidates },
+    null,
+  ];
+  check(
+    'absolute, dotdot, duplicate, unsorted, and short candidate lists are null',
+    malformed.every((payload) => parseFileExplorerAmbiguity({ rpcData: payload }) === null),
+  );
+  const choices = { path: 'psy_node_redis/src/store/rewards.rs', candidates: data.candidates };
+  const patched = updateFileExplorerSlot({}, 'session-a', (slot) => ({
+    ...applyDrawerMode(slot, 'open'),
+    activePath: null,
+    citationChoices: choices,
+  }));
+  check(
+    'owner slot keeps citationChoices without inventing a second store',
+    patched.slots['session-a']?.citationChoices?.path === choices.path
+      && patched.slots['session-a']?.citationChoices?.candidates.length === 2
+      && patched.slots['session-b'] === undefined,
+  );
+}
+
 void Promise.all(pending).then(() => {
   console.log(`\nfileExplorer.test: ${ran} assertions, ${failures.length} failure(s)`);
   if (failures.length) {

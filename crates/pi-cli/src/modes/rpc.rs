@@ -30,7 +30,7 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{Arc, Mutex as StdMutex},
+    sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex as StdMutex},
 };
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::{Semaphore, mpsc};
@@ -103,9 +103,9 @@ pub(crate) fn estimate_value_bytes(value: &Value) -> usize {
 
 const JSONL_CHANNEL_CAPACITY: usize = 8;
 pub(crate) const MAX_CONCURRENT_COMMANDS: usize = 16;
-/// Default transcript lines for `agent_history` when `lines` is omitted.
-/// Bounded by the core `pi_coding::MAX_HISTORY_LINES` cap.
-const DEFAULT_RPC_HISTORY_LINES: usize = 80;
+/// Default transcript message count for `agent_history` when `limit` is
+/// omitted. Bounded by the core `pi_coding::MAX_HISTORY_LINES` cap.
+const DEFAULT_RPC_HISTORY_LIMIT: usize = 80;
 
 /// Deserialize an OPTIONAL sequence field leniently for legacy/foreign/null
 /// payloads: an explicit `null` (a common client shape that always carries
@@ -1047,20 +1047,25 @@ pub enum RpcCommand {
         #[serde(rename = "jobId")]
         job_id: String,
     },
-    /// Fetch one child agent's recent transcript (`hub read_history` mirror).
-    /// `lines` defaults to `DEFAULT_RPC_HISTORY_LINES` and must lie within
-    /// the core `1..=MAX_HISTORY_LINES` bound; the returned `text` is
-    /// secret-redacted and byte-capped. Works while the job is queued/running
-    /// (live transcript) and after settle. Never exposes filesystem paths.
+    /// Fetch one child agent's recent structured transcript. `limit` counts
+    /// projected message rows, defaults to `DEFAULT_RPC_HISTORY_LIMIT`, and
+    /// must lie within the core `1..=MAX_HISTORY_LINES` bound (invalid values
+    /// are RPC errors, never clamped). Rows are the public display projection
+    /// of real session entries — secrets, sensitive argument/details keys,
+    /// and absolute filesystem paths redacted; signatures and provider
+    /// internals stripped — and the response is byte-capped with a real
+    /// `truncation` report. Works while the job is queued/running (live
+    /// transcript) and after settle. Never exposes filesystem paths. The
+    /// retired `lines` field is rejected at the decode boundary.
     /// Wire shape:
-    /// `{ "type": "agent_history", "id"?: string, "agentId": string, "lines"?: number }`.
+    /// `{ "type": "agent_history", "id"?: string, "agentId": string, "limit"?: number }`.
     AgentHistory {
         #[serde(default)]
         id: Option<String>,
         #[serde(rename = "agentId")]
         agent_id: String,
         #[serde(default)]
-        lines: Option<usize>,
+        limit: Option<usize>,
     },
     /// Start an encrypted room bound to the selected recorded session.
     CollabStart {
@@ -1140,11 +1145,16 @@ pub enum RpcCommand {
     ///
     /// Wire shapes:
     /// - `{ "type": "code_review_open" }` — HEAD→working tree
+    /// - `{ "type": "code_review_open", "repo": "<relative>" }` — the same
+    ///   scopes against one workspace-relative repository root. An explicit
+    ///   `null` is a parse-time rejection. Mutually exclusive with `commit`:
+    ///   a bare hexadecimal commit in a parent that is not a repository
+    ///   selects its unique child repository on its own.
     /// - `{ "type": "code_review_open", "commit": "<revision>" }` — one
     ///   pinned commit: parent→commit (a root commit diffs from the empty
     ///   tree, a merge from its first parent), resolved once and pinned to
-    ///   that hash for later refreshes. Mutually exclusive with `from`,
-    ///   `to`, and `includeWorkingTree` (explicit `false` counts as
+    ///   that hash for later refreshes. Mutually exclusive with `repo`,
+    ///   `from`, `to`, and `includeWorkingTree` (explicit `false` counts as
     ///   supplied); an empty commit is rejected.
     /// - `{ "type": "code_review_open", "from": "<base>", "includeWorkingTree": true }`
     ///   — `<base>`→working tree (committed since base + staged + unstaged +
@@ -1156,7 +1166,7 @@ pub enum RpcCommand {
     /// from/to is never overloaded.
     ///
     /// `null` handling is exact and fail-closed for the scope-selecting
-    /// operands: an explicit `"commit": null` or
+    /// operands: an explicit `"commit": null`, `"repo": null`, or
     /// `"includeWorkingTree": null` is a parse-time rejection, never a
     /// silent collapse into "absent". `from`/`to` keep the legacy
     /// null-means-absent baseline: an explicit `null` decodes exactly as
@@ -1174,6 +1184,8 @@ pub enum RpcCommand {
         to: Option<String>,
         #[serde(default, rename = "includeWorkingTree", deserialize_with = "non_null_option")]
         include_working_tree: Option<bool>,
+        #[serde(default, deserialize_with = "non_null_option")]
+        repo: Option<String>,
     },
     /// List recent commits (newest first, first-parent history) for the
     /// `/commit` picker. The optional `limit` (default 100) is clamped by
@@ -1242,7 +1254,8 @@ pub enum RpcCommand {
     /// that start afterwards; in-flight replies are unaffected.
     /// Wire shape:
     /// `{ "type": "code_review_set_model", "id"?: string, "modelId": string }`.
-    /// Response: `{ "ok": true, "model": "<display name>" }`.
+    /// Response: `{ "ok": true, "model": "<display name>" | null }`. A model
+    /// with no display label reports `null`; no label is ever fabricated.
     CodeReviewSetModel {
         #[serde(default)]
         id: Option<String>,
@@ -2490,6 +2503,7 @@ impl RpcCommand {
                 | Self::FileConversationClose { .. }
                 | Self::TodoChildStatus { .. }
                 | Self::TodoChildDetail { .. }
+                | Self::CodeReviewSnapshot { .. }
         )
     }
 }
@@ -2939,6 +2953,19 @@ impl RpcDispatcher {
     pub fn application(&self) -> &Application {
         &self.application
     }
+    /// Test-only: hold the next uncached `code_review_file_diff` after its
+    /// git load returns and before the result is cached. Fields stay private.
+    #[cfg(test)]
+    pub(crate) async fn arm_file_diff_load_gate_for_test(
+        &self,
+    ) -> std::sync::Arc<FileDiffLoadGate> {
+        let gate = std::sync::Arc::new(FileDiffLoadGate {
+            loaded: tokio::sync::Barrier::new(2),
+            release: tokio::sync::Barrier::new(2),
+        });
+        *self.code_review.file_diff_load_gate.lock().await = Some(gate.clone());
+        gate
+    }
     /// Dispatch a command with this dispatcher's full state. Side-chat and
     /// code-review commands live outside the settings/workflows handler
     /// because their controller state is owned by the RPC session, not by the
@@ -3101,8 +3128,8 @@ impl RpcDispatcher {
 
     /// Shut down the RPC-owned code-review controller (session close /
     /// listener shutdown).
-    pub(crate) async fn shutdown_code_review(&self) {
-        self.code_review.shutdown().await;
+    pub(crate) async fn shutdown_code_review(&self) -> Result<()> {
+        self.code_review.shutdown().await
     }
 
     /// Whether the RPC-owned code-review controller still owns cancellable
@@ -3643,9 +3670,20 @@ impl ReviewCaptureGate {
 }
 
 #[cfg(test)]
-struct FileDiffLoadGate {
+pub(crate) struct FileDiffLoadGate {
     loaded: tokio::sync::Barrier,
     release: tokio::sync::Barrier,
+}
+
+#[cfg(test)]
+impl FileDiffLoadGate {
+    pub(crate) async fn wait_loaded(&self) {
+        self.loaded.wait().await;
+    }
+
+    pub(crate) async fn release(&self) {
+        self.release.wait().await;
+    }
 }
 
 #[derive(Clone, Default)]
@@ -3672,31 +3710,38 @@ impl CodeReviewRpcState {
         from: Option<String>,
         to: Option<String>,
         include_working_tree: Option<bool>,
+        repo: Option<String>,
     ) -> Result<Value> {
-        let scope = match (commit, from, to, include_working_tree) {
-            (Some(commit), None, None, None) => {
+        let scope = match (&commit, &from, &to, include_working_tree, repo.as_deref()) {
+            (Some(_), _, _, _, Some(_)) => bail!(
+                "code_review_open commit excludes from, to, includeWorkingTree, and repo"
+            ),
+            (Some(commit), None, None, None, None) => {
                 if commit.trim().is_empty() {
                     bail!("code_review_open `commit` must be a non-empty revision");
                 }
                 // The capture resolves the revision once and fills the
                 // label; refreshes reuse that resolved hash.
                 ReviewScope::Commit {
-                    commit,
+                    commit: commit.clone(),
                     label: String::new(),
                 }
             }
-            (Some(_), _, _, _) => bail!(
-                "code_review_open commit excludes from, to, and includeWorkingTree"
+            (Some(_), _, _, _, None) => bail!(
+                "code_review_open commit excludes from, to, includeWorkingTree, and repo"
             ),
-            (None, None, None, None | Some(false)) => ReviewScope::WorkingTree,
-            (None, Some(base), None, Some(true)) => ReviewScope::BaseToWorkingTree { base },
-            (None, Some(from), Some(to), None | Some(false)) => {
-                ReviewScope::Revisions { from, to }
-            }
-            (None, Some(_), None, _) | (None, None, Some(_), _) => bail!(
+            (None, None, None, None | Some(false), _) => ReviewScope::WorkingTree,
+            (None, Some(base), None, Some(true), _) => ReviewScope::BaseToWorkingTree {
+                base: base.clone(),
+            },
+            (None, Some(from), Some(to), None | Some(false), _) => ReviewScope::Revisions {
+                from: from.clone(),
+                to: to.clone(),
+            },
+            (None, Some(_), None, _, _) | (None, None, Some(_), _, _) => bail!(
                 "code_review_open requires `from` and `to` together, `from` with includeWorkingTree, or neither"
             ),
-            (None, Some(_), Some(_), _) | (None, None, None, Some(true)) => bail!(
+            (None, Some(_), Some(_), _, _) | (None, None, None, Some(true), _) => bail!(
                 "code_review_open includeWorkingTree requires `from` alone (no `to`)"
             ),
         };
@@ -3710,7 +3755,17 @@ impl CodeReviewRpcState {
             state.authority = state.authority.wrapping_add(1);
             state.authority
         };
-        let cwd = app.session().cwd().to_path_buf();
+        let revision = match &scope {
+            ReviewScope::Commit { commit, .. } => Some(commit.as_str()),
+            ReviewScope::WorkingTree
+            | ReviewScope::BaseToWorkingTree { .. }
+            | ReviewScope::Revisions { .. } => None,
+        };
+        let cwd = crate::code_review::resolve_review_repository_root(
+            app,
+            repo.as_deref(),
+            revision,
+        )?;
         #[cfg(test)]
         let capture_gate = self.review_capture_gate.lock().await.clone();
         // Git acquisition is blocking and must run off the async runtime.
@@ -3724,6 +3779,8 @@ impl CodeReviewRpcState {
         })
         .await
         .map_err(|e| anyhow!("code review snapshot load failed: {e}"))?;
+        let repo_projection =
+            session_addressable_review_repo(app.session().cwd(), &snapshot.root)?;
         let mut controller = Some(CodeReviewController::fork_from(app).await?);
         controller
             .as_mut()
@@ -3734,9 +3791,17 @@ impl CodeReviewRpcState {
             let mut state = self.state.lock().await;
             if state.authority != authority {
                 None
-            } else {
+            } else if state.session.is_some() {
+                state
+                    .session
+                    .as_mut()
+                    .expect("review session")
+                    .controller
+                    .shutdown()
+                    .await
+                    .context("shutting down replaced code review")?;
                 state.installed_authority = authority;
-                let old = state.session.replace(CodeReviewSession {
+                state.session = Some(CodeReviewSession {
                     controller: controller.take().expect("fresh controller"),
                     snapshot,
                     paging,
@@ -3746,19 +3811,38 @@ impl CodeReviewRpcState {
                     comment_authority: CommentAuthority::default(),
                 });
                 let session = state.session.as_ref().expect("code review session stored");
-                Some((
-                    old,
-                    code_review_projection(&session.snapshot, &session.controller),
+                Some(project_code_review_with_repo(
+                    &session.snapshot,
+                    &session.controller,
+                    repo_projection,
+                ))
+            } else {
+                state.installed_authority = authority;
+                state.session = Some(CodeReviewSession {
+                    controller: controller.take().expect("fresh controller"),
+                    snapshot,
+                    paging,
+                    file_diff_cache: FileDiffCache::default(),
+                    file_diff_inflight: HashMap::new(),
+                    file_context_cache: HashMap::new(),
+                    comment_authority: CommentAuthority::default(),
+                });
+                let session = state.session.as_ref().expect("code review session stored");
+                Some(project_code_review_with_repo(
+                    &session.snapshot,
+                    &session.controller,
+                    repo_projection,
                 ))
             }
         };
-        let Some((old, projection)) = cutover else {
-            controller.expect("stale fresh controller").shutdown().await;
+        let Some(projection) = cutover else {
+            controller
+                .expect("stale fresh controller")
+                .shutdown()
+                .await
+                .context("shutting down superseded code review")?;
             bail!("code review open was superseded while its snapshot was loading");
         };
-        if let Some(mut old) = old {
-            old.controller.shutdown().await;
-        }
         Ok(projection)
     }
 
@@ -3794,16 +3878,13 @@ impl CodeReviewRpcState {
     }
 
     /// Re-project the currently open review snapshot and controller state.
-    async fn snapshot(&self) -> Result<Value> {
+    async fn snapshot(&self, app: &Application) -> Result<Value> {
         let mut state = self.state.lock().await;
         let Some(session) = state.session.as_mut() else {
             return Err(CodeReviewRpcError::ReviewNotOpen.into());
         };
         session.controller.poll_events();
-        Ok(code_review_projection(
-            &session.snapshot,
-            &session.controller,
-        ))
+        project_code_review(app, &session.snapshot, &session.controller)
     }
 
     /// Reload the review snapshot (re-run the bounded git acquisition) and
@@ -3814,22 +3895,23 @@ impl CodeReviewRpcState {
         // Git work. The previous snapshot stays authoritative until cutover.
         // A close of that same review, a later capture, or shutdown
         // invalidates this reservation; a close of any other review does not.
-        let (authority, installed_authority, expected_snapshot_id, scope) = {
+        let (authority, installed_authority, expected_snapshot_id, scope, cwd) = {
             let mut state = self.state.lock().await;
             let Some(session) = state.session.as_ref() else {
                 return Err(CodeReviewRpcError::ReviewNotOpen.into());
             };
             let expected_snapshot_id = session.snapshot.snapshot_id.clone();
             let scope = session.snapshot.scope.clone();
+            let cwd = session.snapshot.root.clone();
             state.authority = state.authority.wrapping_add(1);
             (
                 state.authority,
                 state.installed_authority,
                 expected_snapshot_id,
                 scope,
+                cwd,
             )
         };
-        let cwd = app.session().cwd().to_path_buf();
         #[cfg(test)]
         let capture_gate = self.review_capture_gate.lock().await.clone();
         let (snapshot, paging) = tokio::task::spawn_blocking(move || {
@@ -3842,6 +3924,8 @@ impl CodeReviewRpcState {
         })
         .await
         .map_err(|e| anyhow!("code review snapshot reload failed: {e}"))?;
+        let repo_projection =
+            session_addressable_review_repo(app.session().cwd(), &snapshot.root)?;
         let mut state = self.state.lock().await;
         if state.authority != authority || state.installed_authority != installed_authority {
             bail!("code review refresh was superseded while its snapshot was loading");
@@ -3865,9 +3949,10 @@ impl CodeReviewRpcState {
         session.file_diff_inflight.clear();
         session.file_context_cache.clear();
         session.comment_authority = CommentAuthority::default();
-        Ok(code_review_projection(
+        Ok(project_code_review_with_repo(
             &session.snapshot,
             &session.controller,
+            repo_projection,
         ))
     }
 
@@ -3932,10 +4017,7 @@ impl CodeReviewRpcState {
                     ResolvedHunk::Authority { .. } => unreachable!("matched above"),
                 };
                 comment_submit_result(result)?;
-                return Ok(code_review_projection(
-                    &session.snapshot,
-                    &session.controller,
-                ));
+                return project_code_review(app, &session.snapshot, &session.controller);
             }
         }
         let served = self.load_file_diff(app, snapshot_id, &normalized).await?;
@@ -3984,10 +4066,7 @@ impl CodeReviewRpcState {
             images,
         );
         comment_submit_result(result)?;
-        Ok(code_review_projection(
-            &session.snapshot,
-            &session.controller,
-        ))
+        project_code_review(app, &session.snapshot, &session.controller)
     }
     /// Resolve `modelId` against the session's public model catalog and swap
     /// the open review's fork model. `modelId` is the `provider/model-id`
@@ -4133,6 +4212,7 @@ impl CodeReviewRpcState {
 
     async fn abort(
         &self,
+        app: &Application,
         snapshot_id: &str,
         path: &str,
         old_start: u32,
@@ -4182,54 +4262,43 @@ impl CodeReviewRpcState {
                 content_hash: record.content_hash.clone(),
             },
         };
-        session.controller.abort_hunk(&identity).await;
+        session.controller.abort_hunk(&identity).await?;
         session.controller.poll_events();
-        Ok(code_review_projection(
-            &session.snapshot,
-            &session.controller,
-        ))
+        project_code_review(app, &session.snapshot, &session.controller)
     }
     async fn close(&self, review_id: Option<&str>) -> Result<Value> {
-        let mut session = {
-            let mut state = self.state.lock().await;
-            // Nothing to close: a typed no-open reject that never bumps the
-            // authority, so an in-flight open/refresh keeps winning. A
-            // stamped close may only take the controller whose identity it
-            // observed; a mismatch is a no-op reject.
-            let Some(session) = state.session.as_ref() else {
-                return Err(CodeReviewRpcError::ReviewNotOpen.into());
-            };
-            if review_id.is_some_and(|expected| session.controller.review_id() != expected) {
-                return Ok(json!({"closed": false, "staleReview": true}));
-            }
-            // Unstamped close, and a stamped close that still owns the
-            // installed generation, invalidate the pending capture. A stamp
-            // for a review already replaced by a reserved open shuts that
-            // controller down without touching the newer token.
-            if review_id.is_none() || state.installed_authority == state.authority {
-                state.authority = state.authority.wrapping_add(1);
-            }
-            state
-                .session
-                .take()
-                .ok_or(CodeReviewRpcError::ReviewNotOpen)?
+        let mut state = self.state.lock().await;
+        let Some(session) = state.session.as_ref() else {
+            return Err(CodeReviewRpcError::ReviewNotOpen.into());
         };
-        session.controller.shutdown().await;
+        if review_id.is_some_and(|expected| session.controller.review_id() != expected) {
+            return Ok(json!({"closed": false, "staleReview": true}));
+        }
+        state
+            .session
+            .as_mut()
+            .expect("review session")
+            .controller
+            .shutdown()
+            .await?;
+        if review_id.is_none() || state.installed_authority == state.authority {
+            state.authority = state.authority.wrapping_add(1);
+        }
+        state.session = None;
         Ok(json!({"closed": true}))
     }
 
     /// Shut down any open review controller (RPC session exit / listener
     /// shutdown). Never errors: a missing review is a no-op.
-    async fn shutdown(&self) {
-        let session = {
-            let mut state = self.state.lock().await;
-            state.authority = state.authority.wrapping_add(1);
-            state.installed_authority = state.authority;
-            state.session.take()
-        };
-        if let Some(mut session) = session {
-            session.controller.shutdown().await;
+    async fn shutdown(&self) -> Result<()> {
+        let mut state = self.state.lock().await;
+        if let Some(session) = state.session.as_mut() {
+            session.controller.shutdown().await?;
         }
+        state.authority = state.authority.wrapping_add(1);
+        state.installed_authority = state.authority;
+        state.session = None;
+        Ok(())
     }
 
     /// Whether a review still owns cancellable work (close/LRU busy check).
@@ -4281,7 +4350,7 @@ impl CodeReviewRpcState {
         let count = count
             .unwrap_or(MAX_CONTEXT_EXPAND_LINES)
             .min(MAX_CONTEXT_EXPAND_LINES);
-        let (file, paging, cached) = {
+        let (file, paging, cached, root) = {
             let mut state = self.state.lock().await;
             let Some(session) = state.session.as_mut() else {
                 return Err(CodeReviewRpcError::ReviewNotOpen.into());
@@ -4304,14 +4373,14 @@ impl CodeReviewRpcState {
                 file,
                 session.paging.clone(),
                 cached,
+                session.snapshot.root.clone(),
             )
         };
         let blobs = if let Some(blobs) = cached {
             blobs
         } else {
-            let cwd = app.session().cwd().to_path_buf();
             let loaded = tokio::task::spawn_blocking(move || {
-                FileContextBlobs::load(&cwd, &paging, &file)
+                FileContextBlobs::load(&root, &paging, &file)
             })
             .await
             .map_err(|e| anyhow!("code review file context load failed: {e}"))?
@@ -4360,7 +4429,7 @@ impl CodeReviewRpcState {
                 }
             }
         }
-        let (file_clone, scope, paging, flight) = {
+        let (file_clone, scope, paging, flight, root) = {
             let mut state = self.state.lock().await;
             let Some(session) = state.session.as_mut() else {
                 return Err(CodeReviewRpcError::ReviewNotOpen.into());
@@ -4394,7 +4463,13 @@ impl CodeReviewRpcState {
                     flight
                 }
             };
-            (file, session.snapshot.scope.clone(), session.paging.clone(), flight)
+            (
+                file,
+                session.snapshot.scope.clone(),
+                session.paging.clone(),
+                flight,
+                session.snapshot.root.clone(),
+            )
         };
 
         let _owner = flight.slot.lock().await;
@@ -4429,9 +4504,8 @@ impl CodeReviewRpcState {
             return served;
         }
 
-        let cwd = app.session().cwd().to_path_buf();
         let diff = tokio::task::spawn_blocking(move || {
-            FileDiff::load_snapshot_file(&cwd, &scope, &paging, &file_clone)
+            FileDiff::load_snapshot_file(&root, &scope, &paging, &file_clone)
         })
         .await
         .map_err(|e| anyhow!("code review file diff load failed: {e}"))?;
@@ -4760,11 +4834,113 @@ fn validate_comment_images(images: &[ContentBlock]) -> Result<Vec<ContentBlock>>
 impl std::error::Error for CodeReviewRpcError {}
 
 /// Build the wire projection of a review snapshot + controller. The absolute
-/// repository `root` is NEVER included — only repo-relative paths leave the
-/// process. Output stays bounded: git acquisition caps the combined patch at
-/// [`crate::code_review::MAX_DIFF_BYTES`] and the changed-file catalog at
-/// [`crate::code_review::MAX_CATALOG_BYTES`]; files the truncated patch could
-/// not carry project as on-demand placeholders instead of vanishing.
+/// repository `root` is NEVER included. Output stays bounded: git acquisition
+/// caps the combined patch at [`crate::code_review::MAX_DIFF_BYTES`] and the
+/// changed-file catalog at [`crate::code_review::MAX_CATALOG_BYTES`]; files
+/// the truncated patch could not carry project as on-demand placeholders
+/// instead of vanishing.
+fn project_code_review(
+    app: &Application,
+    snapshot: &ReviewSnapshot,
+    controller: &CodeReviewController,
+) -> Result<Value> {
+    let repo = session_addressable_review_repo(app.session().cwd(), &snapshot.root)?;
+    Ok(project_code_review_with_repo(snapshot, controller, repo))
+}
+
+fn project_code_review_with_repo(
+    snapshot: &ReviewSnapshot,
+    controller: &CodeReviewController,
+    repo: ReviewRepositoryProjection,
+) -> Value {
+    let mut projection = code_review_projection(snapshot, controller);
+    projection["repo"] = match repo {
+        ReviewRepositoryProjection::Session => Value::Null,
+        ReviewRepositoryProjection::Relative(path) => Value::String(path),
+        ReviewRepositoryProjection::Unavailable => json!({ "unavailable": true }),
+    };
+    projection
+}
+
+#[derive(Debug)]
+enum ReviewRepositoryProjection {
+    Session,
+    Relative(String),
+    Unavailable,
+}
+
+fn session_addressable_review_repo(
+    session_cwd: &Path,
+    root: &Path,
+) -> Result<ReviewRepositoryProjection> {
+    let root_text = root.to_str().ok_or_else(|| {
+        anyhow!("code review repository is not addressable from the session")
+    })?;
+    let comparable_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    if let Ok((root_absolute, root_relative)) =
+        crate::file_explorer::resolve_scoped_path(session_cwd, root_text, true)
+        && (root_absolute == root || root_absolute == comparable_root)
+    {
+        return Ok(if root_relative.is_empty() {
+            ReviewRepositoryProjection::Session
+        } else {
+            ReviewRepositoryProjection::Relative(root_relative)
+        });
+    }
+    if enclosing_review_ancestor(session_cwd, root)? {
+        return Ok(ReviewRepositoryProjection::Unavailable);
+    }
+    bail!("code review repository is not addressable from the session");
+}
+
+
+fn enclosing_review_ancestor(session_cwd: &Path, root: &Path) -> Result<bool> {
+    let comparable = match std::fs::canonicalize(root) {
+        Ok(root) if root.is_dir() => root,
+        _ => return Ok(false),
+    };
+    match crate::code_review::discover_enclosing_repository_root(session_cwd) {
+        Ok(discovered) => Ok(discovered == comparable && discovered != session_cwd),
+        Err(crate::code_review::RepositoryDiscoveryError::NotRepository) => Ok(false),
+        Err(crate::code_review::RepositoryDiscoveryError::Failed(cause)) => {
+            bail!("code review repository is not addressable from the session: {cause}")
+        }
+    }
+}
+
+#[cfg(test)]
+mod review_repo_address_tests {
+    use super::{ReviewRepositoryProjection, session_addressable_review_repo};
+    use std::path::Path;
+
+    #[test]
+    fn session_cwd_review_root_projects_null_repo() {
+        let cwd = Path::new("/workspace/session");
+        let repo = session_addressable_review_repo(cwd, cwd).expect("session root");
+        assert!(matches!(repo, ReviewRepositoryProjection::Session));
+    }
+
+    #[test]
+    fn child_repository_projects_relative_repo() {
+        let cwd = Path::new("/workspace/session");
+        let child = cwd.join("alpha");
+        let repo = session_addressable_review_repo(cwd, &child).expect("child root");
+        assert!(matches!(repo, ReviewRepositoryProjection::Relative(path) if path == "alpha"));
+    }
+
+    #[test]
+    fn prefix_lookalike_repository_is_unaddressable() {
+        let cwd = Path::new("/workspace/session");
+        let lookalike = Path::new("/workspace/session-other/alpha");
+        let error = session_addressable_review_repo(cwd, lookalike)
+            .expect_err("prefix lookalike must not strip onto another path");
+        assert!(
+            error.to_string().contains("not addressable"),
+            "{error:#}"
+        );
+    }
+}
+
 fn code_review_projection(snapshot: &ReviewSnapshot, controller: &CodeReviewController) -> Value {
     let files = snapshot
         .files
@@ -4872,6 +5048,7 @@ fn code_review_projection(snapshot: &ReviewSnapshot, controller: &CodeReviewCont
         .collect::<Vec<_>>();
 
     json!({
+        "repo": Value::Null,
         "comparisonLabel": snapshot.comparison_label(),
         "snapshotId": snapshot.snapshot_id,
         "reviewId": controller.review_id(),
@@ -4886,6 +5063,7 @@ fn code_review_projection(snapshot: &ReviewSnapshot, controller: &CodeReviewCont
         "tldrSnapshotId": controller.tldr_snapshot_id(),
         "tldrError": controller.tldr_error(),
         "tldrMarkdown": controller.tldr_markdown(),
+        "tldrTimestamp": controller.tldr_timestamp(),
         "truncated": snapshot.truncated,
         "totalsComplete": snapshot.summary_complete,
         "error": snapshot.error,
@@ -5079,14 +5257,15 @@ async fn handle_code_review_command(
                 from,
                 to,
                 include_working_tree,
+                repo,
                 ..
             } => {
                 code_review
-                    .open(app, commit, from, to, include_working_tree)
+                    .open(app, commit, from, to, include_working_tree, repo)
                     .await
             }
             RpcCommand::CodeReviewCommits { limit, .. } => code_review.commits(app, limit).await,
-            RpcCommand::CodeReviewSnapshot { .. } => code_review.snapshot().await,
+            RpcCommand::CodeReviewSnapshot { .. } => code_review.snapshot(app).await,
             RpcCommand::CodeReviewRefresh { .. } => code_review.refresh(app).await,
             RpcCommand::CodeReviewComment {
                 snapshot_id,
@@ -5130,6 +5309,7 @@ async fn handle_code_review_command(
             } => {
                 code_review
                     .abort(
+                        app,
                         &snapshot_id,
                         &path,
                         old_start,
@@ -5260,10 +5440,26 @@ async fn handle_file_explorer_command(app: &Application, c: RpcCommand) -> RpcRe
     match result {
         Ok(Ok(data)) => RpcResponse::success(id, name, Some(data)),
         Ok(Err(error)) => {
+            let data = if let Some(ambiguous) =
+                error.downcast_ref::<crate::file_explorer::FileAmbiguous>()
+            {
+                match serde_json::to_value(ambiguous) {
+                    Ok(data) => Some(data),
+                    Err(encode) => {
+                        return RpcResponse::failure(
+                            id,
+                            name,
+                            format!("file explorer operation failed: {encode}"),
+                        );
+                    }
+                }
+            } else {
+                error
+                    .downcast_ref::<crate::file_explorer::FileExplorerError>()
+                    .map(|typed| json!({ "code": typed }))
+            };
             let mut response = RpcResponse::failure(id, name, error.to_string());
-            if let Some(typed) = error.downcast_ref::<crate::file_explorer::FileExplorerError>() {
-                response.data = Some(json!({ "code": typed }));
-            }
+            response.data = data;
             response
         }
         Err(error) if error.is_cancelled() => {
@@ -5271,6 +5467,124 @@ async fn handle_file_explorer_command(app: &Application, c: RpcCommand) -> RpcRe
         }
         Err(_) => RpcResponse::failure(id, name, "file explorer operation failed"),
     }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RpcAssistantMetadata {
+    role: &'static str,
+    api: String,
+    provider: String,
+    model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_id: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    diagnostics: Vec<pi_ai::Diagnostic>,
+    usage: pi_ai::Usage,
+    stop_reason: pi_ai::StopReason,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    raw_stop_reason: Option<String>,
+    timestamp: i64,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum RpcAssistantUpdate {
+    Start,
+    TextStart { content_index: usize },
+    TextDelta { content_index: usize, delta: String },
+    TextEnd { content_index: usize, content: String },
+    ThinkingStart { content_index: usize },
+    ThinkingDelta { content_index: usize, delta: String },
+    ThinkingEnd { content_index: usize, content: String },
+    #[serde(rename = "toolcall_start")]
+    ToolCallStart { content_index: usize },
+    #[serde(rename = "toolcall_delta")]
+    ToolCallDelta { content_index: usize, delta: String },
+    #[serde(rename = "toolcall_end")]
+    ToolCallEnd { content_index: usize, tool_call: pi_ai::ToolCall },
+    Done { reason: pi_ai::StopReason, message: pi_ai::AssistantMessage },
+    Error { reason: pi_ai::StopReason, error: pi_ai::AssistantMessage },
+}
+
+#[derive(Serialize)]
+struct RpcMessageUpdate {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    message: RpcAssistantMetadata,
+    #[serde(rename = "assistantMessageEvent")]
+    assistant_message_event: RpcAssistantUpdate,
+}
+
+fn assistant_metadata(message: pi_ai::AssistantMessage) -> RpcAssistantMetadata {
+    RpcAssistantMetadata {
+        role: "assistant",
+        api: message.api,
+        provider: message.provider,
+        model: message.model,
+        response_model: message.response_model,
+        response_id: message.response_id,
+        diagnostics: message.diagnostics,
+        usage: message.usage,
+        stop_reason: message.stop_reason,
+        error_message: message.error_message,
+        raw_stop_reason: message.raw_stop_reason,
+        timestamp: message.timestamp,
+    }
+}
+
+fn project_message_update(
+    message: Message,
+    event: pi_ai::AssistantMessageEvent,
+) -> Result<Value> {
+    let Message::Assistant(message) = message else {
+        bail!("message_update requires an assistant message");
+    };
+    let assistant_message_event = match event {
+        pi_ai::AssistantMessageEvent::Start { .. } => RpcAssistantUpdate::Start,
+        pi_ai::AssistantMessageEvent::TextStart { content_index, .. } => {
+            RpcAssistantUpdate::TextStart { content_index }
+        }
+        pi_ai::AssistantMessageEvent::TextDelta { content_index, delta, .. } => {
+            RpcAssistantUpdate::TextDelta { content_index, delta }
+        }
+        pi_ai::AssistantMessageEvent::TextEnd { content_index, content, .. } => {
+            RpcAssistantUpdate::TextEnd { content_index, content }
+        }
+        pi_ai::AssistantMessageEvent::ThinkingStart { content_index, .. } => {
+            RpcAssistantUpdate::ThinkingStart { content_index }
+        }
+        pi_ai::AssistantMessageEvent::ThinkingDelta { content_index, delta, .. } => {
+            RpcAssistantUpdate::ThinkingDelta { content_index, delta }
+        }
+        pi_ai::AssistantMessageEvent::ThinkingEnd { content_index, content, .. } => {
+            RpcAssistantUpdate::ThinkingEnd { content_index, content }
+        }
+        pi_ai::AssistantMessageEvent::ToolCallStart { content_index, .. } => {
+            RpcAssistantUpdate::ToolCallStart { content_index }
+        }
+        pi_ai::AssistantMessageEvent::ToolCallDelta { content_index, delta, .. } => {
+            RpcAssistantUpdate::ToolCallDelta { content_index, delta }
+        }
+        pi_ai::AssistantMessageEvent::ToolCallEnd { content_index, tool_call, .. } => {
+            RpcAssistantUpdate::ToolCallEnd { content_index, tool_call }
+        }
+        pi_ai::AssistantMessageEvent::Done { reason, message } => {
+            RpcAssistantUpdate::Done { reason, message }
+        }
+        pi_ai::AssistantMessageEvent::Error { reason, error } => {
+            RpcAssistantUpdate::Error { reason, error }
+        }
+    };
+    Ok(serde_json::to_value(RpcMessageUpdate {
+        kind: "message_update",
+        message: assistant_metadata(message),
+        assistant_message_event,
+    })?)
 }
 
 pub(crate) fn project_application_event(event: ApplicationEvent) -> Result<Value> {
@@ -5282,6 +5596,17 @@ pub(crate) fn project_application_event(event: ApplicationEvent) -> Result<Value
         } => Ok(serde_json::to_value(pi_agent::AgentEvent::MessageStart {
             message: public_message(message),
         })?),
+        ApplicationEvent::Agent(pi_agent::AgentEvent::MessageUpdate {
+            message,
+            assistant_message_event,
+        })
+        | ApplicationEvent::AgentPublished {
+            event: pi_agent::AgentEvent::MessageUpdate {
+                message,
+                assistant_message_event,
+            },
+            ..
+        } => project_message_update(message, assistant_message_event),
         ApplicationEvent::Agent(pi_agent::AgentEvent::MessageEnd { message })
         | ApplicationEvent::AgentPublished {
             event: pi_agent::AgentEvent::MessageEnd { message },
@@ -5727,6 +6052,23 @@ pub(crate) fn parse_input(line: &[u8]) -> std::result::Result<RpcInput, RpcRespo
             )),
         };
     }
+    // `agent_history` clean cutover: the retired `lines` field must fail
+    // explicitly at the decode boundary — presence alone, whatever the value —
+    // instead of silently falling back to the default limit.
+    if command == "agent_history"
+        && value
+            .as_object()
+            .is_some_and(|object| object.contains_key("lines"))
+    {
+        return Err(tag_parse_failure(
+            RpcResponse::failure(
+                id,
+                command,
+                "agent_history no longer accepts \"lines\"; use \"limit\"",
+            ),
+            session_id.as_deref(),
+        ));
+    }
     serde_json::from_value(value)
         .map(|command| RpcInput::Command {
             command,
@@ -6042,6 +6384,22 @@ async fn handle_command(
     handle_command_with_session_storage(app, settings, workflows, None, command).await
 }
 
+fn rpc_request_fingerprint(id: Option<&str>) -> (u32, String) {
+    let Some(id) = id.filter(|id| !id.is_empty()) else {
+        return (0, "-".to_owned());
+    };
+    let len = u32::try_from(id.len()).unwrap_or(u32::MAX);
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"pi-rpc-phase-id-v1\0");
+    hasher.update(id.as_bytes());
+    let digest = hasher.finalize();
+    (
+        len,
+        digest[..8].iter().map(|byte| format!("{byte:02x}")).collect(),
+    )
+}
+
 async fn handle_command_with_session_storage(
     app: &Application,
     settings: &crate::settings_rpc::SettingsRpcState,
@@ -6090,6 +6448,13 @@ fn attach_handle_command_error_code(error: &anyhow::Error, response: &mut RpcRes
     }
     if let Some(typed) = error.downcast_ref::<SessionAlreadyProcessing>() {
         response.data = Some(json!({ "code": typed.code() }));
+        return;
+    }
+    // A model-less agent/session rejects before any turn, event, or history
+    // write with the typed pi-agent error. Stamp the closed wire code by type;
+    // the display message is never parsed.
+    if error.downcast_ref::<pi_agent::ModelNotConfigured>().is_some() {
+        response.data = Some(json!({ "code": "model_not_configured" }));
     }
 }
 
@@ -6308,7 +6673,7 @@ async fn handle_command_inner(
             Ok(None)
         }
         RpcCommand::Abort { .. } => {
-            app.abort().await;
+            app.abort().await?;
             Ok(None)
         }
         RpcCommand::NewSession {
@@ -6335,15 +6700,22 @@ async fn handle_command_inner(
             }
             Ok(Some(json!({"cancelled":outcome.cancelled})))
         }
-        RpcCommand::GetState { .. } => Ok(Some(serde_json::to_value(
-            RpcSessionState::from_application(
+        RpcCommand::GetState { id, .. } => {
+            let (id_len, fp) = rpc_request_fingerprint(id.as_deref());
+            eprintln!("rpc_phase command=get_state phase=enter fp={fp} id_len={id_len}");
+            let state = RpcSessionState::from_application(
                 app.state().await,
                 app.active_turn_model(),
                 app.runtime_settings_state(),
                 app.session().cwd(),
                 None,
-            ),
-        )?)),
+            );
+            eprintln!(
+                "rpc_phase command=get_state phase=state_complete fp={fp} id_len={id_len} is_streaming={} is_compacting={} pending_message_count={}",
+                state.is_streaming, state.is_compacting, state.pending_message_count
+            );
+            Ok(Some(serde_json::to_value(state)?))
+        }
         RpcCommand::SetModel {
             provider, model_id, ..
         } => Ok(Some(serde_json::to_value(
@@ -7139,9 +7511,24 @@ async fn handle_command_inner(
                 Ok(Some(json!({"cancelled": steering.len() + follow_up.len()})))
             }
         },
-        RpcCommand::QueueSendNow { .. } => {
-            let result = app.send_queued_steering_now().await?;
-            Ok(Some(serde_json::to_value(result)?))
+        RpcCommand::QueueSendNow { id, .. } => {
+            static NEXT_OP: AtomicU64 = AtomicU64::new(1);
+            let op = NEXT_OP.fetch_add(1, Ordering::Relaxed);
+            let (id_len, fp) = rpc_request_fingerprint(id.as_deref());
+            eprintln!(
+                "rpc_phase command=queue_send_now phase=dispatch_enter op={op} fp={fp} id_len={id_len}"
+            );
+            let result = app.send_queued_steering_now(Some(op)).await;
+            let outcome = match &result {
+                Ok(sent) if sent.sent == 0 => "empty",
+                Ok(sent) if sent.combined => "accepted_combined",
+                Ok(_) => "accepted",
+                Err(_) => "failed",
+            };
+            eprintln!(
+                "rpc_phase command=queue_send_now phase=dispatch_complete op={op} fp={fp} id_len={id_len} outcome={outcome}"
+            );
+            Ok(Some(serde_json::to_value(result?)?))
         }
         RpcCommand::JobList { .. } => {
             let Some(runtime) = app.orchestration_runtime() else {
@@ -7177,20 +7564,31 @@ async fn handle_command_inner(
             })))
         }
         RpcCommand::TaskSpawn { args, .. } => {
-            let runtime = app
-                .orchestration_runtime()
-                .ok_or_else(|| anyhow!("orchestration is not enabled in this session"))?;
             let parameters: pi_coding::TaskParameters = serde_json::from_value(args)?;
-            let items = parameters.into_items(&runtime)?;
-            let parent = runtime.main_agent_id().to_owned();
-            let spawns = runtime.spawn_tasks(&parent, 0, items)?;
+            // Orchestration children inherit Main's provider generation, so the
+            // launch goes through the application's guarded entry: it holds the
+            // operation gate across the idle generation refresh, the live
+            // runtime re-read, item preparation, and the spawn. Never prepare
+            // on a runtime handle captured before the gate.
+            let spawns = app.spawn_orchestration_tasks(parameters).await?;
             Ok(Some(json!({"spawns": spawns})))
         }
         RpcCommand::JobCancel { job_ids, .. } => {
             let runtime = app
                 .orchestration_runtime()
                 .ok_or_else(|| anyhow!("orchestration is not enabled in this session"))?;
-            let cancelled = runtime.cancel_jobs_result(&job_ids)?;
+            eprintln!(
+                "rpc_phase command=job_cancel phase=dispatch_enter jobs={}",
+                job_ids.len()
+            );
+            let cancelled = runtime.cancel_jobs_result(&job_ids).with_context(|| {
+                format!("cancelling {} orchestration job(s)", job_ids.len())
+            })?;
+            eprintln!(
+                "rpc_phase command=job_cancel phase=dispatch_complete requested={} acknowledged={}",
+                job_ids.len(),
+                cancelled.len()
+            );
             Ok(Some(json!({"cancelled": cancelled})))
         }
         RpcCommand::HubSend {
@@ -7212,23 +7610,24 @@ async fn handle_command_inner(
                 .into_iter()
                 .next()
                 .ok_or_else(|| anyhow!("no orchestration job with id {job_id:?}"))?;
-            Ok(Some(json!({"job": job})))
+            let assignment = runtime.job_assignment(&job);
+            Ok(Some(json!({ "job": job, "assignment": assignment })))
         }
         RpcCommand::AgentHistory {
-            agent_id, lines, ..
+            agent_id, limit, ..
         } => {
             let runtime = app
                 .orchestration_runtime()
                 .ok_or_else(|| anyhow!("orchestration is not enabled in this session"))?;
-            let lines = lines.unwrap_or(DEFAULT_RPC_HISTORY_LINES);
-            if !(1..=pi_coding::MAX_HISTORY_LINES).contains(&lines) {
+            let limit = limit.unwrap_or(DEFAULT_RPC_HISTORY_LIMIT);
+            if !(1..=pi_coding::MAX_HISTORY_LINES).contains(&limit) {
                 bail!(
-                    "lines must be between 1 and {}",
+                    "limit must be between 1 and {}",
                     pi_coding::MAX_HISTORY_LINES
                 );
             }
-            let text = runtime.read_child_history(&agent_id, lines)?;
-            Ok(Some(json!({"agentId": agent_id, "text": text})))
+            let transcript = runtime.read_child_transcript(&agent_id, limit)?;
+            Ok(Some(agent_history_data(&agent_id, transcript)?))
         }
         RpcCommand::TodoChildCreate { request, .. } => Ok(Some(serde_json::to_value(
             app.todo_child_create(request).await?,
@@ -8090,6 +8489,188 @@ pub(crate) fn public_transcript_rows(rows: Vec<TranscriptRow>) -> Vec<Value> {
         .collect()
 }
 
+/// Builds the `agent_history` response `data`: the projected message rows
+/// selected by the runtime's `limit` suffix, further cut from the head —
+/// whole rows only — until the FULL serialized `data` fits
+/// [`pi_coding::MAX_HISTORY_BYTES`]. The `truncation` report is real:
+/// `omittedRows` counts every row dropped by the limit suffix and the byte
+/// budget, and `reason` distinguishes `none`, `limit`, `bytes`, and
+/// `limit_and_bytes`. A single row larger than the whole budget yields
+/// `messages: []` with an honest `bytes`-reasoned report, never a fabricated
+/// empty history.
+fn agent_history_data(agent_id: &str, transcript: pi_coding::ChildTranscript) -> Result<Value> {
+    let limit_dropped = transcript.omitted_rows;
+    let mut rows: Vec<(usize, Value)> = transcript
+        .rows
+        .into_iter()
+        .map(|row| {
+            let message = public_message(row.message);
+            let message = public_history_message(&message)?;
+            let wrapper = match row.id {
+                Some(id) => json!({ "id": id, "message": message }),
+                None => json!({ "message": message }),
+            };
+            Ok((wrapper.to_string().len(), wrapper))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // Fast pre-drop from per-row serialized lengths plus the empty-envelope
+    // size and a small margin for the final truncation fields' digits; the
+    // verify loop below re-serializes the real envelope and keeps dropping
+    // whole rows from the head if the margin was short.
+    let empty_len = agent_history_envelope(agent_id, 0, "none", &[])?.to_string().len();
+    let mut byte_dropped = 0usize;
+    while !rows.is_empty() {
+        let body: usize = rows.iter().map(|(len, _)| len + 1).sum();
+        if empty_len + body + 16 <= pi_coding::MAX_HISTORY_BYTES {
+            break;
+        }
+        rows.remove(0);
+        byte_dropped += 1;
+    }
+    loop {
+        let reason = truncation_reason(limit_dropped > 0, byte_dropped > 0);
+        let wrappers: Vec<&Value> = rows.iter().map(|(_, wrapper)| wrapper).collect();
+        let data =
+            agent_history_envelope(agent_id, limit_dropped + byte_dropped, reason, &wrappers)?;
+        if data.to_string().len() <= pi_coding::MAX_HISTORY_BYTES || rows.is_empty() {
+            return Ok(data);
+        }
+        rows.remove(0);
+        byte_dropped += 1;
+    }
+}
+
+fn agent_history_envelope(
+    agent_id: &str,
+    omitted_rows: usize,
+    reason: &str,
+    messages: &[&Value],
+) -> Result<Value> {
+    Ok(json!({
+        "agentId": agent_id,
+        "messages": messages,
+        "truncation": { "omittedRows": omitted_rows, "reason": reason },
+    }))
+}
+
+fn truncation_reason(limit_dropped: bool, byte_dropped: bool) -> &'static str {
+    match (limit_dropped, byte_dropped) {
+        (true, true) => "limit_and_bytes",
+        (true, false) => "limit",
+        (false, true) => "bytes",
+        (false, false) => "none",
+    }
+}
+
+/// Public display projection of one transcript message for `agent_history`:
+/// display fields only. Content blocks keep text/thinking/image/toolCall but
+/// never signatures; assistant provider/usage/model internals,
+/// `fullOutputPath`, and `excludeFromContext` are stripped. Unknown roles
+/// error with context instead of falling back to flat text.
+fn public_history_message(message: &Message) -> Result<Value> {
+    Ok(match message {
+        Message::User(user) => json!({
+            "role": "user",
+            "content": public_content_blocks(&user.content),
+            "timestamp": user.timestamp,
+        }),
+        Message::Assistant(assistant) => {
+            let stop_reason = serde_json::to_value(&assistant.stop_reason)
+                .context("projecting assistant stop reason")?;
+            let mut value = json!({
+                "role": "assistant",
+                "content": public_content_blocks(&assistant.content),
+                "stopReason": stop_reason,
+                "timestamp": assistant.timestamp,
+            });
+            if let Some(error) = &assistant.error_message {
+                value["errorMessage"] = json!(error);
+            }
+            value
+        }
+        Message::ToolResult(result) => {
+            let mut value = json!({
+                "role": "toolResult",
+                "toolCallId": result.tool_call_id,
+                "toolName": result.tool_name,
+                "content": public_content_blocks(&result.content),
+                "isError": result.is_error,
+                "timestamp": result.timestamp,
+            });
+            if let Some(details) = &result.details {
+                value["details"] = details.clone();
+            }
+            value
+        }
+        Message::BashExecution(bash) => {
+            let mut value = json!({
+                "role": "bashExecution",
+                "command": bash.command,
+                "output": bash.output,
+                "cancelled": bash.cancelled,
+                "truncated": bash.truncated,
+                "timestamp": bash.timestamp,
+            });
+            if let Some(exit_code) = bash.exit_code {
+                value["exitCode"] = json!(exit_code);
+            }
+            value
+        }
+        Message::Custom(custom) => {
+            let mut value = json!({
+                "role": "custom",
+                "customType": custom.custom_type,
+                "content": match &custom.content {
+                    pi_ai::CustomMessageContent::Text(text) => json!(text),
+                    pi_ai::CustomMessageContent::Blocks(blocks) => public_content_blocks(blocks),
+                },
+                "display": custom.display,
+                "timestamp": custom.timestamp,
+            });
+            if let Some(details) = &custom.details {
+                value["details"] = details.clone();
+            }
+            value
+        }
+        // agent_history drops summaries at its child-transcript boundary.
+        Message::BranchSummary(_) | Message::CompactionSummary(_) => {
+            bail!("unsupported history message role");
+        }
+    })
+}
+
+/// Display projection of content blocks, matching the wire shapes of the
+/// persisted blocks minus signature fields.
+fn public_content_blocks(blocks: &[ContentBlock]) -> Value {
+    Value::Array(
+        blocks
+            .iter()
+            .map(|block| match block {
+                ContentBlock::Text { text, .. } => json!({ "type": "text", "text": text }),
+                ContentBlock::Thinking {
+                    thinking, redacted, ..
+                } => {
+                    let mut value = json!({ "type": "thinking", "thinking": thinking });
+                    if *redacted {
+                        value["redacted"] = json!(true);
+                    }
+                    value
+                }
+                ContentBlock::Image { data, mime_type } => {
+                    json!({ "type": "image", "data": data, "mimeType": mime_type })
+                }
+                ContentBlock::ToolCall(call) => json!({
+                    "type": "toolCall",
+                    "id": call.id,
+                    "name": call.name,
+                    "arguments": call.arguments,
+                }),
+            })
+            .collect(),
+    )
+}
+
 fn public_model(mut model: Model) -> Model {
     model.headers = None;
     model
@@ -8207,6 +8788,38 @@ mod tests {
     }
 
     #[test]
+    fn prompt_missing_model_error_attaches_model_not_configured_code() {
+        let mut response = RpcResponse::failure(
+            None,
+            "prompt",
+            pi_agent::ModelNotConfigured.to_string(),
+        );
+        attach_handle_command_error_code(
+            &anyhow::Error::new(pi_agent::ModelNotConfigured),
+            &mut response,
+        );
+        assert_eq!(
+            response.data,
+            Some(json!({"code": "model_not_configured"}))
+        );
+        assert_eq!(
+            response.error.as_deref(),
+            Some(pi_agent::ModelNotConfigured::MESSAGE)
+        );
+        // The same words without the typed error must not stamp a code.
+        let mut untyped = RpcResponse::failure(
+            None,
+            "prompt",
+            pi_agent::ModelNotConfigured::MESSAGE,
+        );
+        attach_handle_command_error_code(
+            &anyhow!("{}", pi_agent::ModelNotConfigured::MESSAGE),
+            &mut untyped,
+        );
+        assert_eq!(untyped.data, None, "message text alone never stamps the code");
+    }
+
+    #[test]
     fn side_chat_entry_wire_carries_tool_and_thinking_fields() {
         use crate::side_chat::{SideChatEntry, SideChatEntryKind, SideChatRole};
         let tool = SideChatEntry {
@@ -8220,6 +8833,7 @@ mod tests {
             thinking: None,
             is_error: false,
             is_partial: false,
+            timestamp: None,
         };
         let tool_wire = tool.to_wire_json();
         assert_eq!(tool_wire["id"], "sc-1");
@@ -8241,6 +8855,7 @@ mod tests {
             thinking: Some("plan".into()),
             is_error: false,
             is_partial: true,
+            timestamp: None,
         };
         let thinking_wire = thinking.to_wire_json();
         assert_eq!(thinking_wire["id"], "sc-2");
@@ -8259,6 +8874,7 @@ mod tests {
             thinking: None,
             is_error: false,
             is_partial: true,
+            timestamp: None,
         };
         let live_wire = live.to_wire_json();
         assert_eq!(live_wire["id"], "sc-3");
@@ -8440,6 +9056,302 @@ mod tests {
     use futures_util::{FutureExt as _, StreamExt as _};
     fn settings_state() -> crate::settings_rpc::SettingsRpcState {
         crate::settings_rpc::SettingsRpcState::default()
+    }
+    fn assistant_wire_fixture(content: Vec<ContentBlock>) -> pi_ai::AssistantMessage {
+        pi_ai::AssistantMessage {
+            content,
+            api: "openai-responses".to_owned(),
+            provider: "fixture-provider".to_owned(),
+            model: "fixture-model".to_owned(),
+            response_model: Some("fixture-response-model".to_owned()),
+            response_id: Some("resp-wire".to_owned()),
+            diagnostics: vec![pi_ai::Diagnostic {
+                message: "cached prefix".to_owned(),
+                code: Some("prefix".to_owned()),
+            }],
+            usage: pi_ai::Usage {
+                input: 11,
+                output: 22,
+                cache_read: 3,
+                cache_write: 4,
+                cache_write_1h: 5,
+                reasoning: 6,
+                total_tokens: 51,
+                cost: pi_ai::CostBreakdown {
+                    input: 0.1,
+                    output: 0.2,
+                    cache_read: 0.3,
+                    cache_write: 0.4,
+                    total: 1.0,
+                },
+            },
+            stop_reason: pi_ai::StopReason::ToolUse,
+            error_message: Some("provider warning".to_owned()),
+            raw_stop_reason: Some("tool_calls".to_owned()),
+            timestamp: 1_700_000_000_000,
+        }
+    }
+
+    fn wrap_agent(event: pi_agent::AgentEvent, published: bool) -> ApplicationEvent {
+        if published {
+            ApplicationEvent::AgentPublished {
+                event,
+                epoch: 9,
+                barrier: 4,
+            }
+        } else {
+            ApplicationEvent::Agent(event)
+        }
+    }
+
+    fn assert_absent(value: &Value, key: &str) {
+        let Some(object) = value.as_object() else {
+            panic!("{key} parent is not an object: {value}");
+        };
+        assert!(
+            !object.contains_key(key),
+            "{key} must be absent, not {value}"
+        );
+    }
+
+    #[test]
+    fn message_update_delta_projection_size_is_independent_of_prefix() {
+        let delta = "d".repeat(64);
+        let small = "s".repeat(1024);
+        let large = "L".repeat(5 * 1024 * 1024);
+        for published in [false, true] {
+            for kind in ["text", "thinking"] {
+                let project = |prefix: &str| {
+                    let block = match kind {
+                        "text" => ContentBlock::text(prefix),
+                        "thinking" => ContentBlock::thinking(prefix),
+                        _ => unreachable!(),
+                    };
+                    let message = assistant_wire_fixture(vec![block]);
+                    let assistant_message_event = match kind {
+                        "text" => pi_ai::AssistantMessageEvent::TextDelta {
+                            content_index: 0,
+                            delta: delta.clone(),
+                            partial: message.clone(),
+                        },
+                        "thinking" => pi_ai::AssistantMessageEvent::ThinkingDelta {
+                            content_index: 0,
+                            delta: delta.clone(),
+                            partial: message.clone(),
+                        },
+                        _ => unreachable!(),
+                    };
+                    project_application_event(wrap_agent(
+                        pi_agent::AgentEvent::MessageUpdate {
+                            message: Message::Assistant(message),
+                            assistant_message_event,
+                        },
+                        published,
+                    ))
+                    .expect("project delta")
+                };
+                let small_json = project(&small);
+                let large_json = project(&large);
+                let small_encoded = serde_json::to_string(&small_json).expect("encode small");
+                let large_encoded = serde_json::to_string(&large_json).expect("encode large");
+                assert_eq!(
+                    small_encoded.len(),
+                    large_encoded.len(),
+                    "{kind} published={published} still duplicates the cumulative prefix"
+                );
+                assert_eq!(small_json, large_json);
+                assert_eq!(large_json["type"], "message_update");
+                assert_eq!(large_json["assistantMessageEvent"]["type"], format!("{kind}_delta"));
+                assert_eq!(large_json["assistantMessageEvent"]["content_index"], 0);
+                assert_eq!(large_json["assistantMessageEvent"]["delta"], delta);
+                assert_absent(&large_json["message"], "content");
+                assert_absent(&large_json["assistantMessageEvent"], "partial");
+                assert!(large_json.get("epoch").is_none() && large_json.get("barrier").is_none());
+            }
+            let tool = |prefix: &str, delta: &str| {
+                let call = pi_ai::ToolCall {
+                    id: "call-1".to_owned(),
+                    name: "write".to_owned(),
+                    arguments: json!({"body": prefix}),
+                    thought_signature: Some("sig".to_owned()),
+                };
+                let message = assistant_wire_fixture(vec![ContentBlock::ToolCall(call)]);
+                project_application_event(wrap_agent(
+                    pi_agent::AgentEvent::MessageUpdate {
+                        message: Message::Assistant(message.clone()),
+                        assistant_message_event: pi_ai::AssistantMessageEvent::ToolCallDelta {
+                            content_index: 0,
+                            delta: delta.to_owned(),
+                            partial: message,
+                        },
+                    },
+                    published,
+                ))
+                .expect("project tool delta")
+            };
+            let small_tool = tool(&small, &delta);
+            let large_tool = tool(&large, &delta);
+            assert_eq!(
+                serde_json::to_string(&small_tool).expect("encode").len(),
+                serde_json::to_string(&large_tool).expect("encode").len()
+            );
+            assert_eq!(large_tool["assistantMessageEvent"]["type"], "toolcall_delta");
+            assert_eq!(large_tool["assistantMessageEvent"]["delta"], delta);
+            assert_absent(&large_tool["message"], "content");
+            assert_absent(&large_tool["assistantMessageEvent"], "partial");
+            let grown = "d".repeat(96);
+            let grown_tool = tool("ignored", &grown);
+            let before = serde_json::to_string(&small_tool).expect("encode").len();
+            let after = serde_json::to_string(&grown_tool).expect("encode").len();
+            let growth = serde_json::to_string(&grown).expect("delta").len()
+                - serde_json::to_string(&delta).expect("delta").len();
+            assert_eq!(after - before, growth);
+        }
+    }
+
+    #[test]
+    fn message_update_projection_preserves_metadata_and_block_payloads() {
+        let message = assistant_wire_fixture(vec![ContentBlock::text("cumulative")]);
+        let mut expected = serde_json::to_value(&message).expect("metadata");
+        expected.as_object_mut().expect("object").remove("content");
+        expected["role"] = json!("assistant");
+        let tool_call = pi_ai::ToolCall {
+            id: "call-end".to_owned(),
+            name: "read".to_owned(),
+            arguments: json!({"path": "src/lib.rs", "offset": 0}),
+            thought_signature: Some("thought-sig".to_owned()),
+        };
+        let cases = [
+            pi_ai::AssistantMessageEvent::Start {
+                partial: message.clone(),
+            },
+            pi_ai::AssistantMessageEvent::TextStart {
+                content_index: 1,
+                partial: message.clone(),
+            },
+            pi_ai::AssistantMessageEvent::TextEnd {
+                content_index: 1,
+                content: "closed text".to_owned(),
+                partial: message.clone(),
+            },
+            pi_ai::AssistantMessageEvent::ThinkingStart {
+                content_index: 2,
+                partial: message.clone(),
+            },
+            pi_ai::AssistantMessageEvent::ThinkingEnd {
+                content_index: 2,
+                content: "closed thought".to_owned(),
+                partial: message.clone(),
+            },
+            pi_ai::AssistantMessageEvent::ToolCallStart {
+                content_index: 3,
+                partial: message.clone(),
+            },
+            pi_ai::AssistantMessageEvent::ToolCallEnd {
+                content_index: 3,
+                tool_call: tool_call.clone(),
+                partial: message.clone(),
+            },
+            pi_ai::AssistantMessageEvent::Done {
+                reason: pi_ai::StopReason::Stop,
+                message: message.clone(),
+            },
+            pi_ai::AssistantMessageEvent::Error {
+                reason: pi_ai::StopReason::Error,
+                error: message.clone(),
+            },
+        ];
+        for assistant_message_event in cases {
+            let projected = project_application_event(ApplicationEvent::Agent(
+                pi_agent::AgentEvent::MessageUpdate {
+                    message: Message::Assistant(message.clone()),
+                    assistant_message_event: assistant_message_event.clone(),
+                },
+            ))
+            .expect("project update");
+            let terminal = matches!(
+                assistant_message_event,
+                pi_ai::AssistantMessageEvent::Done { .. }
+                    | pi_ai::AssistantMessageEvent::Error { .. }
+            );
+            if !terminal {
+                assert_eq!(projected["message"], expected);
+            }
+            let event = &projected["assistantMessageEvent"];
+            assert_absent(event, "partial");
+            match &assistant_message_event {
+                pi_ai::AssistantMessageEvent::TextEnd { content, content_index, .. } => {
+                    assert_eq!(event["type"], "text_end");
+                    assert_eq!(event["content_index"], *content_index);
+                    assert_eq!(event["content"], *content);
+                }
+                pi_ai::AssistantMessageEvent::ThinkingEnd { content, content_index, .. } => {
+                    assert_eq!(event["type"], "thinking_end");
+                    assert_eq!(event["content"], *content);
+                    assert_eq!(event["content_index"], *content_index);
+                }
+                pi_ai::AssistantMessageEvent::ToolCallEnd { tool_call, content_index, .. } => {
+                    assert_eq!(event["type"], "toolcall_end");
+                    assert_eq!(event["content_index"], *content_index);
+                    assert_eq!(event["tool_call"], serde_json::to_value(tool_call).expect("tool"));
+                    assert_eq!(event["tool_call"]["thoughtSignature"], "thought-sig");
+                }
+                pi_ai::AssistantMessageEvent::Done { reason, message } => {
+                    assert_eq!(event["type"], "done");
+                    assert_eq!(event["reason"], serde_json::to_value(reason).expect("reason"));
+                    assert_eq!(event["message"], serde_json::to_value(message).expect("done"));
+                }
+                pi_ai::AssistantMessageEvent::Error { reason, error } => {
+                    assert_eq!(event["type"], "error");
+                    assert_eq!(event["reason"], serde_json::to_value(reason).expect("reason"));
+                    assert_eq!(event["error"], serde_json::to_value(error).expect("error"));
+                }
+                other => {
+                    assert!(other.partial().is_some());
+                    assert!(event.get("content").is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn message_end_projection_preserves_complete_assistant() {
+        let message = assistant_wire_fixture(vec![
+            ContentBlock::Text {
+                text: "T".repeat(8 * 1024),
+                text_signature: Some("text-sig".to_owned()),
+            },
+            ContentBlock::Thinking {
+                thinking: "H".repeat(8 * 1024),
+                thinking_signature: Some("think-sig".to_owned()),
+                redacted: false,
+            },
+            ContentBlock::ToolCall(pi_ai::ToolCall {
+                id: "call-final".to_owned(),
+                name: "bash".to_owned(),
+                arguments: json!({"command": "echo complete"}),
+                thought_signature: Some("final-sig".to_owned()),
+            }),
+        ]);
+        let complete = serde_json::to_value(Message::Assistant(message.clone())).expect("complete");
+        for published in [false, true] {
+            let projected = project_application_event(wrap_agent(
+                pi_agent::AgentEvent::MessageEnd {
+                    message: Message::Assistant(message.clone()),
+                },
+                published,
+            ))
+            .expect("project end");
+            assert_eq!(projected["type"], "message_end");
+            assert_eq!(projected["message"], complete);
+            assert_eq!(projected["message"]["content"][0]["textSignature"], "text-sig");
+            assert_eq!(projected["message"]["content"][1]["thinkingSignature"], "think-sig");
+            assert_eq!(projected["message"]["content"][2]["thoughtSignature"], "final-sig");
+            assert_eq!(projected["message"]["usage"]["totalTokens"], 51);
+            assert_eq!(projected["message"]["stopReason"], "toolUse");
+            assert_eq!(projected["message"]["errorMessage"], "provider warning");
+            assert!(projected.get("epoch").is_none());
+        }
     }
 
     fn bash_execution_event_fixture() -> ApplicationEvent {
@@ -8668,7 +9580,7 @@ mod tests {
             json!({"type":"hub_send","to":"writer","body":"ping"}),
             json!({"type":"job_output","jobId":"job-1"}),
             json!({"type":"agent_history","agentId":"writer"}),
-            json!({"type":"agent_history","agentId":"writer","lines":80}),
+            json!({"type":"agent_history","agentId":"writer","limit":80}),
             json!({"type":"code_review_open"}),
             json!({"type":"code_review_open","from":"HEAD","to":"feature"}),
             json!({"type":"code_review_open","from":"HEAD","includeWorkingTree":true}),
@@ -9255,26 +10167,45 @@ mod tests {
     }
 
     #[test]
-    fn agent_history_parses_agent_id_and_optional_lines() {
-        // lines is optional and omitted requests keep the handler default.
+    fn agent_history_parses_agent_id_and_optional_limit() {
+        // limit is optional and omitted requests keep the handler default.
         let defaulted = parse_input(br#"{"type":"agent_history","agentId":"writer"}"#)
-            .expect("agent history without lines");
+            .expect("agent history without limit");
         assert!(matches!(
             defaulted,
             RpcInput::Command {
-                command: RpcCommand::AgentHistory { agent_id, lines: None, .. },
+                command: RpcCommand::AgentHistory { agent_id, limit: None, .. },
                 ..
             } if agent_id == "writer"
         ));
-        let with_lines = parse_input(br#"{"type":"agent_history","agentId":"writer","lines":120}"#)
-            .expect("agent history with lines");
+        let with_limit = parse_input(br#"{"type":"agent_history","agentId":"writer","limit":120}"#)
+            .expect("agent history with limit");
         assert!(matches!(
-            with_lines,
+            with_limit,
             RpcInput::Command {
-                command: RpcCommand::AgentHistory { agent_id, lines: Some(120), .. },
+                command: RpcCommand::AgentHistory { agent_id, limit: Some(120), .. },
                 ..
             } if agent_id == "writer"
         ));
+        // `lines` is gone: its presence fails explicitly at the decode
+        // boundary, whatever the value.
+        for legacy in [
+            r#"{"type":"agent_history","agentId":"writer","lines":5}"#,
+            r#"{"type":"agent_history","agentId":"writer","lines":null}"#,
+            r#"{"type":"agent_history","agentId":"writer","lines":"many"}"#,
+        ] {
+            let rejected = parse_input(legacy.as_bytes());
+            assert!(
+                rejected.as_ref().err().is_some_and(|response| {
+                    !response.success
+                        && response.command == "agent_history"
+                        && response.error.as_deref().is_some_and(|error| {
+                            error.contains("lines") && error.contains("limit")
+                        })
+                }),
+                "retired lines must be rejected: {rejected:?}"
+            );
+        }
         // agentId is required: a payload without it must not deserialize.
         let missing = parse_input(br#"{"type":"agent_history"}"#);
         assert!(
@@ -9770,7 +10701,7 @@ mod tests {
         let app = build_code_review_app(cwd.path()).await;
         let code_review = CodeReviewRpcState::default();
         let initial = code_review
-            .open(&app, None, None, None, None)
+            .open(&app, None, None, None, None, None)
             .await
             .expect("initial open");
         let gate = Arc::new(ReviewCaptureGate {
@@ -9783,7 +10714,7 @@ mod tests {
         let inflight = tokio::spawn({
             let app = app.clone();
             let state = code_review.clone();
-            async move { state.open(&app, None, None, None, None).await }
+            async move { state.open(&app, None, None, None, None, None).await }
         });
         gate.captured.notified().await;
         let stale = code_review
@@ -9801,7 +10732,7 @@ mod tests {
             opened["snapshotId"], initial["snapshotId"],
             "the gated open must cut over to its own capture"
         );
-        assert!(code_review.snapshot().await.is_ok());
+        assert!(code_review.snapshot(&app).await.is_ok());
         // The complementary case: a matching (unstamped) close during a gated
         // open bumps the authority, so that capture fails its cutover and no
         // controller remains.
@@ -9815,7 +10746,7 @@ mod tests {
         let inflight = tokio::spawn({
             let app = app.clone();
             let state = code_review.clone();
-            async move { state.open(&app, None, None, None, None).await }
+            async move { state.open(&app, None, None, None, None, None).await }
         });
         gate.captured.notified().await;
         let closed = code_review
@@ -9830,7 +10761,7 @@ mod tests {
             .expect_err("a matching close must supersede the gated open capture");
         assert!(superseded.to_string().contains("superseded"), "{superseded:#}");
         assert!(
-            code_review.snapshot().await.is_err(),
+            code_review.snapshot(&app).await.is_err(),
             "the matching close left no controller to cut over to"
         );
         app.cleanup().await;
@@ -9860,7 +10791,7 @@ mod tests {
         let app = build_code_review_app(cwd.path()).await;
         let code_review = CodeReviewRpcState::default();
         let opened_a = code_review
-            .open(&app, None, None, None, None)
+            .open(&app, None, None, None, None, None)
             .await
             .expect("open A");
         let review_a = opened_a["reviewId"]
@@ -9877,7 +10808,7 @@ mod tests {
         let inflight_b = tokio::spawn({
             let app = app.clone();
             let state = code_review.clone();
-            async move { state.open(&app, None, None, None, None).await }
+            async move { state.open(&app, None, None, None, None, None).await }
         });
         gate.captured.notified().await;
         let retired = code_review
@@ -9905,7 +10836,7 @@ mod tests {
             "open B must cut over to its own capture"
         );
         assert_eq!(
-            code_review.snapshot().await.expect("B is open")["reviewId"],
+            code_review.snapshot(&app).await.expect("B is open")["reviewId"],
             review_b,
             "the reserved open must be the live controller"
         );
@@ -9916,7 +10847,7 @@ mod tests {
         assert_eq!(stale["closed"], false, "{stale}");
         assert_eq!(stale["staleReview"], true, "{stale}");
         assert_eq!(
-            code_review.snapshot().await.expect("B survived stale close")["reviewId"],
+            code_review.snapshot(&app).await.expect("B survived stale close")["reviewId"],
             review_b,
             "a stale close of A must not close B"
         );
@@ -9926,7 +10857,7 @@ mod tests {
             .expect("matching close of B");
         assert_eq!(closed_b["closed"], true, "{closed_b:?}");
         assert!(
-            code_review.snapshot().await.is_err(),
+            code_review.snapshot(&app).await.is_err(),
             "a close stamped with the live review must still close it"
         );
         app.cleanup().await;
@@ -9953,7 +10884,7 @@ mod tests {
         let app = build_code_review_app(cwd.path()).await;
         let code_review = CodeReviewRpcState::default();
         let initial = code_review
-            .open(&app, None, None, None, None)
+            .open(&app, None, None, None, None, None)
             .await
             .expect("initial open");
         let review_id = initial["reviewId"].as_str().expect("review id").to_owned();
@@ -9984,7 +10915,7 @@ mod tests {
             refreshed["reviewId"], review_id,
             "refresh keeps the same controller identity"
         );
-        assert!(code_review.snapshot().await.is_ok());
+        assert!(code_review.snapshot(&app).await.is_ok());
         // The complementary case: a matching (unstamped) close during a gated
         // refresh bumps the authority, so that capture fails its cutover and
         // the controller is gone.
@@ -10012,7 +10943,7 @@ mod tests {
             .expect_err("a matching close must supersede the gated refresh capture");
         assert!(superseded.to_string().contains("superseded"), "{superseded:#}");
         assert!(
-            code_review.snapshot().await.is_err(),
+            code_review.snapshot(&app).await.is_err(),
             "the matching close left no controller to cut over to"
         );
         app.cleanup().await;
@@ -10376,7 +11307,7 @@ mod tests {
         registration.set_responses(vec![FauxResponse::text("ok")]);
         let cwd = tempfile::tempdir().expect("tempdir");
         let session = disabled_session(pi_coding::SessionOptions {
-            model,
+            model: Some(model),
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -10437,7 +11368,7 @@ mod tests {
         let cwd = tempfile::tempdir().expect("tempdir");
         let session = disabled_session(pi_coding::SessionOptions {
 
-            model,
+            model: Some(model),
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -10705,7 +11636,7 @@ mod tests {
         std::fs::create_dir_all(&cwd).expect("lifecycle cwd");
         std::fs::create_dir_all(&agent_dir).expect("lifecycle agent dir");
         let session = disabled_session(pi_coding::SessionOptions {
-            model: faux_model(),
+            model: Some(faux_model()),
             cwd: cwd.clone(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -11000,7 +11931,7 @@ mod tests {
         let cwd = tempfile::tempdir().expect("cwd");
         let session_dir = tempfile::tempdir().expect("session dir");
         let session = disabled_session(pi_coding::SessionOptions {
-            model: faux_model(),
+            model: Some(faux_model()),
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -11151,7 +12082,7 @@ mod tests {
             recorder.persist_now().expect("persist");
         }
         let session = disabled_session(pi_coding::SessionOptions {
-            model: faux_model(),
+            model: Some(faux_model()),
             cwd: project_a.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -11247,7 +12178,7 @@ mod tests {
         };
         let cwd = tempfile::tempdir().expect("app cwd");
         let session = disabled_session(pi_coding::SessionOptions {
-            model: faux_model(),
+            model: Some(faux_model()),
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -11332,7 +12263,7 @@ mod tests {
         };
         let cwd = tempfile::tempdir().expect("app cwd");
         let session = disabled_session(pi_coding::SessionOptions {
-            model: faux_model(),
+            model: Some(faux_model()),
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -11535,7 +12466,7 @@ mod tests {
     async fn goal_pin_unpin_and_journal_rpc_replay_recorder_backed_session() {
         let cwd = tempfile::tempdir().expect("goal journal cwd");
         let session = disabled_session(pi_coding::SessionOptions {
-            model: faux_model(),
+            model: Some(faux_model()),
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -11725,7 +12656,7 @@ mod tests {
         resource_options.disable_context_files = true;
         let resources = pi_coding::ResourceManager::new(resource_options).expect("resources");
         let session = disabled_session(pi_coding::SessionOptions {
-            model: faux_model(),
+            model: Some(faux_model()),
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -12829,7 +13760,7 @@ mod tests {
         .expect("write catalog extension manifest");
 
         let session = disabled_session(pi_coding::SessionOptions {
-            model: faux_model(),
+            model: Some(faux_model()),
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -13090,7 +14021,7 @@ mod tests {
         model.name = model_id.into();
         let cwd = tempfile::tempdir().expect("tempdir");
         let session = disabled_session(pi_coding::SessionOptions {
-            model,
+            model: Some(model),
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -13141,7 +14072,7 @@ mod tests {
             })
         });
         let session = disabled_session(pi_coding::SessionOptions {
-            model,
+            model: Some(model),
             cwd: cwd.to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -13372,6 +14303,7 @@ mod tests {
                 from: None,
                 to: None,
                 include_working_tree: None,
+                repo: None,
             },
         )
         .await;
@@ -13453,6 +14385,7 @@ mod tests {
                 from: None,
                 to: None,
                 include_working_tree: None,
+                repo: None,
             },
         )
         .await;
@@ -13592,6 +14525,7 @@ mod tests {
                 from: None,
                 to: None,
                 include_working_tree: None,
+                repo: None,
             },
         )
         .await;
@@ -13741,6 +14675,7 @@ mod tests {
                 from: None,
                 to: None,
                 include_working_tree: None,
+                repo: None,
             },
         )
         .await;
@@ -13987,6 +14922,78 @@ mod tests {
         assert_eq!(binary.error.as_deref(), Some("not a text file"));
         app.cleanup().await;
     }
+    #[tokio::test]
+    async fn file_explorer_read_directory_returns_typed_directory_unavailable() {
+        let cwd = tempfile::tempdir().expect("file explorer cwd");
+        let directory = cwd.path().join("psy-node").join("bridge");
+        std::fs::create_dir_all(&directory).expect("directory anchor");
+        std::fs::write(directory.join("owned.txt"), "owned\n").expect("owned file");
+        let app = build_code_review_app(cwd.path()).await;
+
+        let response = handle_file_explorer_command(
+            &app,
+            RpcCommand::FileExplorerRead {
+                id: Some("read-directory".into()),
+                path: "psy-node/bridge".into(),
+                cursor: 0,
+                max_lines: Some(1),
+            },
+        )
+        .await;
+        assert!(!response.success, "{response:?}");
+        assert_eq!(response.command, "file_explorer_read");
+        assert_eq!(
+            response.data.as_ref().and_then(|data| data["code"].as_str()),
+            Some("directory_unavailable"),
+            "{response:?}"
+        );
+        let encoded = serde_json::to_string(&response).expect("response json");
+        assert!(
+            !encoded.contains(directory.to_string_lossy().as_ref()),
+            "{encoded}"
+        );
+
+        let missing = handle_file_explorer_command(
+            &app,
+            RpcCommand::FileExplorerRead {
+                id: Some("read-missing".into()),
+                path: "psy-node/bridge/missing.txt".into(),
+                cursor: 0,
+                max_lines: Some(1),
+            },
+        )
+        .await;
+        assert!(!missing.success, "{missing:?}");
+        assert_eq!(
+            missing.data.as_ref().and_then(|data| data["code"].as_str()),
+            Some("file_unavailable"),
+            "{missing:?}"
+        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("owned.txt", directory.join("linked.txt"))
+                .expect("symlink");
+            let symlink = handle_file_explorer_command(
+                &app,
+                RpcCommand::FileExplorerRead {
+                    id: Some("read-symlink".into()),
+                    path: "psy-node/bridge/linked.txt".into(),
+                    cursor: 0,
+                    max_lines: Some(1),
+                },
+            )
+            .await;
+            assert!(!symlink.success, "{symlink:?}");
+            assert_eq!(
+                symlink.data.as_ref().and_then(|data| data["code"].as_str()),
+                Some("file_symlink"),
+                "{symlink:?}"
+            );
+        }
+
+        app.cleanup().await;
+    }
+
 
     #[tokio::test]
     async fn file_explorer_rpc_rejects_unsafe_paths_and_non_files_without_leaking_paths() {
@@ -14018,17 +15025,23 @@ mod tests {
             )
             .await;
             assert!(!response.success, "{response:?}");
-            let error = response.error.expect("bounded error");
+            let error = response.error.as_deref().expect("bounded error");
             if path == "dir" {
-                assert_eq!(error, "not a file");
+                assert_eq!(
+                    response.data.as_ref().and_then(|data| data["code"].as_str()),
+                    Some("directory_unavailable"),
+                    "{response:?}"
+                );
             }
-            assert!(matches!(
-                error.as_str(),
-                "path is outside the workspace"
-                    | "not a file"
-                    | "file is unavailable"
-                    | "file is a symlink"
-            ), "{error}");
+            if path != "dir" {
+                assert!(matches!(
+                    error,
+                    "path is outside the workspace"
+                        | "not a file"
+                        | "file is unavailable"
+                        | "file is a symlink"
+                ), "{error}");
+            }
             assert!(!error.contains(cwd.path().to_string_lossy().as_ref()), "{error}");
             assert!(!error.contains(outside.path().to_string_lossy().as_ref()), "{error}");
         }
@@ -14181,10 +15194,10 @@ mod tests {
         // A basename-only citation (`init.rs:495` in the audit findings)
         // misses at the workspace root yet names a real file deeper in the
         // tree: the unique-basename fallback reads it and echoes the real
-        // workspace-relative path. Two REAL homonyms in eligible subtrees
-        // keep the stable missing-file error (the request never guesses),
-        // a file only under the skipped `target/` subtree stays missing,
-        // and a deeper missing path never triggers the basename walk.
+        // workspace-relative path. Two REAL homonyms in eligible subtrees are
+        // a typed ambiguity (the request never guesses), a file only under
+        // the skipped `target/` subtree stays missing, and a deeper missing
+        // path never triggers the basename walk.
         let cwd = tempfile::tempdir().expect("file explorer cwd");
         std::fs::create_dir_all(cwd.path().join("psy_node_common/src/realm/processor/db"))
             .expect("nested dirs");
@@ -14225,8 +15238,17 @@ mod tests {
 
         let homonym = read("homonym.rs", Some(5)).await;
         assert!(!homonym.success, "{homonym:?}");
-        assert_eq!(homonym.error.as_deref(), Some("file is unavailable"));
-        assert_eq!(homonym.data, Some(json!({"code": "file_unavailable"})));
+        assert_eq!(homonym.error.as_deref(), Some("file is ambiguous"));
+        assert_eq!(
+            homonym.data,
+            Some(json!({
+                "code": "file_ambiguous",
+                "candidates": [
+                    "crates/alpha/src/homonym.rs",
+                    "crates/beta/src/homonym.rs"
+                ]
+            }))
+        );
 
         let target_only = read("target_only.rs", Some(5)).await;
         assert!(!target_only.success, "{target_only:?}");
@@ -14623,6 +15645,7 @@ mod tests {
                 from: None,
                 to: None,
                 include_working_tree: None,
+                repo: None,
             },
         )
         .await;
@@ -14724,6 +15747,7 @@ mod tests {
                 from: None,
                 to: None,
                 include_working_tree: None,
+                repo: None,
             },
         )
         .await;
@@ -14792,6 +15816,7 @@ mod tests {
                 from: Some("HEAD".into()),
                 to: None,
                 include_working_tree: None,
+                repo: None,
             },
         )
         .await;
@@ -14812,6 +15837,7 @@ mod tests {
                 from: Some("HEAD".into()),
                 to: None,
                 include_working_tree: Some(true),
+                repo: None,
             },
         )
         .await;
@@ -14838,6 +15864,355 @@ mod tests {
         assert_eq!(closed.data.expect("close data")["closed"], true);
         app.cleanup().await;
     }
+
+    #[tokio::test]
+    async fn code_review_open_explicit_repo_reviews_nested_repository_from_non_repo_parent() {
+        let parent = tempfile::tempdir().expect("non-repo parent");
+        let child = parent.path().join("psy-node");
+        std::fs::create_dir(&child).expect("nested repository directory");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C"])
+                .arg(&child)
+                .args(args)
+                .output()
+                .expect("git invocation")
+        };
+        assert!(git(&["init", "-q"]).status.success(), "git init must succeed");
+        assert!(git(&["config", "user.email", "test@example.com"]).status.success());
+        assert!(git(&["config", "user.name", "Test"]).status.success());
+        std::fs::write(child.join("README.md"), "initial\n").expect("baseline");
+        assert!(git(&["add", "."]).status.success());
+        assert!(git(&["commit", "-q", "-m", "init"]).status.success());
+        std::fs::write(child.join("README.md"), "initial\nchanged\n").expect("change");
+
+        let app = build_code_review_app(parent.path()).await;
+        let code_review = CodeReviewRpcState::default();
+        let response = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewOpen {
+                id: Some("open-nested".into()),
+                commit: None,
+                from: None,
+                to: None,
+                include_working_tree: None,
+                repo: Some("psy-node".into()),
+            },
+        )
+        .await;
+        assert!(response.success, "{response:?}");
+        let data = response.data.expect("open data");
+        assert!(
+            data["error"].is_null(),
+            "explicit nested repo must not inherit the parent non-repo error: {data}"
+        );
+        assert_eq!(data["repo"], "psy-node", "{data}");
+        assert_eq!(data["comparisonLabel"], "HEAD → working tree");
+        let paths: Vec<&str> = data["files"]
+            .as_array()
+            .expect("files")
+            .iter()
+            .map(|file| file["path"].as_str().expect("path"))
+            .collect();
+        assert!(
+            paths.contains(&"README.md"),
+            "the nested repository's change must be reviewed: {paths:?}"
+        );
+
+        std::fs::write(child.join("README.md"), "initial\nchanged again\n").expect("child edit");
+        std::fs::write(parent.path().join("README.md"), "parent only\n").expect("parent decoy");
+        let refreshed = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewRefresh { id: Some("refresh-nested".into()) },
+        )
+        .await;
+        assert!(refreshed.success, "{refreshed:?}");
+        let refreshed_data = refreshed.data.expect("refresh data");
+        assert!(refreshed_data["error"].is_null(), "{refreshed_data}");
+        assert_eq!(refreshed_data["repo"], "psy-node", "{refreshed_data}");
+        let refreshed_paths: Vec<&str> = refreshed_data["files"]
+            .as_array()
+            .expect("refreshed files")
+            .iter()
+            .map(|file| file["path"].as_str().expect("path"))
+            .collect();
+        assert!(
+            refreshed_paths.contains(&"README.md"),
+            "refresh must stay in the child repository: {refreshed_paths:?}"
+        );
+        let refreshed_id = refreshed_data["snapshotId"]
+            .as_str()
+            .expect("refreshed snapshot id")
+            .to_owned();
+
+        let diff = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewFileDiff {
+                id: Some("diff-nested".into()),
+                snapshot_id: refreshed_id.clone(),
+                path: "README.md".into(),
+                cursor: 0,
+                max_lines: Some(25),
+            },
+        )
+        .await;
+        assert!(diff.success, "{diff:?}");
+        let diff_data = diff.data.expect("diff data");
+        assert_eq!(diff_data["path"], "README.md");
+        let diff_text = serde_json::to_string(&diff_data).expect("diff json");
+        assert!(
+            diff_text.contains("changed again"),
+            "file diff must read the child repository: {diff_text}"
+        );
+        assert!(
+            !diff_text.contains("parent only"),
+            "file diff must not read the parent decoy: {diff_text}"
+        );
+
+        let context = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewFileContext {
+                id: Some("context-nested".into()),
+                snapshot_id: refreshed_id,
+                path: "README.md".into(),
+                old_start: 1,
+                new_start: 1,
+                count: Some(2),
+            },
+        )
+        .await;
+        assert!(context.success, "{context:?}");
+        let context_text = serde_json::to_string(&context.data).expect("context json");
+        assert!(
+            context_text.contains("initial"),
+            "file context must read the child repository: {context_text}"
+        );
+        assert!(
+            !context_text.contains("parent only"),
+            "file context must not read the parent decoy: {context_text}"
+        );
+        app.cleanup().await;
+    }
+
+
+    #[tokio::test]
+    async fn code_review_open_session_cwd_nested_in_ancestor_repo_stays_authorized() {
+        let outer = tempfile::tempdir().expect("enclosing repository");
+        let git = |cwd: &std::path::Path, args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C"])
+                .arg(cwd)
+                .args(args)
+                .output()
+                .expect("git invocation")
+        };
+        let init = |cwd: &std::path::Path| {
+            assert!(git(cwd, &["init", "-q"]).status.success(), "git init");
+            assert!(git(cwd, &["config", "user.email", "test@example.com"]).status.success());
+            assert!(git(cwd, &["config", "user.name", "Test"]).status.success());
+        };
+        init(outer.path());
+        let nested = outer.path().join("pkg").join("session");
+        std::fs::create_dir_all(&nested).expect("nested session cwd");
+        std::fs::write(outer.path().join("README.md"), "ancestor baseline\n").expect("baseline");
+        std::fs::write(nested.join("local.txt"), "session only\n").expect("session baseline");
+        assert!(git(outer.path(), &["add", "."]).status.success());
+        assert!(git(outer.path(), &["commit", "-q", "-m", "ancestor"]).status.success());
+        std::fs::write(outer.path().join("README.md"), "ancestor baseline\nancestor edit\n")
+            .expect("ancestor edit");
+
+        let child = nested.join("child-repo");
+        std::fs::create_dir(&child).expect("child repository");
+        init(&child);
+        std::fs::write(child.join("CHILD.md"), "child baseline\n").expect("child baseline");
+        assert!(git(&child, &["add", "."]).status.success());
+        assert!(git(&child, &["commit", "-q", "-m", "child"]).status.success());
+        std::fs::write(child.join("CHILD.md"), "child baseline\nchild edit\n").expect("child edit");
+        let ancestor_output = git(outer.path(), &["rev-parse", "HEAD"]);
+        assert!(ancestor_output.status.success(), "ancestor rev-parse");
+        let ancestor_hex = String::from_utf8(ancestor_output.stdout)
+            .expect("ancestor hash")
+            .trim()
+            .to_owned();
+        assert!(ancestor_hex.len() >= 7, "ancestor commit must be addressable");
+
+        let app = build_code_review_app(&nested).await;
+        let code_review = CodeReviewRpcState::default();
+        let opened = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewOpen {
+                id: Some("open-ancestor".into()),
+                commit: None,
+                from: None,
+                to: None,
+                include_working_tree: None,
+                repo: None,
+            },
+        )
+        .await;
+        assert!(opened.success, "{opened:?}");
+        let data = opened.data.expect("open data");
+        assert!(
+            data["error"].is_null(),
+            "an enclosing repository must open, not be rejected as unaddressable: {data}"
+        );
+        assert_eq!(
+            data["repo"],
+            json!({ "unavailable": true }),
+            "an ancestor root is the closed unavailable projection, not null or a path: {data}"
+        );
+        assert_eq!(data["comparisonLabel"], "HEAD → working tree");
+        let paths: Vec<&str> = data["files"]
+            .as_array()
+            .expect("files")
+            .iter()
+            .map(|file| file["path"].as_str().expect("path"))
+            .collect();
+        assert!(
+            paths.contains(&"README.md"),
+            "ordinary open must review the enclosing repository: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|path| path.contains("CHILD") || path.contains("local.txt")),
+            "ordinary open must not review the nested cwd or its child repository: {paths:?}"
+        );
+        let encoded = serde_json::to_string(&data).expect("open json");
+        let ancestor_root = outer.path().canonicalize().expect("canonical ancestor").display().to_string();
+        assert!(
+            !encoded.contains(&ancestor_root) && !encoded.contains("\"repo\":\".."),
+            "the projection must not leak the absolute root or a parent traversal: {encoded}"
+        );
+
+        std::fs::write(
+            outer.path().join("README.md"),
+            "ancestor baseline\nancestor edit\nancestor again\n",
+        )
+        .expect("ancestor refresh edit");
+
+        let refreshed = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewRefresh {
+                id: Some("refresh-ancestor".into()),
+            },
+        )
+        .await;
+        assert!(refreshed.success, "{refreshed:?}");
+        let refreshed_data = refreshed.data.expect("refresh data");
+        assert!(refreshed_data["error"].is_null(), "{refreshed_data}");
+        assert_eq!(refreshed_data["repo"], json!({ "unavailable": true }), "{refreshed_data}");
+        let refreshed_paths: Vec<&str> = refreshed_data["files"]
+            .as_array()
+            .expect("refreshed files")
+            .iter()
+            .map(|file| file["path"].as_str().expect("path"))
+            .collect();
+        assert!(
+            refreshed_paths.contains(&"README.md"),
+            "refresh must stay on the enclosing repository: {refreshed_paths:?}"
+        );
+        assert!(
+            !refreshed_paths.iter().any(|path| *path == "local.txt" || path.contains("CHILD")),
+            "refresh must not switch to the session cwd or the child repository: {refreshed_paths:?}"
+        );
+        let refreshed_id = refreshed_data["snapshotId"]
+            .as_str()
+            .expect("refreshed snapshot id")
+            .to_owned();
+
+        let diff = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewFileDiff {
+                id: Some("diff-ancestor".into()),
+                snapshot_id: refreshed_id.clone(),
+                path: "README.md".into(),
+                cursor: 0,
+                max_lines: Some(40),
+            },
+        )
+        .await;
+        assert!(diff.success, "{diff:?}");
+        let diff_text = serde_json::to_string(&diff.data).expect("diff json");
+        assert!(
+            diff_text.contains("ancestor again"),
+            "file diff must read the enclosing repository: {diff_text}"
+        );
+        assert!(
+            !diff_text.contains("session only"),
+            "file diff must not read the nested session file: {diff_text}"
+        );
+
+        let context = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewFileContext {
+                id: Some("context-ancestor".into()),
+                snapshot_id: refreshed_id,
+                path: "README.md".into(),
+                old_start: 1,
+                new_start: 1,
+                count: Some(3),
+            },
+        )
+        .await;
+        assert!(context.success, "{context:?}");
+        let context_text = serde_json::to_string(&context.data).expect("context json");
+        assert!(
+            context_text.contains("ancestor baseline"),
+            "file context must read the enclosing repository: {context_text}"
+        );
+        assert!(
+            !context_text.contains("session only") && !context_text.contains("child edit"),
+            "file context must not read the session cwd or the child repository: {context_text}"
+        );
+
+        let ancestor_commit = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewOpen {
+                id: Some("open-ancestor-commit".into()),
+                commit: Some(ancestor_hex),
+                from: None,
+                to: None,
+                include_working_tree: None,
+                repo: None,
+            },
+        )
+        .await;
+        assert!(
+            ancestor_commit.success,
+            "an ancestor commit must open the enclosing repository: {ancestor_commit:?}"
+        );
+        let commit_data = ancestor_commit.data.expect("ancestor commit data");
+        assert!(commit_data["error"].is_null(), "{commit_data}");
+        assert_eq!(
+            commit_data["repo"],
+            json!({ "unavailable": true }),
+            "an ancestor commit keeps the exact unavailable projection: {commit_data}"
+        );
+        let commit_paths: Vec<&str> = commit_data["files"]
+            .as_array()
+            .expect("ancestor commit files")
+            .iter()
+            .map(|file| file["path"].as_str().expect("path"))
+            .collect();
+        assert!(
+            commit_paths.contains(&"README.md"),
+            "the ancestor commit must review the enclosing repository: {commit_paths:?}"
+        );
+        assert!(
+            !commit_paths.iter().any(|path| path.contains("CHILD") || *path == "local.txt"),
+            "the ancestor commit must not select the nested cwd or child repository: {commit_paths:?}"
+        );
+        app.cleanup().await;
+    }
+
 
     #[test]
     fn code_review_open_commit_and_commits_wire_decode() {
@@ -14929,6 +16304,7 @@ mod tests {
                     from,
                     to,
                     include_working_tree,
+                    repo: None,
                 },
             )
             .await;
@@ -14950,6 +16326,7 @@ mod tests {
                 from: None,
                 to: None,
                 include_working_tree: None,
+                repo: None,
             },
         )
         .await;
@@ -14996,6 +16373,7 @@ mod tests {
                 from: None,
                 to: None,
                 include_working_tree: None,
+                repo: None,
             },
         )
         .await;
@@ -15193,6 +16571,7 @@ mod tests {
                 from: None,
                 to: None,
                 include_working_tree: None,
+                repo: None,
             },
         )
         .await;
@@ -15200,7 +16579,11 @@ mod tests {
         {
             let mut state = code_review.state.lock().await;
             let session = state.session.as_mut().expect("open review");
-            let mut model = session.controller.fork_model().clone();
+            let mut model = session
+                .controller
+                .fork_model()
+                .cloned()
+                .expect("fork model is configured");
             model.api = pi_ai::API_OPENAI_COMPLETIONS.to_owned();
             session.controller.set_model(model);
             session.controller.start_auto_review(&session.snapshot, None, None).await.expect("triage accepted");
@@ -15208,7 +16591,7 @@ mod tests {
             assert_eq!(projection["autoReviewState"], "triaging");
             assert_eq!(projection["reviewLanguageDefault"], "zh");
             assert!(projection["threads"].as_array().expect("threads").is_empty());
-            session.controller.abort().await;
+            session.controller.abort().await.expect("abort code review");
         }
 
         let auto = handle_code_review_command(
@@ -15366,6 +16749,7 @@ mod tests {
                 commit: None,
                 to: None,
                 include_working_tree: None,
+                repo: None,
             },
         )
         .await;
@@ -15373,14 +16757,18 @@ mod tests {
         {
             let mut state = code_review.state.lock().await;
             let session = state.session.as_mut().expect("open review");
-            let mut model = session.controller.fork_model().clone();
+            let mut model = session
+                .controller
+                .fork_model()
+                .cloned()
+                .expect("fork model is configured");
             model.api = pi_ai::API_OPENAI_COMPLETIONS.to_owned();
             session.controller.set_model(model);
         }
         let model_before = {
             let state = code_review.state.lock().await;
             let session = state.session.as_ref().expect("open review");
-            fork_model_display(session.controller.fork_model())
+            session.controller.fork_model().and_then(fork_model_display)
         };
         {
             let mut state = code_review.state.lock().await;
@@ -15427,7 +16815,7 @@ mod tests {
             assert_eq!(projection["autoReviewState"], "idle", "{projection}");
             assert!(projection["threads"].as_array().expect("threads").is_empty());
             assert_eq!(
-                fork_model_display(session.controller.fork_model()),
+                session.controller.fork_model().and_then(fork_model_display),
                 model_before,
                 "a rejected triage must not mutate the selected model"
             );
@@ -15504,6 +16892,7 @@ mod tests {
                 commit: None,
                 to: None,
                 include_working_tree: None,
+                repo: None,
             },
         )
         .await;
@@ -15511,7 +16900,11 @@ mod tests {
         {
             let mut state = code_review.state.lock().await;
             let session = state.session.as_mut().expect("open review");
-            let mut model = session.controller.fork_model().clone();
+            let mut model = session
+                .controller
+                .fork_model()
+                .cloned()
+                .expect("fork model is configured");
             model.api = pi_ai::API_OPENAI_COMPLETIONS.to_owned();
             session.controller.set_model(model);
         }
@@ -15754,6 +17147,7 @@ mod tests {
                 commit: None,
                 to: None,
                 include_working_tree: None,
+                repo: None,
             },
         )
         .await;
@@ -15881,6 +17275,7 @@ mod tests {
                 commit: None,
                 to: None,
                 include_working_tree: None,
+                repo: None,
             },
         )
         .await;
@@ -15977,18 +17372,26 @@ mod tests {
                 .output()
                 .expect("git invocation")
         };
-        assert!(git(&["init", "-q"]).status.success());
+        assert!(git(&["init", "-q", "-b", "master"]).status.success());
         git(&["config", "user.email", "test@example.com"]).status.success();
         git(&["config", "user.name", "Test"]).status.success();
+        std::fs::write(cwd.path().join("README.md"), "baseline\n").expect("write");
+        assert!(git(&["add", "."]).status.success());
+        assert!(git(&["commit", "-q", "-m", "baseline"]).status.success());
+        assert!(git(&["update-ref", "refs/remotes/origin/master", "HEAD"]).status.success());
+        assert!(git(&["remote", "add", "origin", cwd.path().join("nowhere.git").to_str().expect("url")]).status.success());
         std::fs::write(cwd.path().join("README.md"), "initial\n").expect("write");
         assert!(git(&["add", "."]).status.success());
         assert!(git(&["commit", "-q", "-m", "init"]).status.success());
         std::fs::write(cwd.path().join("README.md"), "initial\nchanged\n").expect("write");
 
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let summaries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::channel::<()>(2);
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<()>(2);
         let app = build_code_review_app_with_stream(
             cwd.path(),
-            gated_tldr_rpc_stream(gate.clone(), "# Overview\n\nREADME changed.\n"),
+            gated_tldr_rpc_stream(gate.clone(), summaries, entered_tx, done_tx),
         )
         .await;
         let code_review = CodeReviewRpcState::default();
@@ -16014,6 +17417,7 @@ mod tests {
                 from: None,
                 to: None,
                 include_working_tree: None,
+                repo: None,
             },
         )
         .await;
@@ -16028,6 +17432,17 @@ mod tests {
             RpcCommand::CodeReviewSnapshot { id: Some("tldr-idle".into()) },
         )
         .await;
+        {
+            let mut state = code_review.state.lock().await;
+            let session = state.session.as_mut().expect("open review");
+            let mut model = session
+                .controller
+                .fork_model()
+                .cloned()
+                .expect("fork model is configured");
+            model.api = pi_ai::API_OPENAI_COMPLETIONS.to_owned();
+            session.controller.set_model(model);
+        }
         let idle = idle.data.expect("idle snapshot");
         assert_eq!(idle["tldrState"], "idle");
         assert_eq!(idle["tldrGeneration"], 0);
@@ -16064,7 +17479,15 @@ mod tests {
             "{busy:?}"
         );
 
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered_rx.recv())
+            .await
+            .expect("first summary entry")
+            .expect("first summary entry channel");
         gate.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(2), done_rx.recv())
+            .await
+            .expect("first reply delivery")
+            .expect("first reply channel");
         let mut done = serde_json::Value::Null;
         for _ in 0..100 {
             let snapshot = handle_code_review_command(
@@ -16083,9 +17506,22 @@ mod tests {
         assert_eq!(done["tldrGeneration"], generation);
         assert_eq!(done["tldrSnapshotId"], snapshot_id);
         assert!(done["tldrError"].is_null());
-        assert_eq!(
-            done["tldrMarkdown"].as_str().unwrap_or("").trim(),
-            "# Overview\n\nREADME changed.\n".trim(),
+        let published = done["tldrMarkdown"].as_str().expect("published markdown");
+        assert!(
+            published.contains("## root0\n\nPurpose: repository overview"),
+            "first publication must render the repository purpose: {published}"
+        );
+        assert!(
+            published.contains("- M README\\.md +1/-0\n  Purpose: unstaged readme"),
+            "first publication must render the escaped unstaged row: {published}"
+        );
+        assert!(
+            published.contains("Purpose: initial commit") && published.contains("Purpose: committed readme"),
+            "first publication must render the initial commit purposes: {published}"
+        );
+        assert!(
+            !published.contains("stale repository"),
+            "a successful first publication must not keep the stopped reply: {published}"
         );
 
         let stopped_start = handle_code_review_command(
@@ -16099,6 +17535,10 @@ mod tests {
             .as_u64()
             .expect("second generation");
         assert!(stopped_generation > generation);
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered_rx.recv())
+            .await
+            .expect("second summary entry")
+            .expect("second summary entry channel");
         let stopped = handle_code_review_command(
             &app,
             &code_review,
@@ -16110,6 +17550,11 @@ mod tests {
         .await;
         assert!(stopped.success, "{stopped:?}");
         assert_eq!(stopped.data.expect("stop ack")["operation"], "tldr");
+        gate.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(2), done_rx.recv())
+            .await
+            .expect("stale reply delivery")
+            .expect("stale reply channel");
         let after = handle_code_review_command(
             &app,
             &code_review,
@@ -16120,8 +17565,13 @@ mod tests {
         assert_eq!(after["tldrState"], "done", "{after}");
         assert!(after["tldrGeneration"].as_u64().expect("generation") > stopped_generation);
         assert_eq!(
-            after["tldrMarkdown"].as_str().unwrap_or("").trim(),
-            "# Overview\n\nREADME changed.\n".trim(),
+            after["tldrMarkdown"].as_str(),
+            Some(published),
+            "a stopped stale reply must keep the last-good Summary"
+        );
+        assert!(
+            !after["tldrMarkdown"].as_str().unwrap_or("").contains("stale repository"),
+            "the stale purpose must not replace last-good: {after}"
         );
         assert!(after["tldrError"].is_null());
         app.cleanup().await;
@@ -16129,18 +17579,34 @@ mod tests {
 
     fn gated_tldr_rpc_stream(
         gate: Arc<tokio::sync::Semaphore>,
-        markdown: &'static str,
+        summaries: Arc<std::sync::atomic::AtomicUsize>,
+        entered: tokio::sync::mpsc::Sender<()>,
+        delivered: tokio::sync::mpsc::Sender<()>,
     ) -> pi_agent::StreamFn {
         Arc::new(move |model, context, _options| {
             let gate = gate.clone();
+            let summaries = summaries.clone();
+            let entered = entered.clone();
+            let delivered = delivered.clone();
             let prompt = review_request_text(&context);
             Box::pin(async move {
                 let stream = pi_ai::new_assistant_message_event_stream();
                 let producer = stream.clone();
                 tokio::spawn(async move {
-                    let reply = if prompt.contains("comparisonLabel:") {
+                    let summary = prompt.starts_with(
+                        "Summarize repository changes using the required purpose JSON.",
+                    );
+                    let call = if summary {
+                        entered.send(()).await.expect("summary entered");
                         gate.acquire().await.expect("release permit").forget();
-                        markdown.to_owned()
+                        summaries.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    } else {
+                        usize::MAX
+                    };
+                    let reply = if call == 0 {
+                        readme_purpose_json(&prompt, "repository overview", "initial commit", "committed readme", "unstaged readme")
+                    } else if call == 1 {
+                        readme_purpose_json(&prompt, "stale repository", "stale commit", "stale committed readme", "stale unstaged readme")
                     } else {
                         "non-tldr reply".to_owned()
                     };
@@ -16148,10 +17614,93 @@ mod tests {
                     message.content.push(pi_ai::ContentBlock::text(reply));
                     message.stop_reason = pi_ai::StopReason::Stop;
                     producer.end(Some(message)).await;
+                    if summary {
+                        delivered.send(()).await.expect("reply delivered");
+                    }
                 });
                 stream
             })
         })
+    }
+
+    fn readme_purpose_json(
+        prompt: &str,
+        repository: &str,
+        commit: &str,
+        committed: &str,
+        unstaged: &str,
+    ) -> String {
+        let (before_facts, facts_json) = prompt
+            .split_once("\nRepository facts JSON:\n")
+            .expect("facts section");
+        assert!(
+            before_facts.starts_with("Summarize repository changes using the required purpose JSON.\n"),
+            "marker must stay first: {before_facts}"
+        );
+        assert!(
+            !before_facts.contains("Include every repository, commit, committed file, staged file, unstaged file, and untracked file from the facts exactly once."),
+            "old all-keys protocol must not be accepted: {before_facts}"
+        );
+        let (contract, designated_json) = before_facts
+            .split_once("\nDesignated purpose keys JSON:\n")
+            .expect("old protocol without designated purpose keys");
+        assert!(
+            contract.contains("This batch designates exactly these keys. Emit only those keys. Repository overview and repeated repo or commit headers are context. Do not emit a purpose for a key that is not designated, even if its header or counts appear again."),
+            "designated-only contract is required: {contract}"
+        );
+        let designated: serde_json::Value =
+            serde_json::from_str(designated_json.trim()).expect("designated keys");
+        let facts: serde_json::Value = serde_json::from_str(facts_json.trim()).expect("facts");
+        let repositories = facts["repositories"].as_array().expect("repositories");
+        assert_eq!(repositories.len(), 1, "{facts}");
+        let repository_facts = &repositories[0];
+        assert_eq!(repository_facts["label"], "root0", "{repository_facts}");
+        assert_eq!(
+            repository_facts["origin"]["outcome"], "compared",
+            "origin comparison must stay present: {repository_facts}"
+        );
+        assert_eq!(repository_facts["origin"]["ahead"], 1, "{repository_facts}");
+        assert_eq!(repository_facts["origin"]["behind"], 0, "{repository_facts}");
+        let commits = repository_facts["commits"].as_array().expect("commits");
+        assert_eq!(commits.len(), 1, "{repository_facts}");
+        let oid = commits[0]["oid"].as_str().expect("oid");
+        let files = commits[0]["files"].as_array().expect("committed files");
+        assert_eq!(files.len(), 1, "{commits:?}");
+        assert_eq!(files[0]["path"], "README.md");
+        let staged = repository_facts["staged"].as_array().expect("staged");
+        let unstaged_files = repository_facts["unstaged"].as_array().expect("unstaged");
+        let untracked = repository_facts["untracked"].as_array().expect("untracked");
+        assert!(staged.is_empty() && untracked.is_empty(), "{repository_facts}");
+        assert_eq!(unstaged_files.len(), 1, "{repository_facts}");
+        assert_eq!(unstaged_files[0]["path"], "README.md");
+        let designated_repositories = designated["repositories"].as_array().expect("designated repositories");
+        assert_eq!(designated_repositories, &vec![json!("root0")], "{designated}");
+        let designated_changes = designated["changes"].as_array().expect("designated changes");
+        assert_eq!(designated_changes.len(), 3, "duplicate or missing designated keys: {designated}");
+        let mut designated_keys = std::collections::BTreeSet::new();
+        for change in designated_changes {
+            let object = change.as_object().expect("designated change object");
+            assert_eq!(object.len(), 3, "designated change must have exactly repo, kind, id: {change}");
+            let repo = object["repo"].as_str().expect("designated repo").to_owned();
+            let kind = object["kind"].as_str().expect("designated kind").to_owned();
+            let id = object["id"].as_str().expect("designated id").to_owned();
+            assert!(designated_keys.insert((repo, kind, id)), "duplicate designated key: {change}");
+        }
+        let expected = std::collections::BTreeSet::from([
+            ("root0".to_owned(), "commit".to_owned(), oid.to_owned()),
+            ("root0".to_owned(), "committed_file".to_owned(), format!("{oid}:README.md")),
+            ("root0".to_owned(), "unstaged".to_owned(), "README.md".to_owned()),
+        ]);
+        assert_eq!(designated_keys, expected, "designated keys must equal the one-batch readme set");
+        serde_json::to_string(&json!({
+            "repositories": [{ "repo": "root0", "purpose": repository }],
+            "changes": [
+                { "repo": "root0", "kind": "commit", "id": oid, "purpose": commit },
+                { "repo": "root0", "kind": "committed_file", "id": format!("{oid}:README.md"), "purpose": committed },
+                { "repo": "root0", "kind": "unstaged", "id": "README.md", "purpose": unstaged }
+            ]
+        }))
+        .expect("purpose json")
     }
     #[tokio::test]
     async fn code_review_refresh_capture_keeps_snapshot_and_abort_responsive() {
@@ -16182,6 +17731,7 @@ mod tests {
                 from: None,
                 to: None,
                 include_working_tree: None,
+                repo: None,
             },
         )
         .await;
@@ -16283,7 +17833,7 @@ mod tests {
 
         let app = build_code_review_app(cwd.path()).await;
         let code_review = CodeReviewRpcState::default();
-        assert!(code_review.open(&app, None, None, None, None).await.is_ok());
+        assert!(code_review.open(&app, None, None, None, None, None).await.is_ok());
         let gate = Arc::new(ReviewCaptureGate {
             captured: tokio::sync::Notify::new(),
             released: std::sync::Mutex::new(false),
@@ -16308,7 +17858,7 @@ mod tests {
             .expect_err("stale refresh resurrected state");
         assert!(stale.to_string().contains("superseded"), "{stale:#}");
         assert!(
-            code_review.snapshot().await.is_err(),
+            code_review.snapshot(&app).await.is_err(),
             "closed state was resurrected"
         );
         app.cleanup().await;
@@ -16335,7 +17885,7 @@ mod tests {
         let app = build_code_review_app(cwd.path()).await;
         let code_review = CodeReviewRpcState::default();
         let initial = code_review
-            .open(&app, None, None, None, None)
+            .open(&app, None, None, None, None, None)
             .await
             .expect("initial open");
         let initial_id = initial["snapshotId"]
@@ -16351,13 +17901,13 @@ mod tests {
         let stale_state = code_review.clone();
         let stale_open = tokio::spawn({
             let app = app.clone();
-            async move { stale_state.open(&app, None, None, None, None).await }
+            async move { stale_state.open(&app, None, None, None, None, None).await }
         });
         gate.captured.notified().await;
         *code_review.review_capture_gate.lock().await = None;
         let during_open = tokio::time::timeout(
             std::time::Duration::from_millis(250),
-            code_review.snapshot(),
+            code_review.snapshot(&app),
         )
         .await
         .expect("snapshot pinned behind replacement open capture")
@@ -16365,7 +17915,7 @@ mod tests {
         assert_eq!(during_open["snapshotId"], initial_id);
         std::fs::write(cwd.path().join("review.txt"), "second\n").expect("write second change");
         let newer = code_review
-            .open(&app, None, None, None, None)
+            .open(&app, None, None, None, None, None)
             .await
             .expect("newer open");
         let newer_id = newer["snapshotId"]
@@ -16379,7 +17929,7 @@ mod tests {
             .expect_err("stale open overwrote newer state");
         assert!(stale.to_string().contains("superseded"), "{stale:#}");
         assert_eq!(
-            code_review.snapshot().await.expect("live snapshot")["snapshotId"],
+            code_review.snapshot(&app).await.expect("live snapshot")["snapshotId"],
             newer_id,
         );
         assert!(code_review.close(None).await.is_ok());
@@ -16407,11 +17957,11 @@ mod tests {
         let app = build_code_review_app(cwd.path()).await;
         let code_review = CodeReviewRpcState::default();
         code_review
-            .open(&app, None, None, None, None)
+            .open(&app, None, None, None, None, None)
             .await
             .expect("open");
         let review_id = code_review
-            .snapshot()
+            .snapshot(&app)
             .await
             .expect("snapshot")["reviewId"]
             .as_str()
@@ -16424,13 +17974,13 @@ mod tests {
         assert_eq!(stale["closed"], false, "{stale}");
         assert_eq!(stale["staleReview"], true, "{stale}");
         assert_eq!(
-            code_review.snapshot().await.expect("controller survived")["reviewId"],
+            code_review.snapshot(&app).await.expect("controller survived")["reviewId"],
             review_id,
         );
         let closed = code_review.close(Some(&review_id)).await.expect("real close");
         assert_eq!(closed["closed"], true, "{closed:?}");
         assert!(
-            code_review.snapshot().await.is_err(),
+            code_review.snapshot(&app).await.is_err(),
             "the matching close still closes the controller"
         );
         // A repeat stamped close after the review is gone is the typed no-open
@@ -16480,6 +18030,7 @@ mod tests {
                 from: None,
                 to: None,
                 include_working_tree: None,
+                repo: None,
             },
         )
         .await;
@@ -16831,6 +18382,7 @@ mod tests {
                 from: None,
                 to: None,
                 include_working_tree: None,
+                repo: None,
             },
         )
         .await;
@@ -16991,6 +18543,7 @@ mod tests {
                 from: None,
                 to: None,
                 include_working_tree: None,
+                repo: None,
             },
         )
         .await;
@@ -17175,6 +18728,7 @@ mod tests {
                 commit: None,
                 to: None,
                 include_working_tree: None,
+                repo: None,
             },
         )
         .await;
@@ -17338,6 +18892,7 @@ mod tests {
                 commit: None,
                 to: None,
                 include_working_tree: None,
+                repo: None,
             },
         )
         .await;
@@ -17578,6 +19133,7 @@ mod tests {
                 commit: None,
                 to: None,
                 include_working_tree: None,
+                repo: None,
             },
         )
         .await;
@@ -17691,6 +19247,7 @@ mod tests {
                 commit: None,
                 to: None,
                 include_working_tree: None,
+                repo: None,
             },
         )
         .await;
@@ -17803,6 +19360,7 @@ mod tests {
                 commit: None,
                 to: None,
                 include_working_tree: None,
+                repo: None,
             },
         )
         .await;
@@ -17945,6 +19503,7 @@ mod tests {
                 commit: None,
                 to: None,
                 include_working_tree: None,
+                repo: None,
             },
         )
         .await;
@@ -18831,6 +20390,7 @@ mod tests {
                 commit: None,
                 to: None,
                 include_working_tree: None,
+                repo: None,
             },
         )
         .await;
@@ -18905,7 +20465,7 @@ mod tests {
         model.name = model_id.into();
         let cwd = tempfile::tempdir().expect("tempdir");
         let session = disabled_session(pi_coding::SessionOptions {
-            model,
+            model: Some(model),
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -19309,7 +20869,7 @@ mod tests {
             .boxed()
         });
         disabled_session(pi_coding::SessionOptions {
-            model: faux_model(),
+            model: Some(faux_model()),
             cwd: cwd.to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -19389,7 +20949,7 @@ mod tests {
             });
             Box::pin(async move {
                 disabled_session(pi_coding::SessionOptions {
-                    model: request.model,
+                    model: Some(request.model),
                     cwd: child_cwd,
                     system_prompt: request.system_prompt,
                     thinking_level: request.thinking_level.unwrap_or(ThinkingLevel::Off),
@@ -19413,7 +20973,8 @@ mod tests {
             root.path(),
         );
         config.default_agent = "writer".to_owned();
-        config.parent_model = Model::default();
+        // Explicit registered fixture parent; never an empty default model.
+        config.parent_model = Some(faux_model());
         let runtime =
             pi_coding::OrchestrationRuntime::new(config, factory).expect("orchestration runtime");
         let workspace = root.path().join("workspace");
@@ -19595,6 +21156,96 @@ mod tests {
         app.cleanup().await;
     }
 
+    /// job_output exposes the child's FULL redacted assignment as a typed
+    /// `{status:"available",text}` field; unknown jobs keep the original error.
+    #[tokio::test]
+    async fn job_output_assignment_is_full_typed_and_redacted() {
+        let (root, app) = subagents_app().await;
+
+        let secret = ["s", "k-", "abcdefghijklmnop1234"].concat();
+        let task = format!(
+            "HEAD-assignment-head-line\n{}\nMID-assignment-marker-中间\n{}\nsecret {secret}\n{}\nTAIL-assignment-final-line",
+            "f".repeat(700),
+            "g".repeat(700),
+            "h".repeat(200),
+        );
+        let spawned = subagents_handle(
+            &app,
+            RpcCommand::TaskSpawn {
+                id: None,
+                args: json!({ "task": task, "agent": "writer" }),
+            },
+        )
+        .await;
+        assert!(spawned.success, "{spawned:?}");
+        let job_id = spawned.data.expect("spawns")["spawns"][0]["jobId"]
+            .as_str()
+            .expect("job id")
+            .to_owned();
+
+        let output = subagents_handle(
+            &app,
+            RpcCommand::JobOutput {
+                id: None,
+                job_id: job_id.clone(),
+            },
+        )
+        .await;
+        assert!(output.success, "{output:?}");
+        let data = output.data.expect("job_output data");
+        let assignment = &data["assignment"];
+        assert_eq!(assignment["status"], json!("available"));
+        let text = assignment["text"].as_str().expect("assignment text");
+        assert!(
+            text.starts_with("HEAD-assignment-head-line"),
+            "assignment head must survive: {text}"
+        );
+        assert!(
+            text.contains("MID-assignment-marker-中间"),
+            "assignment mid must survive beyond the 1024 description cap"
+        );
+        assert!(
+            text.ends_with("TAIL-assignment-final-line"),
+            "assignment tail must survive: {text}"
+        );
+        assert!(
+            text.chars().count() > 1024,
+            "assignment must exceed the 1024-char description cap: {}",
+            text.chars().count()
+        );
+        assert!(
+            !text.contains(&secret) && text.contains("[REDACTED]"),
+            "assignment must be redacted before it reaches the wire"
+        );
+
+        // The job-card description keeps its own 1024 cap.
+        let description = data["job"]["description"].as_str().expect("task description");
+        assert!(
+            description.chars().count() <= 1024,
+            "description cap must stay: {}",
+            description.chars().count()
+        );
+
+        // Unknown jobs still fail with the original structural error.
+        let missing = subagents_handle(
+            &app,
+            RpcCommand::JobOutput {
+                id: None,
+                job_id: "no-such-job".to_owned(),
+            },
+        )
+        .await;
+        assert!(
+            !missing.success
+                && missing
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("no orchestration job")),
+            "{missing:?}"
+        );
+        app.cleanup().await;
+    }
+
     #[tokio::test]
     async fn agent_history_fetches_running_child_transcript() {
         let (root, app) =
@@ -19636,13 +21287,15 @@ mod tests {
                     RpcCommand::AgentHistory {
                         id: None,
                         agent_id: agent_id.clone(),
-                        lines: None,
+                        limit: None,
                     },
                 )
                 .await;
                 if fetched.success
                     && fetched.data.as_ref().is_some_and(|data| {
-                        data["text"].as_str().is_some_and(|text| !text.is_empty())
+                        data["messages"]
+                            .as_array()
+                            .is_some_and(|rows| !rows.is_empty())
                     })
                 {
                     running_fetch = Some(fetched);
@@ -19658,13 +21311,25 @@ mod tests {
         let fetched = running_fetch.expect("running fetch");
         let data = fetched.data.expect("history data");
         assert_eq!(data["agentId"], json!(agent_id));
-        let text = data["text"].as_str().expect("history text");
-        assert!(!text.is_empty() && text.lines().count() <= 80, "{text:?}");
-        assert!(text.contains("write the release notes"), "{text:?}");
+        let rows = data["messages"].as_array().expect("history rows");
+        assert!(!rows.is_empty() && rows.len() <= 80, "{} rows", rows.len());
+        for row in rows {
+            assert!(row["message"].is_object(), "row shape: {row}");
+            assert!(row["message"]["role"].is_string(), "row role: {row}");
+        }
         let serialized = serde_json::to_string(&data).expect("serialize history");
+        assert!(
+            serialized.contains("write the release notes"),
+            "the child's task reaches the projection: {serialized}"
+        );
         assert!(
             !serialized.contains(root.path().to_string_lossy().as_ref()),
             "no filesystem paths may leak: {serialized}"
+        );
+        assert_eq!(
+            data["truncation"],
+            json!({ "omittedRows": 0, "reason": "none" }),
+            "a short transcript reports no truncation: {data}"
         );
 
         // The same fetch keeps working after the job settles.
@@ -19685,24 +21350,31 @@ mod tests {
             RpcCommand::AgentHistory {
                 id: None,
                 agent_id,
-                lines: Some(20),
+                limit: Some(20),
             },
         )
         .await;
         assert!(settled.success, "{settled:?}");
         let settled_data = settled.data.expect("settled history");
         assert_eq!(settled_data["agentId"], data["agentId"]);
-        assert!(
-            settled_data["text"]
-                .as_str()
-                .is_some_and(|text| text.lines().count() <= 20),
-            "{settled_data:?}"
-        );
+        let settled_rows = settled_data["messages"].as_array().expect("settled rows");
+        assert!(settled_rows.len() <= 20, "{} rows", settled_rows.len());
+        for row in settled_rows {
+            assert!(
+                row["message"].is_object() && row["message"]["role"].is_string(),
+                "{row}"
+            );
+        }
+        assert!(settled_data["truncation"]["omittedRows"].is_number());
+        assert!(matches!(
+            settled_data["truncation"]["reason"].as_str(),
+            Some("none" | "limit" | "bytes" | "limit_and_bytes")
+        ));
         app.cleanup().await;
     }
 
     #[tokio::test]
-    async fn agent_history_rejects_unknown_agent_and_invalid_lines() {
+    async fn agent_history_rejects_unknown_agent_and_invalid_limit() {
         let (_root, app) = subagents_app().await;
 
         // Unknown agent ids fail actionably, naming the offending id.
@@ -19711,7 +21383,7 @@ mod tests {
             RpcCommand::AgentHistory {
                 id: None,
                 agent_id: "no-such-agent".to_owned(),
-                lines: None,
+                limit: None,
             },
         )
         .await;
@@ -19724,27 +21396,238 @@ mod tests {
             "{missing:?}"
         );
 
-        // Line counts outside the core bound fail before any history read.
-        for bad_lines in [0, pi_coding::MAX_HISTORY_LINES + 1] {
+        // Limits outside the core bound fail before any history read.
+        for bad_limit in [0, pi_coding::MAX_HISTORY_LINES + 1] {
             let response = subagents_handle(
                 &app,
                 RpcCommand::AgentHistory {
                     id: None,
                     agent_id: "writer".to_owned(),
-                    lines: Some(bad_lines),
+                    limit: Some(bad_limit),
                 },
             )
             .await;
             assert!(!response.success, "{response:?}");
             assert!(
                 response.error.as_deref().is_some_and(|error| {
-                    error.contains("lines")
+                    error.contains("limit")
                         && error.contains(&pi_coding::MAX_HISTORY_LINES.to_string())
                 }),
                 "{response:?}"
             );
         }
         app.cleanup().await;
+    }
+
+    #[test]
+    fn agent_history_limit_and_byte_budget_report_real_truncation() {
+        let row = |index: usize, text: &str| pi_coding::TranscriptRow {
+            id: Some(format!("entry-{index}")),
+            message: Message::user_text(text, 0),
+        };
+        let big = "x".repeat(150_000);
+
+        // Only the limit suffix dropped rows.
+        let data = agent_history_data(
+            "writer",
+            pi_coding::ChildTranscript {
+                rows: (2..5)
+                    .map(|index| row(index, &format!("row {index}")))
+                    .collect(),
+                omitted_rows: 2,
+            },
+        )
+        .expect("limit-only history");
+        assert_eq!(data["messages"].as_array().expect("rows").len(), 3);
+        let ids: Vec<&str> = data["messages"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .filter_map(|row| row["id"].as_str())
+            .collect();
+        assert_eq!(ids, vec!["entry-2", "entry-3", "entry-4"]);
+        assert_eq!(
+            data["truncation"],
+            json!({ "omittedRows": 2, "reason": "limit" })
+        );
+
+        // Small transcript: nothing dropped.
+        let data = agent_history_data(
+            "writer",
+            pi_coding::ChildTranscript {
+                rows: vec![row(0, "only")],
+                omitted_rows: 0,
+            },
+        )
+        .expect("small history");
+        assert_eq!(
+            data["truncation"],
+            json!({ "omittedRows": 0, "reason": "none" })
+        );
+
+        // The byte budget drops whole HEAD rows; the limit was not binding,
+        // and the kept rows are the LATEST ones.
+        let data = agent_history_data(
+            "writer",
+            pi_coding::ChildTranscript {
+                rows: (0..3)
+                    .map(|index| row(index, &format!("{index} {big}")))
+                    .collect(),
+                omitted_rows: 0,
+            },
+        )
+        .expect("byte-capped history");
+        let rows = data["messages"].as_array().expect("rows");
+        assert!(rows.len() < 3, "{data}");
+        assert_eq!(data["truncation"]["reason"], json!("bytes"));
+        assert_eq!(data["truncation"]["omittedRows"], json!(3 - rows.len()));
+        assert_eq!(rows[0]["id"], json!("entry-1"));
+        assert!(data.to_string().len() <= pi_coding::MAX_HISTORY_BYTES);
+
+        // Both cuts bind: the combined count under limit_and_bytes.
+        let data = agent_history_data(
+            "writer",
+            pi_coding::ChildTranscript {
+                rows: (0..4)
+                    .map(|index| row(index, &format!("{index} {big}")))
+                    .collect(),
+                omitted_rows: 1,
+            },
+        )
+        .expect("double-truncated history");
+        assert_eq!(data["truncation"]["reason"], json!("limit_and_bytes"));
+        assert!(data.to_string().len() <= pi_coding::MAX_HISTORY_BYTES);
+
+        // The newest row alone exceeds the whole budget: an empty message list
+        // with an honest bytes report, never a fabricated empty history.
+        let huge = "y".repeat(pi_coding::MAX_HISTORY_BYTES + 1);
+        let data = agent_history_data(
+            "writer",
+            pi_coding::ChildTranscript {
+                rows: vec![row(0, &huge)],
+                omitted_rows: 0,
+            },
+        )
+        .expect("oversized-row history");
+        assert_eq!(data["messages"], json!([]));
+        assert_eq!(
+            data["truncation"],
+            json!({ "omittedRows": 1, "reason": "bytes" })
+        );
+    }
+
+    #[test]
+    fn agent_history_projection_is_public_display_only() {
+        let mut assistant_message = pi_ai::AssistantMessage::pending(&Model::default());
+        let assistant_timestamp = assistant_message.timestamp;
+        assistant_message.content = vec![
+            ContentBlock::Text {
+                text: "prose".to_owned(),
+                text_signature: Some("text-sig".to_owned()),
+            },
+            ContentBlock::Thinking {
+                thinking: "thought".to_owned(),
+                thinking_signature: Some("think-sig".to_owned()),
+                redacted: false,
+            },
+            ContentBlock::Image {
+                data: "aW1hZ2U=".to_owned(),
+                mime_type: "image/png".to_owned(),
+            },
+            ContentBlock::ToolCall(pi_ai::ToolCall {
+                id: "call-1".to_owned(),
+                name: "read".to_owned(),
+                arguments: json!({ "path": "src/lib.rs" }),
+                thought_signature: Some("thought-sig".to_owned()),
+            }),
+        ];
+        assistant_message.error_message = Some("boom".to_owned());
+        let data = agent_history_data(
+            "writer",
+            pi_coding::ChildTranscript {
+                rows: vec![
+                    pi_coding::TranscriptRow {
+                        id: Some("entry-a".to_owned()),
+                        message: Message::Assistant(assistant_message),
+                    },
+                    pi_coding::TranscriptRow {
+                        id: None,
+                        message: Message::ToolResult(pi_ai::ToolResultMessage {
+                            tool_call_id: "call-1".to_owned(),
+                            tool_name: "read".to_owned(),
+                            content: vec![ContentBlock::text("done")],
+                            usage: Some(pi_ai::Usage::default()),
+                            details: Some(json!({ "display": "keep" })),
+                            added_tool_names: vec!["helper".to_owned()],
+                            is_error: false,
+                            timestamp: 0,
+                        }),
+                    },
+                    pi_coding::TranscriptRow {
+                        id: None,
+                        message: Message::BashExecution(pi_ai::BashExecutionMessage {
+                            command: "cargo check".to_owned(),
+                            output: "ok".to_owned(),
+                            exit_code: Some(0),
+                            cancelled: false,
+                            truncated: false,
+                            full_output_path: Some("/tmp/full-output.txt".to_owned()),
+                            timestamp: 0,
+                            exclude_from_context: Some(true),
+                        }),
+                    },
+                ],
+                omitted_rows: 0,
+            },
+        )
+        .expect("projection history");
+        let serialized = data.to_string();
+        for banned in [
+            "textSignature",
+            "thinkingSignature",
+            "thoughtSignature",
+            "fullOutputPath",
+            "excludeFromContext",
+            "addedToolNames",
+            "rawStopReason",
+            "responseId",
+            "usage",
+            "provider",
+            "\"api\"",
+        ] {
+            assert!(!serialized.contains(banned), "{banned} leaked: {serialized}");
+        }
+        let rows = data["messages"].as_array().expect("rows");
+        assert_eq!(rows.len(), 3);
+        // A real session-entry id is kept; a snapshot row omits it, never
+        // fakes one.
+        assert_eq!(rows[0]["id"], json!("entry-a"));
+        assert_eq!(rows[1].get("id"), None);
+        let assistant_value = &rows[0]["message"];
+        assert_eq!(assistant_value["role"], json!("assistant"));
+        assert_eq!(assistant_value["stopReason"], json!("pending"));
+        assert_eq!(assistant_value["errorMessage"], json!("boom"));
+        assert_eq!(assistant_value["timestamp"], json!(assistant_timestamp));
+        let blocks = assistant_value["content"].as_array().expect("blocks");
+        assert_eq!(blocks.len(), 4);
+        assert_eq!(blocks[0], json!({ "type": "text", "text": "prose" }));
+        assert_eq!(blocks[1]["type"], json!("thinking"));
+        assert_eq!(
+            blocks[2],
+            json!({ "type": "image", "data": "aW1hZ2U=", "mimeType": "image/png" })
+        );
+        assert_eq!(blocks[3]["id"], json!("call-1"));
+        assert_eq!(blocks[3]["arguments"], json!({ "path": "src/lib.rs" }));
+        let tool_result_value = &rows[1]["message"];
+        assert_eq!(tool_result_value["toolCallId"], json!("call-1"));
+        assert_eq!(tool_result_value["toolName"], json!("read"));
+        assert_eq!(tool_result_value["isError"], json!(false));
+        assert_eq!(tool_result_value["details"], json!({ "display": "keep" }));
+        let bash_value = &rows[2]["message"];
+        assert_eq!(bash_value["command"], json!("cargo check"));
+        assert_eq!(bash_value["exitCode"], json!(0));
+        assert_eq!(bash_value["cancelled"], json!(false));
+        assert_eq!(bash_value["truncated"], json!(false));
     }
 
     #[tokio::test]
@@ -19917,7 +21800,7 @@ mod tests {
         options.disable_context_files = true;
         let resources = ResourceManager::new(options).expect("resources");
         let session = disabled_session(SessionOptions {
-            model: model.clone(),
+            model: Some(model.clone()),
             cwd: cwd.clone(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -19968,7 +21851,7 @@ mod tests {
             });
             Box::pin(async move {
                 disabled_session(pi_coding::SessionOptions {
-                    model: request.model,
+                    model: Some(request.model),
                     cwd: child_cwd,
                     system_prompt: request.system_prompt,
                     thinking_level: request.thinking_level.unwrap_or(ThinkingLevel::Off),
@@ -19988,7 +21871,7 @@ mod tests {
             AgentCatalog::from_agents(snapshot.agents.clone()),
             cwd.join(".rpi").join("artifacts"),
         );
-        config.parent_model = model;
+        config.parent_model = Some(model);
         let runtime = OrchestrationRuntime::new(config, factory).expect("orchestration runtime");
         let application = Application::from_runtime_candidate(
             pi_coding::ApplicationRuntimeCandidate::new(session).with_orchestration(runtime),
@@ -20564,7 +22447,7 @@ mod tests {
                 RpcCommand::AgentHistory {
                     id: None,
                     agent_id: "writer".into(),
-                    lines: None,
+                    limit: None,
                 },
                 "orchestration is not enabled",
             ),
@@ -21634,7 +23517,7 @@ mod tests {
                     recorder.close().expect("close writer");
                     let recorder = pi_coding::resume_session(&path).expect("resume deep session");
                     let session = disabled_session(pi_coding::SessionOptions {
-                        model: faux_model(),
+                        model: Some(faux_model()),
                         cwd: cwd.clone(),
                         system_prompt: String::new(),
                         thinking_level: ThinkingLevel::Off,

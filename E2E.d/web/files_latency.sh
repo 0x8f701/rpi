@@ -41,11 +41,13 @@
 #     shortened nested/link-target.txt first (that response fails), then
 #     pkg/nested/link-target.txt (that response succeeds) and the content
 #     shows LINK-NESTED-EXACT. A tree row is not required.
-#     FL6.3 duplicate basename dup-name.txt issues no homonym read.
-#     FL6.4 the absolute citation is a sibling of the workspace root
-#     (<workspace>/../outside-sentinel/outside-only.txt). The click issues
-#     no file_explorer_read and does not show LINK-OUTSIDE. A marker is
-#     allowed.
+#     FL6.3 duplicate basename dup-name.txt: one owner read returns
+#     file_ambiguous candidates pkg/a/dup-name.txt and pkg/b/dup-name.txt.
+#     Neither copy opens. Reopen shows both with no new read/search/get_state.
+#     FL6.4 restores pkg/nested/link-target.txt (LINK-NESTED-EXACT, no
+#     choices) before the outside click. That absolute citation is a sibling
+#     of the workspace root and issues no file_explorer_read. Reopen still
+#     shows LINK-NESTED-EXACT and never LINK-OUTSIDE. A marker is allowed.
 #     FL6.5 the already-seeded workspace-root README.md (marker
 #     FL-ROOT-README-EXACT on line 2) is cited as the BARE basename
 #     `README.md:2` with NO longer path context: the render stamps the
@@ -53,10 +55,37 @@
 #     click opens it through session-a-seed's correlated session-stamped
 #     file_explorer_read showing FL-ROOT-README-EXACT with no
 #     file-unavailable error (no content error, no unavailable toast).
+#     FL6.6: same shape for bare `homonym.rs`: one owner read, candidates
+#     pkg/a/bridge/homonym.rs and pkg/b/bridge/homonym.rs, no search/get_state
+#     and no auto-open. The pkg/a choice shows HOMONYM-A only.
+#     FL6.7: same session cites exact `psy_node_redis/src/store/rewards.rs`.
+#     Both prefixes exist. One owner read, no search/get_state, not
+#     file-not-found. Click A shows A not B; reopen still offers B.
 #   - JOURNEY SURFACES at both breakpoints: zero horizontal overflow (body, the .file-explorer shell, its header, #toasts) and zero visible error toasts.
-#   - SCREENSHOTS: 1440x900 files-latency-open + -refresh-busy; 390x844 -mobile-open + -refresh-busy-mobile; plus -isolation after the A/B round-trip and -subdir-link after FL6.
+#   - EXPLORER BOTTOM / DOCK / SCOPE (rides FL0.7/FL0.8/FL6.6/FL6.7): with a
+#     real non-empty file open the explorer flex body bottom sits ON the
+#     layout viewport bottom — the Files-open hidden main composer leaves no band (±1px, both directions — no outer
+#     whitespace band, no underlap); in ask-focus dock/body/viewport bottom
+#     edges all coincide (±1px); on 390x844 the Ask dock is bounded
+#     (height <= min(280, body*0.45)+1) under a LARGER visible file viewport
+#     with scope header, textarea, and Send/Stop fully inside and each the
+#     elementFromPoint target at its center; every phase shows the "File
+#     conversation" scope header with data-path equal to the active file, and
+#     an empty non-streaming conversation shows the quiet empty-state
+#     message that disappears once entries exist. FL0.7 desktop also runs a
+#     REAL per-file Ask round trip through the dock composer (mock echo
+#     reply), asserting the reply entry, scope survival across file
+#     switches, fresh-empty conversations on the other file, and dock
+#     integrity after the reply.
+#   - SCREENSHOTS: routine acceptance frames are REGISTERED staged artifacts
+#     (desktop/mobile -open, -refresh-busy, -file, -ask-normal/-ask-bounded,
+#     -fullscreen, -closed-composer, -file-content, desktop
+#     -ask-replies, plus -isolation and -subdir-link and the FL6.7
+#     rewards-suffix pair); the unregistered root-dir journeyFrame bypass is
+#     left only for RED diagnostics (e.g. the clipped bottom-left corner
+#     frame).
 #   - zero browser console/page/websocket errors across the whole lane.
-#   - explicit exact assertion IDs (FL0.1-FL6.5, exact-once ledger) are
+#   - explicit exact assertion IDs (FL0.1-FL6.7, exact-once ledger) are
 #     published in coverage-assertions.json inside the run directory
 #     alongside the timings — never timings-only — and the coverage matrix
 #     gates them.
@@ -129,7 +158,14 @@ seed_link_fixture() {
     printf 'LINK-DUP-A\n' >"$ws/pkg/a/dup-name.txt"
     printf 'LINK-DUP-B\n' >"$ws/pkg/b/dup-name.txt"
     printf 'LINK-OUTSIDE\n' >"$(dirname "$ws")/outside-sentinel/outside-only.txt"
-    git -C "$ws" add -- pkg
+    mkdir -p "$ws/pkg/a/bridge" "$ws/pkg/b/bridge"
+    printf 'HOMONYM-A\n' >"$ws/pkg/a/bridge/homonym.rs"
+    printf 'HOMONYM-B\n' >"$ws/pkg/b/bridge/homonym.rs"
+    local suffix="psy_node_redis/src/store"
+    mkdir -p "$ws/psy-node/$suffix" "$ws/psy-node-fix/$suffix"
+    printf 'REWARDS-NODE-A\n' >"$ws/psy-node/$suffix/rewards.rs"
+    printf 'REWARDS-NODE-FIX-B\n' >"$ws/psy-node-fix/$suffix/rewards.rs"
+    git -C "$ws" add -- pkg psy-node psy-node-fix
     git -C "$ws" commit -q -m 'transcript link fixture'
 }
 
@@ -214,15 +250,16 @@ PY
     url="$(web_wait_for_listener "$evidence")"
     log "$SCENARIO: listener at $url"
 
+    log "$SCENARIO: playwright log at $evidence/playwright.out"
     web_run_playwright "$url" "$evidence" "$root/playwright" "$SCRIPT_DIR/files_latency_test.mjs" \
         "RPI_MESSAGES=$MESSAGES" \
         "RPI_TOGGLE_DIR=$TOGGLE_DIR" \
         "RPI_SECOND_DIR=$SECOND_DIR" \
         "RPI_LINK_CWD=$root/workspace/pkg" \
         "RPI_OUTSIDE_FILE=$(dirname "$root/workspace")/outside-sentinel/outside-only.txt" \
-        || pw_status=$?
+        >"$evidence/playwright.out" 2>&1 || pw_status=$?
     if [ "$pw_status" -ne 0 ]; then
-        fail "$SCENARIO: playwright lane failed (exit $pw_status) — files-latency lane is playwright-only"
+        fail "$SCENARIO: playwright lane failed (exit $pw_status) — files-latency lane is playwright-only (log: $evidence/playwright.out)"
     fi
 
     web_sanity_http "$url"

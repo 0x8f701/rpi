@@ -513,6 +513,7 @@ fn workflow_job(
             created_at: 1,
             started_at: None,
             finished_at: None,
+            cancellation_cause: None,
             result: None,
             soft_budget_exhausted: false,
         },

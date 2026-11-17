@@ -59,6 +59,10 @@ pub struct SideChatEntry {
     pub thinking: Option<String>,
     pub is_error: bool,
     pub is_partial: bool,
+    /// Epoch-millisecond creation time. `Some` only on assistant rows that
+    /// captured a real `MessageStart` value; user/tool/system/thinking and
+    /// start-less partials stay `None`.
+    pub timestamp: Option<i64>,
 }
 
 impl Default for SideChatEntry {
@@ -74,6 +78,7 @@ impl Default for SideChatEntry {
             thinking: None,
             is_error: false,
             is_partial: false,
+            timestamp: None,
         }
     }
 }
@@ -112,6 +117,7 @@ impl SideChatEntry {
             "toolArgs": self.tool_args,
             "output": self.output,
             "thinking": self.thinking,
+            "timestamp": self.timestamp,
             "isError": self.is_error,
             "isPartial": self.is_partial,
         })
@@ -274,6 +280,10 @@ pub struct SideChatController {
     entry_seq: u64,
     pending_thinking_index: Option<usize>,
     pending_assistant_index: Option<usize>,
+    /// Assistant creation timestamp captured from `MessageStart` before any
+    /// delta arrives. Applied to the live partial row at first-delta creation
+    /// and never fabricated; cleared on `AgentStart` and transcript resets.
+    pending_assistant_timestamp: Option<i64>,
     /// One submitted turn already published its display row. The next
     /// `MessageEnd::User` is that turn's model prompt and is not a second
     /// display row, even when the texts differ. Cleared when consumed or when
@@ -348,6 +358,7 @@ impl SideChatController {
             entry_seq: 0,
             pending_thinking_index: None,
             pending_assistant_index: None,
+            pending_assistant_timestamp: None,
             pending_user_echo: false,
         })
     }
@@ -528,17 +539,29 @@ impl SideChatController {
         self.pending_thinking_index = Some(index);
     }
 
-    fn settle_streaming_assistant(&mut self, text: String, is_partial: bool) {
+    fn settle_streaming_assistant(&mut self, text: String, is_partial: bool, timestamp: Option<i64>) {
         self.streaming_text.clear();
         match self.pending_assistant_index.take() {
             Some(index) => {
                 if let Some(entry) = self.entries.get_mut(index) {
+                    if entry.timestamp.is_none() {
+                        entry.timestamp = timestamp;
+                    }
                     entry.text = text;
                     entry.is_partial = is_partial;
                 }
             }
             None if !text.is_empty() => {
-                self.push_role(SideChatRole::Assistant, text, false, is_partial);
+                let id = self.alloc_entry_id();
+                self.push_entry(SideChatEntry {
+                    id,
+                    kind: SideChatEntryKind::Assistant,
+                    role: SideChatRole::Assistant,
+                    text,
+                    timestamp,
+                    is_partial,
+                    ..SideChatEntry::default()
+                });
             }
             None => {}
         }
@@ -554,11 +577,13 @@ impl SideChatController {
             return;
         }
         let id = self.alloc_entry_id();
+        let timestamp = self.pending_assistant_timestamp.take();
         let index = self.push_entry(SideChatEntry {
             id,
             kind: SideChatEntryKind::Assistant,
             role: SideChatRole::Assistant,
             text: self.streaming_text.clone(),
+            timestamp,
             is_partial: true,
             ..SideChatEntry::default()
         });
@@ -601,8 +626,8 @@ impl SideChatController {
     }
 
     #[must_use]
-    pub fn model(&self) -> &Model {
-        &self.fork.model
+    pub fn model(&self) -> Option<&Model> {
+        self.fork.model.as_ref()
     }
 
     #[must_use]
@@ -641,7 +666,16 @@ impl SideChatController {
                 self.is_streaming = true;
                 self.streaming_text.clear();
                 self.pending_assistant_index = None;
+                self.pending_assistant_timestamp = None;
                 self.status = "Side chat thinking…".to_owned();
+            }
+            AgentEvent::MessageStart { message } => {
+                // Data-first: capture the assistant's real creation time without
+                // creating or rendering any row; the live partial row is still
+                // created by the first text delta.
+                if let Message::Assistant(assistant) = message {
+                    self.pending_assistant_timestamp = Some(assistant.timestamp);
+                }
             }
             AgentEvent::TurnStart => {
                 self.pending_tool_calls.clear();
@@ -715,6 +749,20 @@ impl SideChatController {
                         let thinking = content_thinking(&assistant.content);
                         self.finalize_thinking_entry(thinking);
                         self.pending_thinking_index = None;
+                        // Consume the captured start clock on every assistant
+                        // end — even a thought-only end with no text — so a
+                        // later start-less delta cannot inherit a stale time.
+                        // A valid end epoch (> 0) is the canonical persisted
+                        // time and overrides an already-captured partial start,
+                        // matching the main App; an invalid end keeps the
+                        // start capture. Cancel paths never see an end and
+                        // keep the start value.
+                        let start = self.pending_assistant_timestamp.take();
+                        let canonical = if assistant.timestamp > 0 {
+                            Some(assistant.timestamp)
+                        } else {
+                            start
+                        };
                         let text = content_text(&assistant.content);
                         let streamed = if text.is_empty() {
                             std::mem::take(&mut self.streaming_text)
@@ -722,6 +770,12 @@ impl SideChatController {
                             self.streaming_text.clear();
                             text
                         };
+                        if canonical.is_some()
+                            && let Some(index) = self.pending_assistant_index
+                            && let Some(entry) = self.entries.get_mut(index)
+                        {
+                            entry.timestamp = canonical;
+                        }
                         if streamed.is_empty() {
                             if let Some(index) = self.pending_assistant_index.take()
                                 && let Some(entry) = self.entries.get_mut(index)
@@ -729,7 +783,7 @@ impl SideChatController {
                                 entry.is_partial = false;
                             }
                         } else {
-                            self.settle_streaming_assistant(streamed, false);
+                            self.settle_streaming_assistant(streamed, false, canonical);
                         }
                     }
                     Message::ToolResult(result) => {
@@ -845,9 +899,10 @@ impl SideChatController {
             AgentEvent::AgentEnd { .. } => {
                 self.is_streaming = false;
                 self.pending_user_echo = false;
+                let timestamp = self.pending_assistant_timestamp.take();
                 if !self.streaming_text.is_empty() {
                     let text = std::mem::take(&mut self.streaming_text);
-                    self.settle_streaming_assistant(text, false);
+                    self.settle_streaming_assistant(text, false, timestamp);
                 } else if let Some(index) = self.pending_assistant_index.take()
                     && let Some(entry) = self.entries.get_mut(index)
                 {
@@ -1030,9 +1085,10 @@ impl SideChatController {
         self.is_streaming = false;
         self.pending_user_echo = false;
         if was_streaming {
+            let timestamp = self.pending_assistant_timestamp.take();
             if !self.streaming_text.is_empty() {
                 let text = std::mem::take(&mut self.streaming_text);
-                self.settle_streaming_assistant(text, true);
+                self.settle_streaming_assistant(text, true, timestamp);
             } else {
                 self.pending_assistant_index = None;
             }
@@ -1096,6 +1152,7 @@ impl SideChatController {
         self.finalized_tool_calls.clear();
         self.pending_thinking_index = None;
         self.pending_assistant_index = None;
+        self.pending_assistant_timestamp = None;
         self.pending_user_echo = false;
         self._subscription = Some(subscription);
         previous_side_application.cleanup().await;
@@ -1118,6 +1175,7 @@ impl SideChatController {
         self.finalized_tool_calls.clear();
         self.pending_thinking_index = None;
         self.pending_assistant_index = None;
+        self.pending_assistant_timestamp = None;
         self.pending_user_echo = false;
         self.status = "Side chat cleared".to_owned();
         Ok(())
@@ -1858,7 +1916,7 @@ mod tests {
         let session =
             pi_coding::Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
                 pi_coding::SessionOptions {
-                    model,
+                    model: Some(model),
                     cwd: cwd.to_path_buf(),
                     system_prompt: "main system\nUse bash for file operations like ls, rg, find."
                         .to_owned(),
@@ -2016,58 +2074,29 @@ mod tests {
         .expect("displayed prompt");
         side.poll_events();
 
-        let wires: Vec<Value> = side
-            .entries()
-            .iter()
-            .map(SideChatEntry::to_wire_json)
-            .collect();
-        let without_ids: Vec<Value> = wires
-            .iter()
-            .map(|wire| {
-                let mut wire = wire.clone();
-                wire.as_object_mut()
-                    .expect("wire object")
-                    .remove("id");
-                wire
-            })
-            .collect();
+        // One assertion on transcript content only — never a whole-wire-JSON
+        // copy, which would re-pin incidental fields (e.g. timestamp, whose
+        // real-source rules are guarded by the dedicated timestamp tests).
         assert_eq!(
-            without_ids,
+            side.entries()
+                .iter()
+                .map(|entry| (entry.role, entry.kind, entry.text.as_str()))
+                .collect::<Vec<_>>(),
             vec![
-                json!({
-                    "kind": "user",
-                    "role": "user",
-                    "text": DISPLAY,
-                    "toolName": null,
-                    "toolArgs": null,
-                    "output": null,
-                    "thinking": null,
-                    "isError": false,
-                    "isPartial": false,
-                }),
-                json!({
-                    "kind": "assistant",
-                    "role": "assistant",
-                    "text": ASSISTANT,
-                    "toolName": null,
-                    "toolArgs": null,
-                    "output": null,
-                    "thinking": null,
-                    "isError": false,
-                    "isPartial": false,
-                }),
+                (
+                    SideChatRole::User,
+                    SideChatEntryKind::User,
+                    DISPLAY
+                ),
+                (
+                    SideChatRole::Assistant,
+                    SideChatEntryKind::Assistant,
+                    ASSISTANT
+                ),
             ],
-            "one display user row and the assistant; model context must not be a wire row: {wires:?}"
+            "one display user row (the composed model prompt must not become a row) and the accurate assistant reply: {:?}",
+            side.entries()
         );
-        assert!(
-            wires.iter().all(|wire| {
-                wire["id"]
-                    .as_str()
-                    .is_some_and(|id| !id.is_empty())
-            }),
-            "wire ids must stay populated: {wires:?}"
-        );
-        assert_ne!(wires[0]["id"], wires[1]["id"]);
 
         let captured = side.agent_messages().await;
         let model_text = captured
@@ -2911,7 +2940,7 @@ mod tests {
         assert_eq!(tool_wire["output"], "ok");
         assert!(tool_wire["id"].as_str().is_some_and(|id| !id.is_empty()));
 
-        let mut partial = pi_ai::AssistantMessage::pending(side.model());
+        let mut partial = pi_ai::AssistantMessage::pending(side.model().expect("side chat model"));
         side.apply_agent_event(AgentEvent::MessageUpdate {
             message: Message::Assistant(partial.clone()),
             assistant_message_event: AssistantMessageEvent::ThinkingStart {
@@ -2968,7 +2997,7 @@ mod tests {
         let (_cwd, mut side) = fresh_side().await;
         side.apply_agent_event(AgentEvent::AgentStart);
         side.apply_agent_event(AgentEvent::TurnStart);
-        let mut partial = pi_ai::AssistantMessage::pending(side.model());
+        let mut partial = pi_ai::AssistantMessage::pending(side.model().expect("side chat model"));
         side.apply_agent_event(AgentEvent::MessageUpdate {
             message: Message::Assistant(partial.clone()),
             assistant_message_event: AssistantMessageEvent::ThinkingStart {
@@ -3068,7 +3097,7 @@ mod tests {
         let (_cwd, mut side) = fresh_side().await;
         side.apply_agent_event(AgentEvent::AgentStart);
         side.apply_agent_event(AgentEvent::TurnStart);
-        let mut partial = pi_ai::AssistantMessage::pending(side.model());
+        let mut partial = pi_ai::AssistantMessage::pending(side.model().expect("side chat model"));
         side.apply_agent_event(AgentEvent::MessageUpdate {
             message: Message::Assistant(partial.clone()),
             assistant_message_event: AssistantMessageEvent::TextDelta {
@@ -3134,5 +3163,295 @@ mod tests {
         assert_eq!(settled_wire["isPartial"], false);
         assert_eq!(settled_wire["text"], "Hello");
         assert!(side.streaming_text().is_empty());
+    }
+
+    /// Canonical timestamp: the partial row carries the MessageStart capture
+    /// while streaming, and a valid MessageEnd epoch (> 0) overrides it — the
+    /// persisted value always matches the final assistant message, the same
+    /// rule as the main App.
+    #[tokio::test]
+    async fn message_end_overrides_partial_start_capture() {
+        let (_cwd, mut side) = fresh_side().await;
+        side.apply_agent_event(AgentEvent::AgentStart);
+        side.apply_agent_event(AgentEvent::TurnStart);
+        let mut partial = pi_ai::AssistantMessage::pending(side.model().expect("side chat model"));
+        partial.timestamp = 1_700_000_000_000;
+        side.apply_agent_event(AgentEvent::MessageStart {
+            message: Message::Assistant(partial.clone()),
+        });
+        assert_eq!(
+            side.entries()
+                .iter()
+                .filter(|entry| entry.kind == SideChatEntryKind::Assistant)
+                .count(),
+            0,
+            "MessageStart must not create an empty row"
+        );
+
+        side.apply_agent_event(AgentEvent::MessageUpdate {
+            message: Message::Assistant(partial.clone()),
+            assistant_message_event: AssistantMessageEvent::TextDelta {
+                content_index: 0,
+                delta: "Hel".into(),
+                partial: partial.clone(),
+            },
+        });
+        let live: Vec<_> = side
+            .entries()
+            .iter()
+            .filter(|entry| entry.kind == SideChatEntryKind::Assistant)
+            .collect();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].timestamp, Some(1_700_000_000_000));
+        let live_id = live[0].id.clone();
+
+        side.apply_agent_event(AgentEvent::MessageUpdate {
+            message: Message::Assistant(partial.clone()),
+            assistant_message_event: AssistantMessageEvent::TextDelta {
+                content_index: 0,
+                delta: "lo".into(),
+                partial: partial.clone(),
+            },
+        });
+        partial.timestamp = 1_700_000_000_999;
+        partial.content.push(ContentBlock::text("Hello"));
+        side.apply_agent_event(AgentEvent::MessageEnd {
+            message: Message::Assistant(partial),
+        });
+        let settled: Vec<_> = side
+            .entries()
+            .iter()
+            .filter(|entry| entry.kind == SideChatEntryKind::Assistant)
+            .collect();
+        assert_eq!(settled.len(), 1, "MessageEnd must not append a second row");
+        assert_eq!(settled[0].id, live_id);
+        assert!(!settled[0].is_partial);
+        assert_eq!(
+            settled[0].timestamp,
+            Some(1_700_000_000_999),
+            "valid end epoch is the canonical persisted value"
+        );
+        assert_eq!(
+            settled[0].to_wire_json()["timestamp"],
+            json!(1_700_000_000_999_i64)
+        );
+    }
+
+    /// Aborting a streaming partial settles it in place with is_partial=true
+    /// and keeps the MessageStart-captured timestamp; no fabricated value and
+    /// no replacement row.
+    #[tokio::test]
+    async fn abort_preserves_partial_timestamp() {
+        let (_cwd, mut side) = fresh_side().await;
+        side.apply_agent_event(AgentEvent::AgentStart);
+        side.apply_agent_event(AgentEvent::TurnStart);
+        let mut partial = pi_ai::AssistantMessage::pending(side.model().expect("side chat model"));
+        partial.timestamp = 1_700_000_005_000;
+        side.apply_agent_event(AgentEvent::MessageStart {
+            message: Message::Assistant(partial.clone()),
+        });
+        side.apply_agent_event(AgentEvent::MessageUpdate {
+            message: Message::Assistant(partial.clone()),
+            assistant_message_event: AssistantMessageEvent::TextDelta {
+                content_index: 0,
+                delta: "partial".into(),
+                partial: partial.clone(),
+            },
+        });
+        let live_id = side
+            .entries()
+            .iter()
+            .find(|entry| entry.kind == SideChatEntryKind::Assistant)
+            .map(|entry| entry.id.clone())
+            .expect("live partial row");
+
+        side.abort_streaming().await;
+
+        let rows: Vec<_> = side
+            .entries()
+            .iter()
+            .filter(|entry| entry.kind == SideChatEntryKind::Assistant)
+            .collect();
+        assert_eq!(rows.len(), 1, "abort must not append a replacement row");
+        assert_eq!(rows[0].id, live_id);
+        assert!(rows[0].is_partial);
+        assert_eq!(rows[0].text, "partial");
+        assert_eq!(rows[0].timestamp, Some(1_700_000_005_000));
+    }
+
+    /// Without a captured `MessageStart` the partial row carries no timestamp
+    /// and `MessageEnd` backfills the assistant's real value without creating
+    /// a second row.
+    #[tokio::test]
+    async fn message_end_backfills_timestamp_when_start_was_not_captured() {
+        let (_cwd, mut side) = fresh_side().await;
+        side.apply_agent_event(AgentEvent::AgentStart);
+        side.apply_agent_event(AgentEvent::TurnStart);
+        let mut partial = pi_ai::AssistantMessage::pending(side.model().expect("side chat model"));
+        partial.timestamp = 1_700_000_009_000;
+        side.apply_agent_event(AgentEvent::MessageUpdate {
+            message: Message::Assistant(partial.clone()),
+            assistant_message_event: AssistantMessageEvent::TextDelta {
+                content_index: 0,
+                delta: "Hey".into(),
+                partial: partial.clone(),
+            },
+        });
+        let live: Vec<_> = side
+            .entries()
+            .iter()
+            .filter(|entry| entry.kind == SideChatEntryKind::Assistant)
+            .collect();
+        assert_eq!(live.len(), 1);
+        assert_eq!(
+            live[0].timestamp,
+            None,
+            "no MessageStart capture, no timestamp yet"
+        );
+
+        partial.content.push(ContentBlock::text("Hey"));
+        side.apply_agent_event(AgentEvent::MessageEnd {
+            message: Message::Assistant(partial),
+        });
+        let settled: Vec<_> = side
+            .entries()
+            .iter()
+            .filter(|entry| entry.kind == SideChatEntryKind::Assistant)
+            .collect();
+        assert_eq!(settled.len(), 1);
+        assert!(!settled[0].is_partial);
+        assert_eq!(settled[0].timestamp, Some(1_700_000_009_000));
+    }
+
+    /// End-only message (Start captured, never any text delta): the settle
+    /// path creates the row with the canonical end epoch — the valid end
+    /// overrides the start capture, never None (which would make a
+    /// stable-name save fail).
+    #[tokio::test]
+    async fn end_only_row_carries_canonical_end_timestamp() {
+        let (_cwd, mut side) = fresh_side().await;
+        side.apply_agent_event(AgentEvent::AgentStart);
+        side.apply_agent_event(AgentEvent::TurnStart);
+        let mut partial = pi_ai::AssistantMessage::pending(side.model().expect("side chat model"));
+        partial.timestamp = 1_700_000_013_000;
+        side.apply_agent_event(AgentEvent::MessageStart {
+            message: Message::Assistant(partial.clone()),
+        });
+        partial.timestamp = 1_700_000_013_500;
+        partial.content.push(ContentBlock::text("done"));
+        side.apply_agent_event(AgentEvent::MessageEnd {
+            message: Message::Assistant(partial),
+        });
+        let rows: Vec<_> = side
+            .entries()
+            .iter()
+            .filter(|entry| entry.kind == SideChatEntryKind::Assistant)
+            .collect();
+        assert_eq!(rows.len(), 1, "end-only must settle exactly one row");
+        assert_eq!(rows[0].text, "done");
+        assert!(!rows[0].is_partial);
+        assert_eq!(
+            rows[0].timestamp,
+            Some(1_700_000_013_500),
+            "valid end epoch is canonical even over the start capture"
+        );
+    }
+
+    /// End-only message without any captured MessageStart: the settle path
+    /// falls back to the end message's real timestamp so a legal end-only
+    /// assistant row never saves with a null timestamp.
+    #[tokio::test]
+    async fn end_only_without_start_falls_back_to_end_timestamp() {
+        let (_cwd, mut side) = fresh_side().await;
+        side.apply_agent_event(AgentEvent::AgentStart);
+        side.apply_agent_event(AgentEvent::TurnStart);
+        let mut partial = pi_ai::AssistantMessage::pending(side.model().expect("side chat model"));
+        partial.timestamp = 1_700_000_014_000;
+        partial.content.push(ContentBlock::text("direct"));
+        side.apply_agent_event(AgentEvent::MessageEnd {
+            message: Message::Assistant(partial),
+        });
+        let rows: Vec<_> = side
+            .entries()
+            .iter()
+            .filter(|entry| entry.kind == SideChatEntryKind::Assistant)
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].is_partial);
+        assert_eq!(
+            rows[0].timestamp,
+            Some(1_700_000_014_000),
+            "end-only fallback uses the end message's real time"
+        );
+    }
+
+    /// A thought-only assistant end (no text row) must still consume the
+    /// pending start clock; a later start-less delta must not inherit the
+    /// stale time.
+    #[tokio::test]
+    async fn thought_only_end_clears_pending_clock_before_startless_delta() {
+        let (_cwd, mut side) = fresh_side().await;
+        side.apply_agent_event(AgentEvent::AgentStart);
+        side.apply_agent_event(AgentEvent::TurnStart);
+        let mut partial = pi_ai::AssistantMessage::pending(side.model().expect("side chat model"));
+        partial.timestamp = 1_700_000_011_000;
+        side.apply_agent_event(AgentEvent::MessageStart {
+            message: Message::Assistant(partial.clone()),
+        });
+        side.apply_agent_event(AgentEvent::MessageUpdate {
+            message: Message::Assistant(partial.clone()),
+            assistant_message_event: AssistantMessageEvent::ThinkingStart {
+                content_index: 0,
+                partial: partial.clone(),
+            },
+        });
+        side.apply_agent_event(AgentEvent::MessageUpdate {
+            message: Message::Assistant(partial.clone()),
+            assistant_message_event: AssistantMessageEvent::ThinkingDelta {
+                content_index: 0,
+                delta: "ponder".into(),
+                partial: partial.clone(),
+            },
+        });
+        side.apply_agent_event(AgentEvent::MessageEnd {
+            message: Message::Assistant(partial.clone()),
+        });
+        assert_eq!(
+            side.entries()
+                .iter()
+                .filter(|entry| entry.kind == SideChatEntryKind::Assistant)
+                .count(),
+            0,
+            "thought-only end must not create an assistant row"
+        );
+        assert_eq!(
+            side.entries()
+                .iter()
+                .filter(|entry| entry.kind == SideChatEntryKind::Thinking)
+                .count(),
+            1
+        );
+
+        let mut second = pi_ai::AssistantMessage::pending(side.model().expect("side chat model"));
+        second.timestamp = 1_700_000_012_000;
+        side.apply_agent_event(AgentEvent::MessageUpdate {
+            message: Message::Assistant(second.clone()),
+            assistant_message_event: AssistantMessageEvent::TextDelta {
+                content_index: 1,
+                delta: "next".into(),
+                partial: second.clone(),
+            },
+        });
+        let rows: Vec<_> = side
+            .entries()
+            .iter()
+            .filter(|entry| entry.kind == SideChatEntryKind::Assistant)
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].timestamp,
+            None,
+            "stale start clock must not leak into the start-less delta"
+        );
     }
 }

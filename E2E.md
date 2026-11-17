@@ -11,13 +11,11 @@ All prose, fixtures, agent definitions, skill bodies, and faux responses used by
 - Active executable: `~/.rpi/bin/rpi` on Unix and `%USERPROFILE%\.rpi\bin\rpi.exe` on Windows.
 - Runtime configuration remains compatible with the upstream Pi layout: `~/.pi/agent`, project `.pi/`, and preserved `PI_*` environment variables (e.g. `PI_CODING_AGENT_DIR`). The installer/updater canonical controls are the `RPI_*` names.
 - Native sessions use append-only Pi v3 JSONL.
-- Release assets use `rpi-<version>-<target-triple>.tar.gz`, or `.zip` for Windows.
-- The five release targets are:
-  - `aarch64-apple-darwin`
+- Release assets use `rpi-<version>-<target-triple>.tar.gz` for Linux CLI builds.
+- The two published CLI targets are:
   - `aarch64-unknown-linux-gnu`
-  - `x86_64-apple-darwin`
-  - `x86_64-pc-windows-msvc`
   - `x86_64-unknown-linux-gnu`
+- The same tag publishes Linux amd64/arm64 desktop `.deb` packages and one Android APK. macOS artifacts are temporarily unavailable; no Windows release artifact is published.
 
 ## Prerequisites and isolation
 
@@ -96,7 +94,7 @@ bash E2E.d/ci/workflow.sh release      # hard release gate: requires tmux; rpc +
 
 ### Release archive fixture
 
-Build the release binary and exercise every archive shape:
+Build the release binary and exercise both Linux archive shapes:
 
 ```sh
 # build-release.sh applies stable rustc --remap-path-prefix (workspace, HOME,
@@ -113,9 +111,9 @@ RPI_BIN=target/release-dist/rpi bash E2E.d/release/archive-fixture-smoke.sh run
 
 The archive gate verifies:
 
-- exactly five platform archives
+- exactly two Linux platform archives
 - exact `rpi-1.0.0-<target-triple>` names
-- a single root-level `rpi` or `rpi.exe`
+- a single root-level `rpi`
 - a root-level `LICENSE`
 - a complete and valid `SHA256SUMS`
 
@@ -277,7 +275,7 @@ All invoked from `run_orchestration_rust` with **`cargo +1.88.0` only** (never b
 | `cargo +1.88.0 test -p pi-coding --test todo_dag_execution failed_and_cancelled_owners_stay_open_and_terminal_reconciliation_is_idempotent --locked -- --nocapture` | Failed/cancelled owners leave tasks open; Blocked status; terminal reconciliation idempotent |
 | `cargo +1.88.0 test -p pi-cli formats_empty_goal_details_for_overlay --locked -- --nocapture` | Goal details overlay formatter (Objective/Status/Tokens/Time) |
 | `cargo +1.88.0 test -p pi-cli orchestration_irc_renders_named_label_body_reply --locked -- --nocapture` | Human IRC `IRC · Main → Child` / `IRC · Child → Sibling` with bodies `hello child` / `child ack` and `reply to m1`; **no** raw `<orchestration-message` and no `Replying to message` |
-| `cargo +1.88.0 test -p pi-cli message_delivered_event_renders_once_and_dedupes_custom_message --locked -- --nocapture` | Child→Main (and peer) MessageDelivered path renders once; custom-message dedupe; no double body |
+| `cargo +1.88.0 test -p pi-cli message_delivered_event_renders_once_and_dedupes_custom_message --locked -- --nocapture` | Child→Main and peer MessageDelivered become that job's activity exactly once; a repeat of the same id and the matching custom message do not stack a second activity event or paint the body on Main |
 | `cargo +1.88.0 test -p pi-coding --test orchestration_supervision main_supervises_two_children_with_irc --locked -- --nocapture` | Runtime bidirectional IRC while Main supervises two children |
 | `cargo +1.88.0 test -p pi-cli clipboard_png_fixture_attaches_one_image --locked -- --nocapture` | Composer attachment label is exactly `[Image #1, WIDTHxHEIGHT]` (1×1 PNG fixture); draft text preserved; no base64/mime leak |
 | `cargo +1.88.0 test -p pi-cli replace_transcript_refreshes_todo_phases_from_application --locked -- --nocapture` | After tree/fork/new-session `replace_transcript_from_application`, `todo_phases` MUST match `application.todo_state()` — no stale Todo panel chrome from the prior DAG |
@@ -309,6 +307,8 @@ Session geometry: 120×40. Evidence files under `$EVIDENCE_ROOT/orchestration-tm
 | `clipboard-meta.txt` | optional xclip path | `clipboard_png=attempted` or `clipboard_png=skipped` + reason. Authoritative image contract is rust `clipboard_png_fixture` |
 
 Cleanup: `tmux kill-session` for the unique session name; outer `cleanup_e2e` removes work roots.
+
+The hub subcampaign inside this lane (`E2E.d/lib/run_hub_tui_campaign.py`) is the only part that uses a private `tmux -L` socket with `-f /dev/null` and an explicit `session:0.0` pane; the rest of `orchestration.tmux` still uses the default server. Mock argv check, not a live tmux run: `python3 E2E.d/lib/test_run_hub_tui_campaign.py`.
 
 ### Workflow campaigns (`E2E.d/ci/workflow.sh`)
 
@@ -621,7 +621,7 @@ child ack
 reply to m1
 ```
 
-Plus runtime gate `main_supervises_two_children_with_irc` and `message_delivered_event_renders_once_and_dedupes_custom_message` for Child→Main / peer delivery without double render.
+Plus runtime gate `main_supervises_two_children_with_irc` and `message_delivered_event_renders_once_and_dedupes_custom_message`: Child→Main / peer delivery is job activity exactly once, and the matching custom message stays off Main.
 
 MUST NOT appear: `<orchestration-message`, `Replying to message`.
 

@@ -28,10 +28,18 @@ binary="$here/../../../target/release-dist/rpi"
 
 # Depends are derived from the libraries the runtime actually links, mapped to
 # the packages this distribution ships them in (Ubuntu 24.04 names libasound2t64,
-# libgtk-3-0t64, ... rather than the pre-t64 names).
+# libgtk-3-0t64, ... rather than the pre-t64 names). A resolved path inside this
+# exact runtime directory is already packaged and is not a dpkg dependency.
 if [ -z "${DEPENDS:-}" ]; then
+  runtime_real="$(readlink -f "$runtime")"
   DEPENDS="$(ldd "$runtime/electron" | sed -n 's/^\s*[^ ]* => \(\/[^ ]*\).*/\1/p' | sort -u \
-    | while read -r lib; do dpkg-query -S "$(readlink -f "$lib")" 2>/dev/null | sed -n 's/:.*//p'; done \
+    | while read -r lib; do
+        resolved="$(readlink -f "$lib")" || exit
+        case "$resolved" in
+          "$runtime_real"/*) continue ;;
+        esac
+        dpkg-query -S "$resolved" | sed -n 's/:.*//p' || exit
+      done \
     | sort -u | grep -v '^firefox$' | tr '\n' ',' | sed 's/,$//; s/,/, /g')"
 fi
 depends="$DEPENDS"
@@ -71,7 +79,7 @@ chmod 0755 "$stage/usr/bin/rpi-desktop"
 cat > "$stage/usr/share/applications/rpi-desktop.desktop" <<'DESKTOP'
 [Desktop Entry]
 Type=Application
-Name=rpi desktop
+Name=rpi
 Comment=rpi listener web and chat client
 Exec=/usr/bin/rpi-desktop
 TryExec=/usr/bin/rpi-desktop

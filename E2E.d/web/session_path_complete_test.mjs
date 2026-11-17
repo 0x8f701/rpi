@@ -39,6 +39,7 @@ import { chromium } from 'playwright';
 import { writeFileSync } from 'node:fs';
 
 import { isAbsolute, relative as pathRelative, resolve as pathResolve } from 'node:path';
+import { clickFeature } from './lib/feature-menu.mjs';
 const url = process.env.RPI_URL;
 const token = process.env.RPI_TOKEN || '';
 const completionDir = process.env.RPI_COMPLETION_DIR || '';
@@ -402,7 +403,7 @@ async function main() {
       fail(`every socket attempt must offer exactly [rpi-auth.\u003ctoken\u003e]: ${JSON.stringify(sockets.offered)}`);
     }
 
-    await page.click('#session-toggle-btn');
+    await clickFeature(page, '#session-toggle-btn');
     await waitFor(page, () => document.getElementById('session-panel') !== null, 'session panel did not open');
     await waitFor(
       page,

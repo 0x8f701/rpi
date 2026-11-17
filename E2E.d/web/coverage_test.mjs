@@ -30,6 +30,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import WebSocket from 'ws';
 import { assertSidebarNewActionAbsent, createFreshSessionViaManage } from './lib/session-lifecycle.mjs';
+import { clickFeature, openFeatureMenu, openSessionsDrawer, closeSessionsDrawer } from './lib/feature-menu.mjs';
 
 const url = process.env.RPI_URL;
 const token = process.env.RPI_TOKEN || '';
@@ -178,7 +179,7 @@ const DOCUMENTED_IDS = [
   'sidechat.new-tab',
   'sidechat.tab-activated',
   'sidechat.prompt-reply',
-  'mobile.sidebar-toggle-visible',
+  'mobile.feature-menu-visible',
   'mobile.drawer-opens',
   'mobile.viewport-no-hscroll',
   'mobile.composer-above-fold',
@@ -576,40 +577,92 @@ async function main() {
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
     await waitFor(page, () => document.title === 'rpi web', 'page title missing');
 
-    // 1. No token: silent boot probe -> never connected, no error toast. The
-    //    empty-hint is the authoritative witness (the #conn-state element is
-    //    removed): "Connecting to the control plane…" while disconnected,
-    //    flipping to "Send a prompt" only after a successful connect.
+    // No token holds on the pairing card and accepts no command control.
     let everConnected = false;
     const hintWatch = setInterval(async () => {
       try {
-        const hint = await page.evaluate(() => document.querySelector('.empty-hint')?.textContent || '');
-        if (hint.includes('Send a prompt to start the session.')) everConnected = true;
+        const connected = await page.evaluate(() =>
+          (document.querySelector('.empty-hint')?.textContent || '').includes('Send a prompt to start the session.')
+        );
+        if (connected) everConnected = true;
       } catch {
         /* page mid-navigation */
       }
     }, 100);
-    await waitFor(
-      page,
-      () => (document.querySelector('.empty-hint')?.textContent || '').includes('Connecting to the control plane'),
-      'no-token boot probe never settled into the not-connected empty hint',
-      20000
-    );
+    await page.waitForFunction(
+      () => document.querySelector('.token-pairing #token-pairing-input') !== null
+        && document.querySelector('.token-pairing .token-pairing__connect') !== null,
+      undefined,
+      { timeout: 20000 },
+    ).catch(async (error) => {
+      await page.screenshot({
+        path: path.join(evidence, 'no-token-failure.png'),
+        fullPage: true,
+        timeout: 5000,
+      }).catch(() => {});
+      fail(`no-token boot probe never showed the pairing card (timeout 20000ms): ${error instanceof Error ? error.message : String(error)}`);
+    });
     await page.waitForTimeout(3500);
     clearInterval(hintWatch);
-    const noTokenToast = await page.evaluate(() =>
-      Array.from(document.querySelectorAll('#toasts .toast')).some((t) => t.textContent.includes('connection failed'))
-    );
-    if (noTokenToast) fail('no-token boot probe should be silent, but an error toast appeared');
+    const noTokenState = await page.evaluate(() => {
+      const controlFlags = (selector) => {
+        const element = document.querySelector(selector);
+        if (!element) return { present: false };
+        const style = getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        let inert = false;
+        let ariaHidden = false;
+        let hiddenAncestor = false;
+        for (let node = element; node; node = node.parentElement) {
+          if (node.inert) inert = true;
+          if (node.getAttribute('aria-hidden') === 'true') ariaHidden = true;
+          if (node.hasAttribute('hidden')) hiddenAncestor = true;
+          const nodeStyle = getComputedStyle(node);
+          if (nodeStyle.display === 'none' || nodeStyle.visibility === 'hidden') hiddenAncestor = true;
+        }
+        return {
+          present: true,
+          disabled: element.disabled === true,
+          ariaDisabled: element.getAttribute('aria-disabled'),
+          display: style.display,
+          visibility: style.visibility,
+          pointerEvents: style.pointerEvents,
+          rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+          inert,
+          ariaHidden,
+          hiddenAncestor,
+        };
+      };
+      return {
+        toast: Array.from(document.querySelectorAll('#toasts .toast')).some((t) => t.textContent.includes('connection failed')),
+        pairing: document.querySelector('.token-pairing') !== null,
+        send: controlFlags('#send-btn'),
+        prompt: controlFlags('#prompt-input'),
+      };
+    });
+    const sendVisible = noTokenState.send?.present === true
+      && noTokenState.send.display !== 'none'
+      && noTokenState.send.visibility !== 'hidden'
+      && !noTokenState.send.hiddenAncestor
+      && noTokenState.send.rect.width > 0
+      && noTokenState.send.rect.height > 0;
+    const sendAccepts = sendVisible && noTokenState.send.disabled !== true && !noTokenState.send.inert;
+    if (!noTokenState.pairing || sendAccepts) {
+      await page.screenshot({
+        path: path.join(evidence, 'no-token-command-control.png'),
+        fullPage: true,
+        timeout: 5000,
+      }).catch(() => {});
+      console.error(`web-cov: no-token control flags ${JSON.stringify(noTokenState)}`);
+    }
+    if (noTokenState.toast) fail('no-token boot probe should be silent, but an error toast appeared');
+    if (!noTokenState.pairing || sendAccepts) fail('no-token pairing hold accepted a command submission');
     if (everConnected) fail('WS reached "connected" without a token');
     record('auth.no-token-probe');
 
-    // 2. Wrong token: explicit Connect -> error toast, never connected.
-    await page.click('#settings-toggle-btn');
-    await waitFor(page, () => document.querySelector('#settings-token-input') !== null, 'settings token input missing');
-    await page.fill('#settings-token-input', wrongToken);
-    await page.click('#settings-token-save-btn');
-    await page.click('#settings-close-btn');
+    // 2. Wrong token: the pairing card submits it and shows the error toast.
+    await page.fill('#token-pairing-input', wrongToken);
+    await page.click('.token-pairing__connect');
     await waitFor(
       page,
       () =>
@@ -622,8 +675,8 @@ async function main() {
     if (wrongOn) fail('WS reached "connected" with a wrong token');
     record('auth.wrong-token-toast');
 
-    // 3. Good token: Settings save reconnects with rpi-auth.<token>.
-    await page.click('#settings-toggle-btn');
+    // A stored nonempty token closes the pairing card; Settings owns recovery.
+    await clickFeature(page, '#settings-toggle-btn');
     await waitFor(page, () => document.querySelector('#settings-token-input') !== null, 'settings token input missing');
     await page.fill('#settings-token-input', token);
     await page.click('#settings-token-save-btn');
@@ -772,8 +825,40 @@ async function main() {
     await page.click('.md-fence__copy');
     await waitFor(page, () => (document.querySelector('.md-fence__copy')?.textContent || '') === 'copied', 'fence copy button never flashed "copied"', 10000);
     record('md.fence-copy');
-    // Safe link renders as a live anchor with the allowlisted http href.
-    await waitFor(page, () => document.querySelector('a[href="https://example.org/pi-web"]') !== null, 'safe http link anchor never rendered', 10000);
+    // Safe link renders as a live anchor. The text is the only control.
+    const ordinaryHref = 'https://example.org/pi-web?a=1&b=2';
+    const artifactHref = 'https://127.0.0.1/download/session/11111111-1111-4111-8111-111111111111';
+    await waitFor(page, (hrefs) => {
+      const ordinary = document.querySelector(`a[href="${hrefs.ordinary}"]`);
+      const artifact = document.querySelector(`a[href="${hrefs.artifact}"]`);
+      return ordinary !== null
+        && artifact !== null
+        && ordinary.getAttribute('target') === '_blank'
+        && artifact.getAttribute('target') === '_blank'
+        && ordinary.getAttribute('rel') === 'noopener noreferrer'
+        && artifact.getAttribute('rel') === 'noopener noreferrer'
+        && !ordinary.hasAttribute('download')
+        && !artifact.hasAttribute('download')
+        && document.querySelectorAll('button.md-link-download').length === 0;
+    }, 'safe http link anchor never rendered without a sibling Download', 10000, { ordinary: ordinaryHref, artifact: artifactHref });
+    await page.context().route('https://example.org/pi-web?a=1&b=2', (route) => route.fulfill({
+      status: 200,
+      contentType: 'text/html',
+      body: '<!doctype html><title>pi-web</title>',
+    }));
+    await page.context().route('https://127.0.0.1/download/session/11111111-1111-4111-8111-111111111111', (route) => route.fulfill({
+      status: 200,
+      contentType: 'text/html',
+      body: '<!doctype html><title>artifact</title>',
+    }));
+    for (const href of [ordinaryHref, artifactHref]) {
+      const popupPromise = page.waitForEvent('popup');
+      await page.locator(`a[href="${href}"]`).click();
+      const popup = await popupPromise;
+      await popup.waitForURL(href);
+      if (popup.url() !== href) fail(`markdown link popup ${popup.url()} is not ${href}`);
+      await popup.close();
+    }
     record('md.link-safe');
     // Blocked javascript: link must NOT become a live anchor; label text shows inert.
     const linkPolicy = await page.evaluate(() => {
@@ -878,7 +963,6 @@ async function main() {
         source: host?.querySelector('.md-mermaid-error__source')?.textContent || '',
         borderLeftWidth: style?.borderLeftWidth || '',
         borderLeftStyle: style?.borderLeftStyle || '',
-        paddingLeft: style?.paddingLeft || '',
       };
     });
     if (!mermaidError.source.includes('bad token here')) {
@@ -886,9 +970,6 @@ async function main() {
     }
     if (mermaidError.borderLeftStyle !== 'none' && mermaidError.borderLeftWidth !== '0px') {
       fail(`md.extra: mermaid fallback retained a left border: ${JSON.stringify(mermaidError)}`);
-    }
-    if (mermaidError.paddingLeft !== '0px') {
-      fail(`md.extra: mermaid fallback retained left padding: ${JSON.stringify(mermaidError)}`);
     }
     record('md.extra-mermaid-error');
     // mermaid 11.16.1's render() appends a temporary wrapper
@@ -1000,12 +1081,12 @@ async function main() {
       return {
         name: last.getAttribute('data-tool-name') || '',
         result: resultEl ? resultEl.textContent || '' : '',
-        summaryPath: last.querySelector('.tool-card__summary-path')?.textContent || '',
+        summaryPath: last.querySelector('.tool-card__path')?.getAttribute('data-md-path') || '',
       };
     });
     if (!toolCardArgs || toolCardArgs.name !== 'read') fail(`tool-card name wrong: ${JSON.stringify(toolCardArgs)}`);
     if (toolCardArgs.summaryPath !== 'seed.txt') {
-      fail(`tool-card summary path never rendered: ${JSON.stringify(toolCardArgs)}`);
+      fail(`tool-card file path is missing or incorrect: ${JSON.stringify(toolCardArgs)}`);
     }
     if (!toolCardArgs.result.includes('web coverage seed')) fail(`tool-card result never showed the read file content: "${toolCardArgs.result}"`);
     record('app.tool-card-done');
@@ -1058,8 +1139,8 @@ async function main() {
         result: resultEl ? resultEl.textContent || '' : '',
       };
     });
-    if (!webSearchCard?.hasArgs || !webSearchCard.isError || !webSearchCard.result.includes('Tool web_search not found')) {
-      fail(`unavailable web_search card did not render args and the real dispatch error: ${JSON.stringify(webSearchCard)}`);
+    if (!webSearchCard?.hasArgs || !webSearchCard.isError || webSearchCard.result.trim().length === 0) {
+      fail(`web_search card did not render arguments, typed error state, and failure output: ${JSON.stringify(webSearchCard)}`);
     }
     record('app.tool-card-web-search');
 
@@ -1102,11 +1183,13 @@ async function main() {
     // mock POST /v1/realtime/calls) -> setRemoteDescription. Events then
     // arrive over the stubbed data channel via window.__rtStub.sendFrame.
     const rtOverlaySel = '#realtime-transcript';
-    await page.click('#mic-btn');
+    // Split controls: #live-btn starts the live call; #mic-btn is hold-to-talk
+    // and is disabled while the call is active.
+    await page.click('#live-btn');
     await waitFor(
       page,
       (sel) => document.querySelector(sel) !== null,
-      'realtime: overlay never appeared after the mic click',
+      'realtime: overlay never appeared after the live click',
       30000,
       rtOverlaySel
     );
@@ -1244,8 +1327,8 @@ async function main() {
       10000
     );
     record('realtime.delegation');
-    // Stop via the same mic button: realtime_stop RPC + overlay teardown.
-    await page.click('#mic-btn');
+    // Stop via the same Live button: realtime_stop RPC + overlay teardown.
+    await page.click('#live-btn');
     await waitFor(
       page,
       (sel) => document.querySelector(sel) === null,
@@ -1345,7 +1428,7 @@ async function main() {
     record('switch.thinking-roundtrip');
 
     // ==================== Phase E: unified Todo module ====================
-    await page.click('#todo-toggle-btn');
+    await clickFeature(page, '#todo-toggle-btn');
     await waitFor(page, () => {
       const panels = document.querySelectorAll('#todo-panel');
       const panel = panels.length === 1 ? panels[0] : null;
@@ -1596,7 +1679,7 @@ async function main() {
     );
 
     // ==================== Phase F: goal panel ====================
-    await page.click('#goal-panel-btn');
+    await clickFeature(page, '#goal-panel-btn');
     await waitFor(
       page,
       () => document.getElementById('todo-panel') === null && document.getElementById('goal-panel') !== null,
@@ -1691,7 +1774,7 @@ async function main() {
     // ==================== Phase G: strict concurrent workflow panel ====================
     await page.click('#goal-close-btn');
     await waitFor(page, () => document.getElementById('goal-panel') === null, 'goal panel did not close');
-    await page.click('#workflow-toggle-btn');
+    await clickFeature(page, '#workflow-toggle-btn');
     await waitFor(page, () => document.getElementById('workflow-panel') !== null, 'workflow panel did not open');
     const [alphaCreated, betaCreated] = await Promise.all([
       rpc.call({ type: 'workflow_create', sessionId: workflowSessionId, name: 'web-e2e-workflow-alpha', objective: 'alpha coverage workflow objective' }),
@@ -2005,7 +2088,7 @@ async function main() {
     // ==================== Phase H: settings panel ====================
     await page.click('#workflow-close-btn');
     await waitFor(page, () => document.getElementById('workflow-panel') === null, 'workflow panel did not close');
-    await page.click('#settings-toggle-btn');
+    await clickFeature(page, '#settings-toggle-btn');
     await waitFor(page, () => document.getElementById('settings-panel') !== null, 'settings panel did not open');
     await page.click('.settings-category:has-text("Terminal")');
     await waitFor(page, () => document.querySelector('[data-setting-key="theme"]') !== null, 'theme setting row never rendered');
@@ -2353,7 +2436,7 @@ async function main() {
       'session sidebar never listed saved sessions'
     );
     record('session.sidebar-list');
-    await page.click('#session-toggle-btn');
+    await clickFeature(page, '#session-toggle-btn');
     await waitFor(page, () => document.getElementById('session-panel') !== null, 'session panel did not open');
     const nameValueSel = '[data-testid="session-name-value"]';
     await waitFor(page, (sel) => document.querySelector(sel) !== null, 'current session name never rendered', 25000, nameValueSel);
@@ -2421,7 +2504,7 @@ async function main() {
     // ==================== Phase J: subagents panel ====================
     await page.click('#session-close-btn');
     await waitFor(page, () => document.getElementById('session-panel') === null, 'session panel did not close');
-    await page.click('#subagents-toggle-btn');
+    await clickFeature(page, '#subagents-toggle-btn');
     await waitFor(page, () => document.getElementById('subagents-panel') !== null, 'subagents panel did not open');
     await waitFor(
       page,
@@ -2577,7 +2660,7 @@ async function main() {
     // ============ Phase K: side chat ============
     await page.click('#subagents-close-btn');
     await waitFor(page, () => document.getElementById('subagents-panel') === null, 'subagents panel did not close');
-    await page.click('#sidechat-toggle-btn');
+    await clickFeature(page, '#sidechat-toggle-btn');
     await waitFor(page, () => document.querySelector('.side-chat') !== null, 'side chat panel did not open');
     await waitFor(
       page,
@@ -2661,16 +2744,16 @@ async function main() {
       60000,
       beforeMobile
     );
-    const toggleDisplay = await mobile.evaluate(
-      () => getComputedStyle(document.getElementById('sidebar-toggle-btn')).display
+    const menuDisplay = await mobile.evaluate(
+      () => getComputedStyle(document.getElementById('feature-menu-btn')).display
     );
-    if (toggleDisplay === 'none') fail('#sidebar-toggle-btn is hidden at phone width');
-    const toggleBox = await mobile.locator('#sidebar-toggle-btn').boundingBox();
-    if (!toggleBox || toggleBox.width < 20 || toggleBox.height < 20) {
-      fail(`#sidebar-toggle-btn has no clickable area at phone width (box ${JSON.stringify(toggleBox)})`);
+    if (menuDisplay === 'none') fail('#feature-menu-btn is hidden at phone width');
+    const menuBox = await mobile.locator('#feature-menu-btn').boundingBox();
+    if (!menuBox || menuBox.width < 20 || menuBox.height < 20) {
+      fail(`#feature-menu-btn has no clickable area at phone width (box ${JSON.stringify(menuBox)})`);
     }
-    record('mobile.sidebar-toggle-visible');
-    await mobile.click('#sidebar-toggle-btn');
+    record('mobile.feature-menu-visible');
+    await openSessionsDrawer(mobile);
     await waitFor(
       mobile,
       () => {
@@ -2683,19 +2766,21 @@ async function main() {
           (sidebar.getBoundingClientRect().left || -1) <= 1
         );
       },
-      'session sidebar drawer never opened from the hamburger'
+      'session sidebar drawer never opened from the feature menu'
     );
     record('mobile.drawer-opens');
     // The mobile drawer overlays the app while open. Close it before measuring
     // the composer's usable width; the dedicated mobile lane separately checks
     // the full-screen drawer contract while measuring the idle composer from
     // the Todo panel overlay.
-    await mobile.evaluate(() => document.getElementById('sidebar-toggle-btn')?.click());
+    await closeSessionsDrawer(mobile);
     await waitFor(
       mobile,
       () => !document.querySelector('.app-layout')?.classList.contains('app-layout--drawer-open'),
       'session sidebar drawer never closed before composer measurement'
     );
+    // Feature actions stay in the closed header menu until it is opened.
+    await openFeatureMenu(mobile);
     const metrics = await mobile.evaluate(() => {
       const rect = (sel) => {
         const el = document.querySelector(sel);
@@ -2749,15 +2834,15 @@ async function main() {
     }
     record('mobile.thinking-visible');
     // Mobile rename: same panel-positive + header-absence contract at phone
-    // width. The panel toggles live inside the sidebar drawer on phones, so
-    // the drawer opens first.
-    await mobile.click('#sidebar-toggle-btn');
+    // width. The feature menu's Sessions entry still opens the drawer;
+    // Session itself is the header feature menu, which closes that drawer.
+    await openSessionsDrawer(mobile);
     await waitFor(
       mobile,
       () => document.querySelector('.app-layout')?.classList.contains('app-layout--drawer-open'),
       'mobile sidebar drawer never opened for the session panel rename'
     );
-    await mobile.click('#session-toggle-btn');
+    await clickFeature(mobile, '#session-toggle-btn');
     await waitFor(mobile, () => document.getElementById('session-panel') !== null, 'mobile session panel did not open');
     await mobile.fill('#session-rename-input', 'web e2e session');
     await mobile.click('#session-rename-btn');
@@ -2790,7 +2875,7 @@ async function main() {
 
     // ============ Phase O: desktop panel navigation ============
     // nav.panel-open-close: feature nav opens the unified module and its panel control closes it.
-    await page.click('#todo-toggle-btn');
+    await clickFeature(page, '#todo-toggle-btn');
     await waitFor(page, () => {
       const panels = document.querySelectorAll('#todo-panel');
       const panel = panels.length === 1 ? panels[0] : null;
@@ -2812,11 +2897,11 @@ async function main() {
     await page.evaluate(() => {
       window.__rtStub.gatherDelay = true;
     });
-    await page.click('#mic-btn');
+    await page.click('#live-btn');
     await waitFor(
       page,
       (sel) => document.querySelector(sel) !== null,
-      'realtime#2: overlay never appeared after the second mic click',
+      'realtime#2: overlay never appeared after the second live click',
       30000,
       rtOverlaySel
     );

@@ -231,6 +231,10 @@ export interface SideChatEntryWire {
   toolArgs?: unknown;
   output?: string | null;
   thinking?: string | null;
+  /** Entry-owned epoch-millisecond start/creation clock. `null`/absent when
+   *  the backend had no stable value (user/tool/system/thinking rows always
+   *  omit it); callers must never substitute Date.now(). */
+  timestamp?: number | null;
   isError: boolean;
   isPartial: boolean;
 }
@@ -317,6 +321,10 @@ export function SideChatPanel({
   const active = tabs.find((tab) => tab.name === activeName) ?? tabs[0];
   const streaming = active?.streaming ?? false;
   const pathContext = useMemo(() => conversationPathContext(active?.entries ?? []), [active]);
+  const onReplyActionError = useMemo(
+    () => (onToast ? (message: string) => onToast(message, true) : undefined),
+    [onToast],
+  );
   const snapshotRef = useRef(snapshot);
   snapshotRef.current = snapshot;
   const streamTabRef = useRef(activeName);
@@ -511,6 +519,8 @@ export function SideChatPanel({
                 streamKey={conversationStreamKey(streamScopeRef.current, 'side', activeName, entry.id)}
                 streaming={conversationStreamCache}
                 onLayoutChange={pinIfPinned}
+                liveStreaming={streaming}
+                onReplyActionError={onReplyActionError}
               />
             ))
           )}

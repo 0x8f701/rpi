@@ -13,6 +13,7 @@ export type HostConnectionChipModel =
   | { kind: 'error'; text: string };
 
 export const HOST_TOKEN_REQUIRED_ERROR = 'This listener requires an access token.';
+export const HOST_CONNECTING_STATUS = 'Connecting…';
 export const HOST_RECONNECTING_STATUS = 'Reconnecting…';
 
 export function hostConnectionChip(
@@ -39,6 +40,9 @@ export function HostConnectionChip(props: {
   const model = hostConnectionChip(props.connState, props.stableError, props.streamStall === true);
   if (!model) return null;
   if (model.kind === 'pulse') {
+    const label = props.connState === 'connecting' && props.streamStall !== true
+      ? HOST_CONNECTING_STATUS
+      : HOST_RECONNECTING_STATUS;
     return (
       <span
         id="host-connection-chip"
@@ -46,7 +50,7 @@ export function HostConnectionChip(props: {
         data-state={props.connState}
         data-kind="pulse"
         role="status"
-        aria-label={HOST_RECONNECTING_STATUS}
+        aria-label={label}
       />
     );
   }

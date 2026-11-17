@@ -122,6 +122,9 @@ run_playwright() {
     # ESM bare-specifier resolution walks up from the script's directory, so
     # run the test from the install dir where node_modules lives.
     cp "$SCRIPT_DIR/goal_test.mjs" "$work/goal_test.mjs"
+    mkdir -p "$work/lib" || return 1
+    cp "$SCRIPT_DIR/lib/session-lifecycle.mjs" "$work/lib/session-lifecycle.mjs" || return 1
+    cp "$SCRIPT_DIR/lib/feature-menu.mjs" "$work/lib/feature-menu.mjs" || return 1
     # Hard-coverage mode: preload the V8 coverage hook (node --import) and
     # name payloads after this lane so step 6's payload check finds them.
     local -a node_preload=()

@@ -420,17 +420,14 @@ export function applyRestoredViewport(
   content: TranscriptContentRoot | null,
   state: ViewportState,
 ): void {
+  // Folds FIRST: fold open/close changes heights and must precede the anchor
+  // measurement, or the scroll lands drifted by the fold height delta.
+  applyOpenFoldKeys(content, state.openFoldKeys);
   if (!state.follow && transcript) {
     const anchor = restoredAnchorElement(content, state.anchorItemId);
     transcript.scrollTop = anchor
       ? transcript.scrollTop + anchor.getBoundingClientRect().top - transcript.getBoundingClientRect().top - state.anchorOffsetPx
       : state.fallbackScrollTop;
-  }
-  if (content) {
-    for (const details of Array.from(content.stampedFolds())) {
-      const key = details.getAttribute(TRANSCRIPT_FOLD_ATTRIBUTE);
-      details.open = key !== null && state.openFoldKeys.has(key);
-    }
   }
 }
 
@@ -447,6 +444,24 @@ export function restoredAnchorElement(
     if (child.getAttribute(TRANSCRIPT_ITEM_ATTRIBUTE) === anchorItemId) return child as TranscriptHitNode & TranscriptAnchorRect;
   }
   return null;
+}
+
+/** ONE id-rect correction: re-seat the anchor item at its recorded viewport
+ *  offset with at most one rect-diff scrollTop write. Fail-closed: a missing
+ *  surface or anchor (recycled out of the mounted window) writes nothing,
+ *  never a fallback scrollTop of 0. Runtime validation and fold-restore
+ *  order are the callers' contract. */
+export function compensateAnchorShapeShift(options: {
+  scroll: TranscriptScrollSurface | null;
+  content: TranscriptContentRoot | null;
+  anchorItemId: string | null;
+  anchorOffsetPx: number;
+}): number {
+  const anchor = restoredAnchorElement(options.content, options.anchorItemId);
+  if (!options.scroll || !anchor) return 0;
+  const deltaPx = anchor.getBoundingClientRect().top - options.scroll.getBoundingClientRect().top - options.anchorOffsetPx;
+  if (deltaPx !== 0) options.scroll.scrollTop += deltaPx;
+  return deltaPx;
 }
 
 /** Fixed per-surface DOM window bound; head/tail access is demand scroll, never auto-expansion. */

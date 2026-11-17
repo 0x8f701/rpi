@@ -24,6 +24,7 @@
 // reports counts and booleans to Node.
 
 import { chromium } from 'playwright';
+import { clickFeature } from './lib/feature-menu.mjs';
 
 const url = process.env.RPI_URL;
 const token = process.env.RPI_TOKEN || '';
@@ -87,7 +88,7 @@ const wsCounters = (page) => page.evaluate(() => ({ ...window.__rpiAuthWs }));
 async function ensureSettingsOpen(page, label) {
   const open = await page.evaluate(() => document.querySelector('#settings-token-input') !== null);
   if (!open) {
-    await page.click('#settings-toggle-btn');
+    await clickFeature(page, '#settings-toggle-btn');
     await waitFor(
       page,
       () => document.querySelector('#settings-token-input') !== null,

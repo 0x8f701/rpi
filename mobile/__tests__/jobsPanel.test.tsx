@@ -26,10 +26,24 @@ function defaults(command: Command): unknown {
     case 'job_cancel': return ok(command.type, {});
     case 'hub_send': return ok(command.type, { receipts: [{ to: command.to, outcome: 'delivered', messageId: 'sent' }] });
     case 'job_output': return output();
-    case 'agent_history': return ok(command.type, { agentId: command.agentId, text: 'History greeting' });
+    case 'agent_history': return ok(command.type, historyData(command.agentId, userHistory('History greeting')));
     default: return fail(command.type, 'unexpected command');
   }
 }
+
+/** Frozen `agent_history` wire data: structured rows plus the required
+ *  truncation account. */
+function historyData(agentId: unknown, messages: unknown[], truncation: Record<string, unknown> = { omittedRows: 0, reason: 'none' }) {
+  return { agentId, messages, truncation };
+}
+function historyRow(id: string, message: unknown) {
+  return { id, message };
+}
+function userHistory(text: string) {
+  return [historyRow('h1', { role: 'user', content: [{ type: 'text', text }] })];
+}
+const HISTORY_CALL = [{ sessionId: SESSION, command: { type: 'agent_history', agentId: 'a1', limit: 200 } }];
+
 function mockClient(handler: (command: Command, sessionId?: string) => unknown = defaults) {
   const calls: Call[] = [];
   let listener: ((frame: unknown) => void) | null = null;
@@ -55,7 +69,13 @@ async function withPanel(client: RunnerClient, onError: (message: string) => voi
 function labeled(tree: renderer.ReactTestRenderer, label: string) { return tree.root.findByProps({ accessibilityLabel: label }); }
 function hasLabel(tree: renderer.ReactTestRenderer, label: string) { return tree.root.findAllByProps({ accessibilityLabel: label }).length > 0; }
 function text(tree: renderer.ReactTestRenderer) {
-  return tree.root.findAllByType(Text).flatMap((node) => typeof node.props.children === 'string' ? [node.props.children] : []).join('\n');
+  const leaves = (value: unknown): string[] => {
+    if (typeof value === 'string') return [value];
+    if (typeof value === 'number') return [String(value)];
+    if (Array.isArray(value)) return value.flatMap(leaves);
+    return [];
+  };
+  return tree.root.findAllByType(Text).map((node) => leaves(React.Children.toArray(node.props.children)).join('')).join('\n');
 }
 async function press(tree: renderer.ReactTestRenderer, label: string) { await act(async () => { labeled(tree, label).props.onPress(); }); }
 async function type(tree: renderer.ReactTestRenderer, label: string, value: string) { await act(async () => { labeled(tree, label).props.onChangeText(value); }); }
@@ -163,6 +183,36 @@ it('filters all job statuses and stops live jobs with a session-scoped refresh',
   });
 });
 
+it('keeps cancelling live under Running with its own label, elapsed, and history poll', async () => {
+  jest.useFakeTimers();
+  jest.setSystemTime(10_000);
+  const CANCELLING = { ...LIVE, id: 'j3', description: 'Draining investigation', status: 'cancelling', createdAt: 4_000, startedAt: 4_000, finishedAt: null };
+  const { client, calls } = mockClient((command) => command.type === 'job_list'
+    ? list({ jobs: [LIVE, CANCELLING, { ...LIVE, id: 'done', status: 'cancelled', description: 'Settled cancel', finishedAt: 9_000 }] })
+    : command.type === 'agent_history' ? ok(command.type, historyData(command.agentId, [historyRow('h1', { role: 'user', content: [{ type: 'text', text: 'Still draining' }] })]))
+    : defaults(command));
+  try {
+    await withPanel(client, () => {}, async (tree) => {
+      expect(text(tree)).toContain('Draining investigation');
+      expect(text(tree)).toContain('Cancelling · 6s');
+      expect(text(tree)).toContain('running');
+      expect(text(tree)).not.toContain('\ncancelling');
+      expect(text(tree)).not.toContain('Settled cancel');
+      expect(hasLabel(tree, 'Stop j3')).toBe(true);
+      expect(hasLabel(tree, 'Stop j1')).toBe(true);
+      await press(tree, 'Details j3');
+      expect(text(tree)).toContain('Still draining');
+      await act(async () => { jest.advanceTimersByTime(2000); });
+      expect(callsOf(calls, 'agent_history')).toHaveLength(2);
+      await press(tree, 'Completed');
+      expect(text(tree)).not.toContain('Draining investigation');
+      expect(text(tree)).toContain('Settled cancel');
+      expect(text(tree)).toContain('cancelled');
+      expect(hasLabel(tree, 'Stop j3')).toBe(false);
+    });
+  } finally { jest.useRealTimers(); }
+});
+
 it('holds Stop across rows until the pending cancellation settles', async () => {
   const pending = deferred();
   const { client, calls } = mockClient((command) => command.type === 'job_list' ? list({ jobs: [LIVE, QUEUED] }) : command.type === 'job_cancel' ? pending.promise : defaults(command));
@@ -239,12 +289,18 @@ it('prevents overlapping output requests and reports invalid snapshots', async (
 
 it.each(['running', 'queued'])('loads and redacts %s history, polls every two seconds, and stops when hidden', async (status) => {
   jest.useFakeTimers();
-  const { client, calls } = mockClient((command) => command.type === 'job_list' ? list({ jobs: [{ ...LIVE, status }] }) : command.type === 'agent_history' ? ok(command.type, { agentId: command.agentId, text: `History ${SECRET}` }) : defaults(command));
+  const { client, calls } = mockClient((command) => command.type === 'job_list'
+    ? list({ jobs: [{ ...LIVE, status }] })
+    : command.type === 'agent_history'
+      ? ok(command.type, historyData(command.agentId, [historyRow('h1', { role: 'user', content: [{ type: 'text', text: `History ${SECRET}` }] })]))
+      : defaults(command));
   try {
     await withPanel(client, () => {}, async (tree) => {
       await press(tree, 'Details j1');
-      expect(labeled(tree, 'History j1').props.children).toBe('History [REDACTED]');
-      expect(callsOf(calls, 'agent_history')).toEqual([{ sessionId: SESSION, command: { type: 'agent_history', agentId: 'a1', lines: 200 } }]);
+      expect(hasLabel(tree, 'History j1')).toBe(true);
+      expect(text(tree)).toContain('[REDACTED]');
+      expect(text(tree)).not.toContain(SECRET);
+      expect(callsOf(calls, 'agent_history')).toEqual([{ sessionId: SESSION, command: { type: 'agent_history', agentId: 'a1', limit: 200 } }]);
       await act(async () => { jest.advanceTimersByTime(1999); });
       expect(callsOf(calls, 'agent_history')).toHaveLength(1);
       await act(async () => { jest.advanceTimersByTime(1); });
@@ -259,18 +315,20 @@ it.each(['running', 'queued'])('loads and redacts %s history, polls every two se
   } finally { jest.useRealTimers(); }
 });
 
-it('shows the selected details history past the legacy 800-char slice with a redacted end marker and an unclamped title', async () => {
-  const history = `${'x'.repeat(900)} ${SECRET} HISTORY-END`;
+it('renders the details transcript through the shared item renderer past the legacy 800-char slice', async () => {
+  const body = `${'x'.repeat(900)} ${SECRET} HISTORY-END`;
   const description = `${'d'.repeat(400)} DESCRIPTION-TAIL`;
   const { client, calls } = mockClient((command) => command.type === 'job_list'
     ? list({ jobs: [{ ...LIVE, description }] })
-    : command.type === 'agent_history' ? ok(command.type, { agentId: command.agentId, text: history }) : defaults(command));
+    : command.type === 'agent_history'
+      ? ok(command.type, historyData(command.agentId, [historyRow('h1', { role: 'user', content: [{ type: 'text', text: body }] })]))
+      : defaults(command));
   await withPanel(client, () => {}, async (tree) => {
     await press(tree, 'Details j1');
-    expect(callsOf(calls, 'agent_history')).toEqual([{ sessionId: SESSION, command: { type: 'agent_history', agentId: 'a1', lines: 200 } }]);
-    const historyText = labeled(tree, 'History j1').props.children as string;
+    expect(callsOf(calls, 'agent_history')).toEqual([{ sessionId: SESSION, command: { type: 'agent_history', agentId: 'a1', limit: 200 } }]);
+    const historyText = text(tree);
     expect(historyText.length).toBeGreaterThan(800);
-    expect(historyText.endsWith('HISTORY-END')).toBe(true);
+    expect(historyText).toContain('HISTORY-END');
     expect(historyText).toContain('[REDACTED]');
     expect(historyText).not.toContain(SECRET);
     const title = tree.root.findAllByType(Text).find((node) => node.props.children === description);
@@ -279,10 +337,71 @@ it('shows the selected details history past the legacy 800-char slice with a red
   });
 });
 
+it('pairs tool results to their calls, shows bash and orphan results read-only, through TranscriptItemView', async () => {
+  const { client } = mockClient((command) => command.type === 'job_list'
+    ? list({ jobs: [LIVE] })
+    : command.type === 'agent_history'
+      ? ok(command.type, historyData('a1', [
+        historyRow('h1', { role: 'assistant', content: [
+          { type: 'thinking', thinking: 'plan the sweep' },
+          { type: 'toolCall', id: 'call-1', name: 'bash', arguments: { cmd: 'ls' } },
+        ] }),
+        historyRow('h2', { role: 'toolResult', toolCallId: 'call-1', toolName: 'bash', content: [{ type: 'text', text: 'paired result' }], isError: false }),
+        historyRow('h3', { role: 'bashExecution', command: 'git status', output: 'clean', exitCode: 0, cancelled: false }),
+        historyRow('h4', { role: 'toolResult', toolCallId: 'call-gone', toolName: 'grep', content: [{ type: 'text', text: 'orphan output' }], isError: false }),
+      ]))
+      : defaults(command));
+  await withPanel(client, () => {}, async (tree) => {
+    await press(tree, 'Details j1');
+    // The toolCall/toolResult pair renders as ONE tool card keyed by
+    // toolCallId, the bash row as a bash card.
+    expect(hasLabel(tree, 'Tool bash')).toBe(true);
+    expect(hasLabel(tree, 'Bash')).toBe(true);
+    expect(text(tree)).toContain('paired result');
+    expect(text(tree)).toContain('git status');
+    expect(text(tree)).toContain('clean');
+    // A result whose call fell outside the loaded suffix is a read-only
+    // notice, never a silently dropped row or a forever-running card.
+    expect(text(tree)).toContain('orphan output');
+    expect(text(tree)).toContain('grep result without its call in the loaded history');
+  });
+});
+
+it('shows the truncation account, including a transcript that is entirely over the size budget', async () => {
+  const { client } = mockClient((command) => command.type === 'job_list'
+    ? list({ jobs: [{ ...LIVE, status: 'completed' }] })
+    : command.type === 'agent_history'
+      ? ok(command.type, historyData('a1', [], { omittedRows: 9, reason: 'bytes' }))
+      : defaults(command));
+  await withPanel(client, () => {}, async (tree) => {
+    await press(tree, 'Completed');
+    await press(tree, 'Details j1');
+    expect(text(tree)).toContain('Messages exceed the history size limit');
+    expect(text(tree)).toContain('9 messages withheld');
+  });
+});
+
+it('names limit truncation above the rendered transcript rows', async () => {
+  const { client } = mockClient((command) => command.type === 'job_list'
+    ? list({ jobs: [LIVE] })
+    : command.type === 'agent_history'
+      ? ok(command.type, historyData('a1', [historyRow('h1', { role: 'user', content: [{ type: 'text', text: 'recent turn' }] })], { omittedRows: 3, reason: 'limit' }))
+      : defaults(command));
+  await withPanel(client, () => {}, async (tree) => {
+    await press(tree, 'Details j1');
+    expect(text(tree)).toContain('3 messages omitted by the history limit');
+    expect(text(tree)).toContain('recent turn');
+  });
+});
+
 it('rejects history for a different agent and does not poll completed jobs', async () => {
   jest.useFakeTimers();
   const errors: string[] = [];
-  const { client, calls } = mockClient((command) => command.type === 'job_list' ? list({ jobs: [{ ...LIVE, status: 'completed' }] }) : command.type === 'agent_history' ? ok(command.type, { agentId: 'wrong', text: 'Wrong history' }) : defaults(command));
+  const { client, calls } = mockClient((command) => command.type === 'job_list'
+    ? list({ jobs: [{ ...LIVE, status: 'completed' }] })
+    : command.type === 'agent_history'
+      ? ok(command.type, historyData('wrong', [historyRow('h1', { role: 'user', content: [{ type: 'text', text: 'Wrong history' }] })]))
+      : defaults(command));
   try {
     await withPanel(client, (message) => errors.push(message), async (tree) => {
       await press(tree, 'Completed');
@@ -294,6 +413,26 @@ it('rejects history for a different agent and does not poll completed jobs', asy
     });
   } finally { jest.useRealTimers(); }
 });
+
+it('reports a malformed history payload instead of rendering a half-valid transcript', async () => {
+  const errors: string[] = [];
+  jest.useFakeTimers();
+  const { client, calls } = mockClient((command) => command.type === 'job_list'
+    ? list({ jobs: [{ ...LIVE, status: 'completed' }] })
+    : command.type === 'agent_history'
+      ? ok(command.type, { agentId: 'a1', messages: [{ id: 'h1' }], truncation: { omittedRows: 0, reason: 'none' } })
+      : defaults(command));
+  try {
+    await withPanel(client, (message) => errors.push(message), async (tree) => {
+      await press(tree, 'Completed');
+      await press(tree, 'Details j1');
+      expect(errors).toEqual(['History: invalid agent_history']);
+      await act(async () => { jest.advanceTimersByTime(6000); });
+      expect(callsOf(calls, 'agent_history')).toHaveLength(1);
+    });
+  } finally { jest.useRealTimers(); }
+});
+
 
 it('shows mailbox messages, redacts secrets, and deduplicates only matching-session deliveries', async () => {
   const { client, emit } = mockClient();

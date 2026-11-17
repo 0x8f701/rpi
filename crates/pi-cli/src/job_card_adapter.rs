@@ -61,6 +61,10 @@ pub struct JobEventLogEntry {
     pub kind: JobEventKind,
     /// Bounded and credential-redacted display text.
     pub text: String,
+    /// Authoritative mailbox id for a delivered message. Lifecycle events
+    /// have none. A repeat of the same id is the same event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
 }
 
 /// Live per-subagent progress projected from the latest orchestration events.
@@ -141,8 +145,27 @@ struct ProjectedJob {
 }
 
 impl ProjectedJob {
-    fn push_event(&mut self, at: u64, kind: JobEventKind, text: String) {
-        self.events.push(JobEventLogEntry { at, kind, text });
+    fn push_event(
+        &mut self,
+        at: u64,
+        kind: JobEventKind,
+        text: String,
+        message_id: Option<String>,
+    ) {
+        if let Some(message_id) = message_id.as_deref()
+            && self
+                .events
+                .iter()
+                .any(|event| event.message_id.as_deref() == Some(message_id))
+        {
+            return;
+        }
+        self.events.push(JobEventLogEntry {
+            at,
+            kind,
+            text,
+            message_id,
+        });
         if self.events.len() > MAX_JOB_EVENT_LOG {
             let excess = self.events.len() - MAX_JOB_EVENT_LOG;
             self.events.drain(..excess);
@@ -204,13 +227,26 @@ impl JobCardPresentationAdapter {
             .values_mut()
             .filter(|job| job.snapshot.agent_id == message.from)
             .max_by_key(|job| match job.snapshot.status {
+                JobStatus::Cancelling => 3,
                 JobStatus::Running => 2,
                 JobStatus::Queued => 1,
                 JobStatus::Completed | JobStatus::Failed | JobStatus::Cancelled => 0,
             });
         if let Some(job) = candidate {
+            if job
+                .events
+                .iter()
+                .any(|event| event.message_id.as_deref() == Some(message.id.as_str()))
+            {
+                return;
+            }
             let text = bounded_redacted(&message.body, MAX_ACTIVITY_CHARS);
-            job.push_event(message.timestamp, JobEventKind::Message, text.clone());
+            job.push_event(
+                message.timestamp,
+                JobEventKind::Message,
+                text.clone(),
+                Some(message.id.clone()),
+            );
             job.activity = Some(text);
             job.activity_at = Some(message.timestamp);
         }
@@ -388,6 +424,7 @@ impl JobCardPresentationAdapter {
         }
         let mut queued = 0usize;
         let mut running = 0usize;
+        let mut cancelling = 0usize;
         let mut parked = 0usize;
         let mut completed = 0usize;
         let mut failed = 0usize;
@@ -396,6 +433,7 @@ impl JobCardPresentationAdapter {
             match job.snapshot.status {
                 JobStatus::Queued => queued += 1,
                 JobStatus::Running => running += 1,
+                JobStatus::Cancelling => cancelling += 1,
                 JobStatus::Completed => completed += 1,
                 JobStatus::Failed => failed += 1,
                 JobStatus::Cancelled => cancelled += 1,
@@ -411,6 +449,7 @@ impl JobCardPresentationAdapter {
         let mut parts = Vec::new();
         for (count, label) in [
             (running, "running"),
+            (cancelling, "cancelling"),
             (queued, "queued"),
             (parked, "parked"),
             (completed, "completed"),
@@ -432,7 +471,7 @@ impl JobCardPresentationAdapter {
     pub fn running_count(&self) -> usize {
         self.jobs
             .values()
-            .filter(|job| matches!(job.snapshot.status, JobStatus::Queued | JobStatus::Running))
+            .filter(|job| !job.snapshot.status.is_settled())
             .count()
     }
 
@@ -455,9 +494,25 @@ impl JobCardPresentationAdapter {
     fn upsert_job(&mut self, snapshot: JobSnapshot) {
         let agent = self.agents.get(&snapshot.agent_id).cloned();
         if let Some(job) = self.jobs.get_mut(&snapshot.id) {
+            // A single-broadcast FIFO does not imply mutation order: a late
+            // publish can replay an earlier snapshot of a job already settled
+            // or cancelled here. Job lifecycle is monotonic per id: the
+            // authority never reopens a settled job and never moves a
+            // `Cancelling` job back to `Queued`/`Running`, so both keep their
+            // committed status. Settled → settled still applies, so updated
+            // terminal results/details are never dropped.
+            if (job.snapshot.status.is_settled() && !snapshot.status.is_settled())
+                || (job.snapshot.status == JobStatus::Cancelling
+                    && matches!(snapshot.status, JobStatus::Queued | JobStatus::Running))
+            {
+                if agent.is_some() {
+                    job.agent = agent;
+                }
+                return;
+            }
             if job.snapshot.status != snapshot.status {
                 let (at, text) = transition_event(&job.snapshot, &snapshot);
-                job.push_event(at, JobEventKind::Job, text);
+                job.push_event(at, JobEventKind::Job, text, None);
             }
             job.snapshot = snapshot;
             if agent.is_some() {
@@ -473,6 +528,7 @@ impl JobCardPresentationAdapter {
                 at,
                 kind: JobEventKind::Job,
                 text,
+                message_id: None,
             });
         }
         self.jobs.insert(
@@ -556,7 +612,7 @@ fn card_rows(job: &ProjectedJob, now: u64) -> JobCardRows {
             bounded_redacted(description, MAX_DESCRIPTION_CHARS),
         ));
     }
-    if matches!(snapshot.status, JobStatus::Queued | JobStatus::Running) {
+    if !snapshot.status.is_settled() {
         // Live one-liner for active jobs: `read tools.rs · 12s`, falling back
         // to the coarse `running · 12s` / `queued` when no detail arrived yet.
         rows.push(row(
@@ -638,6 +694,7 @@ pub(crate) fn job_status_label(status: JobStatus) -> &'static str {
     match status {
         JobStatus::Queued => "queued",
         JobStatus::Running => "running",
+        JobStatus::Cancelling => "Cancelling",
         JobStatus::Completed => "completed",
         JobStatus::Failed => "failed",
         JobStatus::Cancelled => "cancelled",
@@ -702,7 +759,7 @@ pub(crate) fn progress_row_text(progress: &JobCardProgress) -> String {
 /// settled runtime (`finished - started`) otherwise.
 fn elapsed_ms(snapshot: &JobSnapshot, now: u64) -> Option<u64> {
     match snapshot.status {
-        JobStatus::Queued | JobStatus::Running => {
+        JobStatus::Queued | JobStatus::Running | JobStatus::Cancelling => {
             if now == 0 {
                 return None;
             }
@@ -726,6 +783,7 @@ fn initial_event(snapshot: &JobSnapshot) -> Option<(u64, String)> {
     let text = match snapshot.status {
         JobStatus::Queued => "queued".to_owned(),
         JobStatus::Running => "started".to_owned(),
+        JobStatus::Cancelling => "cancelling".to_owned(),
         JobStatus::Completed => "completed".to_owned(),
         JobStatus::Failed => failure_text(snapshot),
         JobStatus::Cancelled => "cancelled".to_owned(),
@@ -743,6 +801,7 @@ fn transition_event(before: &JobSnapshot, after: &JobSnapshot) -> (u64, String) 
         (_, JobStatus::Queued) => "queued".to_owned(),
         (JobStatus::Queued, JobStatus::Running) => "started".to_owned(),
         (_, JobStatus::Running) => "running".to_owned(),
+        (_, JobStatus::Cancelling) => "cancelling".to_owned(),
         (_, JobStatus::Completed) => "completed".to_owned(),
         (_, JobStatus::Failed) => failure_text(after),
         (_, JobStatus::Cancelled) => "cancelled".to_owned(),
@@ -839,6 +898,7 @@ mod tests {
             created_at: 1_000,
             started_at: None,
             finished_at: None,
+            cancellation_cause: None,
             result: None,
             soft_budget_exhausted: false,
         }
@@ -916,6 +976,109 @@ mod tests {
                 .iter()
                 .any(|row| row.text.contains("runtime 1s"))
         );
+    }
+
+    #[test]
+    fn settled_job_never_reopens_on_late_nonterminal_snapshot() {
+        let mut adapter = JobCardPresentationAdapter::new();
+        let mut running = job("job-1", "Child", JobStatus::Running);
+        running.started_at = Some(1_100);
+        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated {
+            group_id: "group".to_owned(),
+            job: running.clone(),
+        });
+        let mut completed = running.clone();
+        completed.status = JobStatus::Completed;
+        completed.finished_at = Some(2_100);
+        completed.result = Some(result("Child", "done", None));
+        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated {
+            group_id: "group".to_owned(),
+            job: completed,
+        });
+        assert_eq!(
+            adapter.cards_in_source_order()[0].job_status,
+            JobStatus::Completed
+        );
+
+        // Late pre-terminal publishes for the same id must not reopen the
+        // settled lifecycle, and must not drop the terminal result.
+        for stale in [
+            running,
+            job("job-1", "Child", JobStatus::Queued),
+            job("job-1", "Child", JobStatus::Running),
+        ] {
+            adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated {
+                group_id: "group".to_owned(),
+                job: stale,
+            });
+            let cards = adapter.cards_in_source_order();
+            assert_eq!(cards.len(), 1);
+            assert_eq!(cards[0].job_status, JobStatus::Completed);
+            assert!(cards[0].rows.iter().any(|row| row.text == "done"));
+        }
+        let cards = adapter.cards_in_source_order();
+        let progress = cards[0].progress.as_ref().expect("progress");
+        assert_eq!(
+            progress
+                .events
+                .iter()
+                .map(|entry| entry.text.as_str())
+                .collect::<Vec<_>>(),
+            ["started", "completed"]
+        );
+
+        // Settled → settled still applies: terminal details update in place.
+        let mut updated = job("job-1", "Child", JobStatus::Completed);
+        updated.started_at = Some(1_100);
+        updated.finished_at = Some(2_100);
+        updated.result = Some(result("Child", "refined", None));
+        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated {
+            group_id: "group".to_owned(),
+            job: updated,
+        });
+        let cards = adapter.cards_in_source_order();
+        assert_eq!(cards[0].job_status, JobStatus::Completed);
+        assert!(cards[0].rows.iter().any(|row| row.text == "refined"));
+        assert!(!cards[0].rows.iter().any(|row| row.text == "done"));
+
+        // A `Cancelling` job never regresses to `Queued`/`Running`: the
+        // authority only moves it forward to a terminal status, so a late
+        // pre-cancel publish must be ignored.
+        let mut cancelling = job("job-2", "Child", JobStatus::Running);
+        cancelling.started_at = Some(1_100);
+        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated {
+            group_id: "group".to_owned(),
+            job: cancelling.clone(),
+        });
+        cancelling.status = JobStatus::Cancelling;
+        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated {
+            group_id: "group".to_owned(),
+            job: cancelling,
+        });
+        for stale in [
+            job("job-2", "Child", JobStatus::Queued),
+            job("job-2", "Child", JobStatus::Running),
+        ] {
+            adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated {
+                group_id: "group".to_owned(),
+                job: stale,
+            });
+            assert_eq!(
+                adapter.cards_in_source_order()[1].job_status,
+                JobStatus::Cancelling
+            );
+        }
+        // `Cancelling` → `Cancelled` (or any terminal) still applies.
+        let mut settled = job("job-2", "Child", JobStatus::Cancelled);
+        settled.started_at = Some(1_100);
+        settled.finished_at = Some(2_200);
+        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated {
+            group_id: "group".to_owned(),
+            job: settled,
+        });
+        let cards = adapter.cards_in_source_order();
+        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[1].job_status, JobStatus::Cancelled);
     }
 
     #[test]

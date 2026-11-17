@@ -45,7 +45,7 @@ fn make_session(
     let cwd_path = cwd.path().to_path_buf();
     std::mem::forget(cwd);
     let session = Session::new(SessionOptions {
-        model,
+        model: Some(model),
         cwd: cwd_path,
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,
@@ -286,7 +286,7 @@ fn dropped_run_survives_owning_runtime_shutdown_and_session_reuses() {
     };
     let cwd = tempfile::tempdir().expect("tempdir");
     let session = Session::new(SessionOptions {
-        model,
+        model: Some(model),
         cwd: cwd.path().to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,
@@ -511,7 +511,7 @@ async fn hidden_custom_message_reaches_provider_as_user_but_stays_typed_in_histo
     model.provider = "test".into();
     let cwd = tempfile::tempdir().expect("cwd");
     let session = Session::new(SessionOptions {
-        model,
+        model: Some(model),
         cwd: cwd.path().to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,
@@ -838,7 +838,7 @@ async fn resolved_auth_stays_request_scoped_and_out_of_model_serialization() {
     };
     let cwd = tempfile::tempdir().expect("tempdir");
     let session = Session::new(SessionOptions {
-        model: Model::default(),
+        model: Some(Model::default()),
         cwd: cwd.path().to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,

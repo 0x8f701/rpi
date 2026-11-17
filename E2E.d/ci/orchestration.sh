@@ -104,57 +104,59 @@ run_orchestration_rust() {
         # Source-backed contracts only (post-FF0F todo_dag_execution surface).
         printf 'todo_lifecycle_contracts=ready_roots_overlap,todo_task_id_completion,failed_cancelled_open\n'
 
+        # `||` below disables errexit for this group. Each gate must
+        # propagate its own nonzero status or a later success masks it.
         # Exact NL agent mention → Subagents job cards; skill-only does not spawn.
-        (cd "$REPO_ROOT" && run_with_timeout 300 "${CARGO_E2E[@]}" test --release -p pi-cli --test nl_exact_agent_spawn --locked -- --nocapture)
+        (cd "$REPO_ROOT" && run_with_timeout 300 "${CARGO_E2E[@]}" test --release -p pi-cli --test nl_exact_agent_spawn --locked -- --nocapture) || exit $?
 
         # Routing contracts: Have researcher vs Use research.
-        (cd "$REPO_ROOT" && run_with_timeout 300 "${CARGO_E2E[@]}" test --release -p pi-coding --test routing_contracts --locked -- --nocapture)
+        (cd "$REPO_ROOT" && run_with_timeout 300 "${CARGO_E2E[@]}" test --release -p pi-coding --test routing_contracts --locked -- --nocapture) || exit $?
 
         # Todo tool DAG lifecycle (readiness / waitingOn projection).
-        (cd "$REPO_ROOT" && run_with_timeout 300 "${CARGO_E2E[@]}" test --release -p pi-coding --test todo_dag_lifecycle --locked -- --nocapture)
+        (cd "$REPO_ROOT" && run_with_timeout 300 "${CARGO_E2E[@]}" test --release -p pi-coding --test todo_dag_lifecycle --locked -- --nocapture) || exit $?
 
         # ---- Authoritative Todo DAG coordinator (existing tests only; fail closed) ----
         # Full binary first so additions are never silently dropped from CI.
-        (cd "$REPO_ROOT" && run_with_timeout 360 "${CARGO_E2E[@]}" test --release -p pi-coding --test todo_dag_execution --locked -- --nocapture)
+        (cd "$REPO_ROOT" && run_with_timeout 360 "${CARGO_E2E[@]}" test --release -p pi-coding --test todo_dag_execution --locked -- --nocapture) || exit $?
 
         # 1) Multiple ready roots overlap; join waits; exact todoTaskId ownership/completion.
         (cd "$REPO_ROOT" && run_with_timeout 300 "${CARGO_E2E[@]}" test --release -p pi-coding --test todo_dag_execution \
-            two_ready_roots_overlap_and_join_waits_for_both_before_three_of_three --locked -- --nocapture)
+            two_ready_roots_overlap_and_join_waits_for_both_before_three_of_three --locked -- --nocapture) || exit $?
 
         # 2) Failed/cancelled owners leave tasks open; reconcile idempotent; Failed status.
         (cd "$REPO_ROOT" && run_with_timeout 300 "${CARGO_E2E[@]}" test --release -p pi-coding --test todo_dag_execution \
-            failed_and_cancelled_owners_stay_open_and_terminal_reconciliation_is_idempotent --locked -- --nocapture)
+            failed_and_cancelled_owners_stay_open_and_terminal_reconciliation_is_idempotent --locked -- --nocapture) || exit $?
 
         # Goal details formatter (Objective/Status/Tokens/Time).
-        (cd "$REPO_ROOT" && run_with_timeout 240 "${CARGO_E2E[@]}" test --release -p pi-cli formats_empty_goal_details_for_overlay --locked -- --nocapture)
+        (cd "$REPO_ROOT" && run_with_timeout 240 "${CARGO_E2E[@]}" test --release -p pi-cli formats_empty_goal_details_for_overlay --locked -- --nocapture) || exit $?
 
         # IRC presentation both directions: named sender→recipient, separate body,
         # no raw XML (human renderer + TUI MessageDelivered path).
-        (cd "$REPO_ROOT" && run_with_timeout 240 "${CARGO_E2E[@]}" test --release -p pi-cli orchestration_irc_renders_named_label_body_reply --locked -- --nocapture)
-        (cd "$REPO_ROOT" && run_with_timeout 240 "${CARGO_E2E[@]}" test --release -p pi-cli message_delivered_event_renders_once_and_dedupes_custom_message --locked -- --nocapture)
+        (cd "$REPO_ROOT" && run_with_timeout 240 "${CARGO_E2E[@]}" test --release -p pi-cli orchestration_irc_renders_named_label_body_reply --locked -- --nocapture) || exit $?
+        (cd "$REPO_ROOT" && run_with_timeout 240 "${CARGO_E2E[@]}" test --release -p pi-cli message_delivered_event_renders_once_and_dedupes_custom_message --locked -- --nocapture) || exit $?
 
         # Runtime bidirectional IRC while supervised (Main↔child / peer).
-        (cd "$REPO_ROOT" && run_with_timeout 300 "${CARGO_E2E[@]}" test --release -p pi-coding --test orchestration_supervision main_supervises_two_children_with_irc --locked -- --nocapture)
+        (cd "$REPO_ROOT" && run_with_timeout 300 "${CARGO_E2E[@]}" test --release -p pi-coding --test orchestration_supervision main_supervises_two_children_with_irc --locked -- --nocapture) || exit $?
 
         # Authoritative real task + identity-bound child hub AgentTool chain.
         (cd "$REPO_ROOT" && run_with_timeout 300 "${CARGO_E2E[@]}" test --release -p pi-coding --test orchestration \
-            real_task_children_route_main_alpha_beta_main_through_owned_hub_tools --locked -- --nocapture)
+            real_task_children_route_main_alpha_beta_main_through_owned_hub_tools --locked -- --nocapture) || exit $?
 
         # Durable orchestration records and application authority resume from
         # validated policy and credential-registry snapshots. Whole targets are
         # fail-closed so newly added schema/reconstruction cases stay covered.
-        (cd "$REPO_ROOT" && run_with_timeout 360 "${CARGO_E2E[@]}" test --release -p pi-coding --test durable_orchestration_e2e --locked -- --nocapture)
-        (cd "$REPO_ROOT" && run_with_timeout 360 "${CARGO_E2E[@]}" test --release -p pi-coding --test application_generation --locked -- --nocapture)
+        (cd "$REPO_ROOT" && run_with_timeout 360 "${CARGO_E2E[@]}" test --release -p pi-coding --test durable_orchestration_e2e --locked -- --nocapture) || exit $?
+        (cd "$REPO_ROOT" && run_with_timeout 360 "${CARGO_E2E[@]}" test --release -p pi-coding --test application_generation --locked -- --nocapture) || exit $?
 
         # Image placeholder [Image #N, WIDTHxHEIGHT].
-        (cd "$REPO_ROOT" && run_with_timeout 240 "${CARGO_E2E[@]}" test --release -p pi-cli clipboard_png_fixture_attaches_one_image --locked -- --nocapture)
+        (cd "$REPO_ROOT" && run_with_timeout 240 "${CARGO_E2E[@]}" test --release -p pi-cli clipboard_png_fixture_attaches_one_image --locked -- --nocapture) || exit $?
 
         # Stale Todo panel after tree/fork/keyboard-new: replace_transcript must
         # refresh todo_phases from the application (not leave prior DAG chrome).
-        (cd "$REPO_ROOT" && run_with_timeout 240 "${CARGO_E2E[@]}" test --release -p pi-cli replace_transcript_refreshes_todo_phases_from_application --locked -- --nocapture)
+        (cd "$REPO_ROOT" && run_with_timeout 240 "${CARGO_E2E[@]}" test --release -p pi-cli replace_transcript_refreshes_todo_phases_from_application --locked -- --nocapture) || exit $?
 
         # Supervised process /ps PTY (unix-only module).
-        (cd "$REPO_ROOT" && run_with_timeout 300 "${CARGO_E2E[@]}" test --release -p pi-cli --test process_ps_pty --locked -- --nocapture)
+        (cd "$REPO_ROOT" && run_with_timeout 300 "${CARGO_E2E[@]}" test --release -p pi-cli --test process_ps_pty --locked -- --nocapture) || exit $?
     } >"$logf" 2>&1 || {
         tail -n 200 "$logf" >&2 || true
         fail "orchestration.rust cargo +1.88.0 gates failed (see $logf)"

@@ -25,6 +25,8 @@ import {
   type TransportTimerHandle,
 } from '../src/reconnect';
 import { RunnerClient } from '../src/runnerClient';
+import { RunnerDisconnectedError } from '../src/transportError';
+import { AppState } from 'react-native';
 
 const ENDPOINT = { origin: 'http://runner.local', authority: 'runner.local', webSocketUrl: 'ws://runner.local/ws' };
 
@@ -553,5 +555,151 @@ describe('reconnect backoff', () => {
     third.onclose?.({ code: 1006, reason: 'lost' });
     jest.advanceTimersByTime(RUNNER_RECONNECT_INITIAL_MS);
     expect(FakeSocket.instances).toHaveLength(4);
+  });
+});
+
+/** The client's own AppState listener, recorded by the RN jest mock. */
+function capturedAppStateListener(): (next: string) => void {
+  const calls = (AppState.addEventListener as jest.Mock).mock.calls;
+  const last = calls[calls.length - 1];
+  if (!last || last[0] !== 'change' || typeof last[1] !== 'function') {
+    throw new Error('RunnerClient did not subscribe to AppState change');
+  }
+  return last[1] as (next: string) => void;
+}
+
+/** Arm the production backoff by failing handshakes until the next wait is the cap. */
+async function armCappedBackoff(client: RunnerClient): Promise<void> {
+  let socket = await connectAndBootstrap(client);
+  socket.onclose?.({ code: 1006, reason: 'lost' });
+  // 500, 1000, 2000, 4000, 8000 — the fifth close leaves the next wait at 15s.
+  const armed = [500, 1_000, 2_000, 4_000, 8_000];
+  for (const delay of armed) {
+    jest.advanceTimersByTime(delay);
+    socket = latestSocket();
+    socket.open();
+    socket.onclose?.({ code: 1006, reason: 'lost' });
+  }
+}
+
+describe('foreground resume seam', () => {
+  it('reconnects immediately from a closed socket and resets an armed long backoff', async () => {
+    const client = newClient();
+    await armCappedBackoff(client);
+    const before = FakeSocket.instances.length;
+    const closed = latestSocket();
+    expect(closed.readyState).toBe(FakeSocket.CLOSED);
+
+    client.resumeFromBackground();
+    expect(FakeSocket.instances).toHaveLength(before + 1);
+    const resumed = latestSocket();
+    expect(resumed).not.toBe(closed);
+    expect(resumed.readyState).toBe(FakeSocket.CONNECTING);
+
+    // Fail this replacement before bootstrap, so the next wait is the delay
+    // resume just wrote — not a stable-bootstrap reset and not the old 15s.
+    resumed.open();
+    resumed.onclose?.({ code: 1006, reason: 'lost' });
+    jest.advanceTimersByTime(RUNNER_RECONNECT_INITIAL_MS - 1);
+    expect(FakeSocket.instances).toHaveLength(before + 1);
+    jest.advanceTimersByTime(1);
+    expect(FakeSocket.instances).toHaveLength(before + 2);
+    client.close();
+  });
+
+  it('reconnects immediately when the client has no socket', () => {
+    const client = newClient();
+    expect(FakeSocket.instances).toHaveLength(0);
+    client.resumeFromBackground();
+    expect(FakeSocket.instances).toHaveLength(1);
+    jest.advanceTimersByTime(15_000);
+    expect(FakeSocket.instances).toHaveLength(1);
+    client.close();
+  });
+
+  it('does not open another socket while the current one is OPEN', async () => {
+    const client = newClient();
+    const open = await connectAndBootstrap(client);
+    expect(open.readyState).toBe(FakeSocket.OPEN);
+    const before = FakeSocket.instances.length;
+
+    client.resumeFromBackground();
+    expect(FakeSocket.instances).toHaveLength(before);
+    expect(latestSocket()).toBe(open);
+    expect(open.readyState).toBe(FakeSocket.OPEN);
+    expect(client.state).toBe('connected');
+    client.close();
+  });
+
+  it('does not revive a stopped client from a later active transition', async () => {
+    const client = newClient();
+    const socket = await connectAndBootstrap(client);
+    const onActive = capturedAppStateListener();
+    client.close();
+    expect(client.state).toBe('offline');
+    expect(socket.readyState).toBe(FakeSocket.CLOSED);
+    const before = FakeSocket.instances.length;
+
+    onActive('active');
+    client.resumeFromBackground();
+    jest.advanceTimersByTime(15_000);
+    expect(FakeSocket.instances).toHaveLength(before);
+    expect(client.state).toBe('offline');
+  });
+
+  it('drives resume only from the captured active AppState callback', async () => {
+    const client = newClient();
+    const socket = await connectAndBootstrap(client);
+    const onChange = capturedAppStateListener();
+    socket.onclose?.({ code: 1006, reason: 'lost' });
+    const before = FakeSocket.instances.length;
+
+    onChange('background');
+    onChange('inactive');
+    expect(FakeSocket.instances).toHaveLength(before);
+
+    onChange('active');
+    expect(FakeSocket.instances).toHaveLength(before + 1);
+    const resumed = latestSocket();
+    jest.advanceTimersByTime(RUNNER_RECONNECT_INITIAL_MS);
+    expect(FakeSocket.instances).toHaveLength(before + 1);
+    expect(latestSocket()).toBe(resumed);
+    client.close();
+  });
+
+  it('retires a pending command with the typed disconnect and re-arms the ready gate', async () => {
+    const client = newClient();
+    const first = await connectAndBootstrap(client);
+    const retired = outcomeOf(client.command({ type: 'compact' }));
+    await flushMicrotasks();
+    expect(retired.state()).toBe('pending');
+    expect(commandFrame(first, 'compact').type).toBe('compact');
+
+    first.readyState = FakeSocket.CLOSED;
+    client.resumeFromBackground();
+    await flushMicrotasks();
+    expect(retired.state()).toBe('rejected');
+    const error = retired.error();
+    expect(error).toBeInstanceOf(RunnerDisconnectedError);
+    expect(error?.message).toBe('Runner is not connected.');
+
+    // Bootstrap has not finished: a command waits, then is admitted once.
+    const second = latestSocket();
+    expect(second).not.toBe(first);
+    second.open();
+    const queued = outcomeOf(client.command({ type: 'session_list', scope: 'all_projects' }));
+    await flushMicrotasks();
+    expect(queued.state()).toBe('pending');
+    expect(second.frames().filter((frame) => frame.type === 'session_list')).toHaveLength(0);
+
+    const bootstrap = commandFrame(second, 'get_state');
+    second.deliver(response('get_state', String(bootstrap.id), { sessionId: 'session-1', runtimeIncarnation: 'inc-1', cwd: '/workspace' }));
+    await flushMicrotasks();
+    const admitted = second.frames().filter((frame) => frame.type === 'session_list');
+    expect(admitted).toHaveLength(1);
+    second.deliver(response('session_list', String(admitted[0].id), { sessions: [] }));
+    await flushMicrotasks();
+    expect(queued.state()).toBe('resolved');
+    client.close();
   });
 });

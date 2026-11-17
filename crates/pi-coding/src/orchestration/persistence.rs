@@ -29,12 +29,17 @@ use super::runtime::{
     AgentSnapshot, AgentStatus, ChildSessionRequest, DELIVERED_MESSAGE_LOG_CAP,
     MAX_MESSAGE_BODY_BYTES, MailboxMessage,
 };
-use super::{JobSnapshot, JobStatus, TaskResult};
+use super::{CancellationCause, JobSnapshot, JobStatus, TaskResult};
 use crate::sandbox::DurablePolicyState;
 
 /// Sidecar schema version. Bumped on incompatible changes; recovery rejects
 /// unknown future versions rather than guessing.
-pub const DURABLE_STATE_VERSION: u32 = 3;
+///
+/// Version 4 adds `JobStatus::Cancelling` and typed `cancellationCause`.
+/// Version 3 is migrated without inventing cancellation intent. Version 2
+/// still derives `groupId` once. Version 1 remains non-authoritative.
+pub const DURABLE_STATE_VERSION: u32 = 4;
+const PREVIOUS_DURABLE_STATE_VERSION: u32 = 3;
 const LEGACY_DURABLE_STATE_VERSION: u32 = 2;
 const SIDECAR_FILENAME: &str = "orchestration-state.json";
 const MAX_SIDECAR_BYTES: u64 = 16 * 1024 * 1024;
@@ -596,6 +601,7 @@ fn validate_state(
                 job.id
             );
         }
+        validate_job_cancellation(job)?;
     }
     Ok(())
 }
@@ -623,7 +629,7 @@ struct LegacyDurableStateV1 {
     #[serde(default)]
     delivered_messages: Vec<MailboxMessage>,
     #[serde(default)]
-    jobs: Vec<JobSnapshot>,
+    jobs: Vec<LegacyJobSnapshotV3>,
 }
 
 /// Exact historical v2 sidecar schema. The execution state is authoritative,
@@ -641,7 +647,7 @@ struct LegacyDurableStateV2 {
     #[serde(default)]
     delivered_messages: Vec<MailboxMessage>,
     #[serde(default)]
-    jobs: Vec<JobSnapshot>,
+    jobs: Vec<LegacyJobSnapshotV3>,
 }
 
 impl LegacyDurableStateV2 {
@@ -655,9 +661,146 @@ impl LegacyDurableStateV2 {
             agents: self.agents,
             main_mailbox: self.main_mailbox,
             delivered_messages: self.delivered_messages,
-            jobs: self.jobs,
+            jobs: self.jobs.into_iter().map(LegacyJobSnapshotV3::into_current).collect(),
         }
     }
+}
+
+/// Exact historical v3 sidecar schema. Statuses and results are authoritative.
+/// `cancellationCause` did not exist, so migration must not invent one.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LegacyDurableStateV3 {
+    version: u32,
+    parent_session_id: String,
+    parent_session_path: String,
+    group_id: String,
+    durable_policy: DurablePolicyState,
+    agents: Vec<PersistedAgent>,
+    #[serde(default)]
+    main_mailbox: Vec<MailboxMessage>,
+    #[serde(default)]
+    delivered_messages: Vec<MailboxMessage>,
+    #[serde(default)]
+    jobs: Vec<LegacyJobSnapshotV3>,
+}
+
+/// v3 job wire shape: same fields as [`JobSnapshot`] except no cancellation cause.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LegacyJobSnapshotV3 {
+    id: String,
+    agent_id: String,
+    agent: String,
+    parent_id: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    todo_task_id: Option<String>,
+    #[serde(default)]
+    workflow_id: Option<String>,
+    #[serde(default)]
+    workflow_generation: Option<u64>,
+    status: LegacyJobStatusV3,
+    created_at: u64,
+    #[serde(default)]
+    started_at: Option<u64>,
+    #[serde(default)]
+    finished_at: Option<u64>,
+    #[serde(default)]
+    result: Option<TaskResult>,
+    #[serde(default)]
+    soft_budget_exhausted: bool,
+}
+
+impl LegacyDurableStateV3 {
+    fn migrate(self) -> DurableState {
+        DurableState {
+            version: DURABLE_STATE_VERSION,
+            group_id: self.group_id,
+            parent_session_id: self.parent_session_id,
+            parent_session_path: self.parent_session_path,
+            durable_policy: self.durable_policy,
+            agents: self.agents,
+            main_mailbox: self.main_mailbox,
+            delivered_messages: self.delivered_messages,
+            jobs: self.jobs.into_iter().map(LegacyJobSnapshotV3::into_current).collect(),
+        }
+    }
+}
+
+impl LegacyJobSnapshotV3 {
+    fn into_current(self) -> JobSnapshot {
+        JobSnapshot {
+            id: self.id,
+            agent_id: self.agent_id,
+            agent: self.agent,
+            parent_id: self.parent_id,
+            description: self.description,
+            todo_task_id: self.todo_task_id,
+            workflow_id: self.workflow_id,
+            workflow_generation: self.workflow_generation,
+            status: self.status.into_current(),
+            created_at: self.created_at,
+            started_at: self.started_at,
+            finished_at: self.finished_at,
+            cancellation_cause: None,
+            result: self.result,
+            soft_budget_exhausted: self.soft_budget_exhausted,
+        }
+    }
+}
+/// Statuses that existed before version 4. `cancelling` is rejected here.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum LegacyJobStatusV3 {
+    Queued,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl LegacyJobStatusV3 {
+    fn into_current(self) -> JobStatus {
+        match self {
+            Self::Queued => JobStatus::Queued,
+            Self::Running => JobStatus::Running,
+            Self::Completed => JobStatus::Completed,
+            Self::Failed => JobStatus::Failed,
+            Self::Cancelled => JobStatus::Cancelled,
+        }
+    }
+}
+
+fn validate_job_cancellation(job: &JobSnapshot) -> Result<()> {
+    match job.status {
+        JobStatus::Queued | JobStatus::Running | JobStatus::Completed | JobStatus::Failed => {
+            if job.cancellation_cause.is_some() {
+                bail!(
+                    "durable state job {:?} status {:?} must not carry a cancellation cause",
+                    job.id,
+                    job.status
+                );
+            }
+        }
+        JobStatus::Cancelling => {
+            if job.cancellation_cause.is_none() {
+                bail!(
+                    "durable state job {:?} is cancelling without a cancellation cause",
+                    job.id
+                );
+            }
+            if job.finished_at.is_some() || job.result.is_some() {
+                bail!(
+                    "durable state job {:?} is cancelling but already has a terminal result",
+                    job.id
+                );
+            }
+        }
+        JobStatus::Cancelled => {}
+    }
+    Ok(())
 }
 
 /// Validate a legacy v1 sidecar's ownership and structural bounds before it is
@@ -734,6 +877,11 @@ fn load_and_validate_state(
         }
         LEGACY_DURABLE_STATE_VERSION => {
             let legacy: LegacyDurableStateV2 =
+                serde_json::from_slice(&bytes).context("parsing durable state sidecar")?;
+            legacy.migrate()
+        }
+        PREVIOUS_DURABLE_STATE_VERSION => {
+            let legacy: LegacyDurableStateV3 =
                 serde_json::from_slice(&bytes).context("parsing durable state sidecar")?;
             legacy.migrate()
         }
@@ -816,28 +964,56 @@ pub fn recovery_status(status: AgentStatus) -> AgentStatus {
     }
 }
 
-/// Transform a job snapshot for recovery. Settled jobs (Completed/Failed/
-/// Cancelled) are kept as-is. Unsettled jobs (Queued/Running) are kept in
-/// their current status — they are pending revival from their durable child
-/// JSONL and must NOT be cancelled. The runtime spawns revival tasks after
-/// installing the recovered state.
-pub fn recovery_job(job: JobSnapshot, _finished_at: u64) -> JobSnapshot {
-    recovery_job_with_persona(job, _finished_at, None)
+/// Transform a job snapshot for recovery.
+///
+/// Settled jobs stay as recorded. `Queued` and `Running` stay unsettled for
+/// revival. `Cancelling` does not revive: cancellation already committed, but
+/// this process did not observe abort or cleanup, so recovery records that
+/// interruption at `finished_at` and settles `Cancelled` / `Aborted`.
+pub fn recovery_job(job: JobSnapshot, finished_at: u64) -> JobSnapshot {
+    recovery_job_with_persona(job, finished_at, None)
 }
 
 pub(crate) fn recovery_job_with_persona(
     mut job: JobSnapshot,
-    _finished_at: u64,
+    finished_at: u64,
     _persona: Option<&str>,
 ) -> JobSnapshot {
     if job.status.is_settled() {
         return job;
     }
-    // Unsettled jobs keep their status (Running/Queued) for revival.
-    // Do NOT cancel, do NOT set finished_at, do NOT synthesize an error result.
-    // The revival task reopens the child JSONL and continues the turn.
-    job.started_at = Some(job.started_at.unwrap_or(_finished_at));
+    if job.status == JobStatus::Cancelling {
+        let cause = job.cancellation_cause.unwrap_or(CancellationCause::Task);
+        job.status = JobStatus::Cancelled;
+        job.cancellation_cause = Some(cause);
+        job.finished_at = Some(finished_at);
+        job.soft_budget_exhausted = false;
+        job.result = Some(interrupted_cancellation_result(&job));
+        return job;
+    }
+    // Queued/Running keep their status for revival. Do not invent a result.
+    job.started_at = Some(job.started_at.unwrap_or(finished_at));
     job
+}
+
+fn interrupted_cancellation_result(job: &JobSnapshot) -> TaskResult {
+    TaskResult {
+        index: 0,
+        id: job.agent_id.clone(),
+        agent: job.agent.clone(),
+        status: AgentStatus::Aborted,
+        output: String::new(),
+        usage: pi_ai::Usage::default(),
+        soft_budget_exhausted: false,
+        error: Some(
+            "cancellation committed but graceful completion and cleanup were not observed before process loss"
+                .to_owned(),
+        ),
+        structured_output: None,
+        artifact_ref: format!("agent://{}", job.agent_id),
+        history_ref: format!("history://{}", job.agent_id),
+        artifact_uri: format!("artifact://{}", job.agent_id),
+    }
 }
 
 /// Reconstruct a `ChildSessionRequest` from persisted execution identity and
@@ -1208,7 +1384,7 @@ mod tests {
       "agents": []
     }"#;
     const FUTURE_VERSION_SIDECAR: &str = r#"{
-      "version": 4,
+      "version": 5,
       "parentSessionId": "parent-session-id",
       "parentSessionPath": "__PARENT_PATH__",
       "groupId": "018f5a8c-1234-7000-8000-000000000001",
@@ -1695,6 +1871,7 @@ mod tests {
             created_at: 1,
             started_at: Some(2),
             finished_at: None,
+            cancellation_cause: None,
             result: None,
             soft_budget_exhausted: false,
         };
@@ -1734,6 +1911,7 @@ mod tests {
             created_at: 1,
             started_at: Some(2),
             finished_at: None,
+            cancellation_cause: None,
             result: None,
             soft_budget_exhausted: false,
         };
@@ -1766,6 +1944,194 @@ mod tests {
             settled.result.expect("settled result").history_ref,
             "history://persona/mentor/MentorRun"
         );
+    }
+    #[test]
+    fn legacy_v3_migrates_without_inventing_cancellation_intent() {
+        let root = tempdir().expect("root");
+        let (rt, parent_path) = runtime(root.path());
+        let mut state = state_with_agents(&parent_path, vec![persisted_agent("Alpha")]);
+        state.jobs = vec![
+            JobSnapshot {
+                id: "job-queued".to_owned(),
+                agent_id: "Alpha".to_owned(),
+                agent: "task".to_owned(),
+                parent_id: "Main".to_owned(),
+                description: Some("queued".to_owned()),
+                todo_task_id: None,
+                workflow_id: None,
+                workflow_generation: None,
+                status: JobStatus::Queued,
+                created_at: 1,
+                started_at: None,
+                finished_at: None,
+                cancellation_cause: None,
+                result: None,
+                soft_budget_exhausted: false,
+            },
+            JobSnapshot {
+                id: "job-running".to_owned(),
+                agent_id: "Alpha".to_owned(),
+                agent: "task".to_owned(),
+                parent_id: "Main".to_owned(),
+                description: None,
+                todo_task_id: None,
+                workflow_id: None,
+                workflow_generation: None,
+                status: JobStatus::Running,
+                created_at: 2,
+                started_at: Some(3),
+                finished_at: None,
+                cancellation_cause: None,
+                result: None,
+                soft_budget_exhausted: false,
+            },
+            JobSnapshot {
+                id: "job-done".to_owned(),
+                agent_id: "Alpha".to_owned(),
+                agent: "task".to_owned(),
+                parent_id: "Main".to_owned(),
+                description: None,
+                todo_task_id: None,
+                workflow_id: None,
+                workflow_generation: None,
+                status: JobStatus::Completed,
+                created_at: 4,
+                started_at: Some(5),
+                finished_at: Some(6),
+                cancellation_cause: None,
+                result: Some(TaskResult {
+                    index: 0,
+                    id: "Alpha".to_owned(),
+                    agent: "task".to_owned(),
+                    status: AgentStatus::Idle,
+                    output: "kept".to_owned(),
+                    usage: pi_ai::Usage::default(),
+                    soft_budget_exhausted: false,
+                    error: None,
+                    structured_output: None,
+                    artifact_ref: "agent://Alpha".to_owned(),
+                    history_ref: "history://Alpha".to_owned(),
+                    artifact_uri: "artifact://Alpha".to_owned(),
+                }),
+                soft_budget_exhausted: false,
+            },
+        ];
+        let mut legacy = serde_json::to_value(&state).expect("encode v3 fixture");
+        legacy["version"] = serde_json::json!(PREVIOUS_DURABLE_STATE_VERSION);
+        for job in legacy["jobs"].as_array_mut().expect("jobs") {
+            job.as_object_mut()
+                .expect("job")
+                .remove("cancellationCause");
+        }
+        let legacy_bytes = serde_json::to_vec_pretty(&legacy).expect("serialize v3");
+        fs::write(rt.sidecar_path(), &legacy_bytes).expect("write v3 fixture");
+
+        let migrated = rt.load().expect("migrate v3");
+        assert_eq!(migrated.version, DURABLE_STATE_VERSION);
+        assert_eq!(migrated.group_id, state.group_id);
+        assert_eq!(migrated.jobs.len(), 3);
+        assert_eq!(migrated.jobs[0].status, JobStatus::Queued);
+        assert_eq!(migrated.jobs[0].description.as_deref(), Some("queued"));
+        assert!(migrated.jobs[0].cancellation_cause.is_none());
+        assert!(migrated.jobs[0].result.is_none());
+        assert_eq!(migrated.jobs[1].status, JobStatus::Running);
+        assert_eq!(migrated.jobs[1].started_at, Some(3));
+        assert!(migrated.jobs[1].finished_at.is_none());
+        assert!(migrated.jobs[1].cancellation_cause.is_none());
+        assert!(migrated.jobs[1].result.is_none());
+        assert_eq!(migrated.jobs[2].status, JobStatus::Completed);
+        assert_eq!(migrated.jobs[2].finished_at, Some(6));
+        assert!(migrated.jobs[2].cancellation_cause.is_none());
+        assert_eq!(
+            migrated.jobs[2]
+                .result
+                .as_ref()
+                .map(|result| result.output.as_str()),
+            Some("kept")
+        );
+        assert_eq!(
+            fs::read(rt.sidecar_path()).expect("v3 source unchanged"),
+            legacy_bytes
+        );
+    }
+
+    #[test]
+    fn v4_rejects_cancelling_without_cause_or_with_result() {
+        let root = tempdir().expect("root");
+        let (rt, parent_path) = runtime(root.path());
+        let mut state = state_with_agents(&parent_path, vec![persisted_agent("Alpha")]);
+        state.jobs.push(JobSnapshot {
+            id: "job-cancel".to_owned(),
+            agent_id: "Alpha".to_owned(),
+            agent: "task".to_owned(),
+            parent_id: "Main".to_owned(),
+            description: None,
+            todo_task_id: None,
+            workflow_id: None,
+            workflow_generation: None,
+            status: JobStatus::Cancelling,
+            created_at: 1,
+            started_at: Some(2),
+            finished_at: None,
+            cancellation_cause: None,
+            result: None,
+            soft_budget_exhausted: false,
+        });
+        let error = rt
+            .persist(&state)
+            .expect_err("cancelling without cause");
+        assert!(
+            error.to_string().contains("without a cancellation cause"),
+            "{error:#}"
+        );
+
+        state.jobs[0].cancellation_cause = Some(CancellationCause::Shutdown);
+        state.jobs[0].finished_at = Some(3);
+        let error = rt.persist(&state).expect_err("cancelling with finish time");
+        assert!(
+            error.to_string().contains("already has a terminal result"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn recovery_cancelling_does_not_revive_and_does_not_claim_cleanup() {
+        let mut job = JobSnapshot {
+            id: "job-cancel".to_owned(),
+            agent_id: "Alpha".to_owned(),
+            agent: "task".to_owned(),
+            parent_id: "Main".to_owned(),
+            description: None,
+            todo_task_id: None,
+            workflow_id: None,
+            workflow_generation: None,
+            status: JobStatus::Cancelling,
+            created_at: 1,
+            started_at: Some(2),
+            finished_at: None,
+            cancellation_cause: Some(CancellationCause::Shutdown),
+            result: None,
+            soft_budget_exhausted: false,
+        };
+        let recovered = recovery_job(job.clone(), 80);
+        assert_eq!(recovered.status, JobStatus::Cancelled);
+        assert_eq!(
+            recovered.cancellation_cause,
+            Some(CancellationCause::Shutdown)
+        );
+        assert_eq!(recovered.finished_at, Some(80));
+        let result = recovered.result.expect("interrupted settlement");
+        assert_eq!(result.status, AgentStatus::Aborted);
+        let error = result.error.expect("diagnostic");
+        assert!(error.contains("not observed"), "{error}");
+        assert!(!error.contains("cleanup completed"), "{error}");
+        assert!(!error.contains("child abort completed"), "{error}");
+
+        job.status = JobStatus::Running;
+        job.cancellation_cause = None;
+        let revived = recovery_job(job, 80);
+        assert_eq!(revived.status, JobStatus::Running);
+        assert!(revived.result.is_none());
     }
 
     #[test]

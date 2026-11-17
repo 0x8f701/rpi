@@ -16,12 +16,13 @@ use std::time::Duration;
 use pi_agent::{AbortController, AgentTool, ThinkingLevel, ToolCallContext};
 use pi_ai::{Model, StopReason};
 use pi_coding::{
-    AgentCatalog, AgentDefinition, AgentDefinitionSource, AgentStatus, ChildSessionFactory,
-    DeliveryOutcome, JobSnapshot, JobStatus, OrchestrationConfig, OrchestrationRuntime, Session,
-    SessionOptions, TaskSpawn,
+    AgentCatalog, AgentDefinition, AgentDefinitionSource, AgentStatus, CancellationCause,
+    ChildSessionFactory, DeliveryOutcome, JobSnapshot, JobStatus, OrchestrationConfig,
+    OrchestrationEvent, OrchestrationRuntime, Session, SessionOptions, TaskSpawn,
 };
 use serde_json::{Value, json};
 use tokio::sync::Notify;
+use tokio::sync::broadcast::error::RecvError;
 use tokio_util::sync::CancellationToken;
 
 fn definition() -> AgentDefinition {
@@ -56,6 +57,7 @@ struct ControlledRuntime {
     started: Arc<Notify>,
     release: CancellationToken,
     aborted: Arc<AtomicUsize>,
+    abort_seen: Arc<Notify>,
 }
 
 fn controlled_runtime(
@@ -69,17 +71,20 @@ fn controlled_runtime(
     let started = Arc::new(Notify::new());
     let release = CancellationToken::new();
     let aborted = Arc::new(AtomicUsize::new(0));
+    let abort_seen = Arc::new(Notify::new());
     let factory_current = current.clone();
     let factory_peak = peak.clone();
     let factory_started = started.clone();
     let factory_release = release.clone();
     let factory_aborted = aborted.clone();
+    let factory_abort_seen = abort_seen.clone();
     let factory: ChildSessionFactory = Arc::new(move |request| {
         let current = factory_current.clone();
         let peak = factory_peak.clone();
         let started = factory_started.clone();
         let release = factory_release.clone();
         let aborted = factory_aborted.clone();
+        let abort_seen = factory_abort_seen.clone();
         Box::pin(async move {
             let stream_fn: pi_agent::StreamFn = Arc::new(move |model, _context, options| {
                 let current = current.clone();
@@ -87,6 +92,7 @@ fn controlled_runtime(
                 let started = started.clone();
                 let release = release.clone();
                 let aborted = aborted.clone();
+                let abort_seen = abort_seen.clone();
                 Box::pin(async move {
                     let stream = pi_ai::new_assistant_message_event_stream();
                     let producer = stream.clone();
@@ -106,6 +112,7 @@ fn controlled_runtime(
                         let mut message = pi_ai::AssistantMessage::pending(&model);
                         if was_aborted {
                             aborted.fetch_add(1, Ordering::SeqCst);
+                            abort_seen.notify_one();
                             message.stop_reason = StopReason::Aborted;
                         } else {
                             message
@@ -119,7 +126,7 @@ fn controlled_runtime(
                 })
             });
             Session::new(SessionOptions {
-                model: request.model,
+                model: Some(request.model),
                 cwd: std::env::current_dir().expect("cwd"),
                 system_prompt: request.system_prompt,
                 thinking_level: ThinkingLevel::Off,
@@ -140,13 +147,13 @@ fn controlled_runtime(
     config.max_concurrency = max_concurrency;
     config.mailbox_capacity = mailbox_capacity;
     config.idle_ttl = idle_ttl;
-    config.parent_model = Model {
+    config.parent_model = Some(Model {
         id: "supervision-e2e".to_owned(),
         name: "Supervision E2E".to_owned(),
         api: "supervision-e2e".to_owned(),
         provider: "supervision-e2e".to_owned(),
         ..Model::default()
-    };
+    });
     ControlledRuntime {
         runtime: OrchestrationRuntime::new(config, factory).expect("runtime"),
         current,
@@ -154,6 +161,7 @@ fn controlled_runtime(
         started,
         release,
         aborted,
+        abort_seen,
     }
 }
 
@@ -219,6 +227,7 @@ async fn wait_for_job_status(
 async fn main_supervises_two_children_with_irc_cancel_and_park() {
     let artifacts = tempfile::tempdir().expect("artifacts");
     let controlled = controlled_runtime(artifacts.path(), 2, 2, Some(Duration::from_millis(40)));
+    let mut events = controlled.runtime.subscribe();
     let tools = controlled.runtime.agent_tools("Main", 0);
     let task = tool(&tools, "task");
     let hub = tool(&tools, "hub");
@@ -339,13 +348,25 @@ async fn main_supervises_two_children_with_irc_cancel_and_park() {
     ))
     .await
     .expect("hub cancel beta");
-    assert_eq!(cancel.details["cancelled"], json!([beta_job]));
+    assert!(
+        cancel.details.get("cancelled").is_none(),
+        "hub cancel must not report settled cancellation"
+    );
+    assert_eq!(
+        cancel.details["cancellationRequested"],
+        json!([beta_job])
+    );
+
+    tokio::time::timeout(Duration::from_secs(3), controlled.abort_seen.notified())
+        .await
+        .expect("beta abort signal did not reach the provider within 3s");
+    assert_eq!(controlled.aborted.load(Ordering::SeqCst), 1);
 
     let waited_beta = tokio::time::timeout(
-        Duration::from_secs(2),
+        Duration::from_secs(5),
         (hub.execute)(context(
             "wait-beta-cancelled",
-            json!({ "op": "wait", "ids": [beta_job], "timeoutMs": 2000 }),
+            json!({ "op": "wait", "ids": [beta_job], "timeoutMs": 4000 }),
         )),
     )
     .await
@@ -355,11 +376,41 @@ async fn main_supervises_two_children_with_irc_cancel_and_park() {
         serde_json::from_value(waited_beta.details["jobs"].clone()).expect("beta jobs");
     assert_eq!(beta_jobs.len(), 1);
     assert_eq!(beta_jobs[0].status, JobStatus::Cancelled);
+    assert_eq!(
+        beta_jobs[0].cancellation_cause,
+        Some(CancellationCause::Task)
+    );
     assert!(beta_jobs[0].finished_at.is_some());
-    assert!(beta_jobs[0].result.as_ref().is_some_and(|result| {
-        result.status == AgentStatus::Aborted && result.error.as_deref() == Some("task cancelled")
-    }));
+    let beta_result = beta_jobs[0].result.as_ref().expect("beta result");
+    assert!(
+        beta_result.status == AgentStatus::Aborted && beta_result.error.is_none(),
+        "result.error {:?} status {:?}",
+        beta_result.error,
+        beta_result.status
+    );
     assert_eq!(controlled.aborted.load(Ordering::SeqCst), 1);
+    let beta_cancel = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await {
+                Ok(OrchestrationEvent::JobUpdated { group_id, job })
+                    if job.id == beta_job
+                        && job.status == JobStatus::Cancelled
+                        && job.parent_id == "Main"
+                        && job.agent_id == "Beta"
+                        && job.cancellation_cause == Some(CancellationCause::Task)
+                        && job.result.as_ref().is_some_and(|result| {
+                            result.status == AgentStatus::Aborted && result.error.is_none()
+                        }) =>
+                {
+                    break group_id;
+                }
+                Ok(_) | Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Closed) => panic!("orchestration event channel closed"),
+            }
+        }
+    })
+    .await
+    .expect("published beta cancellation");
 
     // Alpha still running after Beta cancel.
     let alpha_still = controlled.runtime.jobs(Some(&[alpha_job.clone()]));
@@ -551,6 +602,7 @@ async fn owner_shutdown_cancels_inflight_and_clears_roster() {
         started,
         release: _,
         aborted,
+        abort_seen: _,
         peak: _,
     } = controlled_runtime(artifacts.path(), 1, 8, None);
     let tools = runtime.agent_tools("Main", 0);

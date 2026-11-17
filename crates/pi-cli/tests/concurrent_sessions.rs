@@ -254,7 +254,7 @@ fn faux_model(label: &str) -> Model {
 
 fn session_options(model: Model, cwd: &std::path::Path, gate: &Gate) -> SessionOptions {
     SessionOptions {
-        model,
+        model: Some(model),
         cwd: cwd.to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,

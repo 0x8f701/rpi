@@ -56,13 +56,13 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use parking_lot::Mutex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 
 use pi_agent::{
-    AbortSignal, AgentTool, AgentToolResult, ToolCallContext, ToolCapability, ToolExecutionMode,
-    ToolUpdateFn,
+    AbortSignal, AgentTool, AgentToolResult, ToolCallContext, ToolCapability, ToolExecutionError,
+    ToolExecutionMode, ToolUpdateFn,
 };
 use pi_ai::{ConstrainedSampling, ConstrainedSamplingStrictness, ContentBlock, Schema};
 
@@ -3741,6 +3741,80 @@ fn reject_unsupervised_shell_detach(analysis: &ShellDetachAnalysis) -> Result<()
 }
 
 
+/// The bash layer's structured failure diagnostic. Frozen wire schema:
+/// `details = { requestedCwd: string, stage: 'launch' | 'timed_out' |
+/// 'non_zero_exit', exitCode: null | integer }` — camelCase keys, snake_case
+/// stage values. `requested_cwd` is the authorized workspace root the tool
+/// was built with, never the effective process cwd and never re-derived from
+/// host state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BashDiagnostic {
+    /// The authorized workspace root the tool was built with — never the
+    /// effective process cwd, never re-derived from host state.
+    pub requested_cwd: PathBuf,
+    pub stage: BashFailureStage,
+    pub exit_code: Option<i32>,
+}
+
+/// Where a bash failure happened, serialized snake_case on the wire. The
+/// launch stage is a coarse classification for every failure the shared
+/// runner surfaces as `Err` — pre-start (shell resolution, spawn
+/// authorization, spawn I/O) and post-start wait/stream failures alike —
+/// and says nothing about whether the command executed. Aborts are not part
+/// of this vocabulary: they arrive as runner outcomes, not `Err`s.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BashFailureStage {
+    Launch,
+    TimedOut,
+    NonZeroExit,
+}
+
+impl BashFailureStage {
+    /// The stable snake_case spelling used by both the wire (`serde`) and
+    /// the `[bash diagnostic]` text line; keep the two renderings in sync.
+    fn wire_name(self) -> &'static str {
+        match self {
+            Self::Launch => "launch",
+            Self::TimedOut => "timed_out",
+            Self::NonZeroExit => "non_zero_exit",
+        }
+    }
+}
+
+/// Builds a bash tool failure for the nonzero-exit, timeout, and launch
+/// stages. The original failure body stays the model-visible text (prefix
+/// preserved); the `[bash diagnostic]` line is appended exactly once with
+/// the typed stage's stable spelling and the borrowed requested cwd (the
+/// command is never repeated); the frozen camelCase details are serialized
+/// once and travel on the [`ToolExecutionError`] carrier; and `source`
+/// keeps the original error chain. Abort/cancel failures are never routed
+/// through this helper.
+fn bash_failure_error(
+    stage: BashFailureStage,
+    exit_code: Option<i32>,
+    requested_cwd: &str,
+    body: &str,
+    source: anyhow::Error,
+) -> anyhow::Error {
+    let details = serde_json::to_value(&BashDiagnostic {
+        requested_cwd: PathBuf::from(requested_cwd),
+        stage,
+        exit_code,
+    })
+    .expect("BashDiagnostic (path, enum, option) serializes infallibly");
+    let result = AgentToolResult {
+        content: vec![ContentBlock::text(format!(
+            "{body}\n[bash diagnostic] stage={} requested_cwd={requested_cwd}",
+            stage.wire_name(),
+        ))],
+        details,
+        ..Default::default()
+    };
+    anyhow::Error::new(ToolExecutionError::new(result, source))
+}
+
 /// Bash tool wrapper: validates the tool timeout, checks the working directory,
 /// emits the initial empty update, runs the command, and maps the low-level
 /// outcome to the agent's result contract (abort/timeout/nonzero-exit become
@@ -3865,7 +3939,7 @@ async fn run_bash(
     let auth_manager = process
         .as_ref()
         .and_then(|context| context.auth_manager.clone());
-    let out = run_bash_core(
+    let out = match run_bash_core(
         generation,
         auth_manager,
         cwd,
@@ -3878,7 +3952,28 @@ async fn run_bash(
         pty,
         pty_input,
     )
-    .await?;
+    .await
+    {
+        Ok(out) => out,
+        // Wrap the complete error at this tool boundary (requested cwd,
+        // original chain preserved as the source). Launch is the coarse
+        // stage for every `Err` the shared runner surfaces: mostly pre-start
+        // failures (shell resolution, spawn authorization, spawn I/O), but
+        // post-start wait/stream failures (foreground waiter death, brush
+        // thread failure) arrive the same way, so the stage does not claim
+        // the command never ran. Aborts never arrive as `Err` — they are
+        // runner outcomes.
+        Err(error) => {
+            let body = format!("{error:#}");
+            return Err(bash_failure_error(
+                BashFailureStage::Launch,
+                None,
+                cwd,
+                &body,
+                error,
+            ));
+        }
+    };
 
     let content = out.content;
     let truncation = out.truncation;
@@ -3963,16 +4058,20 @@ async fn run_bash(
         // The message reports the measured execution window (bounded to two
         // decimals) next to the configured limit, so queued wait time is
         // never mistaken for run time.
-        return Err(anyhow!(
-            "{}",
-            append_status(
-                &text,
-                &format!(
-                    "Command execution timed out after {} seconds (limit {} seconds)",
-                    format_elapsed_seconds(execution.execution_elapsed.unwrap_or_default()),
-                    format_float(timeout.unwrap_or(0.0))
-                )
-            )
+        let body = append_status(
+            &text,
+            &format!(
+                "Command execution timed out after {} seconds (limit {} seconds)",
+                format_elapsed_seconds(execution.execution_elapsed.unwrap_or_default()),
+                format_float(timeout.unwrap_or(0.0))
+            ),
+        );
+        return Err(bash_failure_error(
+            BashFailureStage::TimedOut,
+            None,
+            cwd,
+            &body,
+            anyhow!("{body}"),
         ));
     }
     // A signal-killed child has no exit code (pi: exitCode === null) and is
@@ -3981,9 +4080,13 @@ async fn run_bash(
         if code != 0 {
             let (text, _) = format_output("(no output)", false);
             cleanup_full_output_path(&full_output_path);
-            return Err(anyhow!(
-                "{}",
-                append_status(&text, &format!("Command exited with code {code}"))
+            let body = append_status(&text, &format!("Command exited with code {code}"));
+            return Err(bash_failure_error(
+                BashFailureStage::NonZeroExit,
+                Some(code),
+                cwd,
+                &body,
+                anyhow!("{body}"),
             ));
         }
     }
@@ -4507,14 +4610,32 @@ async fn run_glob_captured(
         None => workspace.cwd().to_path_buf(),
     };
     let fs = captured_policy_fs(&generation)?;
-    let metadata = fs.metadata(&target)?;
+    // One-pass glob target: symlink aliases resolve via the retained
+    // root-confined walker; directories walk on the same pinned lease.
+    let directory = fs.resolve_glob_target(&target)?;
     let mut ignores = if use_gitignore {
         IgnoreStack::new(generation, &target.to_string_lossy(), false, true).await?
     } else {
         IgnoreStack::without_gitignore(&target.to_string_lossy())
     };
     let mut results = Vec::new();
-    if metadata.identity.kind() == crate::fs::EntryKind::RegularFile {
+    if let Some(directory) = directory {
+        // Ignore files share this pinned directory. Lexical alias reads stay
+        // nofollow and drop the rules; physical reads use the opened lease.
+
+        walk_policy_directory(
+            &fs,
+            &mut ignores,
+            directory,
+            &target,
+            Path::new(""),
+            &pattern,
+            include_hidden,
+            limit,
+            &abort,
+            &mut results,
+        )?;
+    } else {
         let name = target
             .file_name()
             .and_then(|value| value.to_str())
@@ -4524,18 +4645,6 @@ async fn run_glob_captured(
         {
             results.push(pathdiff_rel(workspace.cwd(), &target.to_string_lossy()));
         }
-    } else {
-        walk_policy_fs(
-            &fs,
-            &mut ignores,
-            &target,
-            Path::new(""),
-            &pattern,
-            include_hidden,
-            limit,
-            &abort,
-            &mut results,
-        )?;
     }
     results.sort();
     // A mid-walk abort yields partial results from the walkers; surface it as
@@ -4557,59 +4666,6 @@ async fn run_glob_captured(
     }
 }
 
-fn walk_policy_fs(
-    fs: &Arc<crate::fs::PolicyFs>,
-    ignores: &mut IgnoreStack,
-    root: &Path,
-    relative: &Path,
-    pattern: &str,
-    include_hidden: bool,
-    limit: usize,
-    abort: &AbortSignal,
-    results: &mut Vec<String>,
-) -> Result<()> {
-    if results.len() >= limit || abort.is_aborted() {
-        return Ok(());
-    }
-    let directory = root.join(relative);
-    let mut entries = fs.read_dir(&directory)?;
-    while let Some(entry) = entries.next()? {
-        if results.len() >= limit || abort.is_aborted() {
-            break;
-        }
-        let name = entry.name().to_string_lossy();
-        if !include_hidden && name.starts_with('.') {
-            continue;
-        }
-        let child_relative = relative.join(entry.name());
-        if ignores.ignored(
-            &entry.display_path().to_string_lossy(),
-            &child_relative.to_string_lossy(),
-            matches!(entry.opened(), crate::fs::PolicyOpenedEntry::Directory(_)),
-        ) {
-            continue;
-        }
-        let rel = child_relative.to_string_lossy().replace('\\', "/");
-        if match_fd_glob(pattern, &rel, &entry.display_path().to_string_lossy()) {
-            results.push(rel.clone());
-        }
-        if let crate::fs::PolicyOpenedEntry::Directory(directory) = entry.into_opened() {
-            walk_policy_directory(
-                fs,
-                ignores,
-                directory,
-                root,
-                &child_relative,
-                pattern,
-                include_hidden,
-                limit,
-                abort,
-                results,
-            )?;
-        }
-    }
-    Ok(())
-}
 
 fn walk_policy_directory(
     fs: &Arc<crate::fs::PolicyFs>,
@@ -4623,7 +4679,11 @@ fn walk_policy_directory(
     abort: &AbortSignal,
     results: &mut Vec<String>,
 ) -> Result<()> {
-    let mut entries = directory.read_dir(fs)?;
+    // Lexical walk coordinate (alias path when the target is an alias).
+    // Load this directory's `.gitignore` from the pinned fd before listing,
+    // so a lexical alias path is never the open coordinate.
+    ignores.load_pinned_directory(fs, &directory, &root.join(relative), relative)?;
+    let mut entries = directory.read_dir_glob(fs, &root.join(relative))?;
     while let Some(entry) = entries.next()? {
         if results.len() >= limit || abort.is_aborted() {
             break;
@@ -4637,7 +4697,7 @@ fn walk_policy_directory(
             &entry.display_path().to_string_lossy(),
             &child_relative.to_string_lossy(),
             matches!(entry.opened(), crate::fs::PolicyOpenedEntry::Directory(_)),
-        ) {
+        )? {
             continue;
         }
         let rel = child_relative.to_string_lossy().replace('\\', "/");
@@ -4782,7 +4842,7 @@ async fn run_grep_captured(
         .map(|value| value.max(0) as usize)
         .unwrap_or(0);
     let glob = arg_str(&args, "glob");
-    let mut ignores = IgnoreStack::new(generation, &root.to_string_lossy(), true, false).await?;
+    let ignores = IgnoreStack::new(generation.clone(), &root.to_string_lossy(), true, false).await?;
     let mut output = GrepOutput::default();
     // `limit` counts MATCHES only; context rows never consume the budget
     // (pi tracks matchCount separately from the output rows).
@@ -4791,9 +4851,8 @@ async fn run_grep_captured(
     let mut output_truncated = false;
     grep_policy_entry(
         &fs,
-        &mut ignores,
+        &generation,
         &root,
-        Path::new(""),
         &regex,
         &glob,
         context,
@@ -4803,7 +4862,9 @@ async fn run_grep_captured(
         &mut matched,
         &mut lines_truncated,
         &mut output_truncated,
-    )?;
+        ignores,
+    )
+    .await?;
     // A mid-scan abort yields partial rows from the walker; surface it as an
     // abort instead of a truncated-but-successful result.
     check_aborted(&abort)?;
@@ -4848,11 +4909,34 @@ async fn run_grep_captured(
     )
 }
 
-fn grep_policy_entry(
+/// One paused directory of the iterative grep DFS. `read_dir` is the paused
+/// parent enumerator; `dir_search`/`dir_search_rel` locate the directory
+/// relative to the SEARCH root (display/glob/output basis, never changes);
+/// `dir_ignore_rel` locates it relative to the active ignore context root,
+/// which itself travels inside the active stack's own root. `saved_active` is
+/// `Some` on the frame of a subtree that entered a repository: popping that
+/// frame restores the parent's active ignore context; `None` shares it.
+/// Stacks move in and out of frames — never cloned.
+struct GrepWalkFrame {
+    read_dir: crate::fs::PolicyReadDir,
+    dir_search: PathBuf,
+    dir_search_rel: String,
+    dir_ignore_rel: String,
+    saved_active: Option<IgnoreStack>,
+}
+
+/// Iterative async DFS over the policy filesystem. Per reachable child
+/// repository boundary the active `IgnoreStack` is replaced by one built for
+/// that repository (`require_git=true` preserved, outer rules cut inside —
+/// dep contract `ignore` 0.4.31 src/dir.rs:344-357,463,560-561,579-585) and
+/// restored when the subtree exits. Already-ignored directories are never
+/// entered or probed. Display paths, glob matching, limits, abort checks, and
+/// the exact fs-error propagation policy of the previous recursive walk are
+/// preserved verbatim.
+async fn grep_policy_entry(
     fs: &Arc<crate::fs::PolicyFs>,
-    ignores: &mut IgnoreStack,
+    generation: &Arc<crate::application::generation::ApplicationGeneration>,
     root: &Path,
-    relative: &Path,
     regex: &regex::Regex,
     glob: &str,
     context: usize,
@@ -4862,28 +4946,24 @@ fn grep_policy_entry(
     matched: &mut usize,
     lines_truncated: &mut bool,
     output_truncated: &mut bool,
+    ignores: IgnoreStack,
 ) -> Result<()> {
     if *matched >= limit || abort.is_aborted() {
         return Ok(());
     }
-    let target = root.join(relative);
-    let metadata = fs.metadata(&target)?;
+    let metadata = fs.metadata(root)?;
     if metadata.identity.kind() == crate::fs::EntryKind::RegularFile {
-        let rel = if relative.as_os_str().is_empty() {
-            target
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned()
-        } else {
-            relative.to_string_lossy().replace('\\', "/")
-        };
+        let rel = root
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
         if !glob.is_empty() && !match_rg_glob(glob, &rel) {
             return Ok(());
         }
-        grep_policy_file(
+        return grep_policy_file(
             fs,
-            &target,
+            root,
             &rel,
             regex,
             context,
@@ -4893,40 +4973,149 @@ fn grep_policy_entry(
             matched,
             lines_truncated,
             output_truncated,
-        )?;
-        return Ok(());
+        );
     }
-    let directory = fs.open_directory(&target)?;
-    let mut entries = directory.read_dir(fs)?;
-    while let Some(entry) = entries.next()? {
-        let child = relative.join(entry.name());
-        if ignores.ignored(
-            &entry.display_path().to_string_lossy(),
-            &child.to_string_lossy(),
-            matches!(entry.opened(), crate::fs::PolicyOpenedEntry::Directory(_)),
-        ) {
+    let mut active = ignores;
+    let root_directory = fs.open_directory(root)?;
+    let mut frames = vec![GrepWalkFrame {
+        read_dir: root_directory.read_dir(fs)?,
+        dir_search: PathBuf::new(),
+        dir_search_rel: String::new(),
+        dir_ignore_rel: String::new(),
+        saved_active: None,
+    }];
+    enum GrepStep {
+        Child(crate::fs::PolicyDirEntry),
+        FrameDone,
+    }
+    loop {
+        if *matched >= limit || abort.is_aborted() {
+            return Ok(());
+        }
+        let step = {
+            let Some(frame) = frames.last_mut() else {
+                return Ok(());
+            };
+            loop {
+                match frame.read_dir.next() {
+                    Ok(Some(entry)) => break GrepStep::Child(entry),
+                    Ok(None) => break GrepStep::FrameDone,
+                    Err(error) if enumerated_child_vanished(&error) => continue,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        };
+        let entry = match step {
+            GrepStep::FrameDone => {
+                let done = frames.pop().expect("frame exists");
+                if let Some(saved) = done.saved_active {
+                    active = saved;
+                }
+                continue;
+            }
+            GrepStep::Child(entry) => entry,
+        };
+        let name = entry.name().to_string_lossy().into_owned();
+        let is_dir = matches!(entry.opened(), crate::fs::PolicyOpenedEntry::Directory(_));
+        let display_abs = entry.display_path().to_string_lossy().into_owned();
+        let (child_search, child_search_rel, child_ignore_rel) = {
+            let current = frames.last().expect("frame exists");
+            (
+                current.dir_search.join(entry.name()),
+                if current.dir_search_rel.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{}/{name}", current.dir_search_rel)
+                },
+                if current.dir_ignore_rel.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{}/{name}", current.dir_ignore_rel)
+                },
+            )
+        };
+        // Parent-context pruning always comes first: an ignored child is
+        // never entered and never probed for a repository marker.
+        if active.ignored(&display_abs, &child_ignore_rel, is_dir)? {
             continue;
         }
-        grep_policy_entry(
-            fs,
-            ignores,
-            root,
-            &child,
-            regex,
-            glob,
-            context,
-            limit,
-            abort,
-            output,
-            matched,
-            lines_truncated,
-            output_truncated,
-        )?;
-        if *matched >= limit {
-            break;
+        if !is_dir {
+            if !glob.is_empty() && !match_rg_glob(glob, &child_search_rel) {
+                continue;
+            }
+            let target = root.join(&child_search);
+            grep_policy_file(
+                fs,
+                &target,
+                &child_search_rel,
+                regex,
+                context,
+                limit,
+                abort,
+                output,
+                matched,
+                lines_truncated,
+                output_truncated,
+            )?;
+            continue;
         }
+        // Directory: probe the child's own retained directory for a repository
+        // boundary. Exact contract: `Some(_)` is a marker (directory or
+        // worktree file); `None` covers absence and the established
+        // nofollow-blocked categories; every other error propagates.
+        let crate::fs::PolicyOpenedEntry::Directory(child_directory) = entry.into_opened() else {
+            continue;
+        };
+        let marker = child_directory.entry_kind_relative(
+            fs,
+            root.join(&child_search).as_path(),
+            Path::new(".git"),
+        )?;
+        if marker.is_none() {
+            frames.push(GrepWalkFrame {
+                read_dir: child_directory.read_dir(fs)?,
+                dir_search: child_search,
+                dir_search_rel: child_search_rel,
+                dir_ignore_rel: child_ignore_rel,
+                saved_active: None,
+            });
+            continue;
+        }
+        check_aborted(&abort)?;
+        let nested = IgnoreStack::new(
+            generation.clone(),
+            &root.join(&child_search).to_string_lossy(),
+            true,
+            true,
+        )
+        .await?;
+        check_aborted(&abort)?;
+        // The parent context is saved on the CHILD frame: popping the child
+        // subtree frame restores it, so the parent frame itself stays
+        // untouched and remaining siblings resume the outer context.
+        frames.push(GrepWalkFrame {
+            read_dir: child_directory.read_dir(fs)?,
+            dir_search: child_search,
+            dir_search_rel: child_search_rel,
+            dir_ignore_rel: String::new(),
+            saved_active: Some(active),
+        });
+        active = nested;
     }
-    Ok(())
+}
+
+/// An enumerated child that disappears before its post-listing open is not a
+/// search failure. Only `OpenEntry` + `NotFound` qualifies; permission,
+/// identity, and every other error still fail the walk.
+fn enumerated_child_vanished(error: &crate::fs::FsError) -> bool {
+    matches!(
+        error,
+        crate::fs::FsError::System {
+            operation: crate::fs::FsOperation::OpenEntry,
+            kind: std::io::ErrorKind::NotFound,
+            ..
+        }
+    )
 }
 
 fn grep_policy_file(
@@ -5502,9 +5691,18 @@ mod tests {
         resolver: Option<InternalUriResolverFn>,
         danger_full_access: bool,
     ) -> ToolGenerationFixture {
-        tool_generation_fixture_result(workspace, skills, resolver, danger_full_access)
-            .await
-            .expect("publish policy filesystem application")
+        tool_generation_fixture_result(
+            workspace,
+            skills,
+            resolver,
+            if danger_full_access {
+                json!({ "sandbox": { "mode": "danger-full-access" } })
+            } else {
+                json!({ "sandbox": { "mode": "workspace-write" } })
+            },
+        )
+        .await
+        .expect("publish policy filesystem application")
     }
 
     /// Confined-mode fixture behind the trusted-launcher gate (mirror of
@@ -5516,7 +5714,37 @@ mod tests {
     async fn confined_generation_fixture(
         workspace: crate::WorkspaceRoots,
     ) -> Option<ToolGenerationFixture> {
-        match tool_generation_fixture_result(workspace, None, None, false).await {
+        match tool_generation_fixture_result(
+            workspace,
+            None,
+            None,
+            json!({ "sandbox": { "mode": "workspace-write" } }),
+        )
+        .await
+        {
+            Ok(fixture) => Some(fixture),
+            Err(error) => {
+                let message = format!("{error:#}");
+                if message.contains("launcher") {
+                    eprintln!(
+                        "skipping live confinement test: trusted sandbox launcher unavailable ({message})"
+                    );
+                    None
+                } else {
+                    panic!("confined fixture failed beyond an unavailable launcher: {message}");
+                }
+            }
+        }
+    }
+
+    /// Confined fixture with an explicit sandbox settings object (e.g.
+    /// `sandbox.deniedPaths`), behind the same trusted-launcher skip gate as
+    /// `confined_generation_fixture`.
+    async fn confined_generation_fixture_with_sandbox(
+        workspace: crate::WorkspaceRoots,
+        sandbox: serde_json::Value,
+    ) -> Option<ToolGenerationFixture> {
+        match tool_generation_fixture_result(workspace, None, None, sandbox).await {
             Ok(fixture) => Some(fixture),
             Err(error) => {
                 let message = format!("{error:#}");
@@ -5536,15 +5764,10 @@ mod tests {
         workspace: crate::WorkspaceRoots,
         skills: Option<SkillSnapshotFn>,
         resolver: Option<InternalUriResolverFn>,
-        danger_full_access: bool,
+        sandbox_settings: serde_json::Value,
     ) -> anyhow::Result<ToolGenerationFixture> {
         let agent_dir = tempfile::tempdir().expect("agent dir");
         let session_dir = tempfile::tempdir().expect("session dir");
-        let sandbox_settings = if danger_full_access {
-            json!({ "sandbox": { "mode": "danger-full-access" } })
-        } else {
-            json!({ "sandbox": { "mode": "workspace-write" } })
-        };
         fs::write(
             agent_dir.path().join("settings.json"),
             serde_json::to_vec(&sandbox_settings).expect("serialize isolated sandbox settings"),
@@ -5579,7 +5802,7 @@ mod tests {
         let session =
             crate::Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
                 crate::SessionOptions {
-                    model,
+                    model: Some(model),
                     cwd: workspace.cwd().to_path_buf(),
                     system_prompt: String::new(),
                     thinking_level: pi_agent::ThinkingLevel::Off,
@@ -7974,6 +8197,124 @@ mod tests {
         assert!(error.contains("Command exited with code 7"), "{error}");
     }
 
+    /// RED (frozen Path A interface): a nonzero-exit bash Err must stay an
+    /// error AND the model-visible text must carry the requested-cwd/stage
+    /// diagnostic line. Today only the preserved-behavior half holds; the
+    /// diagnostic half is the RED half and goes green exactly when the bash
+    /// layer emits `[bash diagnostic] stage=… requested_cwd=…` (stage
+    /// vocabulary: Launch | TimedOut | NonZeroExit — snake_case on the wire).
+    #[tokio::test]
+    async fn bash_nonzero_exit_error_text_carries_requested_cwd_and_stage() {
+        let d = tmpdir();
+        let fixture = tool_generation_fixture(&d).await;
+        let requested_cwd = d.canonicalize().expect("canonical test cwd");
+        let error = (fixture.tool("bash").execute)(make_ctx(json!({ "command": "exit 7" })))
+            .await
+            .unwrap_err()
+            .to_string();
+        // Preserved behavior (must hold before and after the fix):
+        assert!(error.contains("Command exited with code 7"), "{error}");
+        // RED half (fails today): model-visible requested cwd + stage.
+        assert!(
+            error.contains(requested_cwd.to_string_lossy().as_ref()),
+            "model-visible error must carry the requested cwd: {error}"
+        );
+        assert!(
+            error.contains("stage=non_zero_exit"),
+            "model-visible error must carry the failure stage: {error}"
+        );
+    }
+
+    /// RED: same contract for the timeout stage.
+    #[tokio::test]
+    async fn bash_timeout_error_text_carries_requested_cwd_and_stage() {
+        let d = tmpdir();
+        let fixture = tool_generation_fixture(&d).await;
+        let requested_cwd = d.canonicalize().expect("canonical test cwd");
+        let error = (fixture.tool("bash").execute)(make_ctx(json!({
+            "command": "sleep 30",
+            "timeout": 0.5
+        })))
+        .await
+        .unwrap_err()
+        .to_string();
+        // Preserved behavior:
+        assert!(error.contains("Command execution timed out after"), "{error}");
+        // RED half (fails today):
+        assert!(
+            error.contains(requested_cwd.to_string_lossy().as_ref()),
+            "model-visible error must carry the requested cwd: {error}"
+        );
+        assert!(
+            error.contains("stage=timed_out"),
+            "model-visible error must carry the failure stage: {error}"
+        );
+    }
+
+    /// The frozen details schema travels with the carrier: camelCase keys,
+    /// snake_case stage values, `exitCode` null/integer, and the diagnostic
+    /// line appended exactly once with the `[bash diagnostic]` marker (no
+    /// command repetition).
+    #[test]
+    fn bash_failure_error_carries_frozen_details_schema() {
+        let error = bash_failure_error(
+            BashFailureStage::NonZeroExit,
+            Some(7),
+            "/tmp/authorized-workspace",
+            "Command exited with code 7",
+            anyhow!("Command exited with code 7"),
+        );
+        let carrier = error
+            .downcast::<ToolExecutionError>()
+            .expect("bash failures travel on the frozen carrier");
+        let result = carrier.into_result();
+        assert_eq!(
+            result.details,
+            json!({
+                "requestedCwd": "/tmp/authorized-workspace",
+                "stage": "non_zero_exit",
+                "exitCode": 7,
+            })
+        );
+        let text = text_of(&result);
+        assert!(text.starts_with("Command exited with code 7"), "{text}");
+        assert_eq!(
+            text.matches("[bash diagnostic]").count(),
+            1,
+            "the diagnostic line must be appended exactly once: {text}"
+        );
+        assert!(
+            text.ends_with("[bash diagnostic] stage=non_zero_exit requested_cwd=/tmp/authorized-workspace"),
+            "{text}"
+        );
+        assert!(!text.contains("exit 7"), "the command must not be repeated: {text}");
+
+        let error = bash_failure_error(
+            BashFailureStage::Launch,
+            None,
+            "/tmp/authorized-workspace",
+            "spawn failed: permission denied",
+            anyhow!("permission denied"),
+        );
+        let source = error
+            .source()
+            .expect("launch failures preserve the original error chain")
+            .to_string();
+        assert_eq!(source, "permission denied");
+        let carrier = error
+            .downcast::<ToolExecutionError>()
+            .expect("launch failures travel on the frozen carrier");
+        assert_eq!(
+            carrier.into_result().details,
+            json!({
+                "requestedCwd": "/tmp/authorized-workspace",
+                "stage": "launch",
+                "exitCode": null,
+            })
+        );
+    }
+
+
     #[tokio::test]
     async fn bash_unmatched_quote_settles_with_exit_two() {
         let d = tmpdir();
@@ -10129,6 +10470,355 @@ mod tests {
         );
     }
 
+    /// Regression for the reported production failure: `glob` with `path`
+    /// pointing at a directory alias (symlink) inside an admitted root failed
+    /// with `UnsupportedEntryType` because strict `PolicyFs::metadata` stats
+    /// the link entry itself with `SYMLINK_NOFOLLOW`. End state: the alias
+    /// resolves through the retained, root-confined target resolution and the
+    /// walk matches the real files under the resolved directory.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn glob_directory_alias_within_admitted_root_matches_target_files() {
+        use std::os::unix::fs::symlink;
+
+        let cwd = tempfile::tempdir().expect("cwd");
+        let parent = tempfile::tempdir().expect("admitted parent");
+        fs::create_dir_all(parent.path().join("real/docs")).expect("real docs dir");
+        fs::write(parent.path().join("real/docs/spec.md"), b"# spec\n").expect("spec");
+        let alias = parent.path().join("alias");
+        symlink(parent.path().join("real"), &alias).expect("directory alias");
+
+        // Confined (workspace-write) roots only: with danger-full-access the
+        // ambient `/` fallback root would make the alias trivially contained,
+        // so the retained root confinement under the admitted parent would not
+        // be exercised. Skips only when the trusted sandbox launcher is
+        // unavailable (documented non-fatal skip of `confined_generation_fixture`).
+        let Some(fixture) = confined_generation_fixture(
+            crate::WorkspaceRoots::new(cwd.path(), [parent.path()]).expect("workspace"),
+        )
+        .await
+        else {
+            return;
+        };
+        let result = (fixture
+            .tool("glob")
+            .execute)(make_ctx(json!({
+            "pattern": "docs/**/*.md",
+            "path": alias.display().to_string()
+        })))
+        .await
+        .expect(
+            "glob through a within-root directory alias must resolve the retained target, not fail with UnsupportedEntryType",
+        );
+        let text = text_of(&result);
+        assert!(
+            text.contains("docs/spec.md"),
+            "expected the alias target's docs match, got: {text}"
+        );
+
+        // The same alias via a cwd-relative path: lexical scoped resolution
+        // admits it and the retained target resolution behaves identically.
+        let relative_alias = format!(
+            "../{}/alias",
+            parent
+                .path()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("admitted parent basename")
+        );
+        let relative_result = (fixture
+            .tool("glob")
+            .execute)(make_ctx(json!({
+            "pattern": "docs/**/*.md",
+            "path": relative_alias
+        })))
+        .await
+        .expect("relative alias path must resolve to the same retained target");
+        let relative_text = text_of(&relative_result);
+        assert!(
+            relative_text.contains("docs/spec.md"),
+            "relative alias must match the target docs, got: {relative_text}"
+        );
+
+        // The reported shape uses a RELATIVE link target (psy-node ->
+        // psy-backup/psy-node): alias2 -> "real" must resolve identically.
+        let alias2 = parent.path().join("alias2");
+        symlink("real", &alias2).expect("relative-target alias");
+        let alias2_result = (fixture
+            .tool("glob")
+            .execute)(make_ctx(json!({
+            "pattern": "docs/**/*.md",
+            "path": alias2.display().to_string()
+        })))
+        .await
+        .expect("relative-target alias must resolve the same retained target");
+        let alias2_text = text_of(&alias2_result);
+        assert!(
+            alias2_text.contains("docs/spec.md"),
+            "relative-target alias must match the target docs, got: {alias2_text}"
+        );
+    }
+
+    /// Fail-closed escape: a directory alias whose physical target lies
+    /// OUTSIDE the admitted root must be rejected (`OutsideCapability`),
+    /// never followed, and must not leak the external target.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn glob_alias_outside_root_target_fails_closed() {
+        use std::os::unix::fs::symlink;
+
+        let cwd = tempfile::tempdir().expect("cwd");
+        let parent = tempfile::tempdir().expect("admitted parent");
+        let external = tempfile::tempdir().expect("external");
+        fs::create_dir_all(external.path().join("docs")).expect("external docs");
+        fs::write(external.path().join("docs/secret.md"), b"secret\n").expect("secret");
+        let alias = parent.path().join("alias");
+        symlink(external.path(), &alias).expect("outside alias");
+
+        let Some(fixture) = confined_generation_fixture(
+            crate::WorkspaceRoots::new(cwd.path(), [parent.path()]).expect("workspace"),
+        )
+        .await
+        else {
+            return;
+        };
+        let error = (fixture
+            .tool("glob")
+            .execute)(make_ctx(json!({
+            "pattern": "docs/**/*.md",
+            "path": alias.display().to_string()
+        })))
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("filesystem capability does not cover the requested path"),
+            "outside-root alias target must fail closed with OutsideCapability, got: {error}"
+        );
+        assert!(
+            !error.contains("secret"),
+            "must not leak the external target: {error}"
+        );
+    }
+
+    /// Fail-closed denial at the alias root: a directory alias whose PHYSICAL
+    /// target is a policy-denied path must be rejected with `Denied` even
+    /// though the alias coordinate itself sits inside the admitted root.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn glob_alias_denied_physical_target_fails_closed() {
+        use std::os::unix::fs::symlink;
+
+        let cwd = tempfile::tempdir().expect("cwd");
+        let parent = tempfile::tempdir().expect("admitted parent");
+        fs::create_dir_all(parent.path().join("real/docs")).expect("docs");
+        fs::write(parent.path().join("real/docs/spec.md"), b"# spec\n").expect("spec");
+        let alias = parent.path().join("alias");
+        symlink(parent.path().join("real"), &alias).expect("alias");
+
+        let Some(fixture) = confined_generation_fixture_with_sandbox(
+            crate::WorkspaceRoots::new(cwd.path(), [parent.path()]).expect("workspace"),
+            json!({
+                "sandbox": {
+                    "mode": "workspace-write",
+                    "deniedPaths": [parent.path().join("real").display().to_string()]
+                }
+            }),
+        )
+        .await
+        else {
+            return;
+        };
+        let error = (fixture
+            .tool("glob")
+            .execute)(make_ctx(json!({
+            "pattern": "docs/**/*.md",
+            "path": alias.display().to_string()
+        })))
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("filesystem operation is denied by sandbox policy"),
+            "denied physical alias target must fail closed with Denied, got: {error}"
+        );
+        assert!(
+            !error.contains("spec.md"),
+            "must not leak denied target contents: {error}"
+        );
+    }
+
+    /// Fail-closed denial on descendants: with the walk root allowed, a denied
+    /// descendant must be filtered on EITHER coordinate — the physical
+    /// authority path or the requested lexical alias path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn glob_alias_denied_descendants_filtered_on_both_coordinates() {
+        use std::os::unix::fs::symlink;
+
+        for (label, denied) in [
+            ("physical", "real/docs"),
+            ("lexical", "alias/docs"),
+        ] {
+            let cwd = tempfile::tempdir().expect("cwd");
+            let parent = tempfile::tempdir().expect("admitted parent");
+            fs::create_dir_all(parent.path().join("real/docs")).expect("docs");
+            fs::write(parent.path().join("real/docs/spec.md"), b"# spec\n").expect("spec");
+            // Allowed sibling proves the walk genuinely descended and matched —
+            // guards the absence assertion below against a vacuous pass.
+            fs::write(parent.path().join("real/keep.md"), b"keep\n").expect("keep");
+            let alias = parent.path().join("alias");
+            symlink(parent.path().join("real"), &alias).expect("alias");
+
+            let Some(fixture) = confined_generation_fixture_with_sandbox(
+                crate::WorkspaceRoots::new(cwd.path(), [parent.path()]).expect("workspace"),
+                json!({
+                    "sandbox": {
+                        "mode": "workspace-write",
+                        "deniedPaths": [parent.path().join(denied).display().to_string()]
+                    }
+                }),
+            )
+            .await
+            else {
+                return;
+            };
+            let result = (fixture
+                .tool("glob")
+                .execute)(make_ctx(json!({
+                "pattern": "**/*.md",
+                "path": alias.display().to_string()
+            })))
+            .await
+            .expect("walk root alias must resolve when only a descendant is denied");
+            let text = text_of(&result);
+            assert!(
+                text.contains("keep.md"),
+                "allowed sibling must still match through the alias walk: {text}"
+            );
+            assert!(
+                !text.contains("docs/spec.md"),
+                "denied {label} descendant leaked through the alias walk: {text}"
+            );
+        }
+    }
+
+    /// Child symlink behavior is unchanged under a resolved alias walk:
+    /// entries that are themselves symlinks stay invisible and are never
+    /// traversed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn glob_alias_child_symlink_entries_stay_skipped() {
+        use std::os::unix::fs::symlink;
+
+        let cwd = tempfile::tempdir().expect("cwd");
+        let parent = tempfile::tempdir().expect("admitted parent");
+        fs::create_dir_all(parent.path().join("real/docs")).expect("docs");
+        fs::write(parent.path().join("real/docs/spec.md"), b"# spec\n").expect("spec");
+        fs::create_dir_all(parent.path().join("other")).expect("other");
+        fs::write(parent.path().join("other/leaked.md"), b"leak\n").expect("leak");
+        symlink(
+            parent.path().join("other"),
+            parent.path().join("real/docs2"),
+        )
+        .expect("child link");
+        let alias = parent.path().join("alias");
+        symlink(parent.path().join("real"), &alias).expect("alias");
+
+        let Some(fixture) = confined_generation_fixture(
+            crate::WorkspaceRoots::new(cwd.path(), [parent.path()]).expect("workspace"),
+        )
+        .await
+        else {
+            return;
+        };
+        let result = (fixture
+            .tool("glob")
+            .execute)(make_ctx(json!({
+            "pattern": "**/*.md",
+            "path": alias.display().to_string()
+        })))
+        .await
+        .expect("child symlinks are skipped, not fatal");
+        let text = text_of(&result);
+        assert!(text.contains("docs/spec.md"), "real docs must match: {text}");
+        assert!(
+            !text.contains("docs2"),
+            "child symlink entry must stay invisible: {text}"
+        );
+        assert!(
+            !text.contains("leaked.md"),
+            "child symlink must never be traversed: {text}"
+        );
+    }
+
+    /// `.gitignore` must be read through the same pinned directory the walk
+    /// uses. A lexical `PolicyFs::read_bounded` on the alias path stats the
+    /// symlink itself (`SYMLINK_NOFOLLOW`) and `.ok()` drops the failure, so
+    /// rules never load and ignored files leak. Nested ignore plus negation
+    /// must still apply; the kept control must remain visible. Display stays
+    /// lexical (alias-relative).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn glob_directory_alias_applies_gitignore_from_pinned_target() {
+        use std::os::unix::fs::symlink;
+
+        let cwd = tempfile::tempdir().expect("cwd");
+        let parent = tempfile::tempdir().expect("admitted parent");
+        fs::create_dir_all(parent.path().join("real/nested")).expect("nested");
+        fs::write(parent.path().join("real/.git"), b"gitdir: real.git\n").expect("gitdir");
+        fs::write(
+            parent.path().join("real/.gitignore"),
+            b"ignored.md\nnested/secret.md\n",
+        )
+        .expect("root gitignore");
+        fs::write(parent.path().join("real/nested/.gitignore"), b"!secret.md\n").expect("negation");
+        fs::write(parent.path().join("real/keep.md"), b"keep\n").expect("keep");
+        fs::write(parent.path().join("real/ignored.md"), b"ignored\n").expect("ignored");
+        fs::write(parent.path().join("real/nested/secret.md"), b"secret\n").expect("secret");
+        fs::write(parent.path().join("real/nested/other.md"), b"other\n").expect("other");
+        let alias = parent.path().join("alias");
+        symlink(parent.path().join("real"), &alias).expect("directory alias");
+
+        let Some(fixture) = confined_generation_fixture(
+            crate::WorkspaceRoots::new(cwd.path(), [parent.path()]).expect("workspace"),
+        )
+        .await
+        else {
+            return;
+        };
+        let result = (fixture
+            .tool("glob")
+            .execute)(make_ctx(json!({
+            "pattern": "**/*.md",
+            "path": alias.display().to_string()
+        })))
+        .await
+        .expect("alias glob must apply gitignore from the pinned target directory");
+        let text = text_of(&result);
+        assert!(
+            text.contains("keep.md"),
+            "kept control must remain visible through the alias: {text}"
+        );
+        assert!(
+            text.contains("nested/secret.md"),
+            "nested negation must un-ignore secret.md: {text}"
+        );
+        assert!(
+            text.contains("nested/other.md"),
+            "unignored nested file must remain visible: {text}"
+        );
+        assert!(
+            !text.contains("ignored.md"),
+            "root gitignore must hide ignored.md when read through the pinned alias target: {text}"
+        );
+        assert!(
+            !text.contains(&parent.path().join("real").display().to_string()),
+            "results must stay lexical to the alias, not the physical target: {text}"
+        );
+    }
+
+
     // -----------------------------------------------------------------------
     // Abort propagation for ls / find / glob / grep
     // -----------------------------------------------------------------------
@@ -10592,7 +11282,7 @@ mod tests {
         let fs = captured_policy_fs(&generation).expect("policy fs");
         let (controller, abort) = pi_agent::AbortController::new();
         controller.abort();
-        let mut ignores = IgnoreStack::new(generation, &d.to_string_lossy(), true, false)
+        let ignores = IgnoreStack::new(generation.clone(), &d.to_string_lossy(), true, false)
             .await
             .expect("ignore stack");
         let mut output = GrepOutput::default();
@@ -10602,9 +11292,8 @@ mod tests {
         let regex = regex::Regex::new("needle").expect("regex");
         grep_policy_entry(
             &fs,
-            &mut ignores,
+            &generation,
             &d,
-            Path::new(""),
             &regex,
             "",
             0,
@@ -10614,11 +11303,486 @@ mod tests {
             &mut matched,
             &mut lines_truncated,
             &mut output_truncated,
+            ignores,
         )
+        .await
         .expect("entry scan");
         assert!(output.is_empty(), "aborted grep must not scan: {output:?}");
         assert_eq!(matched, 0);
     }
+    /// CONTRACT REGRESSION: a nested repo below a non-repo search root must
+    /// honor its own .gitignore, like direct dep ignore 0.4.31 (Cargo.toml:28;
+    /// src/dir.rs:344-357,463 per-walked-dir has_git; 560-561,579-585 any_git).
+    /// The walker detects repo boundaries during the walk and swaps in the
+    /// nested repo's own ignore context; non-repo sibling .gitignore stays inert.
+    #[tokio::test]
+    async fn grep_honors_nested_repo_gitignore_under_nonrepo_parent_root() {
+        let d = tmpdir();
+        fs::create_dir_all(d.join("nested/src")).unwrap();
+        fs::create_dir_all(d.join("nested/target")).unwrap();
+        fs::create_dir_all(d.join("sibling")).unwrap();
+        let initialized = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(d.join("nested"))
+            .output()
+            .expect("real git init for the nested repo fixture");
+        assert!(
+            initialized.status.success(),
+            "real git init failed: {}",
+            String::from_utf8_lossy(&initialized.stderr)
+        );
+        fs::write(d.join("nested/.gitignore"), b"target/\n").unwrap();
+        fs::write(
+            d.join("nested/src/a.rs"),
+            b"fn a() {}\n// synthetic_needle_marker in src\n",
+        )
+        .unwrap();
+        fs::write(
+            d.join("nested/target/b.rs"),
+            b"fn b() {}\n// synthetic_needle_marker in target\n",
+        )
+        .unwrap();
+        // Non-repo sibling: its .gitignore must be inert under require_git and
+        // must never pollute the nested repo's marker.
+        fs::write(d.join("sibling/.gitignore"), b"*.rs\n").unwrap();
+        fs::write(
+            d.join("sibling/visible.rs"),
+            b"fn v() {}\n// synthetic_needle_marker in sibling\n",
+        )
+        .unwrap();
+
+        let fixture = tool_generation_fixture(&d).await;
+        let tool = fixture.tool("grep");
+        let result = (tool.execute)(make_ctx(json!({
+            "pattern": "synthetic_needle_marker",
+            "glob": "*.{rs,ts,tsx,js}"
+        })))
+        .await
+        .unwrap();
+        let text = text_of(&result);
+
+        assert!(
+            text.contains("nested/src/a.rs") && text.contains("synthetic_needle_marker"),
+            "positive control: nested/src/a.rs must match through the published grep tool: {text}"
+        );
+        assert!(
+            text.contains("sibling/visible.rs"),
+            "non-repo sibling .gitignore (*.rs) must stay inert under require_git and must not hide the marker: {text}"
+        );
+        assert!(
+            !text.contains("nested/target/b.rs"),
+            "nested repo .gitignore target/ must hide nested/target/b.rs even when the search root's parent chain has no .git (ignore-0.4.31 src/dir.rs:344-357,463,560-561,579-585); got: {text}"
+        );
+    }
+    /// PERF FIXTURE (manual #[ignore]; Main executes). Identical fixture through the
+    /// real grep tool from parent-root vs repo-root, timed before/after the
+    /// nested-repo ignore change; values are printed, never pinned. Zero-match
+    /// pattern => the walk cannot early-exit via limit (matched stays 0, the
+    /// whole tree is enumerated either way). Asserts only "No matches found".
+    #[tokio::test]
+    #[ignore = "manual perf fixture; run explicitly with --ignored"]
+    async fn grep_perf_ignored_tree_parent_vs_repo_root_timing() {
+        let d = tmpdir();
+        fs::create_dir_all(d.join("tree/repo/target")).unwrap();
+        let initialized = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(d.join("tree/repo"))
+            .output()
+            .expect("real git init for the perf fixture repo");
+        assert!(
+            initialized.status.success(),
+            "real git init failed: {}",
+            String::from_utf8_lossy(&initialized.stderr)
+        );
+        fs::write(d.join("tree/repo/.gitignore"), b"target/\n").unwrap();
+        let line = "x".repeat(8_000);
+        for i in 0..1_000 {
+            fs::write(
+                d.join(format!("tree/repo/target/pad_{i:04}.rs")),
+                format!("fn pad_{i}() {{}}\n{line}\n"),
+            )
+            .unwrap();
+        }
+
+        let fixture = tool_generation_fixture(&d).await;
+        let tool = fixture.tool("grep");
+        for (label, path) in [
+            ("parent-root", "tree"),
+            ("repo-root", "tree/repo"),
+        ] {
+            let started = std::time::Instant::now();
+            let result = (tool.execute)(make_ctx(json!({
+                "pattern": "synthetic_needle_marker",
+                "glob": "*.{rs,ts,tsx,js}",
+                "path": path
+            })))
+            .await
+            .unwrap();
+            let elapsed = started.elapsed();
+            let text = text_of(&result);
+            assert_eq!(
+                text, "No matches found",
+                "{label}: zero-match walk must complete the full traversal: {text}"
+            );
+            println!("{label}: elapsed {elapsed:?}");
+        }
+    }
+    /// Contract: a reachable nested repo uses its OWN ignore context; outer
+    /// repo rules are cut inside it (ignore-0.4.31 dir.rs:579-593 saw_git) and
+    /// the outer context is restored for siblings after the subtree exits.
+    /// Fails on the pre-fix tree: the outer rule leaks onto nested/src/a.rs.
+    #[tokio::test]
+    async fn grep_nested_repo_cuts_outer_rules_and_restores_sibling_context() {
+        let d = tmpdir();
+        fs::create_dir_all(d.join("outer/nested/src")).unwrap();
+        fs::create_dir_all(d.join("outer/nested/target")).unwrap();
+        fs::create_dir_all(d.join("outer/outer_ignored")).unwrap();
+        fs::create_dir_all(d.join("outer/sibling_ok")).unwrap();
+        for repo in ["outer", "outer/nested"] {
+            let initialized = std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(d.join(repo))
+                .output()
+                .expect("real git init for the nested-cut fixture");
+            assert!(
+                initialized.status.success(),
+                "real git init failed for {repo}: {}",
+                String::from_utf8_lossy(&initialized.stderr)
+            );
+        }
+        fs::write(d.join("outer/.gitignore"), b"a.rs\nouter_ignored/\n").unwrap();
+        fs::write(d.join("outer/nested/.gitignore"), b"target/\n").unwrap();
+        fs::write(
+            d.join("outer/nested/src/a.rs"),
+            b"// synthetic_needle_marker in nested src\n",
+        )
+        .unwrap();
+        fs::write(
+            d.join("outer/nested/target/b.rs"),
+            b"// synthetic_needle_marker in nested target\n",
+        )
+        .unwrap();
+        fs::write(
+            d.join("outer/outer_ignored/x.rs"),
+            b"// synthetic_needle_marker outer ignored\n",
+        )
+        .unwrap();
+        fs::write(
+            d.join("outer/sibling_ok/y.rs"),
+            b"// synthetic_needle_marker sibling\n",
+        )
+        .unwrap();
+
+        let fixture = tool_generation_fixture(&d).await;
+        let tool = fixture.tool("grep");
+        let result = (tool.execute)(make_ctx(json!({
+            "pattern": "synthetic_needle_marker",
+            "glob": "*.{rs,ts,tsx,js}",
+            "path": "outer"
+        })))
+        .await
+        .unwrap();
+        let text = text_of(&result);
+
+        assert!(
+            text.contains("nested/src/a.rs"),
+            "outer repo rule nested/ must be cut inside the nested repo (dir.rs:579-593 saw_git); got: {text}"
+        );
+        assert!(
+            !text.contains("nested/target/b.rs"),
+            "the nested repo's own target/ must be ignored; got: {text}"
+        );
+        assert!(
+            !text.contains("outer_ignored/x.rs"),
+            "outer rules must still apply outside the nested repo; got: {text}"
+        );
+        assert!(
+            text.contains("sibling_ok/y.rs"),
+            "outer context must be restored for siblings after the nested subtree; got: {text}"
+        );
+    }
+
+    /// Contract: a `.git` worktree FILE is a real repository boundary marker
+    /// (ignore-0.4.31 dir.rs:347-357 `git_type.is_some()`), so a nested repo
+    /// reached from a non-repo parent honors its .gitignore. The plain file is
+    /// the faithful fixture for the marker probe (no repo to init). Fails on
+    /// the pre-fix tree: use_gitignore=false scans target/b.rs.
+    #[tokio::test]
+    async fn grep_honors_gitignore_of_worktree_file_marker_under_nonrepo_parent() {
+        let d = tmpdir();
+        fs::create_dir_all(d.join("nested/src")).unwrap();
+        fs::create_dir_all(d.join("nested/target")).unwrap();
+        fs::write(d.join("nested/.git"), b"gitdir: /somewhere/else\n").unwrap();
+        fs::write(d.join("nested/.gitignore"), b"target/\n").unwrap();
+        fs::write(
+            d.join("nested/src/a.rs"),
+            b"// synthetic_needle_marker in src\n",
+        )
+        .unwrap();
+        fs::write(
+            d.join("nested/target/b.rs"),
+            b"// synthetic_needle_marker in target\n",
+        )
+        .unwrap();
+
+        let fixture = tool_generation_fixture(&d).await;
+        let tool = fixture.tool("grep");
+        let result = (tool.execute)(make_ctx(json!({
+            "pattern": "synthetic_needle_marker",
+            "glob": "*.{rs,ts,tsx,js}"
+        })))
+        .await
+        .unwrap();
+        let text = text_of(&result);
+
+        assert!(
+            text.contains("nested/src/a.rs"),
+            "positive control: nested/src/a.rs must match: {text}"
+        );
+        assert!(
+            !text.contains("nested/target/b.rs"),
+            "a .git worktree-file marker must enable the nested repo's own gitignore (dir.rs:347-357); got: {text}"
+        );
+    }
+
+    /// Contract: marker-probe errors outside the exact absent/nofollow
+    /// categories propagate fail-closed (UnsupportedEntryType must NOT be
+    /// swallowed as "no repo"). A fifo `.git` produces the real error through
+    /// the retained open path; arm_enumerated_child_open_fault only reaches
+    /// enumeration-cursor opens (capability.rs:2589), not the probe. Fails on
+    /// the pre-fix tree: no probe exists, the walk succeeds.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grep_nested_git_marker_probe_error_propagates() {
+        let root = tmpdir();
+        fs::create_dir_all(root.join("nested")).unwrap();
+        // Repo convention (pi-cli/build.rs:386-396): create the fifo through the
+        // mkfifo binary; skip the test when the tool is unavailable.
+        let made = std::process::Command::new("mkfifo")
+            .arg(root.join("nested/.git"))
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !made {
+            eprintln!("note: mkfifo unavailable; skipping marker-probe error contract test");
+            return;
+        }
+        fs::write(
+            root.join("nested/src.rs"),
+            b"// synthetic_needle_marker\n",
+        )
+        .unwrap();
+
+        let fixture = tool_generation_fixture(&root).await;
+        let generation = fixture.generation();
+        let policy = captured_policy_fs(&generation).expect("policy fs");
+        let ignores = IgnoreStack::new(generation.clone(), &root.to_string_lossy(), true, false)
+            .await
+            .expect("ignore stack");
+        let (_controller, abort) = pi_agent::AbortController::new();
+        let regex = regex::Regex::new("synthetic_needle_marker").expect("regex");
+        let mut output = GrepOutput::default();
+        let mut matched = 0usize;
+        let mut lines_truncated = false;
+        let mut output_truncated = false;
+        let scanned = grep_policy_entry(
+            &policy,
+            &generation,
+            &root,
+            &regex,
+            "",
+            0,
+            100,
+            &abort,
+            &mut output,
+            &mut matched,
+            &mut lines_truncated,
+            &mut output_truncated,
+            ignores,
+        )
+        .await;
+        let error = scanned.expect_err("unsupported .git marker probe must propagate");
+        assert!(
+            matches!(
+                fs_error_of(&error),
+                Some(crate::fs::FsError::UnsupportedEntryType)
+            ),
+            "probe failure must carry the exact fs error: {error:#}"
+        );
+    }
+
+    /// Contract: pruning happens BEFORE any repository marker probe — an
+    /// ignored directory is never entered, so its `.git` (a fifo here, whose
+    /// probe would fail closed) and its arbitrary subtree stay untouched and
+    /// the walk succeeds. Guards the fix's probe order against regressions.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grep_ignored_directory_is_never_entered_or_probed_for_markers() {
+        let d = tmpdir();
+        // Repo root so the root .gitignore applies (require_git satisfied).
+        let initialized = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&d)
+            .output()
+            .expect("real git init for the ignored-subtree fixture");
+        assert!(
+            initialized.status.success(),
+            "real git init failed: {}",
+            String::from_utf8_lossy(&initialized.stderr)
+        );
+        fs::write(d.join(".gitignore"), b"pruned/\n").unwrap();
+        fs::create_dir_all(d.join("pruned/deep")).unwrap();
+        // mkfifo binary convention (pi-cli/build.rs:386-396); skip if absent.
+        let made = std::process::Command::new("mkfifo")
+            .arg(d.join("pruned/.git"))
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !made {
+            eprintln!("note: mkfifo unavailable; skipping ignored-subtree probe-order test");
+            return;
+        }
+        fs::write(
+            d.join("pruned/deep/x.rs"),
+            b"// synthetic_needle_marker hidden inside ignored subtree\n",
+        )
+        .unwrap();
+        fs::write(d.join("visible.rs"), b"// unrelated content, no marker\n").unwrap();
+
+        let fixture = tool_generation_fixture(&d).await;
+        let tool = fixture.tool("grep");
+        let result = (tool.execute)(make_ctx(json!({
+            "pattern": "synthetic_needle_marker",
+            "glob": "*.{rs,ts,tsx,js}"
+        })))
+        .await
+        .unwrap();
+        let text = text_of(&result);
+
+        assert_eq!(
+            text, "No matches found",
+            "the ignored directory must be pruned before any marker probe: its fifo .git must never be touched and its needle file must stay hidden: {text}"
+        );
+    }
+    fn open_entry_fault(kind: std::io::ErrorKind) -> crate::fs::FsError {
+        crate::fs::FsError::System {
+            operation: crate::fs::FsOperation::OpenEntry,
+            kind,
+            raw_os_error: None,
+            purpose: Some(crate::fs::CapabilityRootPurpose::ProjectResources),
+            path: Some(PathBuf::from("tmp/anvil-state.json")),
+        }
+    }
+
+    fn fs_error_of(error: &anyhow::Error) -> Option<&crate::fs::FsError> {
+        error
+            .chain()
+            .find_map(|source| source.downcast_ref::<crate::fs::FsError>())
+    }
+
+    async fn scan_grep_with_enumerated_fault(
+        fault: crate::fs::FsError,
+    ) -> (
+        crate::fs::EnumeratedChildOpenFaultGuard,
+        Result<(GrepOutput, usize), anyhow::Error>,
+    ) {
+        let root = tmpdir();
+        fs::create_dir(root.join("tmp")).unwrap();
+        fs::write(root.join("keep.rs"), b"fn needle() {}\n").unwrap();
+        fs::write(root.join("tmp/anvil-state.json"), b"{}\n").unwrap();
+        let fixture = tool_generation_fixture(&root).await;
+        let generation = fixture.generation();
+        let policy = captured_policy_fs(&generation).expect("policy fs");
+        let guard = crate::fs::arm_enumerated_child_open_fault(
+            Path::new("tmp/anvil-state.json"),
+            fault,
+        );
+        let ignores = IgnoreStack::new(generation.clone(), &root.to_string_lossy(), true, false)
+            .await
+            .expect("ignore stack");
+        let (_controller, abort) = pi_agent::AbortController::new();
+        let mut output = GrepOutput::default();
+        let mut matched = 0usize;
+        let mut lines_truncated = false;
+        let mut output_truncated = false;
+        let regex = regex::Regex::new("needle").expect("regex");
+        let scanned = grep_policy_entry(
+            &policy,
+            &generation,
+            &root,
+            &regex,
+            "*.rs",
+            0,
+            100,
+            &abort,
+            &mut output,
+            &mut matched,
+            &mut lines_truncated,
+            &mut output_truncated,
+            ignores,
+        )
+        .await
+        .map(|()| (output, matched));
+        (guard, scanned)
+    }
+
+    #[tokio::test]
+    async fn grep_keeps_match_when_enumerated_nonmatching_file_vanishes() {
+        let (guard, scanned) = scan_grep_with_enumerated_fault(open_entry_fault(
+            std::io::ErrorKind::NotFound,
+        ))
+        .await;
+        let (output, matched) = scanned.expect("vanished nonmatching child is nonfatal");
+        assert!(
+            guard.fired(),
+            "NotFound must be injected on the enumerated json open"
+        );
+        assert_eq!(matched, 1);
+        assert!(
+            output.iter().any(|row| row.contains("keep.rs") && row.contains("needle")),
+            "matching rust file must survive: {output:?}"
+        );
+        assert!(
+            output.iter().all(|row| !row.contains("anvil-state")),
+            "nonmatching json must not be a hit: {output:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_enumerated_child_permission_failure_propagates() {
+        let (guard, scanned) = scan_grep_with_enumerated_fault(open_entry_fault(
+            std::io::ErrorKind::PermissionDenied,
+        ))
+        .await;
+        let error = scanned.expect_err("permission failure is fatal");
+        assert!(guard.fired(), "fault must hit the enumerated json open");
+        assert!(
+            fs_error_of(&error).is_some_and(|error| {
+                matches!(
+                    error,
+                    crate::fs::FsError::System {
+                        operation: crate::fs::FsOperation::OpenEntry,
+                        kind: std::io::ErrorKind::PermissionDenied,
+                        ..
+                    }
+                )
+            }),
+            "permission error must stay typed, got {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_enumerated_child_identity_change_propagates() {
+        let (guard, scanned) =
+            scan_grep_with_enumerated_fault(crate::fs::FsError::IdentityChanged).await;
+        let error = scanned.expect_err("identity change is fatal");
+        assert!(guard.fired(), "fault must hit the enumerated json open");
+        assert!(
+            fs_error_of(&error).is_some_and(|error| matches!(error, crate::fs::FsError::IdentityChanged)),
+            "identity change must stay typed, got {error:#}"
+        );
+    }
+
 
     /// Barrier-driven abort seam: a BufRead whose second chunk arms the
     /// AbortController before yielding. The scan must stop on its per-line

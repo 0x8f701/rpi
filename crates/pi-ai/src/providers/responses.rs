@@ -235,10 +235,18 @@ pub(crate) fn build_simple_responses_options(
         ctx,
         requested_max_tokens,
     ));
-    let reasoning_effort = opts.reasoning.and_then(|level| {
-        let clamped = clamp_thinking_level(model, reasoning_effort_for(level));
-        (clamped != "off").then(|| clamped.to_string())
-    });
+    // Absent reasoning clamps "off" once: keep unset when off is allowed,
+    // otherwise send that tier. Explicit levels keep the existing clamp.
+    let reasoning_effort = opts
+        .reasoning
+        .and_then(|level| {
+            let clamped = clamp_thinking_level(model, reasoning_effort_for(level));
+            (clamped != "off").then(|| clamped.to_string())
+        })
+        .or_else(|| {
+            let clamped = clamp_thinking_level(model, "off");
+            (clamped != "off").then(|| clamped.to_string())
+        });
     OpenAIResponsesOptions {
         stream,
         reasoning_effort,
@@ -4746,6 +4754,114 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\
         assert!(
             openai_off.get("include").is_none(),
             "non-xai off path must not request encrypted reasoning: {openai_off}"
+        );
+    }
+
+    /// Reasoning model whose explicit map drops off/minimal/medium/xhigh.
+    /// Clamp of an absent level must land on low, the lowest remaining tier.
+    fn always_thinking_low_floor_model(base_url: &str) -> Model {
+        Model {
+            id: "always-thinking".into(),
+            api: API_OPENAI_RESPONSES.into(),
+            provider: "openai".into(),
+            base_url: base_url.into(),
+            reasoning: true,
+            thinking_level_map: Some(HashMap::from([
+                ("off".into(), None),
+                ("minimal".into(), None),
+                ("medium".into(), None),
+                ("xhigh".into(), None),
+                ("low".into(), Some("low".into())),
+                ("high".into(), Some("high".into())),
+                ("max".into(), Some("max".into())),
+            ])),
+            ..Model::default()
+        }
+    }
+
+    fn simple_reasoning(level: Option<ThinkingLevel>) -> SimpleStreamOptions {
+        SimpleStreamOptions {
+            stream: StreamOptions {
+                api_key: Some("sk".into()),
+                http_executor: Some(crate::http::test_http_executor()),
+                ..StreamOptions::default()
+            },
+            reasoning: level,
+            thinking_budgets: None,
+            responses_stateful_chain: false,
+        }
+    }
+
+    async fn captured_simple_reasoning_effort(
+        model: Model,
+        reasoning: Option<ThinkingLevel>,
+    ) -> Value {
+        let captured = Arc::new(Mutex::new(None::<Captured>));
+        let url = spawn_mock(captured.clone());
+        let mut model = model;
+        model.base_url = url;
+        let stream = stream_simple_openai_responses(
+            model,
+            Context::default(),
+            simple_reasoning(reasoning),
+        );
+        let message = stream.result().await.expect("simple responses stream");
+        assert_eq!(
+            message.stop_reason,
+            StopReason::ToolUse,
+            "shared SSE fixture ends in a function call; stream failed: {:?}",
+            message.error_message
+        );
+        let cap = captured.lock().unwrap().clone().expect("request captured");
+        serde_json::from_str(&cap.body).expect("captured body is json")
+    }
+
+    #[tokio::test]
+    async fn simple_none_on_always_thinking_model_wires_reasoning_effort_low() {
+        let body = captured_simple_reasoning_effort(
+            always_thinking_low_floor_model(""),
+            None,
+        )
+        .await;
+        assert_eq!(
+            body["reasoning"]["effort"],
+            json!("low"),
+            "absent reasoning must clamp to the lowest allowed tier, not off/none/omit: {body}"
+        );
+        let effort = body["reasoning"]["effort"].as_str();
+        assert_ne!(effort, Some("off"));
+        assert_ne!(effort, Some("none"));
+        assert!(body.get("reasoning").is_some(), "reasoning must not be omitted");
+    }
+
+    #[tokio::test]
+    async fn simple_none_keeps_reasoning_off_when_off_is_allowed() {
+        let model = Model {
+            id: "reasoning-model".into(),
+            api: API_OPENAI_RESPONSES.into(),
+            provider: "openai".into(),
+            reasoning: true,
+            ..Model::default()
+        };
+        let body = captured_simple_reasoning_effort(model, None).await;
+        assert_eq!(
+            body["reasoning"],
+            json!({ "effort": "off" }),
+            "off remains available, so Simple None must keep the existing off wire: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn simple_high_on_always_thinking_model_keeps_reasoning_effort_high() {
+        let body = captured_simple_reasoning_effort(
+            always_thinking_low_floor_model(""),
+            Some(ThinkingLevel::High),
+        )
+        .await;
+        assert_eq!(
+            body["reasoning"]["effort"],
+            json!("high"),
+            "an explicit allowed level must stay on that level: {body}"
         );
     }
 }

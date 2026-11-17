@@ -120,7 +120,7 @@ fn fixture(
 
     let session = Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
         SessionOptions {
-            model,
+            model: Some(model),
             cwd,
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,

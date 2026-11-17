@@ -208,6 +208,15 @@ export interface AutoReviewWireError {
 
 export interface CodeReviewSnapshot {
   comparisonLabel: string;
+  /**
+   * Authoritative repository for this review's citations, relative to the
+   * owning session. `null` is that session's current directory. A string is
+   * one session-relative child root. `{ unavailable: true }` is an ancestor
+   * the session cannot address. Missing, empty, absolute, traversal, and any
+   * other object reject the snapshot.
+   */
+  repo: ReviewRepository;
+
   snapshotId: string;
   reviewId: string;
   generation: number;
@@ -272,6 +281,14 @@ export interface CodeReviewSnapshot {
   tldrError: string | null;
   /** Last approved markdown. Empty before the first accepted body. */
   tldrMarkdown: string;
+  /** Stable wire creation time (epoch ms) of the last approved markdown,
+   *  captured from the final assistant message and stored ONLY as a pair
+   *  with `tldrMarkdown`. Null before the first accepted body; error/abort
+   *  keeps the last-good pair. A non-usable wire value degrades to null
+   *  (the snapshot/markdown pair survives; save reports through the central
+   *  toast) while range validity stays `replyMarkdownFileName`'s alone.
+   *  Never a client clock. */
+  tldrTimestamp: number | null;
 
 }
 
@@ -605,10 +622,53 @@ export function normalizeThreads(raw: unknown): ReviewThread[] {
   return out;
 }
 
+export type ReviewRepository = string | null | { readonly unavailable: true };
+
+export function reviewRepositoryUnavailable(
+  repo: ReviewRepository | undefined,
+): repo is { readonly unavailable: true } {
+  return repo !== null && typeof repo === 'object' && repo.unavailable === true;
+}
+
+/** Exact structural rejection for a missing/malformed snapshot repo. */
+export const INVALID_CODE_REVIEW_SNAPSHOT_REPO = 'Invalid code-review snapshot repo';
+
+/**
+ * Required repo authority: `null` (the session's current directory) or a
+ * canonical non-empty session-relative path. Absolute roots, drive roots,
+ * traversal, empty segments, and control/backslash bytes are malformed and
+ * reject the whole snapshot instead of degrading to a workspace-relative
+ * guess.
+ */
+function normalizeSnapshotRepo(
+  value: unknown,
+): { ok: true; repo: ReviewRepository } | { ok: false } {
+  if (value === null) return { ok: true, repo: null };
+  if (typeof value === 'string') {
+    if (value === '' || value.trim() !== value) return { ok: false };
+    if (/[\u0000-\u001f\u007f\\]/.test(value)) return { ok: false };
+    if (value.startsWith('/') || /^[A-Za-z]:\//.test(value)) return { ok: false };
+    const segments = value.split('/');
+    if (segments.some((segment) => segment === '' || segment === '.' || segment === '..')) {
+      return { ok: false };
+    }
+    return { ok: true, repo: value };
+  }
+  if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+    const record = value as Record<string, unknown>;
+    const keys = Object.keys(record);
+    if (keys.length === 1 && keys[0] === 'unavailable' && record.unavailable === true) {
+      return { ok: true, repo: { unavailable: true } };
+    }
+  }
+  return { ok: false };
+}
+
 /** Empty snapshot used when open/snapshot fails before any data arrives. */
 export function emptyCodeReviewSnapshot(error: string | null = null): CodeReviewSnapshot {
   return {
     comparisonLabel: '',
+    repo: null,
     snapshotId: '',
     reviewId: '',
     generation: 0,
@@ -641,23 +701,46 @@ export function emptyCodeReviewSnapshot(error: string | null = null): CodeReview
     tldrSnapshotId: null,
     tldrError: null,
     tldrMarkdown: '',
+    tldrTimestamp: null,
   };
 }
 
+/** Discriminated parse boundary: structural rejection never masquerades as an
+ *  empty snapshot, and the raw (identity-validated) review id is available for
+ *  an owner-targeted cleanup close. */
+export type CodeReviewSnapshotParse =
+  | { ok: true; snapshot: CodeReviewSnapshot }
+  | { ok: false; error: string; reviewId: string | null };
+
+/** Accept ONLY an exact raw review identity for cleanup. Never infer identity
+ *  from error prose or a repaired value. */
+function validReviewId(value: unknown): string | null {
+  return typeof value === 'string'
+    && value !== ''
+    && value.trim() === value
+    && !/[\u0000-\u001f\u007f]/.test(value)
+    ? value
+    : null;
+}
+
 /**
- * Normalize a code_review_* response payload into a stable CodeReviewSnapshot.
- * Returns a snapshot with `error` set (never throws) for unusable shapes so
- * the panel can always render an actionable state.
+ * Parse a code_review_* response payload. Structural failures (shape, repo,
+ * findings, TLDR) return `ok: false` so callers preserve their last-good
+ * state; a server-reported `snapshot.error` remains valid in-band data (for
+ * example a non-git open).
  */
-export function normalizeCodeReviewSnapshot(data: unknown): CodeReviewSnapshot {
+export function parseCodeReviewSnapshot(data: unknown): CodeReviewSnapshotParse {
   const obj = asRecord(data);
   if (!obj) {
-    return emptyCodeReviewSnapshot('Invalid code-review snapshot response');
+    return { ok: false, error: 'Invalid code-review snapshot response', reviewId: null };
   }
+  const reviewId = validReviewId(obj.reviewId);
+  const repo = normalizeSnapshotRepo(obj.repo);
+  if (!repo.ok) return { ok: false, error: INVALID_CODE_REVIEW_SNAPSHOT_REPO, reviewId };
   const findings = normalizeReviewFindings(obj.reviewFindings);
-  if (!findings.ok) return emptyCodeReviewSnapshot(findings.error);
+  if (!findings.ok) return { ok: false, error: findings.error, reviewId };
   const tldr = normalizeTldrFields(obj);
-  if (!tldr.ok) return emptyCodeReviewSnapshot(tldr.error);
+  if (!tldr.ok) return { ok: false, error: tldr.error, reviewId };
   const filesRaw = Array.isArray(obj.files) ? obj.files : [];
   const files: DiffFile[] = [];
   for (const entry of filesRaw) {
@@ -678,8 +761,9 @@ export function normalizeCodeReviewSnapshot(data: unknown): CodeReviewSnapshot {
     typeof obj.isStreaming === 'boolean' ? obj.isStreaming : activeCount > 0;
   const internalBusy = boolField(obj.internalBusy);
 
-  return {
+  const snapshot: CodeReviewSnapshot = {
     comparisonLabel: stringField(obj.comparisonLabel),
+    repo: repo.repo,
     snapshotId: stringField(obj.snapshotId),
     reviewId: stringField(obj.reviewId),
     generation: uintField(obj.generation),
@@ -712,8 +796,10 @@ export function normalizeCodeReviewSnapshot(data: unknown): CodeReviewSnapshot {
     tldrSnapshotId: tldr.snapshotId,
     tldrError: tldr.error,
     tldrMarkdown: tldr.markdown,
+    tldrTimestamp: tldr.timestamp,
 
   };
+  return { ok: true, snapshot };
 }
 /**
  * Strict typed Auto Review error: null unless the wire carries exactly
@@ -747,13 +833,21 @@ function normalizeTldrFields(obj: Record<string, unknown>): {
   snapshotId: string | null;
   error: string | null;
   markdown: string;
+  timestamp: number | null;
 } | { ok: false; error: string } {
-  const supplied = 'tldrState' in obj || 'tldrGeneration' in obj || 'tldrSnapshotId' in obj || 'tldrError' in obj || 'tldrMarkdown' in obj;
+  const supplied = 'tldrState' in obj || 'tldrGeneration' in obj || 'tldrSnapshotId' in obj || 'tldrError' in obj || 'tldrMarkdown' in obj || 'tldrTimestamp' in obj;
   if (!supplied) {
-    return { ok: true, state: 'idle', generation: 0, snapshotId: null, error: null, markdown: '' };
+    return { ok: true, state: 'idle', generation: 0, snapshotId: null, error: null, markdown: '', timestamp: null };
   }
   const snapshotId = typeof obj.tldrSnapshotId === 'string' ? obj.tldrSnapshotId : null;
   const tldrError = typeof obj.tldrError === 'string' ? obj.tldrError : null;
+  // A non-usable wire timestamp degrades to null: it must never reject the
+  // snapshot/markdown pair (missing time is a save-time central-toast
+  // failure, not a structural one), and range validity stays exclusively
+  // with replyMarkdownFileName.
+  const tldrTimestamp = typeof obj.tldrTimestamp === 'number' && Number.isInteger(obj.tldrTimestamp)
+    ? obj.tldrTimestamp
+    : null;
   if (
     typeof obj.tldrState !== 'string'
     || !Object.hasOwn(TLDR_STATES, obj.tldrState)
@@ -771,6 +865,7 @@ function normalizeTldrFields(obj: Record<string, unknown>): {
     snapshotId,
     error: tldrError,
     markdown: obj.tldrMarkdown,
+    timestamp: tldrTimestamp,
   };
 }
 
@@ -2024,11 +2119,6 @@ export function codeReviewOpenCommand(args: {
   return { ok: true, command };
 }
 
-export function codeReviewOpenSnapshotError(data: unknown): string | null {
-  const error = normalizeCodeReviewSnapshot(data).error;
-  return error && error !== '' ? error : null;
-}
-
 // ---------------------------------------------------------------------------
 // `/show` chooser: recent-commit listing (`code_review_commits`) plus the
 // picker search/selection decisions. Pure so the node lane exercises them
@@ -3097,31 +3187,7 @@ export function shouldEagerFileDiffFetch(
   return !loadState.loading && loadState.error == null && !stalled;
 }
 
-/** Reconcile decision for a reconnect/restart probe of the review controller. */
-export type ReviewProbeOutcome =
-  | { kind: 'preserve' }
-  | { kind: 'reopen' }
-  | { kind: 'wait' };
-
 const CODE_REVIEW_NOT_OPEN_CODE = 'code_review_not_open';
-
-/**
- * Classify a `code_review_snapshot` probe of the authoritative controller
- * after a new connection epoch. A live snapshot (non-empty snapshotId) means
- * the same-process controller survived — preserve it. Only the backend's
- * typed no-open code proves a process restart lost the controller.
- * Other business failures preserve the retained last-good client snapshot
- * while the caller toasts the cause through the App's single toast surface;
- * transport failures wait for the next epoch without any local surface.
- */
-export function classifyReviewProbe(data: unknown, error: unknown): ReviewProbeOutcome {
-  if (error) {
-    if (!shouldRenderReviewError(error)) return { kind: 'wait' };
-    return isNoOpenCodeReviewError(error) ? { kind: 'reopen' } : { kind: 'preserve' };
-  }
-  const snap = normalizeCodeReviewSnapshot(data);
-  return snap.snapshotId ? { kind: 'preserve' } : { kind: 'reopen' };
-}
 
 export const CONTEXT_EXPAND_LINES = 20;
 
@@ -3922,6 +3988,17 @@ export function tldrMarkdownForSnapshot(
 ): string {
   if (!snapshot.tldrSnapshotId || snapshot.tldrSnapshotId !== snapshot.snapshotId) return '';
   return snapshot.tldrMarkdown;
+}
+
+/** Stable wire timestamp bound to the visible TLDR markdown. Same
+ *  snapshot-match rule as tldrMarkdownForSnapshot: a stale or mismatched
+ *  snapshot yields null so a save can never be named after a document the
+ *  host is not rendering. */
+export function tldrTimestampForSnapshot(
+  snapshot: Pick<CodeReviewSnapshot, 'snapshotId' | 'tldrSnapshotId' | 'tldrTimestamp'>,
+): number | null {
+  if (!snapshot.tldrSnapshotId || snapshot.tldrSnapshotId !== snapshot.snapshotId) return null;
+  return snapshot.tldrTimestamp;
 }
 
 /** TLDR button. Pending click and wire `running` share one busy state.

@@ -24,7 +24,7 @@ use super::Application;
 pub struct SideChatFork {
     pub messages: Vec<Message>,
     pub system_prompt: String,
-    pub model: Model,
+    pub model: Option<Model>,
     pub thinking_level: ThinkingLevel,
     pub cwd: PathBuf,
     pub stream_fn: StreamFn,
@@ -513,7 +513,7 @@ mod tests {
             let session =
                 crate::Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
                     crate::SessionOptions {
-                        model: self.model.clone(),
+                        model: Some(self.model.clone()),
                         cwd: self.cwd.path().to_path_buf(),
                         system_prompt: "main system".to_owned(),
                         thinking_level: ThinkingLevel::Off,

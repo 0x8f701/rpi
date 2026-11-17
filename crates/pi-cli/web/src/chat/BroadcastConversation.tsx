@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type UIEvent } from 'react';
 import { createAutoResizeController, type AutoResizeController } from '../autoResize';
 import { MarkdownBody } from '../MarkdownBody';
+import { ReplyActions } from '../ReplyActions';
 import { appendDraft, parseSlashLine } from '../commands';
 import { CommandPicker } from '../CommandPicker';
 import { composerBeforeInputShouldSubmit, composerEnterShouldPreventDefault, composerEnterShouldSubmit, nativeEventShiftKey, nextPasteEnterGuard } from '../composerPaste';
@@ -38,6 +39,10 @@ export interface BroadcastConversationProps {
   onCancelTarget: (runId: string, mappingId: string) => Promise<void>;
   onRetryTarget: (runId: string, mappingId: string) => Promise<void>;
   onViewRunner: (mappingId: string) => void;
+  /** Central error sink for the shared reply action strip (copy/save
+   *  failures). Owned by ChatApp's session toast; required so a Broadcast
+   *  assistant reply never renders a strip whose failures are swallowed. */
+  onReplyActionError: (message: string) => void;
 }
 
 const ATTEMPT_LABEL: Record<BroadcastAttemptStatus, string> = {
@@ -84,6 +89,7 @@ export function BroadcastConversation({
   onCancelTarget,
   onRetryTarget,
   onViewRunner,
+  onReplyActionError,
 }: BroadcastConversationProps) {
   const [draft, setDraft] = useState('');
   const [sending, setSending] = useState(false);
@@ -206,12 +212,23 @@ export function BroadcastConversation({
           <article
             className={message.kind === 'human'
               ? 'chat-session-message chat-session-message--user'
-              : 'chat-session-message chat-session-message--assistant'}
+              : 'chat-session-message chat-session-message--assistant msg--assistant'}
             key={message.id}
           >
             <span className="chat-session-message__role">
               {message.kind === 'human' ? 'You' : `@${message.author}`}
             </span>
+            {message.kind === 'runner' ? (
+              // Terminal channel-log reply: the stored log text IS the raw reply
+              // source and `generatedAt` is its real wire END clock (never the
+              // `at` log-append clock). No star: a channel message has no
+              // authoritative transcript entry id.
+              <ReplyActions
+                markdown={message.text}
+                timestampMs={message.generatedAt}
+                onError={onReplyActionError}
+              />
+            ) : null}
             <MarkdownBody className="chat-session-markdown" text={message.text} onLayoutChange={pinIfPinned} />
           </article>
         ))}
@@ -242,8 +259,12 @@ export function BroadcastConversation({
                     {attempt.modelLabel && <span className="chat-broadcast-card__model">{safeText(attempt.modelLabel)}</span>}
                   </header>
                   {attempt.error && <p className="chat-form-error" role="status">{safeText(attempt.error)}</p>}
+                  {/* Broadcast transcripts are live-only (no hydrated rows), so
+                      an item has no authoritative entryId: shared copy/save is
+                      wired through the central sink, and `star` is omitted —
+                      never fabricated from a synthetic id. */}
                   {attempt.transcript.items.map((item) => (
-                    <TranscriptItem item={item} key={item.id} runnerId={card.runnerId} mappingId={card.mappingId} sessionId={card.sessionId} cwd={project.cwd} pathContext={attemptPathContext} onLayoutChange={pinIfPinned} />
+                    <TranscriptItem item={item} key={item.id} runnerId={card.runnerId} mappingId={card.mappingId} sessionId={card.sessionId} cwd={project.cwd} pathContext={attemptPathContext} onLayoutChange={pinIfPinned} reply={item.kind === 'assistant' ? { timestampMs: item.timestamp, onError: onReplyActionError } : undefined} />
                   ))}
                   <div className="chat-broadcast-card__actions">
                     {canCancel && (
@@ -296,7 +317,7 @@ export function BroadcastConversation({
                       <span className="chat-runner-state" data-state={row.status}>{ATTEMPT_LABEL[row.status]}</span>
                       {row.error && <p className="chat-form-error">{safeText(row.error)}</p>}
                       {row.transcript.items.map((item) => (
-                        <TranscriptItem item={item} key={item.id} runnerId={card.runnerId} mappingId={card.mappingId} sessionId={card.sessionId} cwd={project.cwd} pathContext={rowPathContext} onLayoutChange={pinIfPinned} />
+                        <TranscriptItem item={item} key={item.id} runnerId={card.runnerId} mappingId={card.mappingId} sessionId={card.sessionId} cwd={project.cwd} pathContext={rowPathContext} onLayoutChange={pinIfPinned} reply={item.kind === 'assistant' ? { timestampMs: item.timestamp, onError: onReplyActionError } : undefined} />
                       ))}
                     </div>
                     );

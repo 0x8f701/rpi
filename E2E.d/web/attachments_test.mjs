@@ -58,6 +58,7 @@
 
 
 import { chromium } from 'playwright';
+import { closeSessionsDrawer } from './lib/feature-menu.mjs';
 
 const url = process.env.RPI_URL;
 const token = process.env.RPI_TOKEN || '';
@@ -167,20 +168,26 @@ async function main() {
       'WS did not reach "connected"'
     );
 
-    // The composer surface must exist: #prompt-input textarea, #attach-btn,
-    // and the hidden file input. Glyph-only attach/mic buttons must expose
-    // a stable accessible name (emoji textContent is not a name).
+    // The composer surface must exist: #prompt-input, #attach-btn,
+    // Hold-to-talk #mic-btn, idle #live-btn, and the hidden file input.
+    // Glyph-only buttons must expose a stable accessible name.
     if (!await page.locator('#prompt-input').count()) fail('#prompt-input not found');
     if (!await page.locator('#attach-btn').count()) fail('#attach-btn not found');
     if (!await page.locator('#mic-btn').count()) fail('#mic-btn not found');
+    if (!await page.locator('#live-btn').count()) fail('#live-btn not found');
     if (!await page.locator('input[type=file]').count()) fail('hidden input[type=file] not found');
     const attachName = await page.getAttribute('#attach-btn', 'aria-label');
     if (attachName !== 'Attach files') {
       fail(`#attach-btn aria-label must be "Attach files" (got "${attachName}")`);
     }
     const micName = await page.getAttribute('#mic-btn', 'aria-label');
-    if (micName !== 'Microphone') {
-      fail(`#mic-btn aria-label must be "Microphone" (got "${micName}")`);
+    if (micName !== 'Hold to talk') {
+      fail(`#mic-btn aria-label must be "Hold to talk" (got "${micName}")`);
+    }
+    const liveName = await page.getAttribute('#live-btn', 'aria-label');
+    const livePressed = await page.getAttribute('#live-btn', 'aria-pressed');
+    if (liveName !== 'Start live voice' || livePressed !== 'false') {
+      fail(`#live-btn must be idle Start live voice (label=${JSON.stringify(liveName)} pressed=${JSON.stringify(livePressed)})`);
     }
 
     // ------------------------------------------------------------------
@@ -655,7 +662,7 @@ async function main() {
     }
     await page.setViewportSize({ width: 1280, height: 800 });
     if (await page.locator('.app-layout.app-layout--drawer-open').count()) {
-      await page.click('#sidebar-toggle-btn');
+      await closeSessionsDrawer(page);
     }
     await page.click('.composer-attachment .composer-attachment__remove');
     await waitFor(

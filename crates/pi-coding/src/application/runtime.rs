@@ -86,6 +86,7 @@ impl ApplicationRuntime {
         orchestration_runtime: Option<OrchestrationRuntime>,
         goal_tool_binding: Option<GoalToolBinding>,
         todo_child_tool_binding: Option<TodoChildToolBinding>,
+        orchestration_explicit: bool,
     ) -> Self {
         let process_manager = session.process_manager();
         if let Some(auth_manager) = session.auth_manager() {
@@ -124,7 +125,7 @@ impl ApplicationRuntime {
             process_events: Mutex::new(None),
             session_events: Mutex::new(None),
             charged_goal_jobs: Mutex::new(HashSet::new()),
-            orchestration_explicit: AtomicBool::new(false),
+            orchestration_explicit: AtomicBool::new(orchestration_explicit),
             turn_gate: Arc::new(AsyncMutex::new(())),
             loop_turn_active: AtomicBool::new(false),
             todo_dag: Mutex::new(todo_execution::TodoDagCoordinator::default()),
@@ -333,6 +334,10 @@ pub struct ApplicationRuntimeCandidate {
     pub(super) session: Session,
     pub(super) extension_runtime: Option<(ExtensionRuntime, ExtensionPermissionSet)>,
     pub(super) orchestration_runtime: Option<OrchestrationRuntime>,
+    /// Whether the supplied orchestration runtime is explicit launching-mode
+    /// authority (CLI tool gates, workflow runtime) rather than derived from
+    /// settings. Explicit runtimes survive implicit settings reloads.
+    pub(super) orchestration_explicit: bool,
     pub(super) goal_tool_binding: Option<GoalToolBinding>,
     pub(super) todo_child_tool_binding: Option<TodoChildToolBinding>,
 }
@@ -344,6 +349,7 @@ impl ApplicationRuntimeCandidate {
             session,
             extension_runtime: None,
             orchestration_runtime: None,
+            orchestration_explicit: false,
             goal_tool_binding: None,
             todo_child_tool_binding: None,
         }
@@ -362,6 +368,23 @@ impl ApplicationRuntimeCandidate {
     #[must_use]
     pub fn with_orchestration(mut self, runtime: OrchestrationRuntime) -> Self {
         self.orchestration_runtime = Some(runtime);
+        // Settings-driven construction: an implicit settings reload may retire
+        // it when orchestration is disabled.
+        self.orchestration_explicit = false;
+        self
+    }
+
+    /// Supplies an orchestration runtime that the launching mode owns
+    /// explicitly (CLI tool gates, workflow runtime). Unlike
+    /// [`Self::with_orchestration`], an implicit settings reload keeps it.
+    #[must_use]
+    pub fn with_orchestration_override(
+        mut self,
+        runtime: OrchestrationRuntime,
+        explicit: bool,
+    ) -> Self {
+        self.orchestration_runtime = Some(runtime);
+        self.orchestration_explicit = explicit;
         self
     }
 
@@ -385,6 +408,7 @@ impl ApplicationRuntimeCandidate {
             self.orchestration_runtime,
             self.goal_tool_binding,
             self.todo_child_tool_binding,
+            self.orchestration_explicit,
         )
     }
 
@@ -459,7 +483,7 @@ mod tests {
         let workspace = WorkspaceRoots::new(cwd, Vec::<PathBuf>::new()).expect("workspace");
         let session = Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
             SessionOptions {
-                model,
+                model: Some(model),
                 cwd: cwd.to_path_buf(),
                 system_prompt: String::new(),
                 thinking_level: pi_agent::ThinkingLevel::Off,

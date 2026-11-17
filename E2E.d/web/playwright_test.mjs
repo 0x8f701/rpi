@@ -24,6 +24,7 @@
 import { chromium } from 'playwright';
 import fs from 'node:fs';
 import { assertSidebarNewActionAbsent, createFreshSessionViaManage } from './lib/session-lifecycle.mjs';
+import { clickFeature, openSessionsDrawer } from './lib/feature-menu.mjs';
 
 const url = process.env.RPI_URL;
 const token = process.env.RPI_TOKEN || '';
@@ -78,6 +79,7 @@ function observeTurnFrames(page) {
   });
   return {
     nextStart: () => new Promise((resolve) => starts.push(resolve)),
+    seenTerminal: (sessionId, turnId) => terminals.get(`${sessionId}:${turnId}`),
     waitForTerminal: (sessionId, turnId, timeoutMs = 30000) => {
       const key = `${sessionId}:${turnId}`;
       const existing = terminals.get(key);
@@ -373,7 +375,7 @@ async function main() {
 
     // 5. Unified Todo module: open it, add a task (todo_op append), complete
     //    it (todo_op done), reopen it (todo_op start), assert panel state.
-    await page.click('#todo-toggle-btn');
+    await clickFeature(page, '#todo-toggle-btn');
     await waitFor(page, () => {
       const panels = document.querySelectorAll('#todo-panel');
       const panel = panels.length === 1 ? panels[0] : null;
@@ -539,14 +541,14 @@ async function main() {
     observePageErrors(mobilePage, 'mobile', pageErrors, consoleErrors);
     await mobilePage.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
     await waitFor(mobilePage, () => document.getElementById('send-btn')?.hasAttribute('disabled') !== true, 'mobile WS did not connect');
-    // Panel toggles live inside the session-sidebar drawer on phones.
-    await mobilePage.click('#sidebar-toggle-btn');
+    // The feature menu's Sessions entry still opens the drawer. Todo is the header feature menu, which closes that drawer.
+    await openSessionsDrawer(mobilePage);
     await waitFor(
       mobilePage,
       () => document.querySelector('.app-layout')?.classList.contains('app-layout--drawer-open'),
       'mobile sidebar drawer never opened'
     );
-    await mobilePage.click('#todo-toggle-btn');
+    await clickFeature(mobilePage, '#todo-toggle-btn');
     await waitFor(mobilePage, () => {
       const panels = document.querySelectorAll('#todo-panel');
       const panel = panels.length === 1 ? panels[0] : null;
@@ -696,7 +698,7 @@ async function main() {
 
     // 7. Workflow panel: two real concurrent workflow runtimes must stay live
     //    together with backend-projected identities, worktrees, and detail.
-    await page.click('#workflow-toggle-btn');
+    await clickFeature(page, '#workflow-toggle-btn');
     await waitFor(
       page,
       () => document.getElementById('todo-panel') === null && document.getElementById('workflow-panel') !== null,
@@ -897,7 +899,7 @@ async function main() {
     //    renders redacted with no editable control), open a global draft,
     //    change `theme` (a LIVE string setting), apply, and assert the panel
     //    reflects the persisted value.
-    await page.click('#settings-toggle-btn');
+    await clickFeature(page, '#settings-toggle-btn');
     await waitFor(page, () => document.getElementById('settings-panel') !== null, 'settings panel did not open');
     await page.click('.settings-category:has-text("Terminal")');
     await waitFor(
@@ -966,7 +968,7 @@ async function main() {
       () => document.querySelectorAll('.session-sidebar__row').length >= 1,
       'session sidebar never listed saved sessions'
     );
-    await page.click('#session-toggle-btn');
+    await clickFeature(page, '#session-toggle-btn');
     await waitFor(page, () => document.getElementById('session-panel') !== null, 'session panel did not open');
     const nameValueSel = '[data-testid="session-name-value"]';
     await waitFor(page, (sel) => document.querySelector(sel) !== null, 'current session name never rendered', 25000, nameValueSel);
@@ -1039,7 +1041,7 @@ async function main() {
     // intercept the header toggle click (same fix as the workflow step).
     await page.click('#session-close-btn');
     await waitFor(page, () => document.getElementById('session-panel') === null, 'session panel did not close');
-    await page.click('#subagents-toggle-btn');
+    await clickFeature(page, '#subagents-toggle-btn');
     await waitFor(page, () => document.getElementById('subagents-panel') !== null, 'subagents panel did not open');
     // The orchestration fixture must be enabled; otherwise the panel hides the
     // spawn form and this step fails fast with a clear message. The panel
@@ -1091,9 +1093,8 @@ async function main() {
     // modal via the Details trigger and assert an
     // accessible dialog (role=dialog, aria-modal, aria-label, correct
     // data-job-id, initial focus on Close) showing the task description, live
-    // status/elapsed, latest activity, the live badge, and NON-EMPTY recent
-    // history while the job runs — the acceptance that fails when a
-    // long-running job exposes only status/output. Exercise Refresh
+    // status/elapsed, and NON-EMPTY recent history while the job runs — the
+    // acceptance that fails when a long-running job exposes only status/output.
     // (refetch keeps the transcript live with no error), close via Escape,
     // reopen by clicking the card, and close via the Close button.
     await page.evaluate(() => {
@@ -1102,6 +1103,16 @@ async function main() {
       if (!card) throw new Error('subagent card missing before modal open');
       card.querySelector('[data-details-trigger]').click();
     });
+    const failModal = async (message) => {
+      const state = await page.evaluate(() => {
+        const q = (sel) => document.querySelector(sel);
+        const description = q('[data-details-description]');
+        return { jobId: q('[data-details-dialog]')?.getAttribute('data-job-id') || '', assignmentStatus: description?.getAttribute('data-assignment-status') || '', descriptionLength: (description?.textContent || '').trim().length, status: (q('[data-details-status]')?.textContent || '').trim(), elapsed: (q('[data-details-elapsed]')?.textContent || '').trim(), activityPresent: q('[data-details-activity]') !== null, live: q('[data-details-live]') !== null, historyHead: (q('[data-details-history]')?.textContent || '').trim().slice(0, 120), historyError: (q('[data-details-error]')?.textContent || '').trim(), assignmentError: (q('[data-details-assignment-error]')?.textContent || '').trim() };
+      });
+      await page.screenshot({ path: `${evidence}/details-modal-failure.png`, fullPage: true });
+      fs.writeFileSync(`${evidence}/details-modal-state.json`, JSON.stringify({ message, ...state }));
+      fail(`${message}: ${JSON.stringify(state)}`);
+    };
     await waitFor(page, () => document.querySelector('[data-details-dialog]') !== null, 'detail modal never opened (Details trigger)');
     const detailsA11y = await page.evaluate(() => {
       const dlg = document.querySelector('[data-details-dialog]');
@@ -1124,6 +1135,12 @@ async function main() {
       fail(`detail modal bound to wrong job: dialog=${detailsA11y.jobId} card=${detailsA11y.cardJobId}`);
     }
     if (!detailsA11y.focusOnClose) fail('detail modal initial focus did not land on the Close button');
+    await waitFor(
+      page,
+      () => document.querySelector('[data-details-description]')?.getAttribute('data-assignment-status') === 'available',
+      'detail assignment never became available',
+      20000
+    );
     const detailsContent = await page.evaluate(() => {
       const txt = (sel) => (document.querySelector(sel)?.textContent || '').trim();
       return {
@@ -1135,15 +1152,14 @@ async function main() {
       };
     });
     if (!detailsContent.description.includes('audit the release notes')) {
-      fail(`detail modal description missing the task text: "${detailsContent.description}"`);
+      await failModal(`detail modal description missing the task text: "${detailsContent.description}"`);
     }
     if (!['queued', 'running'].includes(detailsContent.status)) {
-      fail(`detail modal status must be live (queued/running), got "${detailsContent.status}"`);
+      await failModal(`detail modal status must be live (queued/running), got "${detailsContent.status}"`);
     }
-    if (!detailsContent.elapsed) fail('detail modal elapsed never rendered while running');
-    if (!detailsContent.activity) fail('detail modal latest activity never rendered');
-    if (!detailsContent.live) fail('detail modal live badge missing while the job is running');
-    // Recent history MUST be non-empty while the job is still running.
+    if (!detailsContent.elapsed) await failModal('detail modal elapsed never rendered while running');
+    if (detailsContent.activity) await failModal('Latest activity rendered without a hub message');
+    if (detailsContent.live) await failModal('detail modal still shows a live-word badge');
     await waitFor(
       page,
       () => {
@@ -1288,6 +1304,7 @@ async function main() {
       (expected) => {
         const strip = document.getElementById('activity-strip');
         if (strip?.dataset.state !== 'child' || !(strip.textContent || '').includes('Waiting for')) return false;
+        window.__stripChild = { jobId: strip.dataset.jobId || '', sessionId: strip.dataset.sessionId || '', turnId: strip.dataset.turnId || '' };
         const cards = [...document.querySelectorAll('.tool-card--task')];
         const child = cards.flatMap((card) => [...card.querySelectorAll('.tool-card__child')])
           .find((candidate) => (candidate.querySelector('.tool-card__child-target')?.textContent || '').includes('audit the release notes'));
@@ -1303,6 +1320,58 @@ async function main() {
       taskTurn,
     );
     await page.screenshot({ path: `${evidence}/activity-strip-child-desktop.png`, fullPage: true });
+    const barrierDir = process.env.RPI_TASK_BARRIER_DIR || '';
+    if (!barrierDir) fail('task-parent barrier directory env RPI_TASK_BARRIER_DIR is not set');
+    const childIdentity = await page.evaluate(() => window.__stripChild || null);
+    if (!childIdentity?.jobId) fail('confirmed child strip never exposed its typed job id');
+    // Marker wait: the deadline is only a failure bound — readiness is proven
+    // by the file existing, never by elapsed time or poll counts.
+    const waitForMarker = async (name, label) => {
+      const deadline = Date.now() + 30000;
+      while (Date.now() < deadline) {
+        if (fs.existsSync(`${barrierDir}/${name}`)) return;
+        await failOnBarrierMarker(`awaiting-${name}`);
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      fail(`${label} marker never appeared in ${barrierDir}`);
+    };
+    const failOnBarrierMarker = async (context) => {
+      const marker = `${barrierDir}/task-parent-failure.marker`;
+      if (!fs.existsSync(marker)) return;
+      const content = fs.readFileSync(marker, 'utf8').trim();
+      fs.writeFileSync(`${evidence}/strip-gate-failure.json`, JSON.stringify({ context, barrierFailure: content }));
+      fail(`task-parent barrier failure marker (${context}): ${content}`);
+    };
+    await waitForMarker('task-parent-ready.marker', 'task-parent-ready');
+    const settledJob = (jobs) => jobs.some((job) => job.id === childIdentity.jobId && ['completed', 'failed', 'cancelled'].includes(job.status));
+    let jobRows = [];
+    const settleDeadline = Date.now() + 30000;
+    while (Date.now() < settleDeadline) {
+      jobRows = (await rpc.call({ type: 'job_list' })).jobs || [];
+      if (settledJob(jobRows)) break;
+      await failOnBarrierMarker('awaiting-job-terminal');
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    if (!settledJob(jobRows)) fail(`child job ${childIdentity.jobId} never settled in the authoritative job_list: ${JSON.stringify(jobRows)}`);
+    const parentTerminalSeen = turnFrames.seenTerminal(taskTurn.sessionId, taskTurn.turnId) !== undefined;
+    const stripAfterSettle = await page.evaluate(() => {
+      const strip = document.getElementById('activity-strip');
+      return { state: strip?.getAttribute('data-state') || '', sessionId: strip?.getAttribute('data-session-id') || '', turnId: strip?.getAttribute('data-turn-id') || '', text: strip?.textContent || '' };
+    });
+    const settlementGate = { childIdentity, parentTerminalSeen, jobs: jobRows.map((job) => ({ id: job.id, status: job.status })), strip: stripAfterSettle };
+    if (stripAfterSettle.state === 'child') {
+      await page.screenshot({ path: `${evidence}/strip-stuck-child.png`, fullPage: true });
+      fs.writeFileSync(`${evidence}/strip-gate-state.json`, JSON.stringify(settlementGate));
+      fail(`strip stayed in the typed child state after its job is authoritatively terminal with the parent turn held by the barrier: ${JSON.stringify(settlementGate)}`);
+    }
+    if (parentTerminalSeen) {
+      fs.writeFileSync(`${evidence}/strip-gate-state.json`, JSON.stringify(settlementGate));
+      fail(`parent turn_terminal frame observed while the barrier held the parent stream: ${JSON.stringify(settlementGate)}`);
+    }
+    await failOnBarrierMarker('pre-release');
+    // Only after every gate assertion passed: release the held parent turn.
+    fs.writeFileSync(`${evidence}/strip-gate-state.json`, JSON.stringify(settlementGate));
+    fs.writeFileSync(`${barrierDir}/task-parent-release.marker`, String(Date.now()));
     const taskCard = await page.evaluate(() => {
       const cards = [...document.querySelectorAll('.tool-card--task')];
       const last = cards.find((card) => [...card.querySelectorAll('.tool-card__child-target')]
@@ -1343,6 +1412,17 @@ async function main() {
     if (taskCard.text.includes('Goal null')) fail(`task card rendered "Goal null": ${taskCard.text.slice(0, 200)}`);
     const taskTerminal = await turnFrames.waitForTerminal(taskTurn.sessionId, taskTurn.turnId, 30000).catch((error) => fail(error.message));
     if (taskTerminal !== 'succeeded') fail(`Task turn ended with ${taskTerminal || 'unknown'} status`);
+    await failOnBarrierMarker('after-parent-terminal');
+    let barrierSuccess = false;
+    const successDeadline = Date.now() + 30000;
+    while (Date.now() < successDeadline) {
+      await failOnBarrierMarker('awaiting-barrier-success');
+      barrierSuccess = fs.existsSync(`${barrierDir}/task-parent-success.marker`);
+      if (barrierSuccess) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    if (!barrierSuccess) fail(`task-parent success marker never appeared in ${barrierDir}`);
+    fs.writeFileSync(`${evidence}/strip-gate-success.json`, JSON.stringify({ ...settlementGate, parentTerminal: taskTerminal, barrierSuccess: true }));
     await waitFor(
       page,
       () => document.getElementById('activity-strip') === null,

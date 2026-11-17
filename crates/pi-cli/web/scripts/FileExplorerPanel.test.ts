@@ -16,8 +16,10 @@ import {
   FILE_EXPLORER_LOADING_DELAY_MS,
   FILE_EXPLORER_REFRESH_BTN_ID,
   FILE_EXPLORER_TREE_TOGGLE_ID,
+  FILE_EXPLORER_TOGGLE_ID,
   fileExplorerBodyLayout,
   fileExplorerContentLoadingIdentity,
+  fileExplorerControlId,
   fileExplorerIsRefreshBusy,
   fileExplorerTreeLoadingIdentity,
   fileExplorerLineDataOfNode,
@@ -47,6 +49,10 @@ import {
   fileExplorerPageCacheKey,
   fileExplorerReadCachedPage,
   readModuleFileExplorerPageCache,
+  fileExplorerConversationToastLatchesResetAll,
+  fileExplorerPeekSnapshotFlight,
+  fileExplorerResetSnapshotFlights,
+  fileExplorerSnapshotFlightKey,
   writeModuleFileExplorerPageCache,
   type FileExplorerSessionSlot,
 } from '../src/fileExplorer.ts';
@@ -92,7 +98,7 @@ function headerSlice(html: string): string {
   check('a11y: Graph is an icon-only header action', head.includes('data-testid="file-explorer-map-toggle"') && head.includes('aria-label="Graph"') && !head.includes('>Graph<') && !head.includes('◇') && !head.includes('File surface'));
   check('a11y: Refresh keeps its accessible name and has no text label', head.includes(`id="${FILE_EXPLORER_REFRESH_BTN_ID}"`) && head.includes('aria-label="Refresh"') && head.includes('title="Refresh"') && head.includes('aria-hidden="true"') && !head.includes('file-explorer__refresh-label') && !head.includes('Refreshing'));
   check('a11y: close button names Close file explorer', head.includes(`id="${FILE_EXPLORER_CLOSE_BTN_ID}"`) && head.includes('aria-label="Close file explorer"') && head.includes('title="Close file explorer"'));
-  check('a11y: fullscreen is absent without onToggleExpanded', !head.includes('expand-btn'));
+  check('a11y: header has no expand control', !html.includes('expand-btn') && !html.includes('Expand file explorer') && !html.includes('Shrink file explorer'));
   check('a11y: expanded search is the tree toolbar and precedes the only toggle', html.includes('data-testid="file-explorer-search"') && html.includes('aria-label="Search workspace files and folders"') && !html.includes('file-explorer__tree-edge') && html.indexOf('data-testid="file-explorer-tree"') < html.indexOf('file-explorer-search') && html.indexOf('file-explorer-search') < html.indexOf(`id="${FILE_EXPLORER_TREE_TOGGLE_ID}"`) && html.includes('aria-label="Collapse file tree"') && (html.match(new RegExp(`id="${FILE_EXPLORER_TREE_TOGGLE_ID}"`, 'g')) ?? []).length === 1);
   check('a11y: tree viewport starts visible', html.includes('data-testid="file-explorer-tree"') && !/data-testid="file-explorer-tree"[^>]*hidden/.test(html));
   check('a11y: desktop SSR layout stays split', html.includes('data-testid="file-explorer-layout"') && html.includes('data-layout="split"'));
@@ -117,12 +123,7 @@ function headerSlice(html: string): string {
   check('exclusive panes with active path SSR hides the tree', /data-testid="file-explorer-tree"[^>]*\bhidden/.test(html));
 }
 
-{
-  const html = renderExplorer({ onToggleExpanded: () => {} });
-  const head = headerSlice(html);
-  check('a11y: fullscreen control expands and shrinks the drawer', head.includes('file-explorer__expand-btn') && head.includes('Expand file explorer to the full app area') && head.includes(FILE_EXPLORER_CLOSE_BTN_ID));
-  check('a11y: close stays in the header actions', head.includes(FILE_EXPLORER_CLOSE_BTN_ID));
-}
+
 
 {
   fileExplorerSyncPageCacheWithSlots({
@@ -141,7 +142,6 @@ function headerSlice(html: string): string {
     ...panelProps,
     sessionId: 'sess-md',
     slot: { tabs: [{ path: 'docs/README.md', view: 'file' }], activePath: 'docs/README.md', mode: 'open' },
-    onToggleExpanded: () => {},
   }));
   const head = headerSlice(html);
   const content = html.slice(html.indexOf('data-testid="file-explorer-content"'));
@@ -159,14 +159,7 @@ function headerSlice(html: string): string {
     'header touch controls stay at least 44px',
     /file-explorer__refresh-btn[\s\S]{0,220}min-width:\s*44px/.test(css)
       && /file-explorer__refresh-btn[\s\S]{0,220}min-height:\s*44px/.test(css)
-      && /file-explorer__expand-btn[\s\S]{0,220}min-(?:width|height):\s*44px/.test(css)
       && /file-explorer__close[\s\S]{0,220}min-(?:width|height):\s*44px/.test(css),
-  );
-  check(
-    'mobile Files drawer sits above the footer',
-    /@media \(max-width: 768px\) \{[\s\S]*?\.file-explorer,[\s\S]*?bottom:\s*var\(--app-footer-height/.test(css)
-      && /@media \(max-width: 720px\) \{[\s\S]*?\.file-explorer \{[\s\S]*?bottom:\s*var\(--app-footer-height/.test(css)
-      && !/@media \(max-width: 720px\) \{[\s\S]*?\.file-explorer \{[^}]*bottom:\s*0\s*;/.test(css),
   );
 }
 
@@ -230,6 +223,7 @@ type MiniEvent = {
   cancelable: boolean;
   defaultPrevented: boolean;
   button: number;
+  key: string;
   preventDefault(): void;
   stopPropagation(): void;
   stopImmediatePropagation(): void;
@@ -267,7 +261,7 @@ type MiniNode = {
   getAttributeNS(_ns: string | null, name: string): string | null;
   addEventListener(type: string, fn: MiniListener, options?: boolean | { capture?: boolean }): void;
   removeEventListener(type: string, fn: MiniListener, options?: boolean | { capture?: boolean }): void;
-  dispatchEvent(event: { type: string; target?: MiniNode }): boolean;
+  dispatchEvent(event: { type: string; target?: MiniNode; key?: string }): boolean;
   click(): void;
   focus(): void;
   blur(): void;
@@ -485,7 +479,7 @@ function createMiniDom(narrow = false): { window: MiniWindow; document: MiniDocu
         const key = capture ? `${type}-capture` : type;
         node.listeners.get(key)?.delete(fn);
       },
-      dispatchEvent(raw: { type: string; target?: MiniNode }) {
+      dispatchEvent(raw: { type: string; target?: MiniNode; key?: string; preventDefault?: () => void; stopPropagation?: () => void }) {
         const payload: MiniEvent = {
           type: raw.type,
           target: raw.target ?? node,
@@ -494,8 +488,9 @@ function createMiniDom(narrow = false): { window: MiniWindow; document: MiniDocu
           cancelable: true,
           defaultPrevented: false,
           button: 0,
-          preventDefault() { payload.defaultPrevented = true; },
-          stopPropagation() { stopped = true; },
+          key: raw.key ?? '',
+          preventDefault() { payload.defaultPrevented = true; raw.preventDefault?.(); },
+          stopPropagation() { stopped = true; raw.stopPropagation?.(); },
           stopImmediatePropagation() { stopped = true; immediate = true; },
         };
         let stopped = false;
@@ -1344,7 +1339,13 @@ async function flushMicrotasks(): Promise<void> {
     sessionId: 'sess-ask-diff',
     slot: { tabs: [{ path: 'src/app.rs', view: 'diff' }], activePath: 'src/app.rs', mode: 'open' },
   }));
-  check('ask: diff view never docks Ask', !html.includes('file-explorer-ask-toggle') && !html.includes('file-explorer-ask-split'));
+  const focusTag = /<button[^>]*id="file-explorer-focus-btn"[^>]*>/.exec(html)?.[0] ?? '';
+  check('ask: diff view docks Ask and enables the fullscreen toggle',
+    html.includes('data-testid="file-explorer-ask-split"')
+      && html.includes('class="file-conversation"')
+      && focusTag.includes('aria-pressed="false"')
+      && focusTag.includes('aria-label="Show conversation fullscreen"')
+      && !focusTag.includes('disabled'));
 }
 
 {
@@ -1429,7 +1430,7 @@ async function flushMicrotasks(): Promise<void> {
       && popupBelow.popup.top === barBottom + edge
       && popupBelow.popup.left === below.left
       && popupBelow.popup.maxWidth === viewport.width - 2 * edge
-      && popupBelow.popup.maxHeight === viewport.height - edge - barBottom,
+      && popupBelow.popup.maxHeight === viewport.height - edge - (barBottom + edge),
   );
   const popupAbove = fileExplorerSelectionAnchor({
     viewport,
@@ -1444,7 +1445,7 @@ async function flushMicrotasks(): Promise<void> {
       && popupAbove.popup.top === above.top - edge - 100
       && popupAbove.popup.top >= edge
       && popupAbove.popup.left === above.left
-      && popupAbove.popup.maxHeight === above.top - viewport.top - edge,
+      && popupAbove.popup.maxHeight === above.top - edge - (viewport.top + edge),
   );
   const popupCapped = fileExplorerSelectionAnchor({
     viewport,
@@ -1455,9 +1456,10 @@ async function flushMicrotasks(): Promise<void> {
   check(
     'popup caps its height at the larger direction space',
     popupCapped.popup != null
-      && popupCapped.popup.maxHeight === viewport.height - edge - barBottom
+      && popupCapped.popup.maxHeight === viewport.height - edge - (barBottom + edge)
       && popupCapped.popup.maxHeight < 500
       && popupCapped.popup.top === barBottom + edge
+      && popupCapped.popup.top + popupCapped.popup.maxHeight === viewport.height - edge
       && popupCapped.popup.maxWidth === viewport.width - 2 * edge,
   );
   const tiny = fileExplorerSelectionAnchor({
@@ -1499,6 +1501,36 @@ async function flushMicrotasks(): Promise<void> {
       && widePopup.popup.left < widePopup.left
       && widePopup.popup.maxWidth === viewport.width - 2 * edge,
   );
+  const blameBar = { width: 220, height: 52 };
+  const blameSelectionTop = 80;
+  const blameSelectionHeight = 72;
+  const blameViewport = { top: 44, left: 0, width: 390, height: 280 };
+  const blameOverlap = fileExplorerSelectionAnchor({
+    viewport: blameViewport,
+    selection: { top: blameSelectionTop, left: 16, width: 360, height: blameSelectionHeight },
+    bar: blameBar,
+    popup: { width: 360, height: 160 },
+  });
+  const blameBarTop = blameSelectionTop + blameSelectionHeight + edge;
+  const blamePopupTop = blameBarTop + blameBar.height + edge;
+  const blamePopupMax = blameViewport.top + blameViewport.height - edge - blamePopupTop;
+  const blameSelectionBottom = blameSelectionTop + blameSelectionHeight;
+  const blamePopupHeight = Math.min(160, blameOverlap.popup?.maxHeight ?? 0);
+  check(
+    'open blame popup stays below the selection inside the viewport inset',
+    blameOverlap.placement === 'below'
+      && blameOverlap.top === blameBarTop
+      && blameOverlap.popup != null
+      && blameOverlap.popup.top === blamePopupTop
+      && blameOverlap.popup.maxHeight === blamePopupMax
+      && blameOverlap.popup.maxHeight < 160
+      && (blameOverlap.top >= blameSelectionBottom || blameOverlap.top + blameBar.height <= blameSelectionTop)
+      && (blameOverlap.popup.top >= blameSelectionBottom || blameOverlap.popup.top + blamePopupHeight <= blameSelectionTop)
+      && blameOverlap.popup.top + blameOverlap.popup.maxHeight <= blameViewport.top + blameViewport.height - edge,
+  );
+
+
+
 }
 
 await withDelayHarness(async (doc, root) => {
@@ -1707,6 +1739,63 @@ await withDelayHarness(async (doc, root) => {
     prompt != null
       && prompt.conversationId === 'conv-compact'
       && JSON.stringify(prompt.selection) === '{"startLine":4,"endLine":7}',
+  );
+});
+
+// Left-drag contract: mouseup selection fully inside the painted source
+// mounts the floating toolbar outside the code pane (browser E2E predicate).
+await withDelayHarness(async (doc, root) => {
+  writeModuleFileExplorerPageCache(emptyFileExplorerPageCache());
+  updateFileExplorerDirCache(() => ({}));
+  const floatSlot = openFileSlot('src/a.ts', 'conv-float');
+  fileExplorerSyncPageCacheWithSlots({ 'sess-ask-float': floatSlot });
+  updateFileExplorerViewCache('sess-ask-float', () => fileExplorerWithPathSurface(emptyFileExplorerViewState(), 'src/a.ts', 'ask'));
+  updateFileExplorerDirCache((prev) => fileExplorerWriteDirState(prev, 'sess-ask-float', '', () => ({
+    entries: [{ name: 'a.ts', path: 'src/a.ts', kind: 'file' }],
+    truncated: false,
+    loading: false,
+    error: null,
+    transportIncomplete: false,
+    generation: 1,
+  })));
+  seedReadCache('sess-ask-float', 'src/a.ts', ['line 1', 'line 2', 'line 3', 'line 4', 'line 5', 'line 6', 'line 7']);
+
+  function FloatAskHost() {
+    const [slots] = useState<Record<string, FileExplorerSessionSlot>>({ 'sess-ask-float': floatSlot });
+    const slot = slots['sess-ask-float'] ?? emptyFileExplorerSlot();
+    useCommittedFileExplorerSlots(slots);
+    return createElement(FileExplorerPanel, {
+      ...panelProps,
+      sessionId: 'sess-ask-float',
+      slot,
+    });
+  }
+
+  await act(async () => {
+    root.render(createElement(FloatAskHost));
+  });
+  const code = doc.body.querySelector('.file-explorer__code');
+  const line = doc.body.querySelector('[data-line="4"]');
+  const focus = doc.body.querySelector('[data-line="7"]');
+  check('ask float: selected lines are painted before mouseup', code != null && line != null && focus != null);
+  const selection: MiniSelection = { anchorNode: line, focusNode: focus, isCollapsed: false };
+  (doc.defaultView as MiniWindow).getSelection = () => selection;
+  await act(async () => { code?.dispatchEvent({ type: 'mouseup', target: code }); });
+  check(
+    'ask float: mouseup captures the retained range for the dock',
+    (doc.body.querySelector('.file-conversation__context')?.textContent ?? '') === 'Selection lines 4–7',
+  );
+  const toolbar = doc.body.querySelector('[data-testid="file-selection-actions"]');
+  const wrapper = doc.body.querySelector('.file-explorer__selection-float');
+  check(
+    'ask float: left-drag mouseup mounts the selection toolbar outside the code pane',
+    toolbar != null
+      && wrapper != null
+      && wrapper.contains(toolbar)
+      && code != null
+      && !code.contains(wrapper)
+      && toolbar.getAttribute('role') === 'toolbar'
+      && toolbar.getAttribute('aria-label') === 'Selected lines',
   );
 });
 
@@ -1944,6 +2033,108 @@ await withDelayHarness(async (doc, root) => {
 });
 
 await withDelayHarness(async (doc, root) => {
+  // Snapshot singleflight: a slow (never-answered) snapshot must hold the
+  // poll to ONE outstanding request per tab across real timer ticks. The
+  // saturation incident: pollOnce re-armed every 1500ms regardless of the
+  // outstanding request, piling per-connection RPC slots until the backend
+  // rejected everything with "too many concurrent RPC commands (limit 16)".
+  writeModuleFileExplorerPageCache(emptyFileExplorerPageCache());
+  updateFileExplorerDirCache(() => ({}));
+  const singleflightSlot = openFileSlot('src/a.ts', 'conv-sf');
+  fileExplorerSyncPageCacheWithSlots({ 'sess-ask-sf': singleflightSlot });
+  updateFileExplorerViewCache('sess-ask-sf', () => fileExplorerWithPathSurface(emptyFileExplorerViewState(), 'src/a.ts', 'ask'));
+  updateFileExplorerDirCache((prev) => fileExplorerWriteDirState(prev, 'sess-ask-sf', '', () => ({
+    entries: [{ name: 'a.ts', path: 'src/a.ts', kind: 'file' }],
+    truncated: false,
+    loading: false,
+    error: null,
+    transportIncomplete: false,
+    generation: 1,
+  })));
+  seedReadCache('sess-ask-sf', 'src/a.ts', ['const x = 1;']);
+
+  const commands: Array<Record<string, unknown>> = [];
+  const errors: string[] = [];
+  let setSlotsExternal: Dispatch<SetStateAction<Record<string, FileExplorerSessionSlot>>> | null = null;
+  const pendingSnapshots: Array<{ id: string; resolve: (value: Record<string, unknown>) => void }> = [];
+  const send = (command: Record<string, unknown>) => {
+    if (command.type !== 'file_conversation_snapshot') return new Promise<unknown>(() => {});
+    commands.push(command);
+    const deferred = Promise.withResolvers<unknown>();
+    pendingSnapshots.push({ id: String(command.conversationId), resolve: deferred.resolve });
+    return deferred.promise;
+  };
+  const resolveById = async (id: string, snapshot: Record<string, unknown>) => {
+    await act(async () => {
+      for (const entry of pendingSnapshots.filter((pending) => pending.id === id)) entry.resolve(snapshot);
+    });
+  };
+  const snapshotCommands = () => commands.filter((command) => command.type === 'file_conversation_snapshot');
+
+  function SingleflightHost() {
+    const [slots, setSlots] = useState<Record<string, FileExplorerSessionSlot>>({ 'sess-ask-sf': singleflightSlot });
+    useEffect(() => {
+      setSlotsExternal = setSlots;
+    }, []);
+    useCommittedFileExplorerSlots(slots);
+    return createElement(FileExplorerPanel, {
+      ...panelProps,
+      sendCommand: send,
+      sessionId: 'sess-ask-sf',
+      slot: slots['sess-ask-sf'] ?? emptyFileExplorerSlot(),
+      onConversationError: (message: string) => {
+        errors.push(message);
+      },
+    });
+  }
+
+  await act(async () => {
+    root.render(createElement(SingleflightHost));
+  });
+  await flushMicrotasks();
+  check('singleflight: id-bearing tab polls immediately', commands.length === 1 && commands[0]?.conversationId === 'conv-sf');
+
+  // Slow server: several idle ticks pass while the first snapshot never
+  // answers. At most ONE snapshot per tab may stay outstanding.
+  for (let tick = 0; tick < 5; tick += 1) {
+    await act(async () => { advanceClock(FILE_CONVERSATION_POLL_IDLE_MS); });
+    await flushMicrotasks();
+  }
+  check('singleflight: slow snapshot holds one outstanding poll per tab across ticks', snapshotCommands().length === 1,
+    `saw ${snapshotCommands().length} snapshot commands while the first was pending`);
+  check('singleflight: held poll surfaces no host errors', errors.length === 0);
+
+  // Close the tab while the first snapshot is still pending, then reopen the
+  // same path under a NEW conversation id. The stale settlement must stay
+  // silent, write nothing, and never block the new owner's cadence.
+  await act(async () => { setSlotsExternal?.({ 'sess-ask-sf': emptyFileExplorerSlot() }); });
+  await flushMicrotasks();
+  await act(async () => {
+    setSlotsExternal?.({ 'sess-ask-sf': openFileSlot('src/a.ts', 'conv-sf2') });
+    updateFileExplorerViewCache('sess-ask-sf', (view) => fileExplorerWithPathSurface(view, 'src/a.ts', 'ask'));
+  });
+  await flushMicrotasks();
+  check('singleflight: reopened tab polls the new id while the stale poll hangs', commands.length === 2
+    && commands[1]?.conversationId === 'conv-sf2');
+  await resolveById('conv-sf', snapshotFor('conv-sf', {
+    entries: [wireEntry('e0', 'assistant', 'stale sf reply')],
+  }));
+  await flushMicrotasks();
+  check('singleflight: stale settlement after reopen stays silent and writes nothing', errors.length === 0
+    && !(doc.body.querySelector('.file-conversation__transcript')?.textContent ?? '').includes('stale sf reply'));
+  await resolveById('conv-sf2', snapshotFor('conv-sf2', {
+    entries: [wireEntry('e1', 'assistant', 'fresh sf answer')],
+  }));
+  await flushMicrotasks();
+  check('singleflight: answered new-owner poll renders in the dock', (doc.body.querySelector('.file-conversation__transcript')?.textContent ?? '').includes('fresh sf answer'));
+  await act(async () => { advanceClock(FILE_CONVERSATION_POLL_IDLE_MS); });
+  await flushMicrotasks();
+  const resumed = snapshotCommands().filter((command) => command.conversationId === 'conv-sf2');
+  check('singleflight: cadence resumes after the held poll resolves', resumed.length === 2
+    && errors.length === 0);
+});
+
+await withDelayHarness(async (doc, root) => {
   writeModuleFileExplorerPageCache(emptyFileExplorerPageCache());
   updateFileExplorerDirCache(() => ({}));
   const askLateSlot = openFileSlot('src/a.ts', 'conv-late');
@@ -2111,6 +2302,178 @@ await withDelayHarness(async (doc, root) => {
   check('stop: no conversation errors surfaced', errors.length === 0);
 });
 
+// ---------------------------------------------------------------------
+// Ask fullscreen (focus) conversation: the REAL mounted right-hand dock
+// must expose ONE accessible toggle whose id is derived from the host
+// toggle id, so the shared App/Chat panel never collides. State is read
+// from aria-pressed + the root focus class; Escape exits focus BEFORE the
+// drawer close triage, and a fresh mount (real close → reopen) starts off.
+// ---------------------------------------------------------------------
+await withDelayHarness(async (doc, root) => {
+  writeModuleFileExplorerPageCache(emptyFileExplorerPageCache());
+  updateFileExplorerDirCache(() => ({}));
+  updateFileExplorerViewCache('sess-ask-focus', () => emptyFileExplorerViewState());
+  const conversationSlot = openFileSlot('src/a.ts', 'conv-focus');
+  fileExplorerSyncPageCacheWithSlots({ 'sess-ask-focus': conversationSlot });
+  seedReadCache('sess-ask-focus', 'src/a.ts', ['const x = 1;']);
+
+  const toggleId = 'chat-file-explorer-toggle-btn';
+  const focusButtonId = fileExplorerControlId(toggleId, 'focus-btn');
+  const closes: number[] = [];
+  const mount = async (slot: FileExplorerSessionSlot): Promise<void> => {
+    await act(async () => {
+      root.render(createElement(FileExplorerPanel, {
+        ...panelProps,
+        sendCommand: () => new Promise<unknown>(() => {}),
+        sessionId: 'sess-ask-focus',
+        slot,
+        toggleId,
+        onClose: () => { closes.push(1); },
+      }));
+    });
+  };
+  const focusButton = () => doc.getElementById(focusButtonId);
+  const focusMode = () => (doc.body.querySelector('section.file-explorer')?.className ?? '')
+    .split(/\s+/).includes('file-explorer--ask-focus');
+  const focusLabel = () => focusButton()?.getAttribute('aria-label') ?? '';
+
+  // Real conversation mount: the dock is the right-hand conversation.
+  await mount(conversationSlot);
+  const openButton = focusButton();
+  check('ask fullscreen: the mounted conversation exposes one derived, accessible focus toggle',
+    openButton != null
+      && openButton.tagName === 'BUTTON'
+      && openButton.getAttribute('type') === 'button'
+      && doc.body.querySelectorAll(`#${focusButtonId}`).length === 1
+      && openButton.getAttribute('aria-pressed') === 'false'
+      && /fullscreen/i.test(openButton.getAttribute('aria-label') ?? '')
+      && focusMode() === false);
+
+  // Click in.
+  await act(async () => { focusButton()?.click(); });
+  check('ask fullscreen: click enters focus mode and reports pressed state',
+    focusMode() === true
+      && focusButton()?.getAttribute('aria-pressed') === 'true'
+      && /exit fullscreen/i.test(focusLabel()));
+  check('ask fullscreen: entering focus keeps the drawer and dock mounted',
+    closes.length === 0
+      && doc.body.querySelector('[data-testid="file-explorer-ask-split"]') != null
+      && doc.body.querySelector('.file-conversation') != null);
+
+  // Click out.
+  await act(async () => { focusButton()?.click(); });
+  check('ask fullscreen: second click exits and restores the entry name',
+    focusMode() === false
+      && focusButton()?.getAttribute('aria-pressed') === 'false'
+      && /fullscreen/i.test(focusLabel())
+      && !/exit fullscreen/i.test(focusLabel()));
+
+  // Escape exits focus, never the drawer (the close triage comes later).
+  await act(async () => { focusButton()?.click(); });
+  await act(async () => { doc.dispatchEvent({ type: 'keydown', key: 'Escape' }); });
+  check('ask fullscreen: Escape exits focus before closing the drawer',
+    focusMode() === false
+      && focusButton()?.getAttribute('aria-pressed') === 'false'
+      && closes.length === 0
+      && doc.body.querySelector('[data-testid="file-explorer-ask-split"]') != null);
+
+  // Real close → reopen: the host unmounts the panel, then mounts it again.
+  await act(async () => { focusButton()?.click(); });
+  check('ask fullscreen: re-enter before the close probe', focusMode() === true);
+  await act(async () => { root.render(null); });
+  await mount(conversationSlot);
+  check('ask fullscreen: close → reopen resets focus mode',
+    focusMode() === false
+      && focusButton()?.getAttribute('aria-pressed') === 'false');
+});
+
+// Diff tabs are a right-hand conversation too: the dirty tree's real
+// openDiff path (row click -> diff tab) must mount the dock and enable the
+// same derived fullscreen toggle; no source-text assertion.
+await withDelayHarness(async (doc, root) => {
+  writeModuleFileExplorerPageCache(emptyFileExplorerPageCache());
+  updateFileExplorerDirCache(() => ({}));
+  updateFileExplorerViewCache('sess-ask-diff-focus', () => emptyFileExplorerViewState());
+  const send = (command: Record<string, unknown>) => {
+    if (command.type === 'file_explorer_changes') {
+      return Promise.resolve({ files: [{ path: 'app.rs', status: 'modified' }], isRepo: true, truncated: false });
+    }
+    if (command.type === 'file_explorer_list') {
+      return Promise.resolve({ entries: [{ name: 'app.rs', path: 'app.rs', kind: 'file', sizeBytes: 12 }], truncated: false });
+    }
+    if (command.type === 'file_explorer_diff') return new Promise<unknown>(() => {});
+    return Promise.resolve({});
+  };
+  let latestSlot: FileExplorerSessionSlot = { ...emptyFileExplorerSlot(), mode: 'open' };
+  function DiffFocusHost() {
+    const [slots, setSlots] = useState<Record<string, FileExplorerSessionSlot>>({
+      'sess-ask-diff-focus': { ...emptyFileExplorerSlot(), mode: 'open' },
+    });
+    const slot = slots['sess-ask-diff-focus'] ?? emptyFileExplorerSlot();
+    latestSlot = slot;
+    useCommittedFileExplorerSlots(slots);
+    return createElement(FileExplorerPanel, {
+      ...panelProps,
+      sendCommand: send,
+      sessionId: 'sess-ask-diff-focus',
+      slot,
+      onOpenPath: (path: string, _line?: number, view: 'file' | 'diff' = 'file') => {
+        setSlots({ 'sess-ask-diff-focus': { tabs: [{ path, view }], activePath: path, mode: 'open' } });
+      },
+      onPatchSlot: (updater: (current: FileExplorerSessionSlot) => FileExplorerSessionSlot) => {
+        setSlots((prev) => ({
+          'sess-ask-diff-focus': updater(prev['sess-ask-diff-focus'] ?? emptyFileExplorerSlot()),
+        }));
+      },
+    });
+  }
+  await act(async () => { root.render(createElement(DiffFocusHost)); });
+  await flushMicrotasks();
+  const dirtyRow = doc.body.querySelector('.file-explorer__row--has-status');
+  check('ask diff: the dirty tree lists the changed file', dirtyRow != null);
+  await act(async () => { dirtyRow?.click(); });
+  await flushMicrotasks();
+  const focusButtonId = fileExplorerControlId(FILE_EXPLORER_TOGGLE_ID, 'focus-btn');
+  const focusButton = doc.getElementById(focusButtonId);
+  check('ask diff: opening the diff docks Ask and enables its focus toggle',
+    focusButton != null
+      && focusButton.hasAttribute('disabled') === false
+      && focusButton.getAttribute('aria-pressed') === 'false'
+      && doc.body.querySelector('[data-testid="file-explorer-ask-split"]') != null
+      && doc.body.querySelector('.file-conversation') != null);
+  const focusMode = () => (doc.body.querySelector('section.file-explorer')?.className ?? '')
+    .split(/\s+/).includes('file-explorer--ask-focus');
+  await act(async () => { focusButton?.click(); });
+  const entered = focusMode() === true && focusButton?.getAttribute('aria-pressed') === 'true';
+  await act(async () => { focusButton?.click(); });
+  check('ask diff: fullscreen enters and exits from the diff view',
+    entered && focusMode() === false && focusButton?.getAttribute('aria-pressed') === 'false');
+});
+
+await withDelayHarness(async (doc, root) => {
+  writeModuleFileExplorerPageCache(emptyFileExplorerPageCache());
+  updateFileExplorerDirCache(() => ({}));
+  const send = (command: Record<string, unknown>) => {
+    if (command.type === 'file_explorer_changes') return Promise.resolve({ files: [], isRepo: false, truncated: false });
+    if (command.type === 'file_explorer_list') {
+      return Promise.resolve({ entries: [{ name: 'app.rs', path: 'app.rs', kind: 'file', sizeBytes: 12 }], truncated: false });
+    }
+    return Promise.resolve({});
+  };
+  await act(async () => {
+    root.render(createElement(FileExplorerPanel, {
+      ...panelProps,
+      sendCommand: send,
+      sessionId: 'sess-non-git',
+      slot: { ...emptyFileExplorerSlot(), mode: 'open' },
+    }));
+  });
+  await flushMicrotasks();
+  check('non-git: normal listing renders without the retired prose',
+    doc.body.querySelector('.file-explorer__row') != null
+    && !(doc.body.textContent ?? '').includes('Not a git repository'));
+});
+
 // Admission repro: first click on a fresh tab loses its read response. The
 // child's loadActive passive effect begins the page BEFORE the host's passive
 // committed-slot sync admits the tab, so the begin write is admission-pruned
@@ -2209,17 +2572,23 @@ await withDelayHarness(async (doc, root) => {
     }
     return Promise.resolve({});
   };
-  await act(async () => {
+  let searchSlot: FileExplorerSessionSlot = emptyFileExplorerSlot();
+  const renderSearch = () => {
     root.render(createElement(FileExplorerPanel, {
       ...panelProps,
       sendCommand,
       sessionId: 'sess-search',
-      slot: emptyFileExplorerSlot(),
+      slot: searchSlot,
+      onPatchSlot: (updater: (current: FileExplorerSessionSlot) => FileExplorerSessionSlot) => {
+        searchSlot = updater(searchSlot);
+        renderSearch();
+      },
       onOpenPath: (path: string, _line?: number, view: 'file' | 'diff' = 'file') => {
         opened.push({ path, view });
       },
     }));
-  });
+  };
+  await act(async () => { renderSearch(); });
   await act(async () => {});
   const input = doc.body.querySelector('[data-testid="file-explorer-search"]');
   check('search box is mounted', input != null);
@@ -2232,9 +2601,9 @@ await withDelayHarness(async (doc, root) => {
     field.type = 'search';
     field.attachEvent = () => {};
     field.detachEvent = () => {};
-    field.dispatchEvent({ type: 'focusin' });
+    field.dispatchEvent({ type: 'focusin', target: field, preventDefault() {}, stopPropagation() {} });
     field.value = 'widget';
-    field.dispatchEvent({ type: 'keyup' });
+    field.dispatchEvent({ type: 'keyup', target: field, preventDefault() {}, stopPropagation() {} });
   });
   await act(async () => { advanceClock(200); });
   await act(async () => {});
@@ -2271,6 +2640,1281 @@ await withDelayHarness(async (doc, root) => {
     commands.some((command) => command.type === 'file_explorer_search' && command.query === 'widget'),
   );
 });
+
+await withDelayHarness(async (doc, root) => {
+  let slot: FileExplorerSessionSlot = {
+    ...emptyFileExplorerSlot(),
+    mode: 'open',
+    tabs: [{ path: 'src/nested', view: 'dir' }],
+    activePath: 'src/nested',
+    treeQuery: 'daemon.rs',
+  };
+  await act(async () => {
+    root.render(createElement(FileExplorerPanel, {
+      ...panelProps,
+      sendCommand: (command: Record<string, unknown>) => {
+        if (command.type === 'file_explorer_list' || command.type === 'file_explorer_changes') {
+          return Promise.resolve(command.type === 'file_explorer_list'
+            ? { entries: [], truncated: false }
+            : { files: [], isRepo: true, truncated: false });
+        }
+        if (command.type === 'file_explorer_search') {
+          return Promise.resolve({ entries: [], truncated: false });
+        }
+        return Promise.resolve({});
+      },
+      sessionId: 'session-owner',
+      slot,
+      onPatchSlot: (updater: (current: FileExplorerSessionSlot) => FileExplorerSessionSlot) => {
+        slot = updater(slot);
+      },
+    }));
+  });
+  const search = doc.body.querySelector('[data-testid="file-explorer-search"]') as (MiniNode & { value?: string }) | null;
+  check(
+    'passive directory restore keeps the injected search query',
+    search?.value === 'daemon.rs' && slot.treeQuery === 'daemon.rs',
+    JSON.stringify({ value: search?.value, query: slot.treeQuery }),
+  );
+});
+
+await withDelayHarness(async (doc, root) => {
+  writeModuleFileExplorerPageCache(emptyFileExplorerPageCache());
+  updateFileExplorerDirCache(() => ({}));
+  fileExplorerSyncPageCacheWithSlots({ 'session-reveal': emptyFileExplorerSlot() });
+  updateFileExplorerViewCache('session-reveal', () => emptyFileExplorerViewState());
+  const commands: Array<Record<string, unknown>> = [];
+  const listed: string[] = [];
+  let slot: FileExplorerSessionSlot = {
+    ...emptyFileExplorerSlot(),
+    mode: 'open',
+    tabs: [{ path: 'src/nested', view: 'dir' }],
+    activePath: 'src/nested',
+    treeQuery: 'daemon.rs',
+  };
+  const renderReveal = () => {
+    root.render(createElement(FileExplorerPanel, {
+      ...panelProps,
+      exclusivePanes: true,
+      sendCommand: (command: Record<string, unknown>) => {
+        commands.push(command);
+        if (command.type === 'file_explorer_list') {
+          const path = typeof command.path === 'string' ? command.path : '';
+          listed.push(path);
+          if (path === 'src') {
+            return Promise.resolve({
+              entries: [{ name: 'nested', path: 'src/nested', kind: 'dir' }],
+              truncated: false,
+            });
+          }
+          if (path === 'src/nested') {
+            return Promise.resolve({
+              entries: [{ name: 'widget.rs', path: 'src/nested/widget.rs', kind: 'file' }],
+              truncated: false,
+            });
+          }
+          return Promise.resolve({
+            entries: [{ name: 'src', path: 'src', kind: 'dir' }],
+            truncated: false,
+          });
+        }
+        if (command.type === 'file_explorer_changes') {
+          return Promise.resolve({ files: [], isRepo: true, truncated: false });
+        }
+        if (command.type === 'file_explorer_search') {
+          return Promise.resolve({ entries: [], truncated: false });
+        }
+        return Promise.resolve({});
+      },
+      sessionId: 'session-reveal',
+      slot,
+      onPatchSlot: (updater: (current: FileExplorerSessionSlot) => FileExplorerSessionSlot) => {
+        slot = updater(slot);
+        renderReveal();
+      },
+      onOpenPath: () => {},
+    }));
+  };
+  await act(async () => { renderReveal(); });
+  await act(async () => {});
+  await flushMicrotasks();
+  const view = fileExplorerViewForOwner(getFileExplorerViewCacheSnapshot(), 'session-reveal');
+  const tree = doc.body.querySelector('[data-testid="file-explorer-tree"]');
+  const layout = doc.body.querySelector('[data-testid="file-explorer-layout"]')?.getAttribute('data-layout') ?? '';
+  const search = doc.body.querySelector('[data-testid="file-explorer-search"]') as (MiniNode & { value?: string }) | null;
+  const reads = commands.filter((command) => command.type === 'file_explorer_read');
+  check(
+    'external nested dir tab loads and expands its ancestor chain',
+    view.expandedDirs.src === true
+      && view.expandedDirs['src/nested'] === true
+      && listed.includes('src')
+      && listed.includes('src/nested'),
+    JSON.stringify({ expandedDirs: view.expandedDirs, listed }),
+  );
+  check(
+    'external nested dir tab keeps the injected search and does not read the directory as a file',
+    search?.value === 'daemon.rs'
+      && slot.treeQuery === 'daemon.rs'
+      && slot.tabs.length === 1
+      && slot.tabs[0]?.path === 'src/nested'
+      && slot.tabs[0]?.view === 'dir'
+      && slot.activePath === 'src/nested'
+      && reads.length === 0,
+    JSON.stringify({ value: search?.value, treeQuery: slot.treeQuery, tabs: slot.tabs, activePath: slot.activePath, reads }),
+  );
+  check(
+    'mobile directory destination keeps the tree visible',
+    tree?.hasAttribute('hidden') === false
+      && layout === 'tree'
+      && (doc.body.textContent ?? '').includes('Directory expanded in the tree.'),
+    JSON.stringify({ hidden: tree?.hasAttribute('hidden'), layout }),
+  );
+}, { matchMediaMatches: true });
+
+
+await withDelayHarness(async (doc, root) => {
+  writeModuleFileExplorerPageCache(emptyFileExplorerPageCache());
+  updateFileExplorerDirCache(() => ({}));
+  updateFileExplorerViewCache('session-mobile', () => emptyFileExplorerViewState());
+  const commands: Array<Record<string, unknown>> = [];
+  let resolveRead: ((data: unknown) => void) | null = null;
+  const initial: FileExplorerSessionSlot = {
+    ...emptyFileExplorerSlot(),
+    mode: 'open',
+    tabs: [{ path: 'unique.rs', view: 'file' }],
+    activePath: null,
+    treeQuery: 'homonym.rs',
+  };
+  const slots = { 'session-mobile': initial };
+  let latest = initial;
+  function MobileSearchHost() {
+    const [state, setState] = useState(slots);
+    latest = state['session-mobile'] ?? initial;
+    useCommittedFileExplorerSlots(state);
+    return createElement(FileExplorerPanel, {
+      ...panelProps,
+      exclusivePanes: true,
+      sessionId: 'session-mobile',
+      slot: latest,
+      onOpenPath: (path: string, _line?: number, view: 'file' | 'diff' = 'file') => {
+        setState((current) => ({
+          ...current,
+          'session-mobile': {
+            ...(current['session-mobile'] ?? initial),
+            tabs: [...(current['session-mobile']?.tabs ?? []), { path, view }],
+            activePath: path,
+            mode: 'open',
+          },
+        }));
+      },
+      sendCommand: (command: Record<string, unknown>) => {
+        commands.push(command);
+        if (command.type === 'file_explorer_search') {
+          return Promise.resolve({
+            entries: [
+              { name: 'homonym.rs', path: 'pkg/a/bridge/homonym.rs', kind: 'file' },
+              { name: 'homonym.rs', path: 'pkg/b/bridge/homonym.rs', kind: 'file' },
+            ],
+            truncated: false,
+          });
+        }
+        if (command.type === 'file_explorer_read') {
+          return new Promise<unknown>((resolve) => { resolveRead = resolve; });
+        }
+        return Promise.resolve(command.type === 'file_explorer_list'
+          ? { entries: [], truncated: false }
+          : { files: [], isRepo: true, truncated: false });
+      },
+    });
+  }
+  await act(async () => { root.render(createElement(MobileSearchHost)); });
+  await act(async () => { advanceClock(200); });
+  await flushMicrotasks();
+  const tree = doc.body.querySelector('[data-testid="file-explorer-tree"]');
+  const layout = doc.body.querySelector('[data-testid="file-explorer-layout"]')?.getAttribute('data-layout') ?? '';
+  const labels = [...doc.body.querySelectorAll('.file-explorer__row')]
+    .map((node) => (node.textContent ?? '').trim());
+  check(
+    'mobile search is the visible tree while the previous file tab stays retained',
+    tree?.hasAttribute('hidden') === false
+      && layout === 'tree'
+      && labels.includes('pkg/a/bridge/homonym.rs')
+      && labels.includes('pkg/b/bridge/homonym.rs')
+      && latest.tabs.some((tab) => tab.path === 'unique.rs')
+      && !(doc.body.textContent ?? '').includes('CITE-UNIQUE'),
+    JSON.stringify({ hidden: tree?.hasAttribute('hidden'), layout, labels, tabs: latest.tabs, commands }),
+  );
+  const chosen = [...doc.body.querySelectorAll('.file-explorer__row')]
+    .find((node) => (node.textContent ?? '').includes('pkg/a/bridge/homonym.rs'));
+  await act(async () => { chosen?.click(); });
+  await act(async () => {
+    resolveRead?.({ path: 'pkg/a/bridge/homonym.rs', lines: ['HOMONYM-A'], totalLines: 1, truncated: false });
+  });
+  await flushMicrotasks();
+  const content = doc.body.querySelector('[data-testid="file-explorer-content"]');
+  const after = doc.body.querySelector('[data-testid="file-explorer-layout"]')?.getAttribute('data-layout') ?? '';
+  const reads = commands.filter((command) => command.type === 'file_explorer_read');
+  const cacheKey = fileExplorerPageCacheKey('session-mobile', 'pkg/a/bridge/homonym.rs', 'file');
+  check(
+    'selecting a mobile search row shows that file and keeps the previous tab',
+    latest.activePath === 'pkg/a/bridge/homonym.rs'
+      && latest.tabs.some((tab) => tab.path === 'unique.rs')
+      && latest.tabs.some((tab) => tab.path === 'pkg/a/bridge/homonym.rs')
+      && reads.some((command) => command.path === 'pkg/a/bridge/homonym.rs')
+      && readModuleFileExplorerPageCache()[cacheKey]?.lines.includes('HOMONYM-A') === true
+      && after === 'content'
+      && content?.hasAttribute('hidden') === false
+      && (content?.textContent ?? '').includes('HOMONYM-A')
+      && !(doc.body.textContent ?? '').includes('CITE-UNIQUE'),
+    JSON.stringify({ activePath: latest.activePath, tabs: latest.tabs, reads, cache: readModuleFileExplorerPageCache()[cacheKey], after, hidden: content?.hasAttribute('hidden'), text: (content?.textContent ?? '').slice(0, 300) }),
+  );
+}, { matchMediaMatches: true });
+
+/** Mounted Files panel: a slot treeQuery is the only search authority. Two
+ *  same-basename hits stay listed until the user clicks one row. This does
+ *  not execute the App click interceptor; the browser lane owns that. */
+const AMBIGUOUS_BASENAMES = [
+  {
+    query: 'deposit_logs.rs',
+    paths: [
+      'psy-node/psy_cli/psy_relayer_cli/src/bridge/deposit_logs.rs',
+      'psy-node-fix/psy_cli/psy_relayer_cli/src/bridge/deposit_logs.rs',
+    ],
+  },
+  {
+    query: 'daemon.rs',
+    paths: [
+      'psy-node/psy_cli/psy_relayer_cli/src/bridge/daemon.rs',
+      'psy-node-fix/psy_cli/psy_relayer_cli/src/bridge/daemon.rs',
+    ],
+  },
+  {
+    query: 'prove_bridge.rs',
+    paths: [
+      'psy-node/psy_cli/psy_relayer_cli/src/bridge/prove_bridge.rs',
+      'psy-node-fix/psy_cli/psy_relayer_cli/src/bridge/prove_bridge.rs',
+    ],
+  },
+] as const;
+
+function fileExplorerSearchHits(query: string): { name: string; path: string; kind: 'file' }[] {
+  const spec = AMBIGUOUS_BASENAMES.find((candidate) => candidate.query === query);
+  return (spec?.paths ?? []).map((path) => ({ name: query, path, kind: 'file' as const }));
+}
+
+await withDelayHarness(async (doc, root) => {
+  const ownerSessionId = 'session-owner';
+  const opened: { path: string; view: string }[] = [];
+  const commands: Record<string, unknown>[] = [];
+  let slot: FileExplorerSessionSlot = {
+    ...emptyFileExplorerSlot(),
+    mode: 'open',
+    treeQuery: 'daemon.rs',
+  };
+  const renderSlot = () => {
+    root.render(createElement(FileExplorerPanel, {
+      ...panelProps,
+      sendCommand: (command: Record<string, unknown>) => {
+        commands.push(command);
+        if (command.type === 'file_explorer_list') {
+          return Promise.resolve({ entries: [], truncated: false });
+        }
+        if (command.type === 'file_explorer_changes') {
+          return Promise.resolve({ files: [], isRepo: true, truncated: false });
+        }
+        if (command.type === 'file_explorer_search') {
+          const query = typeof command.query === 'string' ? command.query : '';
+          return Promise.resolve({ entries: fileExplorerSearchHits(query), truncated: false });
+        }
+        return Promise.resolve({});
+      },
+      sessionId: ownerSessionId,
+      workspaceCwd: '/workspace/mainnet-beta',
+      slot,
+      onPatchSlot: (updater: (current: FileExplorerSessionSlot) => FileExplorerSessionSlot) => {
+        slot = updater(slot);
+        renderSlot();
+      },
+      onOpenPath: (path: string, _line?: number, view: 'file' | 'diff' = 'file') => {
+        opened.push({ path, view });
+        slot = { ...slot, tabs: [{ path, view }], activePath: path, mode: 'open' };
+        renderSlot();
+      },
+    }));
+  };
+  await act(async () => { renderSlot(); });
+  await act(async () => { advanceClock(200); });
+  await act(async () => {});
+  const search = doc.body.querySelector('[data-testid="file-explorer-search"]') as (MiniNode & { value?: string }) | null;
+  const labels = [...doc.body.querySelectorAll('.file-explorer__row')]
+    .map((node) => (node.textContent ?? '').trim());
+  const searches = commands.filter((command) => command.type === 'file_explorer_search');
+  check(
+    'ambiguous daemon basename shows the slot query without a file tab',
+    search?.value === 'daemon.rs'
+      && searches.length === 1
+      && searches[0]?.query === 'daemon.rs'
+      && searches[0]?.sessionId === ownerSessionId
+      && labels.length === 2
+      && labels.includes('psy-node/psy_cli/psy_relayer_cli/src/bridge/daemon.rs')
+      && labels.includes('psy-node-fix/psy_cli/psy_relayer_cli/src/bridge/daemon.rs')
+      && doc.body.querySelector('.file-explorer__tab') == null
+      && opened.length === 0,
+    JSON.stringify({ value: search?.value, searches, labels, opened }),
+  );
+  const chosen = [...doc.body.querySelectorAll('.file-explorer__row')]
+    .find((node) => (node.textContent ?? '').includes('psy-node/psy_cli/psy_relayer_cli/src/bridge/daemon.rs'));
+  await act(async () => { chosen?.click(); });
+  check(
+    'selecting the psy-node daemon row opens only that exact file',
+    opened.length === 1
+      && opened[0]?.path === 'psy-node/psy_cli/psy_relayer_cli/src/bridge/daemon.rs'
+      && opened[0]?.view === 'file'
+      && slot.activePath === opened[0]?.path
+      && slot.tabs.length === 1,
+    JSON.stringify({ opened, activePath: slot.activePath, tabs: slot.tabs }),
+  );
+});
+
+function graphFixtureMap(dir: string, node: string): Record<string, unknown> {
+  return {
+    path: dir,
+    nodes: [{ path: node, language: 'rust', parse: 'ok', declarations: [], purpose: [] }],
+    outgoing: [],
+    incoming: [],
+    coverage: {
+      scanned_files: 1,
+      unsupported_files: 0,
+      unreadable_files: 0,
+      unreadable_directories: 0,
+      incomplete_files: 0,
+      dynamic_omitted: 0,
+      truncated: false,
+      visible_entries_only: false,
+      incomplete: false,
+    },
+  };
+}
+
+function graphMapPaths(commands: Array<Record<string, unknown>>): string[] {
+  return commands.filter((command) => command.type === 'file_explorer_map').map((command) => String(command.path));
+}
+
+function graphPainted(doc: MiniDocument): { path: string | null; text: string } {
+  const node = doc.body.querySelector('[data-testid="file-dependency-map"]');
+  return { path: node?.getAttribute('data-map-path') ?? null, text: node?.textContent ?? '' };
+}
+
+function graphRow(doc: MiniDocument, label: string, rootTestId?: string): MiniNode | undefined {
+  const root = rootTestId ? doc.body.querySelector(`[data-testid="${rootTestId}"]`) : doc.body;
+  return [...(root?.querySelectorAll('.file-explorer__row') ?? [])]
+    .find((node) => (node.textContent ?? '').trim() === label);
+}
+
+async function mountGraph(
+  doc: MiniDocument,
+  root: Root,
+  sessionId: string,
+  initial: FileExplorerSessionSlot,
+  listings: Record<string, Array<{ name: string; path: string; kind: 'dir' | 'file' }>>,
+  hitsFor: (query: string) => Array<{ name: string; path: string; kind: 'dir' | 'file' }>,
+): Promise<{
+  commands: Array<Record<string, unknown>>;
+  replies: Array<{ path: string; cwd: string; resolve: (data: unknown) => void }>;
+  render: (next?: FileExplorerSessionSlot, cwd?: string) => void;
+  slot: () => FileExplorerSessionSlot;
+}> {
+  writeModuleFileExplorerPageCache(emptyFileExplorerPageCache());
+  updateFileExplorerDirCache(() => ({}));
+  fileExplorerSyncPageCacheWithSlots({ [sessionId]: initial });
+  updateFileExplorerViewCache(sessionId, () => emptyFileExplorerViewState());
+  const commands: Array<Record<string, unknown>> = [];
+  const replies: Array<{ path: string; cwd: string; resolve: (data: unknown) => void }> = [];
+  let slot = initial;
+  let cwd = '/workspace/alpha-root';
+  const sendCommand = (command: Record<string, unknown>) => {
+    commands.push(command);
+    if (command.type === 'file_explorer_changes') {
+      return Promise.resolve({ files: [], isRepo: true, truncated: false });
+    }
+    if (command.type === 'file_explorer_list') {
+      const path = typeof command.path === 'string' ? command.path : '';
+      return Promise.resolve({ entries: listings[path] ?? [], truncated: false });
+    }
+    if (command.type === 'file_explorer_search') {
+      const query = typeof command.query === 'string' ? command.query : '';
+      return Promise.resolve({ entries: hitsFor(query), truncated: false });
+    }
+    if (command.type === 'file_explorer_read') {
+      return Promise.resolve({ path: command.path, lines: ['fn commit() {}'], totalLines: 1, truncated: false });
+    }
+    if (command.type === 'file_explorer_map') {
+      const path = typeof command.path === 'string' ? command.path : '';
+      const deferred = Promise.withResolvers<unknown>();
+      replies.push({ path, cwd, resolve: deferred.resolve });
+      return deferred.promise;
+    }
+    return Promise.resolve({});
+  };
+  const render = (next?: FileExplorerSessionSlot, nextCwd?: string) => {
+    if (next) slot = next;
+    if (nextCwd != null) cwd = nextCwd;
+    root.render(createElement(FileExplorerPanel, {
+      ...panelProps,
+      sendCommand,
+      sessionId,
+      workspaceCwd: cwd,
+      slot,
+      onPatchSlot: (updater: (current: FileExplorerSessionSlot) => FileExplorerSessionSlot) => {
+        slot = updater(slot);
+        render();
+      },
+      onOpenPath: (path: string, _line?: number, view: 'file' | 'diff' = 'file') => {
+        slot = { ...slot, tabs: [{ path, view }], activePath: path, mode: 'open', treeQuery: undefined };
+        render();
+      },
+    }));
+  };
+  await act(async () => { render(); });
+  await flushMicrotasks();
+  return { commands, replies, render: (next, nextCwd) => { render(next, nextCwd); }, slot: () => slot };
+}
+
+await withDelayHarness(async (doc, root) => {
+  const mounted = await mountGraph(doc, root, 'sess-graph-search', {
+    ...emptyFileExplorerSlot(),
+    mode: 'open',
+    tabs: [{ path: 'alpha/commit.rs', view: 'file' }],
+    activePath: 'alpha/commit.rs',
+    treeQuery: 'beta',
+  }, {}, (query) => (query === 'beta' ? [{ name: 'beta', path: 'beta', kind: 'dir' }] : []));
+  await act(async () => { advanceClock(200); });
+  await flushMicrotasks();
+  const beta = graphRow(doc, 'beta', 'file-explorer-search-results');
+  check('graph search: beta row is listed while the alpha file stays active', beta != null && mounted.slot().activePath === 'alpha/commit.rs');
+  await act(async () => { beta?.click(); });
+  await flushMicrotasks();
+  const before = graphMapPaths(mounted.commands).length;
+  await act(async () => { doc.body.querySelector('[data-testid="file-explorer-map-toggle"]')?.click(); });
+  await flushMicrotasks();
+  check(
+    'graph search: selected beta requests beta once',
+    graphMapPaths(mounted.commands).length === before + 1 && graphMapPaths(mounted.commands).at(-1) === 'beta',
+    JSON.stringify(graphMapPaths(mounted.commands)),
+  );
+  check('graph search: dialog names beta', (doc.body.querySelector('.file-explorer__map-dialog-title')?.textContent ?? '').trim() === 'Graph · beta');
+});
+
+await withDelayHarness(async (doc, root) => {
+  const mounted = await mountGraph(doc, root, 'sess-graph-tree', emptyFileExplorerSlot(), {
+    '': [{ name: 'beta', path: 'beta', kind: 'dir' }],
+  }, () => []);
+  await flushMicrotasks();
+  const beta = graphRow(doc, 'beta');
+  check('graph tree: beta directory row is present with no active file', beta != null && mounted.slot().activePath == null);
+  await act(async () => { beta?.click(); });
+  await flushMicrotasks();
+  const before = graphMapPaths(mounted.commands).length;
+  await act(async () => { doc.body.querySelector('[data-testid="file-explorer-map-toggle"]')?.click(); });
+  await flushMicrotasks();
+  check(
+    'graph tree: clicking beta with no open file requests beta once',
+    graphMapPaths(mounted.commands).length === before + 1 && graphMapPaths(mounted.commands).at(-1) === 'beta',
+    JSON.stringify(graphMapPaths(mounted.commands)),
+  );
+});
+
+await withDelayHarness(async (doc, root) => {
+  const mounted = await mountGraph(doc, root, 'sess-graph-host', {
+    ...emptyFileExplorerSlot(),
+    mode: 'open',
+    tabs: [{ path: 'alpha/commit.rs', view: 'file' }],
+    activePath: 'alpha/commit.rs',
+    treeQuery: 'beta',
+  }, {
+    '': [
+      { name: 'alpha', path: 'alpha', kind: 'dir' },
+      { name: 'beta', path: 'beta', kind: 'dir' },
+    ],
+    alpha: [{ name: 'commit.rs', path: 'alpha/commit.rs', kind: 'file' }],
+  }, (query) => (query === 'beta' ? [{ name: 'beta', path: 'beta', kind: 'dir' }] : []));
+  await act(async () => { advanceClock(200); });
+  await flushMicrotasks();
+  await act(async () => { graphRow(doc, 'beta', 'file-explorer-search-results')?.click(); });
+  await flushMicrotasks();
+  await act(async () => { doc.body.querySelector('[data-testid="file-explorer-map-toggle"]')?.click(); });
+  await flushMicrotasks();
+  const heldBeta = mounted.replies.at(-1);
+  check('graph host: beta map is held', heldBeta?.path === 'beta');
+  await act(async () => {
+    mounted.render({
+      ...mounted.slot(),
+      tabs: [{ path: 'alpha/commit.rs', view: 'file' }, { path: 'gamma/note.rs', view: 'file' }],
+      activePath: 'gamma/note.rs',
+      mode: 'open',
+    });
+  });
+  check(
+    'graph host: opening another file requests that file parent',
+    graphMapPaths(mounted.commands).at(-1) === 'gamma' && graphMapPaths(mounted.commands).filter((path) => path === 'beta').length === 1,
+    JSON.stringify(graphMapPaths(mounted.commands)),
+  );
+  heldBeta?.resolve(graphFixtureMap('beta', 'beta/old.rs'));
+  await flushMicrotasks();
+  check(
+    'graph host: stale beta folder reply does not paint over the opened file parent',
+    !graphPainted(doc).text.includes('old.rs'),
+    graphPainted(doc).path ?? 'none',
+  );
+  const parent = mounted.replies.at(-1);
+  await act(async () => { parent?.resolve(graphFixtureMap('gamma', 'gamma/note.rs')); });
+  await flushMicrotasks();
+  check('graph host: authoritative file-parent map settles', graphPainted(doc).path === 'gamma' && graphPainted(doc).text.includes('note.rs'));
+});
+
+await withDelayHarness(async (doc, root) => {
+  const mounted = await mountGraph(doc, root, 'sess-graph-cwd', {
+    ...emptyFileExplorerSlot(),
+    mode: 'open',
+    tabs: [{ path: 'alpha/commit.rs', view: 'file' }],
+    activePath: 'alpha/commit.rs',
+  }, {}, () => []);
+  await act(async () => { doc.body.querySelector('[data-testid="file-explorer-map-toggle"]')?.click(); });
+  await flushMicrotasks();
+  const first = mounted.replies.at(-1);
+  check('graph cwd: first map is alpha', first?.path === 'alpha' && first?.cwd === '/workspace/alpha-root');
+  await act(async () => { mounted.render(undefined, '/workspace/beta-root'); });
+  await flushMicrotasks();
+  const second = mounted.replies.at(-1);
+  check(
+    'graph cwd: same relative parent is requested again for the new workspace',
+    graphMapPaths(mounted.commands).length === 2 && second?.path === 'alpha' && second?.cwd === '/workspace/beta-root',
+  );
+  first?.resolve(graphFixtureMap('alpha', 'alpha/old-root.rs'));
+  await flushMicrotasks();
+  check('graph cwd: old workspace reply does not paint', !graphPainted(doc).text.includes('old-root.rs'), graphPainted(doc).path ?? 'none');
+  await act(async () => { second?.resolve(graphFixtureMap('alpha', 'alpha/new-root.rs')); });
+  await flushMicrotasks();
+  check('graph cwd: new workspace map settles', graphPainted(doc).path === 'alpha' && graphPainted(doc).text.includes('new-root.rs'));
+});
+
+await withDelayHarness(async (doc, root) => {
+  const mounted = await mountGraph(doc, root, 'sess-graph-order', {
+    ...emptyFileExplorerSlot(),
+    mode: 'open',
+    tabs: [{ path: 'alpha/commit.rs', view: 'file' }],
+    activePath: 'alpha/commit.rs',
+    treeQuery: 'beta',
+  }, {}, (query) => (query === 'beta' ? [{ name: 'beta', path: 'beta', kind: 'dir' }] : []));
+  await act(async () => { advanceClock(200); });
+  await flushMicrotasks();
+  await act(async () => { graphRow(doc, 'beta', 'file-explorer-search-results')?.click(); });
+  await flushMicrotasks();
+  await act(async () => { doc.body.querySelector('[data-testid="file-explorer-map-toggle"]')?.click(); });
+  await flushMicrotasks();
+  const betaReply = mounted.replies.at(-1);
+  await act(async () => {
+    mounted.render({
+      ...mounted.slot(),
+      tabs: [{ path: 'alpha/commit.rs', view: 'file' }, { path: 'gamma/note.rs', view: 'file' }],
+      activePath: 'gamma/note.rs',
+    });
+  });
+  const gammaReply = mounted.replies.at(-1);
+  check('graph order: file open requests gamma', gammaReply?.path === 'gamma');
+  await act(async () => { gammaReply?.resolve(graphFixtureMap('gamma', 'gamma/note.rs')); });
+  await flushMicrotasks();
+  await act(async () => { betaReply?.resolve(graphFixtureMap('beta', 'beta/ledger.rs')); });
+  await flushMicrotasks();
+  check(
+    'graph order: late beta after settled gamma stays gamma',
+    graphPainted(doc).path === 'gamma' && graphPainted(doc).text.includes('note.rs') && !graphPainted(doc).text.includes('ledger.rs'),
+  );
+});
+
+await withDelayHarness(async (doc, root) => {
+  const mounted = await mountGraph(doc, root, 'sess-graph-race', {
+    ...emptyFileExplorerSlot(),
+    mode: 'open',
+    tabs: [{ path: 'alpha/commit.rs', view: 'file' }],
+    activePath: 'alpha/commit.rs',
+    treeQuery: 'beta',
+  }, {}, (query) => (query === 'beta' ? [{ name: 'beta', path: 'beta', kind: 'dir' }] : []));
+  await act(async () => { advanceClock(200); });
+  await flushMicrotasks();
+  await act(async () => { graphRow(doc, 'beta', 'file-explorer-search-results')?.click(); });
+  await flushMicrotasks();
+  await act(async () => { doc.body.querySelector('[data-testid="file-explorer-map-toggle"]')?.click(); });
+  await flushMicrotasks();
+  const betaReply = mounted.replies.at(-1);
+  await act(async () => {
+    mounted.render({
+      ...mounted.slot(),
+      tabs: [{ path: 'alpha/commit.rs', view: 'file' }, { path: 'gamma/note.rs', view: 'file' }],
+      activePath: 'gamma/note.rs',
+    });
+    betaReply?.resolve(graphFixtureMap('beta', 'beta/stale.rs'));
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+  check(
+    'graph race: reply settled before the passive effect cannot paint beta',
+    !graphPainted(doc).text.includes('stale.rs') && graphPainted(doc).path !== 'beta',
+    graphPainted(doc).path ?? 'none',
+  );
+});
+
+await withDelayHarness(async (doc, root) => {
+  const mounted = await mountGraph(doc, root, 'sess-graph-dir-tab', {
+    ...emptyFileExplorerSlot(),
+    mode: 'open',
+    tabs: [{ path: 'beta', view: 'dir' }],
+    activePath: 'beta',
+  }, {}, () => []);
+  const before = graphMapPaths(mounted.commands).length;
+  await act(async () => { doc.body.querySelector('[data-testid="file-explorer-map-toggle"]')?.click(); });
+  await flushMicrotasks();
+  check(
+    'graph dir tab: active directory tab requests itself once',
+    graphMapPaths(mounted.commands).length === before + 1 && graphMapPaths(mounted.commands).at(-1) === 'beta',
+    JSON.stringify(graphMapPaths(mounted.commands)),
+  );
+});
+
+await withDelayHarness(async (doc, root) => {
+  const mounted = await mountGraph(doc, root, 'sess-graph-local-file', emptyFileExplorerSlot(), {
+    '': [
+      { name: 'beta', path: 'beta', kind: 'dir' },
+      { name: 'note.rs', path: 'gamma/note.rs', kind: 'file' },
+    ],
+  }, () => []);
+  await flushMicrotasks();
+  await act(async () => { graphRow(doc, 'beta')?.click(); });
+  await flushMicrotasks();
+  await act(async () => { doc.body.querySelector('[data-testid="file-explorer-map-toggle"]')?.click(); });
+  await flushMicrotasks();
+  const before = graphMapPaths(mounted.commands).length;
+  await act(async () => { graphRow(doc, 'note.rs')?.click(); });
+  await flushMicrotasks();
+  check(
+    'graph local file: opening a file after beta requests that file parent once',
+    graphMapPaths(mounted.commands).length === before + 1 && graphMapPaths(mounted.commands).at(-1) === 'gamma',
+    JSON.stringify(graphMapPaths(mounted.commands)),
+  );
+});
+
+await withDelayHarness(async (doc, root) => {
+  const listings: Record<string, Array<{ name: string; path: string; kind: 'dir' | 'file' }>> = {
+    '': [{ name: 'beta', path: 'beta', kind: 'dir' }, { name: 'commit.rs', path: 'alpha/commit.rs', kind: 'file' }],
+    beta: [{ name: 'ledger.rs', path: 'beta/ledger.rs', kind: 'file' }],
+  };
+  const mounted = await mountGraph(doc, root, 'sess-graph-search-tree', {
+    ...emptyFileExplorerSlot(),
+    mode: 'open',
+    tabs: [{ path: 'alpha/commit.rs', view: 'file' }],
+    activePath: 'alpha/commit.rs',
+    treeQuery: 'beta',
+  }, listings, (query) => (query === 'beta' ? [{ name: 'beta', path: 'beta', kind: 'dir' }] : []));
+  await act(async () => { advanceClock(200); });
+  await flushMicrotasks();
+  await act(async () => { graphRow(doc, 'beta', 'file-explorer-search-results')?.click(); });
+  await flushMicrotasks();
+  await act(async () => { graphRow(doc, 'beta')?.click(); });
+  await flushMicrotasks();
+  const before = graphMapPaths(mounted.commands).length;
+  await act(async () => { doc.body.querySelector('[data-testid="file-explorer-map-toggle"]')?.click(); });
+  await flushMicrotasks();
+  const reply = mounted.replies.at(-1);
+  check(
+    'graph search-tree: the click sequence requests beta once while the file tab stays',
+    mounted.slot().activePath === 'alpha/commit.rs'
+      && graphMapPaths(mounted.commands).length === before + 1
+      && reply?.path === 'beta',
+    JSON.stringify(graphMapPaths(mounted.commands)),
+  );
+  await act(async () => { reply?.resolve(graphFixtureMap('beta', 'beta/ledger.rs')); });
+  await flushMicrotasks();
+  check(
+    'graph search-tree: the beta response paints while the old file stays active',
+    graphPainted(doc).path === 'beta' && graphPainted(doc).text.includes('ledger.rs'),
+    graphPainted(doc).path ?? 'none',
+  );
+});
+
+await withDelayHarness(async (doc, root) => {
+  const commands: Record<string, unknown>[] = [];
+  const pathA = 'psy-node/psy_node_redis/src/store/rewards.rs';
+  const pathB = 'psy-node-fix/psy_node_redis/src/store/rewards.rs';
+  let slot: FileExplorerSessionSlot = {
+    ...emptyFileExplorerSlot(),
+    mode: 'open',
+    treeQuery: 'rewards.rs',
+    citationChoices: {
+      path: 'psy_node_redis/src/store/rewards.rs',
+      candidates: [pathA, pathB],
+    },
+  };
+  const renderSlot = () => {
+    fileExplorerSyncPageCacheWithSlots({ 'session-a': slot });
+    root.render(createElement(FileExplorerPanel, {
+      ...panelProps,
+      exclusivePanes: true,
+      sessionId: 'session-a',
+      slot,
+      sendCommand: (command: Record<string, unknown>) => {
+        commands.push(command);
+        if (command.type === 'file_explorer_read') {
+          return Promise.resolve({ path: command.path, lines: ['REWARDS-NODE-A'], totalLines: 1, truncated: false });
+        }
+        return Promise.resolve(command.type === 'file_explorer_list'
+          ? { entries: [], truncated: false }
+          : { files: [], isRepo: true, truncated: false });
+      },
+      onPatchSlot: (updater: (current: FileExplorerSessionSlot) => FileExplorerSessionSlot) => {
+        slot = updater(slot);
+        renderSlot();
+      },
+      onOpenPath: (path: string, line?: number, view: 'file' | 'diff' = 'file') => {
+        slot = { ...slot, tabs: [{ path, line, view }], activePath: path, mode: 'open' };
+        renderSlot();
+      },
+    }));
+  };
+  await act(async () => { renderSlot(); });
+  await flushMicrotasks();
+  const choices = [...doc.body.querySelectorAll('[data-file-ambiguous-choice]')]
+    .map((node) => node.getAttribute('data-file-ambiguous-choice'));
+  const search = doc.body.querySelector('[data-testid="file-explorer-search"]') as { value?: string } | null;
+  check(
+    'citation choices render both relative paths without a search query',
+    choices.includes(pathA) && choices.includes(pathB) && search?.value === ''
+      && commands.every((command) => command.type !== 'file_explorer_search'),
+    JSON.stringify({ choices, value: search?.value, commands }),
+  );
+  const chosen = [...doc.body.querySelectorAll('[data-file-ambiguous-choice]')]
+    .find((node) => node.getAttribute('data-file-ambiguous-choice') === pathA);
+  await act(async () => { chosen?.click(); });
+  await flushMicrotasks();
+  const reads = commands.filter((command) => command.type === 'file_explorer_read');
+  check(
+    'choosing A reads only A and keeps the stored choices',
+    slot.activePath === pathA
+      && slot.citationChoices?.candidates.length === 2
+      && slot.citationChoices?.path === 'psy_node_redis/src/store/rewards.rs'
+      && reads.length === 1 && reads[0]?.path === pathA
+      && commands.every((command) => command.type !== 'file_explorer_search' && command.type !== 'get_state'),
+    JSON.stringify({ activePath: slot.activePath, commands }),
+  );
+  await act(async () => { await Promise.resolve(); });
+  await flushMicrotasks();
+  const content = doc.body.querySelector('[data-testid="file-explorer-content"]');
+  check(
+    'choosing A shows that file text',
+    content?.hasAttribute('hidden') === false
+      && (content?.textContent ?? '').includes('REWARDS-NODE-A')
+      && !(content?.textContent ?? '').includes('REWARDS-NODE-FIX-B'),
+    content?.textContent ?? '',
+  );
+});
+
+// Mounted regression: a non-empty file and a settled empty diff share one
+// path; a different path is a real zero-line file. Diff must say No changes,
+// never Empty file. Open file on the diff toolbar reuses openFile and reads
+// the already-cached file body.
+await withDelayHarness(async (doc, root) => {
+  const sessionId = 'sess-empty-diff';
+  const path = 'src/same.ts';
+  const emptyPath = 'src/empty.ts';
+  const fileLines = ['export const same = 1;'];
+  writeModuleFileExplorerPageCache(emptyFileExplorerPageCache());
+  updateFileExplorerDirCache(() => ({}));
+  updateFileExplorerViewCache(sessionId, () => emptyFileExplorerViewState());
+  fileExplorerSyncPageCacheWithSlots({
+    [sessionId]: {
+      tabs: [{ path, view: 'diff' }, { path: emptyPath, view: 'file' }],
+      activePath: path,
+      mode: 'open',
+    },
+  });
+  const fileRequest = { sessionId, path, view: 'file' as const, generation: 1 };
+  const diffRequest = { sessionId, path, view: 'diff' as const, generation: 2 };
+  const emptyRequest = { sessionId, path: emptyPath, view: 'file' as const, generation: 3 };
+  let cache = emptyFileExplorerPageCache();
+  cache = fileExplorerApplyCachedPage(fileExplorerBeginCachedPage(cache, fileRequest), fileRequest, {
+    path, lines: fileLines, truncated: false, totalLines: fileLines.length,
+  });
+  cache = fileExplorerApplyCachedPage(fileExplorerBeginCachedPage(cache, diffRequest), diffRequest, {
+    path, lines: [], truncated: false, totalLines: 0,
+  });
+  cache = fileExplorerApplyCachedPage(fileExplorerBeginCachedPage(cache, emptyRequest), emptyRequest, {
+    path: emptyPath, lines: [], truncated: false, totalLines: 0,
+  });
+  writeModuleFileExplorerPageCache(cache);
+  let slot: FileExplorerSessionSlot = {
+    tabs: [{ path, view: 'diff' }, { path: emptyPath, view: 'file' }],
+    activePath: path,
+    mode: 'open',
+  };
+  const reads: string[] = [];
+  const renderSlot = () => {
+    root.render(createElement(FileExplorerPanel, {
+      ...panelProps,
+      sessionId,
+      slot,
+      sendCommand: (command: Record<string, unknown>) => {
+        if (command.type === 'file_explorer_read' && command.path === path) {
+          reads.push(path);
+          return Promise.resolve({ path, lines: fileLines, totalLines: fileLines.length, truncated: false });
+        }
+        if (command.type === 'file_explorer_read' && command.path === emptyPath) {
+          reads.push(emptyPath);
+          return Promise.resolve({ path: emptyPath, lines: [], totalLines: 0, truncated: false });
+        }
+        if (command.type === 'file_explorer_diff' && command.path === path) {
+          return Promise.resolve({ path, lines: [], totalLines: 0, truncated: false });
+        }
+        if (command.type === 'file_explorer_list') return Promise.resolve({ entries: [], truncated: false });
+        if (command.type === 'file_explorer_changes') return Promise.resolve({ files: [], isRepo: true, truncated: false });
+        return Promise.resolve({});
+      },
+      onOpenPath: (nextPath: string, line?: number, view: 'file' | 'diff' | 'dir' = 'file') => {
+        const tabs = slot.tabs.map((tab) => tab.path === nextPath
+          ? { ...tab, ...(line != null ? { line } : {}), view }
+          : tab);
+        slot = { ...slot, tabs, activePath: nextPath, mode: 'open' };
+        renderSlot();
+      },
+    }));
+  };
+  await act(async () => { renderSlot(); });
+  await flushMicrotasks();
+  const contentText = () => doc.body.querySelector('[data-testid="file-explorer-content"]')?.textContent ?? '';
+  const diffState = fileExplorerReadCachedPage(readModuleFileExplorerPageCache(), sessionId, path, 'diff');
+  const diffView = contentText();
+  const openFile = doc.body.querySelector('[data-testid="file-explorer-open-file"]');
+  check(
+    'mounted empty diff keeps lines=[] and totalLines=0',
+    diffState != null && diffState.loading === false && diffState.lines.length === 0 && diffState.totalLines === 0,
+    JSON.stringify(diffState),
+  );
+  check(
+    'mounted empty diff says No changes and not Empty file',
+    diffView.includes('No changes') && !diffView.includes('Empty file'),
+    diffView,
+  );
+  check(
+    'diff toolbar exposes Open file',
+    openFile != null && openFile.getAttribute('aria-label') === 'Open file' && (openFile.textContent ?? '').includes('Open file'),
+    openFile?.textContent ?? '',
+  );
+  await act(async () => { openFile?.click(); });
+  await flushMicrotasks();
+  const opened = contentText();
+  const openedState = fileExplorerReadCachedPage(readModuleFileExplorerPageCache(), sessionId, path, 'file');
+  check(
+    'Open file click reads the cached file body',
+    slot.activePath === path
+      && slot.tabs.find((tab) => tab.path === path)?.view === 'file'
+      && openedState != null && openedState.lines.join('\n') === fileLines[0]
+      && opened.includes(fileLines[0]!)
+      && !opened.includes('Empty file')
+      && !opened.includes('No changes')
+      && reads.includes(path) === false,
+    JSON.stringify({ view: slot.tabs.find((tab) => tab.path === path)?.view, reads, text: opened }),
+  );
+  await act(async () => {
+    slot = { ...slot, activePath: emptyPath };
+    renderSlot();
+  });
+  await flushMicrotasks();
+  const zeroView = contentText();
+  const zeroState = fileExplorerReadCachedPage(readModuleFileExplorerPageCache(), sessionId, emptyPath, 'file');
+  check(
+    'mounted zero-line file on its own path says Empty file',
+    slot.activePath === emptyPath
+      && zeroState != null && zeroState.loading === false && zeroState.lines.length === 0 && zeroState.totalLines === 0
+      && zeroView.includes('Empty file')
+      && !zeroView.includes('No changes')
+      && doc.body.querySelector('[data-testid="file-explorer-open-file"]') == null,
+    JSON.stringify({ lines: zeroState?.lines.length, total: zeroState?.totalLines, text: zeroView }),
+  );
+});
+
+// ---------------------------------------------------------------------
+// Module snapshot singleflight + failure-toast latch. Shared seed: one
+// admitted tab carrying a conversation id, per session.
+// ---------------------------------------------------------------------
+function seedAskSession(sessionId: string, conversationId: string): FileExplorerSessionSlot {
+  const slot = openFileSlot('src/a.ts', conversationId);
+  fileExplorerSyncPageCacheWithSlots({ [sessionId]: slot });
+  updateFileExplorerViewCache(sessionId, () => fileExplorerWithPathSurface(emptyFileExplorerViewState(), 'src/a.ts', 'ask'));
+  updateFileExplorerDirCache((prev) => fileExplorerWriteDirState(prev, sessionId, '', () => ({
+    entries: [{ name: 'a.ts', path: 'src/a.ts', kind: 'file' }],
+    truncated: false,
+    loading: false,
+    error: null,
+    transportIncomplete: false,
+    generation: 1,
+  })));
+  seedReadCache(sessionId, 'src/a.ts', ['const x = 1;']);
+  return slot;
+}
+
+function resetModuleFlightState(): void {
+  writeModuleFileExplorerPageCache(emptyFileExplorerPageCache());
+  updateFileExplorerDirCache(() => ({}));
+  fileExplorerResetSnapshotFlights();
+  fileExplorerConversationToastLatchesResetAll();
+}
+
+// Double mount, same flight identity: TWO panels polling the SAME
+// authority+session+canonical path+conversation+generation key must share
+// ONE request per tick (never two global RPC slots) and BOTH must apply
+// the shared result — a `.has → continue` join would drop it for the
+// second mount.
+await withDelayHarness(async (doc, root) => {
+  resetModuleFlightState();
+  const dmSlot = seedAskSession('sess-dm', 'conv-dm');
+  const commands: Array<Record<string, unknown>> = [];
+  const errors: string[] = [];
+  const firstFlight = Promise.withResolvers<unknown>();
+  let holdFirst = true;
+  const send = (command: Record<string, unknown>) => {
+    if (command.type !== 'file_conversation_snapshot') return new Promise<unknown>(() => {});
+    commands.push(command);
+    if (holdFirst) return firstFlight.promise;
+    return Promise.resolve(snapshotFor(String(command.conversationId), {
+      entries: [wireEntry('e1', 'assistant', 'dm shared answer')],
+    }));
+  };
+  const snapshotCommands = () => commands.filter((command) => command.type === 'file_conversation_snapshot');
+
+  function DoubleMountHost() {
+    return createElement('div', null,
+      createElement(FileExplorerPanel, {
+        ...panelProps,
+        sendCommand: send,
+        sessionId: 'sess-dm',
+        slot: dmSlot,
+        onConversationError: (message: string) => { errors.push(message); },
+      }),
+      createElement(FileExplorerPanel, {
+        ...panelProps,
+        sendCommand: send,
+        sessionId: 'sess-dm',
+        slot: dmSlot,
+        onConversationError: (message: string) => { errors.push(message); },
+      }),
+    );
+  }
+
+  await act(async () => { root.render(createElement(DoubleMountHost)); });
+  await flushMicrotasks();
+  check('double mount: first tick issues exactly ONE shared send', snapshotCommands().length === 1,
+    `saw ${snapshotCommands().length}`);
+  for (let tick = 0; tick < 4; tick += 1) {
+    await act(async () => { advanceClock(FILE_CONVERSATION_POLL_IDLE_MS); });
+    await flushMicrotasks();
+  }
+  check('double mount: held flight holds BOTH mounts across ticks (still one send)', snapshotCommands().length === 1,
+    `saw ${snapshotCommands().length} sends while the shared flight was pending`);
+  check('double mount: no errors while the shared flight is held', errors.length === 0);
+  await act(async () => {
+    holdFirst = false;
+    firstFlight.resolve(snapshotFor('conv-dm', { entries: [wireEntry('e1', 'assistant', 'dm shared answer')] }));
+  });
+  await flushMicrotasks();
+  const docks = Array.from(doc.body.querySelectorAll('.file-conversation__transcript'));
+  check('double mount: BOTH mounts applied the shared result', docks.length === 2
+    && docks.every((dock) => (dock.textContent ?? '').includes('dm shared answer')),
+    `docks=${docks.length}`);
+  await act(async () => { advanceClock(FILE_CONVERSATION_POLL_IDLE_MS); });
+  await flushMicrotasks();
+  check('double mount: next tick resumes with exactly one send', snapshotCommands().length === 2,
+    `saw ${snapshotCommands().length}`);
+  await act(async () => { advanceClock(FILE_CONVERSATION_POLL_IDLE_MS); });
+  await flushMicrotasks();
+  check('double mount: cadence keeps exactly one send per tick', snapshotCommands().length === 3,
+    `saw ${snapshotCommands().length}`);
+});
+
+// Two DIFFERENT sessions with the same path+conversation never share a
+// flight: A and B each send (and keep sending) their own request.
+await withDelayHarness(async (doc, root) => {
+  resetModuleFlightState();
+  const slotA = seedAskSession('sess-ab', 'conv-ab');
+  const slotB = seedAskSession('sess-bb', 'conv-ab');
+  const commands: Array<Record<string, unknown>> = [];
+  const send = (command: Record<string, unknown>) => {
+    if (command.type !== 'file_conversation_snapshot') return new Promise<unknown>(() => {});
+    commands.push(command);
+    return Promise.resolve(snapshotFor(String(command.conversationId), {
+      entries: [wireEntry('e1', 'assistant', `answer for ${String(command.sessionId)}`)],
+    }));
+  };
+  const bySession = (sid: string) => commands.filter((command) => command.type === 'file_conversation_snapshot' && command.sessionId === sid);
+
+  function TwoSessionHost() {
+    return createElement('div', null,
+      createElement(FileExplorerPanel, {
+        ...panelProps,
+        sendCommand: send,
+        sessionId: 'sess-ab',
+        slot: slotA,
+        onConversationError: () => {},
+      }),
+      createElement(FileExplorerPanel, {
+        ...panelProps,
+        sendCommand: send,
+        sessionId: 'sess-bb',
+        slot: slotB,
+        onConversationError: () => {},
+      }),
+    );
+  }
+
+  await act(async () => { root.render(createElement(TwoSessionHost)); });
+  await flushMicrotasks();
+  check('A/B sessions: first tick sends once per session', bySession('sess-ab').length === 1 && bySession('sess-bb').length === 1,
+    `a=${bySession('sess-ab').length} b=${bySession('sess-bb').length}`);
+  check('A/B sessions: each session renders its own answer', (doc.body.textContent ?? '').includes('answer for sess-ab')
+    && (doc.body.textContent ?? '').includes('answer for sess-bb'));
+  await act(async () => { advanceClock(FILE_CONVERSATION_POLL_IDLE_MS); });
+  await flushMicrotasks();
+  check('A/B sessions: next tick still sends exactly once per session', bySession('sess-ab').length === 2 && bySession('sess-bb').length === 2,
+    `a=${bySession('sess-ab').length} b=${bySession('sess-bb').length}`);
+});
+
+// Reconnect (new connection generation): a new epoch MUST start a NEW
+// request even while the old epoch's flight hangs, the old flight's
+// release must never delete the NEW flight, and the cancelled
+// old-epoch subscriber must apply nothing.
+await withDelayHarness(async (doc, root) => {
+  resetModuleFlightState();
+  const rcSlot = seedAskSession('sess-rc', 'conv-rc');
+  const commands: Array<Record<string, unknown>> = [];
+  const errors: string[] = [];
+  const oldFlight = Promise.withResolvers<unknown>();
+  const newFlight = Promise.withResolvers<unknown>();
+  const send = (command: Record<string, unknown>) => {
+    if (command.type !== 'file_conversation_snapshot') return new Promise<unknown>(() => {});
+    commands.push(command);
+    if (commands.length === 1) return oldFlight.promise;
+    if (commands.length === 2) return newFlight.promise;
+    return Promise.resolve(snapshotFor(String(command.conversationId), {
+      entries: [wireEntry('e2', 'assistant', 'resumed reply')],
+    }));
+  };
+  const snapshotCommands = () => commands.filter((command) => command.type === 'file_conversation_snapshot');
+  let setEpoch: Dispatch<SetStateAction<number>> | null = null;
+  function ReconnectHost() {
+    const [epoch, setEpochState] = useState(0);
+    useEffect(() => { setEpoch = setEpochState; }, []);
+    return createElement(FileExplorerPanel, {
+      ...panelProps,
+      sendCommand: send,
+      sessionId: 'sess-rc',
+      slot: rcSlot,
+      connectionEpoch: epoch,
+      onConversationError: (message: string) => { errors.push(message); },
+    });
+  }
+
+  await act(async () => { root.render(createElement(ReconnectHost)); });
+  await flushMicrotasks();
+  check('reconnect: epoch 0 polls once', snapshotCommands().length === 1);
+  await act(async () => { setEpoch?.(1); });
+  await flushMicrotasks();
+  check('reconnect: new generation starts a NEW request while the old hangs', snapshotCommands().length === 2,
+    `saw ${snapshotCommands().length}`);
+  const oldKey = fileExplorerSnapshotFlightKey('127.0.0.1:1', 'sess-rc', 'src/a.ts', 'conv-rc', 0);
+  const newKey = fileExplorerSnapshotFlightKey('127.0.0.1:1', 'sess-rc', 'src/a.ts', 'conv-rc', 1);
+  check('reconnect: old and new flights live under distinct identities',
+    fileExplorerPeekSnapshotFlight(oldKey) != null && fileExplorerPeekSnapshotFlight(newKey) != null);
+  for (let tick = 0; tick < 3; tick += 1) {
+    await act(async () => { advanceClock(FILE_CONVERSATION_POLL_IDLE_MS); });
+    await flushMicrotasks();
+  }
+  check('reconnect: new flight gates the cadence (no stacked sends)', snapshotCommands().length === 2,
+    `saw ${snapshotCommands().length}`);
+  await act(async () => {
+    oldFlight.resolve(snapshotFor('conv-rc', { entries: [wireEntry('e0', 'assistant', 'old epoch reply')] }));
+  });
+  await flushMicrotasks();
+  check('reconnect: old flight settle never deletes the NEW flight', fileExplorerPeekSnapshotFlight(newKey) != null,
+    'the new flight was released by the old finally');
+  check('reconnect: cancelled old-epoch subscriber applies nothing', errors.length === 0
+    && !(doc.body.querySelector('.file-conversation__transcript')?.textContent ?? '').includes('old epoch reply'));
+  await act(async () => { advanceClock(FILE_CONVERSATION_POLL_IDLE_MS); });
+  await flushMicrotasks();
+  check('reconnect: new flight still gates before it resolves', snapshotCommands().length === 2);
+  await act(async () => {
+    newFlight.resolve(snapshotFor('conv-rc', { entries: [wireEntry('e1', 'assistant', 'new epoch reply')] }));
+  });
+  await flushMicrotasks();
+  check('reconnect: new-generation result renders', (doc.body.querySelector('.file-conversation__transcript')?.textContent ?? '').includes('new epoch reply'));
+  await act(async () => { advanceClock(FILE_CONVERSATION_POLL_IDLE_MS); });
+  await flushMicrotasks();
+  check('reconnect: cadence resumes after the new flight resolves', snapshotCommands().length === 3
+    && errors.length === 0
+    && (doc.body.querySelector('.file-conversation__transcript')?.textContent ?? '').includes('resumed reply'),
+    `saw ${snapshotCommands().length}`);
+});
+
+// Failure-toast latch: the SAME owner+message failing repeatedly collapses
+// to ONE toast; a DIFFERENT message still reports; only a valid, accepted
+// same-owner success resets the latch so the identical failure reports
+// again. Failures never clear the last-good snapshot.
+await withDelayHarness(async (doc, root) => {
+  resetModuleFlightState();
+  const latchSlot = seedAskSession('sess-latch', 'conv-latch');
+  const commands: Array<Record<string, unknown>> = [];
+  const errors: string[] = [];
+  const responses: Array<Record<string, unknown> | Error> = [
+    snapshotFor('conv-latch', { entries: [wireEntry('e1', 'assistant', 'latch good answer')] }),
+    new Error('boom one'),
+    new Error('boom one'),
+    new Error('boom two'),
+    snapshotFor('conv-latch', { entries: [wireEntry('e2', 'assistant', 'latch good answer 2')] }),
+    new Error('boom one'),
+    new Error('boom one'),
+  ];
+  const send = (command: Record<string, unknown>) => {
+    if (command.type !== 'file_conversation_snapshot') return new Promise<unknown>(() => {});
+    commands.push(command);
+    const next = responses.shift();
+    if (next === undefined) throw new Error('missing snapshot fixture response');
+    return next instanceof Error ? Promise.reject(next) : Promise.resolve(next);
+  };
+  const snapshotCommands = () => commands.filter((command) => command.type === 'file_conversation_snapshot');
+  const transcriptText = () => doc.body.querySelector('.file-conversation__transcript')?.textContent ?? '';
+
+  function LatchHost() {
+    return createElement(FileExplorerPanel, {
+      ...panelProps,
+      sendCommand: send,
+      sessionId: 'sess-latch',
+      slot: latchSlot,
+      onConversationError: (message: string) => { errors.push(message); },
+    });
+  }
+
+  await act(async () => { root.render(createElement(LatchHost)); });
+  await flushMicrotasks();
+  check('toast latch: good poll renders and no error surfaced', transcriptText().includes('latch good answer') && errors.length === 0);
+  await act(async () => { advanceClock(FILE_CONVERSATION_POLL_IDLE_MS); });
+  await flushMicrotasks();
+  await act(async () => { advanceClock(FILE_CONVERSATION_POLL_IDLE_MS); });
+  await flushMicrotasks();
+  check('toast latch: duplicate same-message failures toast once', errors.length === 1 && errors[0] === 'boom one',
+    JSON.stringify(errors));
+  check('toast latch: failure keeps the last-good snapshot', transcriptText().includes('latch good answer'));
+  await act(async () => { advanceClock(FILE_CONVERSATION_POLL_IDLE_MS); });
+  await flushMicrotasks();
+  check('toast latch: different error still reports', errors.length === 2 && errors[1] === 'boom two',
+    JSON.stringify(errors));
+  await act(async () => { advanceClock(FILE_CONVERSATION_POLL_IDLE_MS); });
+  await flushMicrotasks();
+  check('toast latch: accepted success resets the latch and renders', errors.length === 2
+    && transcriptText().includes('latch good answer 2'));
+  await act(async () => { advanceClock(FILE_CONVERSATION_POLL_IDLE_MS); });
+  await flushMicrotasks();
+  await act(async () => { advanceClock(FILE_CONVERSATION_POLL_IDLE_MS); });
+  await flushMicrotasks();
+  check('toast latch: same error after a success toasts again, then folds', errors.length === 3 && errors[2] === 'boom one',
+    JSON.stringify(errors));
+  check('toast latch: repeated identical failure stays folded (one send per tick)', snapshotCommands().length === 7
+    && errors.length === 3,
+    `sends=${snapshotCommands().length} errors=${JSON.stringify(errors)}`);
+});
+
+// Per-conversation latch scope: A healthy + B failing in ONE session.
+// B folds its identical repeats after its OWN first report; A's accepted
+// successes never reset B's latch; the same message from A and B is
+// first-reported independently per conversation.
+await withDelayHarness(async (doc, root) => {
+  resetModuleFlightState();
+  const abSlot: FileExplorerSessionSlot = {
+    tabs: [
+      { path: 'src/a.ts', view: 'file', conversationId: 'conv-a' },
+      { path: 'src/b.ts', view: 'file', conversationId: 'conv-b' },
+    ],
+    activePath: 'src/a.ts',
+    mode: 'open',
+  };
+  fileExplorerSyncPageCacheWithSlots({ 'sess-ab-latch': abSlot });
+  updateFileExplorerViewCache('sess-ab-latch', () => fileExplorerWithPathSurface(emptyFileExplorerViewState(), 'src/a.ts', 'ask'));
+  updateFileExplorerDirCache((prev) => fileExplorerWriteDirState(prev, 'sess-ab-latch', '', () => ({
+    entries: [
+      { name: 'a.ts', path: 'src/a.ts', kind: 'file' },
+      { name: 'b.ts', path: 'src/b.ts', kind: 'file' },
+    ],
+    truncated: false,
+    loading: false,
+    error: null,
+    transportIncomplete: false,
+    generation: 1,
+  })));
+  seedReadCache('sess-ab-latch', 'src/a.ts', ['const a = 1;']);
+
+  const commands: Array<Record<string, unknown>> = [];
+  const errors: string[] = [];
+  let failA = false;
+  const send = (command: Record<string, unknown>) => {
+    if (command.type !== 'file_conversation_snapshot') return new Promise<unknown>(() => {});
+    commands.push(command);
+    if (command.conversationId === 'conv-a' && !failA) {
+      return Promise.resolve(snapshotFor('conv-a', { entries: [wireEntry('e1', 'assistant', 'healthy a')] }));
+    }
+    return Promise.reject(new Error('boom b'));
+  };
+  const pollCount = (id: string) => commands.filter((command) => command.conversationId === id).length;
+
+  function AbLatchHost() {
+    return createElement(FileExplorerPanel, {
+      ...panelProps,
+      sendCommand: send,
+      sessionId: 'sess-ab-latch',
+      slot: abSlot,
+      onConversationError: (message: string) => { errors.push(message); },
+    });
+  }
+
+  await act(async () => { root.render(createElement(AbLatchHost)); });
+  await flushMicrotasks();
+  check('latch scope: healthy A renders and failing B reports its first episode', errors.length === 1
+    && errors[0] === 'boom b'
+    && (doc.body.querySelector('.file-conversation__transcript')?.textContent ?? '').includes('healthy a'),
+    JSON.stringify(errors));
+  for (let tick = 0; tick < 3; tick += 1) {
+    await act(async () => { advanceClock(FILE_CONVERSATION_POLL_IDLE_MS); });
+    await flushMicrotasks();
+  }
+  check('latch scope: B folds its repeats across ticks while A succeeds each tick', errors.length === 1
+    && pollCount('conv-a') === 4 && pollCount('conv-b') === 4,
+    `errors=${JSON.stringify(errors)} a=${pollCount('conv-a')} b=${pollCount('conv-b')}`);
+  // A now fails with the SAME message: its own first episode reports even
+  // though B already reported the identical text.
+  await act(async () => { failA = true; });
+  await act(async () => { advanceClock(FILE_CONVERSATION_POLL_IDLE_MS); });
+  await flushMicrotasks();
+  check('latch scope: same message from A and B is first-reported per conversation', errors.length === 2
+    && errors[0] === 'boom b' && errors[1] === 'boom b',
+    JSON.stringify(errors));
+  // A recovers (accepted write resets ONLY A's latch), then fails again.
+  await act(async () => { failA = false; });
+  await act(async () => { advanceClock(FILE_CONVERSATION_POLL_IDLE_MS); });
+  await flushMicrotasks();
+  await act(async () => { failA = true; });
+  await act(async () => { advanceClock(FILE_CONVERSATION_POLL_IDLE_MS); });
+  await flushMicrotasks();
+  check('latch scope: A reports again after its own success; B stays folded', errors.length === 3
+    && errors[2] === 'boom b',
+    `errors=${JSON.stringify(errors)} a=${pollCount('conv-a')} b=${pollCount('conv-b')}`);
+});
+
+
+
 
 console.log(`\nFileExplorerPanel.test: ${ran} assertions, ${failures.length} failure(s)`);
 if (failures.length > 0) {

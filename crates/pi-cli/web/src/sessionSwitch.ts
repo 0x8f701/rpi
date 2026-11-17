@@ -976,6 +976,48 @@ export function acceptedCutLiveCursor(
   return events[events.length - 1]!.sequence;
 }
 
+/** Active-turn stream frames from a cold-full cut's contiguous replay: the
+ *  turn's turn_started plus ONLY the in-flight assistant chain — itemIds
+ *  tracked by assistant message_start/message_end pairing, so a settled
+ *  (message_end-matched) assistant is never replayed (it is already
+ *  authoritative in the cut's messages; the live pipeline would duplicate
+ *  it), while the unmatched-end item's start+updates rebuild the streamed
+ *  partial, mount the live node, and re-track the activity strip so the
+ *  turn's turn_terminal lands on the terminal ledger (the settled-refill
+ *  ownership check requires it). Tool-wait turns (no open assistant) replay
+ *  turn_started alone. Resync cuts, cuts without an active turn, and
+ *  trimmed (non-contiguous) chains never replay. */
+function coldActiveTurnReplayEvents(
+  cut: SubscriptionCut,
+  replay: ExactRuntimeEventFrame[],
+): ExactRuntimeEventFrame[] {
+  if (cut.reason !== 'cold-full' || !cut.activeTurnId) return [];
+  const inFlight = new Set<string>();
+  for (const event of replay) {
+    if (event.turnId !== cut.activeTurnId) continue;
+    if (event.type !== 'message_start' && event.type !== 'message_end') continue;
+    const message = event.message as { role?: unknown } | undefined;
+    if (typeof message !== 'object' || message === null || message.role !== 'assistant') continue;
+    if (typeof event.itemId !== 'string' || event.itemId === '') continue;
+    if (event.type === 'message_start') inFlight.add(event.itemId);
+    else inFlight.delete(event.itemId);
+  }
+  if (inFlight.size === 0) {
+    return replay.filter((event) => event.type === 'turn_started' && event.turnId === cut.activeTurnId);
+  }
+  return replay.filter((event) => {
+    if (event.turnId !== cut.activeTurnId) return false;
+    if (event.type === 'turn_started') return true;
+    if (typeof event.itemId !== 'string' || !inFlight.has(event.itemId)) return false;
+    if (event.type === 'message_update') return true;
+    if (event.type === 'message_start') {
+      const message = event.message as { role?: unknown } | undefined;
+      return typeof message === 'object' && message !== null && message.role === 'assistant';
+    }
+    return false;
+  });
+}
+
 export function switchFailureShouldToast(origin: SessionSwitchOrigin): boolean {
   return origin === 'user' || origin === 'bootstrap';
 }
@@ -1054,12 +1096,18 @@ export function acceptAuthoritativeCut(
         settlesPromise: false,
       };
     }
+    const activeTurnReplay = coldActiveTurnReplayEvents(cut, replay ?? []);
     actions.push({
       type: 'apply-messages',
       identity,
       messages,
-      preserveInflight: cut.reason === 'cold-full',
+      preserveInflight: cut.reason === 'cold-full'
+        && !activeTurnReplay.some((event) => event.type === 'message_start'),
     });
+    if (activeTurnReplay.length > 0) {
+      actions.push({ type: 'replay-events', identity, events: activeTurnReplay });
+      actions.push({ type: 'install-cursor', identity, cursor: cut.watermark });
+    }
   }
 
   // Every valid authoritative cut advances the client cursor/ready cache for

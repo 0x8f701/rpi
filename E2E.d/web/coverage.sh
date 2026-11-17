@@ -489,9 +489,10 @@ EOF
     export MOCK_REALTIME_EVIDENCE="$evidence/realtime-call.json"
     port="$(web_start_mock "$root" "$evidence")"
     # Advertise Codex Live realtime mode to the web client at boot: the
-    # steering driver's realtime scenario clicks the composer mic and drives
-    # a REAL realtime_create_call RPC (Rust proxy -> this mock's create-call
-    # endpoint). allowInsecure is required for the loopback http:// base URL.
+    # steering driver's realtime scenario clicks the composer Live button
+    # (#live-btn) and drives a REAL realtime_create_call RPC (Rust proxy ->
+    # this mock's create-call endpoint). allowInsecure is required for the
+    # loopback http:// base URL.
     python3 - "$root/home/.rpi/settings.json" "$port" <<'PY'
 import json, sys
 path, port = sys.argv[1], sys.argv[2]

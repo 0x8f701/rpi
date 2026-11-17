@@ -9,7 +9,7 @@ use super::{
     CapabilityAccess, CapabilityDirectory, CapabilityEntry, CapabilityEntryAuthority,
     CapabilityFile, CapabilityFs, CapabilityReadDir, CapabilityRootLease, CapabilityRootPurpose,
     CapabilityWritableFile, EntryKind, FileIdentity, FileMode, FsError, FsMetadata, Replacement,
-    RootCreation,
+    RootCreation, is_link_blocked,
 };
 
 #[derive(Clone)]
@@ -90,6 +90,7 @@ pub(crate) struct PolicyReadDir {
     revision: PolicyRevision,
     policy: Option<Arc<PolicyFs>>,
     parent_display: PathBuf,
+    authority_display: Option<PathBuf>,
     inner: CapabilityReadDir,
 }
 
@@ -281,6 +282,73 @@ impl PolicyFs {
         }
     }
 
+    /// One-pass glob target: strict metadata first; symlink failures (intermediate
+    /// and final — `is_link_blocked` handles both) resolve via the retained
+    /// within-root managed walker with the physical target denied/private re-checked.
+    pub(crate) fn resolve_glob_target(
+        &self,
+        path: &Path,
+    ) -> Result<Option<PolicyDirectory>, FsError> {
+        let (root, relative) = self.resolve(path, false)?;
+        match &root.authority {
+            PolicyRootAuthority::Directory(lease) => {
+                self.glob_target_in_lease(self.revision, lease, &relative)
+            }
+            PolicyRootAuthority::File(file) if relative.as_os_str().is_empty() => {
+                file.metadata().map(|_| None)
+            }
+            PolicyRootAuthority::File(_) => Err(FsError::OutsideCapability),
+        }
+    }
+
+    fn glob_target_in_lease(
+        &self,
+        revision: PolicyRevision,
+        lease: &CapabilityRootLease,
+        relative: &Path,
+    ) -> Result<Option<PolicyDirectory>, FsError> {
+        match lease.metadata(relative) {
+            Ok(metadata) => {
+                if metadata.identity.kind() == crate::fs::EntryKind::Directory {
+                    let directory = lease.open_directory(relative)?;
+                    Ok(Some(PolicyDirectory {
+                        revision,
+                        directory,
+                    }))
+                } else {
+                    Ok(None)
+                }
+            }
+            Err(error)
+                if is_link_blocked(&error)
+                    || matches!(error, FsError::UnsupportedEntryType) =>
+            {
+                let opened = lease.open_managed_entry_within_root_checked(
+                    relative,
+                    &mut |traversed: &Path| {
+                        self.ensure_not_denied_or_private(&lease.authority_root().join(traversed))
+                    },
+                )?;
+                self.ensure_not_denied_or_private(opened.resolved_path())?;
+                match opened.into_entry() {
+                    CapabilityEntry::File(_) => Ok(None),
+                    CapabilityEntry::Directory(directory) => Ok(Some(PolicyDirectory {
+                        revision,
+                        directory,
+                    })),
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn ensure_not_denied_or_private(&self, absolute: &Path) -> Result<(), FsError> {
+        if self.is_denied(absolute) || self.is_private(absolute) {
+            return Err(FsError::Denied);
+        }
+        Ok(())
+    }
+
     pub(crate) fn open_file(&self, path: &Path) -> Result<PolicyFile, FsError> {
         let (root, relative) = self.resolve(path, false)?;
         match &root.authority {
@@ -331,9 +399,11 @@ impl PolicyFs {
             revision: self.revision,
             policy: Some(self.clone()),
             parent_display: absolute,
+            authority_display: None,
             inner: lease.read_dir(&relative)?,
         })
     }
+
 
     pub(crate) fn create_dir_all(&self, path: &Path, mode: FileMode) -> Result<(), FsError> {
         let (root, relative) = self.resolve(path, true)?;
@@ -560,8 +630,90 @@ impl PolicyDirectory {
             revision: self.revision,
             policy: Some(fs.clone()),
             parent_display,
+            authority_display: None,
             inner: self.directory.read_dir()?,
         })
+    }
+
+    /// Dual denied/private coordinate filtering (lexical + physical) per entry.
+    pub(crate) fn read_dir_glob(
+        self,
+        fs: &Arc<PolicyFs>,
+        lexical_display: &Path,
+    ) -> Result<PolicyReadDir, FsError> {
+        if self.revision != fs.revision {
+            return Err(FsError::IdentityChanged);
+        }
+        let parent_display = lexical_display.to_path_buf();
+        fs.resolve_indexed(&fs.absolute(&parent_display)?, false)?;
+        let authority_display = self.directory.authority_path();
+        fs.resolve_indexed(&fs.absolute(&authority_display)?, false)?;
+        Ok(PolicyReadDir {
+            revision: self.revision,
+            policy: Some(fs.clone()),
+            parent_display,
+            authority_display: Some(authority_display),
+            inner: self.directory.read_dir()?,
+        })
+    }
+
+
+    pub(crate) fn entry_kind_relative(
+        &self,
+        fs: &Arc<PolicyFs>,
+        lexical_display: &Path,
+        relative: &Path,
+    ) -> Result<Option<EntryKind>, FsError> {
+        self.authorize_relative(fs, lexical_display, relative)?;
+        match self.directory.open_entry_exact(relative) {
+            Ok(CapabilityEntry::File(_)) => Ok(Some(EntryKind::RegularFile)),
+            Ok(CapabilityEntry::Directory(_)) => Ok(Some(EntryKind::Directory)),
+            Err(error) if is_optional_ignore_child(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+
+    pub(crate) fn read_optional_relative(
+        &self,
+        fs: &Arc<PolicyFs>,
+        lexical_display: &Path,
+        relative: &Path,
+        max_bytes: u64,
+    ) -> Result<Option<Vec<u8>>, FsError> {
+        self.authorize_relative(fs, lexical_display, relative)?;
+        match self.directory.open_file(relative) {
+            Ok(file) => Ok(Some(file.read_bounded(max_bytes)?)),
+            Err(error) if is_optional_ignore_child(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn authorize_relative(
+        &self,
+        fs: &Arc<PolicyFs>,
+        lexical_display: &Path,
+        relative: &Path,
+    ) -> Result<(), FsError> {
+        if self.revision != fs.revision {
+            return Err(FsError::IdentityChanged);
+        }
+        validate_relative(relative)?;
+        if relative.as_os_str().is_empty() {
+            return Err(FsError::InvalidPath);
+        }
+        let mut lexical = lexical_display.to_path_buf();
+        let mut authority = self.directory.authority_path();
+        for component in relative.components() {
+            let Component::Normal(name) = component else {
+                return Err(FsError::InvalidPath);
+            };
+            lexical.push(name);
+            authority.push(name);
+            fs.resolve_indexed(&fs.absolute(&lexical)?, false)?;
+            fs.resolve_indexed(&fs.absolute(&authority)?, false)?;
+        }
+        Ok(())
     }
 }
 
@@ -640,6 +792,14 @@ impl PolicyReadDir {
                 policy.is_denied(&display_path) || policy.is_private(&display_path)
             }) {
                 continue;
+            }
+            if let Some(authority_display) = &self.authority_display {
+                let authority_child = authority_display.join(&name);
+                if self.policy.as_ref().is_some_and(|policy| {
+                    policy.is_denied(&authority_child) || policy.is_private(&authority_child)
+                }) {
+                    continue;
+                }
             }
             let opened = match entry.into_entry() {
                 CapabilityEntry::File(file) => PolicyOpenedEntry::File(PolicyFile {
@@ -785,6 +945,7 @@ impl PolicyScratch {
             revision: self.revision(),
             policy: None,
             parent_display: self.lease.display_root().join(relative),
+            authority_display: None,
             inner: self.lease.read_dir(relative)?,
         })
     }
@@ -1030,6 +1191,18 @@ fn validate_entry_name(name: &OsStr) -> Result<(), FsError> {
     } else {
         Err(FsError::InvalidPath)
     }
+}
+
+/// Missing files and nofollow-blocked symlinks are absent ignore children.
+/// A directory (`.git`) is `UnsupportedEntryType` and is not optional.
+fn is_optional_ignore_child(error: &FsError) -> bool {
+    matches!(
+        error,
+        FsError::System {
+            kind: io::ErrorKind::NotFound,
+            ..
+        }
+    ) || is_link_blocked(error)
 }
 
 fn validate_browser_request_id(request_id: &str) -> Result<&str, FsError> {
@@ -1376,6 +1549,187 @@ mod tests {
         }
         fs.create_new(&home.join("control.txt"), FileMode::Private)
             .expect("workspace control marker must stay writable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn glob_alias_chain_through_denied_directory_is_denied() {
+        // Denied applies to traversal, not only the resolved endpoint: a glob
+        // target whose alias chain crosses a denied directory must fail closed,
+        // matching `authorize_relative` per-component lexical+authority checks.
+        let root = tempfile::tempdir().expect("root");
+        let workspace = root.path().join("workspace");
+        let denied = workspace.join("denied");
+        let final_dir = workspace.join("final");
+        let scratch = root.path().join("scratch");
+        std::fs::create_dir_all(&final_dir).expect("final");
+        std::fs::create_dir_all(&denied).expect("denied");
+        std::fs::create_dir(&scratch).expect("scratch");
+        std::os::unix::fs::symlink("../final", denied.join("escape")).expect("escape link");
+        std::os::unix::fs::symlink(denied.join("escape"), workspace.join("alias"))
+            .expect("alias link");
+        let workspace = AbsolutePath::parse(workspace).expect("workspace");
+        let scratch_path = AbsolutePath::parse(scratch).expect("scratch");
+        let filesystem = FileSystemPolicy::new(
+            Vec::new(),
+            vec![
+                pi_sandbox::WritableRoot::new(workspace.clone(), Vec::new()).expect("root"),
+            ],
+            vec![AbsolutePath::parse(denied).expect("denied")],
+        )
+        .expect("filesystem");
+        let policy = SandboxPolicy::workspace_write(
+            filesystem,
+            NetworkPolicy::None,
+            HostHttpPolicy::new(Vec::new()).expect("http"),
+            CredentialPolicy::new(Vec::new()).expect("credentials"),
+            ResourceLimits::confined_defaults(),
+        )
+        .expect("policy");
+        let snapshot = Arc::new(
+            pi_sandbox::PolicySnapshot::new(
+                PolicyRevision::new(1).expect("revision"),
+                current_host_platform(),
+                policy,
+            )
+            .expect("snapshot"),
+        );
+        let capabilities = CapabilityFs::new().expect("capabilities");
+        let scratch = PolicyScratchRoot::acquire(
+            PolicyRevision::new(1).expect("revision"),
+            &capabilities,
+            scratch_path.clone(),
+            scratch_path,
+        )
+        .expect("scratch");
+        let fs = PolicyFs::new(snapshot, workspace.clone(), capabilities, scratch)
+            .expect("policy fs");
+        match fs.resolve_glob_target(&workspace.as_path().join("alias")) {
+            Ok(_) => panic!("alias chain through a denied directory must fail closed"),
+            Err(error) => assert!(matches!(error, FsError::Denied), "{error}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn glob_single_symlink_denied_prefix_before_parent_pop_is_denied() {
+        // One link whose target normalizes across a denied directory
+        // (`denied/../final`) is denied too: the pre-pop prefix must be
+        // authorized, normalization must not erase the traversal.
+        let root = tempfile::tempdir().expect("root");
+        let workspace = root.path().join("workspace");
+        let denied = workspace.join("denied");
+        let final_dir = workspace.join("final");
+        let scratch = root.path().join("scratch");
+        std::fs::create_dir_all(&final_dir).expect("final");
+        std::fs::create_dir_all(&denied).expect("denied");
+        std::fs::create_dir(&scratch).expect("scratch");
+        std::os::unix::fs::symlink("denied/../final", workspace.join("alias"))
+            .expect("alias link");
+        let workspace = AbsolutePath::parse(workspace).expect("workspace");
+        let scratch_path = AbsolutePath::parse(scratch).expect("scratch path");
+        let filesystem = FileSystemPolicy::new(
+            Vec::new(),
+            vec![
+                pi_sandbox::WritableRoot::new(workspace.clone(), Vec::new()).expect("root"),
+            ],
+            vec![AbsolutePath::parse(denied).expect("denied")],
+        )
+        .expect("filesystem");
+        let policy = SandboxPolicy::workspace_write(
+            filesystem,
+            NetworkPolicy::None,
+            HostHttpPolicy::new(Vec::new()).expect("http"),
+            CredentialPolicy::new(Vec::new()).expect("credentials"),
+            ResourceLimits::confined_defaults(),
+        )
+        .expect("policy");
+        let snapshot = Arc::new(
+            pi_sandbox::PolicySnapshot::new(
+                PolicyRevision::new(1).expect("revision"),
+                current_host_platform(),
+                policy,
+            )
+            .expect("snapshot"),
+        );
+        let capabilities = CapabilityFs::new().expect("capabilities");
+        let scratch = PolicyScratchRoot::acquire(
+            PolicyRevision::new(1).expect("revision"),
+            &capabilities,
+            scratch_path.clone(),
+            scratch_path,
+        )
+        .expect("scratch");
+        let fs = PolicyFs::new(snapshot, workspace.clone(), capabilities, scratch)
+            .expect("policy fs");
+        match fs.resolve_glob_target(&workspace.as_path().join("alias")) {
+            Ok(_) => panic!("link target crossing a denied prefix must fail closed"),
+            Err(error) => assert!(matches!(error, FsError::Denied), "{error}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn glob_legal_within_root_links_still_resolve() {
+        // Within-root links that never traverse a denied prefix stay allowed:
+        // a directory link resolves to its target directory, a file link
+        // resolves as a file target (None).
+        let root = tempfile::tempdir().expect("root");
+        let workspace = root.path().join("workspace");
+        let final_dir = workspace.join("final");
+        let scratch = root.path().join("scratch");
+        std::fs::create_dir_all(&final_dir).expect("final");
+        std::fs::create_dir(&scratch).expect("scratch");
+        std::fs::write(final_dir.join("note.txt"), b"ok").expect("note");
+        std::os::unix::fs::symlink("final", workspace.join("alias")).expect("dir link");
+        std::os::unix::fs::symlink("final/note.txt", workspace.join("alias_file"))
+            .expect("file link");
+        let workspace = AbsolutePath::parse(workspace).expect("workspace");
+        let scratch_path = AbsolutePath::parse(scratch).expect("scratch path");
+        let filesystem = FileSystemPolicy::new(
+            Vec::new(),
+            vec![
+                pi_sandbox::WritableRoot::new(workspace.clone(), Vec::new()).expect("root"),
+            ],
+            Vec::new(),
+        )
+        .expect("filesystem");
+        let policy = SandboxPolicy::workspace_write(
+            filesystem,
+            NetworkPolicy::None,
+            HostHttpPolicy::new(Vec::new()).expect("http"),
+            CredentialPolicy::new(Vec::new()).expect("credentials"),
+            ResourceLimits::confined_defaults(),
+        )
+        .expect("policy");
+        let snapshot = Arc::new(
+            pi_sandbox::PolicySnapshot::new(
+                PolicyRevision::new(1).expect("revision"),
+                current_host_platform(),
+                policy,
+            )
+            .expect("snapshot"),
+        );
+        let capabilities = CapabilityFs::new().expect("capabilities");
+        let scratch = PolicyScratchRoot::acquire(
+            PolicyRevision::new(1).expect("revision"),
+            &capabilities,
+            scratch_path.clone(),
+            scratch_path,
+        )
+        .expect("scratch");
+        let fs = PolicyFs::new(snapshot, workspace.clone(), capabilities, scratch)
+            .expect("policy fs");
+        match fs.resolve_glob_target(&workspace.as_path().join("alias")) {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("legal within-root directory link must resolve to a directory"),
+            Err(error) => panic!("legal within-root directory link must resolve: {error}"),
+        }
+        match fs.resolve_glob_target(&workspace.as_path().join("alias_file")) {
+            Ok(None) => {}
+            Ok(Some(_)) => panic!("legal within-root file link must resolve as a file target"),
+            Err(error) => panic!("legal within-root file link must resolve: {error}"),
+        }
     }
 
     const fn current_host_platform() -> pi_sandbox::HostPlatform {

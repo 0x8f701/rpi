@@ -25,7 +25,6 @@ import {
   HEADER_HEIGHT_FLOOR,
   applyFooterHeight,
   applyHeaderHeight,
-  fileExplorerFullscreenActive,
   footerHeightPx,
   headerHeightPx,
   measureChromeHeight,
@@ -93,13 +92,10 @@ check('passes integers through', headerHeightPx(58) === 58);
 check('floors tiny heights at 44px', headerHeightPx(40) === HEADER_HEIGHT_FLOOR);
 check('maps NaN to the floor', headerHeightPx(Number.NaN) === HEADER_HEIGHT_FLOOR);
 check('maps Infinity to the floor', headerHeightPx(Infinity) === HEADER_HEIGHT_FLOOR);
-check('hidden header height is exactly 0', headerHeightPx(57.7, true) === 0 && headerHeightPx(0, true) === 0 && headerHeightPx(Number.NaN, true) === 0);
 check(
   'never returns a non-integer',
-  [0, 0.5, 57.2, 57.7031, 58, 100.9, Number.NaN].every((h) => Number.isInteger(headerHeightPx(h)))
-    && headerHeightPx(80, true) === 0,
+  [0, 0.5, 57.2, 57.7031, 58, 100.9, Number.NaN].every((h) => Number.isInteger(headerHeightPx(h))),
 );
-check('fullscreen is open and expanded only', fileExplorerFullscreenActive(true, true) === true && fileExplorerFullscreenActive(true, false) === false && fileExplorerFullscreenActive(false, true) === false);
 
 /* ------------------------------------------------------------------ *
  * 2. CSS-var application (one top authority)
@@ -173,14 +169,11 @@ check(
   headerEffect.length > 0 && !headerEffect.includes('setProperty'),
 );
 check(
-  'App measures the header unconditionally (no keep-alive hidden gate remains)',
-  !headerEffect.includes('appShellHidden'),
-);
-check(
-  'expanded Files bypasses the 44px floor and writes 0 before paint',
-  app.includes('fileExplorerFullscreenActive')
-    && app.includes('hidden={filesFullscreen}')
-    && /applyHeaderHeight\(\s*measureChromeHeight\(header\),\s*filesFullscreen\s*\)/.test(app),
+  'App measures the header unconditionally and never hides it for Files',
+  !headerEffect.includes('appShellHidden')
+    && !app.includes('fileExplorerFullscreenActive')
+    && !app.includes('hidden={filesFullscreen}')
+    && !app.includes('app-layout--files-expanded'),
 );
 check(
   'the ResizeObserver stays armed so later viewport changes remeasure the header',
@@ -217,39 +210,12 @@ check(
   /min-height:\s*var\(--app-header-height/.test(headerBlock),
 );
 
-const drawerIdx = css.indexOf('.file-explorer {');
-const drawerBlock = drawerIdx >= 0 ? css.slice(drawerIdx, css.indexOf('}', drawerIdx)) : '';
 check(
-  'the drawer top reads the shared var (no literal competing top)',
-  /top:\s*var\(--app-header-height/.test(drawerBlock),
-);
-check(
-  'the drawer has no literal px top of its own',
-  !/top:\s*\d+(\.\d+)?px/.test(drawerBlock),
-);
-check(
-  'the drawer height is auto (spans header bottom -> viewport bottom)',
-  /height:\s*auto/.test(drawerBlock) && /max-height:\s*none/.test(drawerBlock),
-);
-
-const resizerIdx = css.indexOf('\n.file-explorer-resizer {');
-const resizerBlock = resizerIdx >= 0 ? css.slice(resizerIdx, css.indexOf('}', resizerIdx)) : '';
-check(
-  'the resizer top reads the shared var (seam control matches the drawer)',
-  /top:\s*var\(--app-header-height/.test(resizerBlock),
-);
-check(
-  'the resizer has no literal px top of its own',
-  !/top:\s*\d+(\.\d+)?px/.test(resizerBlock),
+  'open Files has no outer width resizer',
+  !css.includes('.file-explorer-resizer'),
 );
 
 
-const footerIdx = css.indexOf('footer {');
-const footerBlock = footerIdx >= 0 ? css.slice(footerIdx, css.indexOf('}', footerIdx)) : '';
-check(
-  'the footer pins its height to --app-footer-height',
-  /min-height:\s*var\(--app-footer-height/.test(footerBlock),
-);
 check(
   'desktop ordinary panels sit above the measured footer',
   css.includes('bottom: var(--app-footer-height, 0px)'),
@@ -260,50 +226,8 @@ check(
     && css.includes('height: min(var(--panel-drawer-height, 90vh), calc(100dvh - var(--app-header-height, 0px) - var(--app-footer-height, 0px)))'),
 );
 check(
-  'desktop footer stays above ordinary panels',
-  /z-index:\s*51/.test(footerBlock),
-);
-check(
   'tablet drawers sit under the header and above the footer',
   /@media \(max-width: 768px\) \{[\s\S]*?#session-panel \{[\s\S]*?top:\s*var\(--app-header-height\)[\s\S]*?bottom:\s*var\(--app-footer-height/.test(css),
-);
-check(
-  'tablet file explorer is in the same header/footer drawer envelope',
-  /@media \(max-width: 768px\) \{[\s\S]*?\.file-explorer,[\s\S]*?\.code-review-panel,[\s\S]*?#session-panel \{[\s\S]*?top:\s*var\(--app-header-height\)[\s\S]*?bottom:\s*var\(--app-footer-height/.test(css),
-);
-check(
-  'phone file explorer sits above the footer',
-  /@media \(max-width: 720px\) \{[\s\S]*?\.file-explorer \{[\s\S]*?bottom:\s*var\(--app-footer-height/.test(css),
-);
-check(
-  'phone file explorer must not pin to the viewport bottom',
-  !/@media \(max-width: 720px\) \{[\s\S]*?\.file-explorer \{[^}]*bottom:\s*0\s*;/.test(css),
-);
-check(
-  'phone session sidebar sits under the header and above the footer',
-  /@media \(max-width: 720px\) \{[\s\S]*?\.session-sidebar \{[\s\S]*?top:\s*var\(--app-header-height\)[\s\S]*?bottom:\s*var\(--app-footer-height/.test(css),
-);
-check(
-  'phone session sidebar must not pin to the viewport bottom',
-  !/@media \(max-width: 720px\) \{[\s\S]*?\.session-sidebar \{[^}]*bottom:\s*0\s*;/.test(css),
-);
-check(
-  'opening the session drawer does not hide the mobile footer',
-  /@media \(max-width: 720px\) \{[\s\S]*?\.app-layout--drawer-open footer \{[^}]*z-index:\s*51/.test(css)
-    && !/@media \(max-width: 720px\) \{[\s\S]*?\.app-layout--drawer-open footer \{[^}]*display:\s*none/.test(css),
-);
-check(
-  'files-expanded and code-review hide the footer only on desktop',
-  /@media \(min-width: 769px\) \{[\s\S]*?\.app-layout--files-expanded footer[\s\S]*?\.app-layout--code-review footer[\s\S]*?display:\s*none/.test(css),
-);
-check(
-  'expanded Files hides the sibling header and pins the drawer to the viewport top',
-  /header\[hidden\][\s\S]{0,160}display:\s*none/.test(css)
-    && /\.app-layout--files-expanded \.file-explorer \{[^}]*top:\s*0/.test(css),
-);
-check(
-  'ordinary drawer top still reads the shared header var',
-  /top:\s*var\(--app-header-height/.test(drawerBlock),
 );
 check(
   'session actions size the path autocomplete as a 44px equal column',

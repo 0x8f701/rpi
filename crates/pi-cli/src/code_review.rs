@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 /// Hard cap on combined git stdout for the review snapshot.
@@ -56,7 +57,8 @@ const MAX_GIT_METADATA_BYTES: usize = 64 * 1024;
 const MAX_SHARED_INDEX_FILES: usize = 128;
 
 /// How a path changed relative to the review comparison source.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FileStatus {
     Added,
     Deleted,
@@ -64,6 +66,7 @@ pub enum FileStatus {
     Renamed,
     Copied,
     Binary,
+    Unmerged,
     Unknown,
 }
 
@@ -77,6 +80,7 @@ impl FileStatus {
             Self::Renamed => "R",
             Self::Copied => "C",
             Self::Binary => "B",
+            Self::Unmerged => "U",
             Self::Unknown => "?",
         }
     }
@@ -90,10 +94,157 @@ impl FileStatus {
             Self::Renamed => "renamed",
             Self::Copied => "copied",
             Self::Binary => "binary",
+            Self::Unmerged => "unmerged",
             Self::Unknown => "changed",
         }
     }
 }
+/// Host document bound for one rendered Summary. Exceeding it fails; nothing
+/// is trimmed.
+pub(crate) const MAX_SUMMARY_DOCUMENT_BYTES: usize = 2 * 1024 * 1024;
+/// Workspace-wide aggregate budget for patch bodies retained by summary
+/// collection, shared by every repository and layer. Independent of the
+/// review snapshot cap: bodies are bounded per file, and this bound fails
+/// closed when the retained patch text alone is beyond summarizing.
+pub(crate) const MAX_SUMMARY_PATCH_BYTES: usize = 64 * 1024 * 1024;
+
+/// Closed model-purpose identity. Every variant is a valid key: a committed
+/// file always carries its commit, and a worktree file never does.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum PurposeKey {
+    Repository { label: String },
+    Commit { label: String, oid: String },
+    CommittedFile { label: String, oid: String, path: String },
+    StagedFile { label: String, path: String },
+    UnstagedFile { label: String, path: String },
+    UntrackedFile { label: String, path: String },
+}
+
+/// Authoritative `+/-`, or the only other facts Git actually reported.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum LineStats {
+    Text { insertions: usize, deletions: usize },
+    Binary,
+    Unavailable,
+}
+
+/// One changed path. `patch` is the unified diff when one was captured;
+/// binary and pure rename/copy records leave it empty rather than inventing
+/// one. Raw path bytes stay inside the collector.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct ChangedFileFacts {
+    pub(crate) path: String,
+    pub(crate) previous_path: Option<String>,
+    pub(crate) status: FileStatus,
+    pub(crate) lines: LineStats,
+    pub(crate) patch: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct CommitFacts {
+    pub(crate) oid: String,
+    pub(crate) subject: String,
+    pub(crate) files: Vec<ChangedFileFacts>,
+}
+
+/// Symbolic HEAD. `oid` is absent only for an unborn branch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub(crate) enum HeadState {
+    Branch { name: String, oid: Option<String> },
+    Detached { oid: String },
+    Unborn { name: String },
+}
+
+/// Counts are independent of whether the origin comparison succeeded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct GitCounts {
+    pub(crate) staged: usize,
+    pub(crate) unstaged: usize,
+    pub(crate) untracked: usize,
+    pub(crate) commits: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct RepositoryOverview {
+    pub(crate) head: HeadState,
+    pub(crate) upstream: Option<String>,
+    pub(crate) counts: GitCounts,
+}
+
+/// Origin comparison pinned to the captured OIDs. Absence is not a command
+/// failure.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub(crate) enum OriginOutcome {
+    Compared {
+        branch: String,
+        head_oid: String,
+        origin_oid: String,
+        ahead: u32,
+        behind: u32,
+    },
+    NoOrigin,
+    MissingOriginBranch { branch: String },
+    Detached,
+    Unborn,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct RepositorySummaryFacts {
+    pub(crate) root_index: usize,
+    /// `root{index}/{path relative to that discovery root}`.
+    pub(crate) label: String,
+    pub(crate) overview: RepositoryOverview,
+    pub(crate) origin: OriginOutcome,
+    pub(crate) commits: Vec<CommitFacts>,
+    pub(crate) staged: Vec<ChangedFileFacts>,
+    pub(crate) unstaged: Vec<ChangedFileFacts>,
+    pub(crate) untracked: Vec<ChangedFileFacts>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct WorkspaceSummaryFacts {
+    pub(crate) repositories: Vec<RepositorySummaryFacts>,
+}
+
+/// Collection or render failure. There is no partial-success variant.
+#[derive(Debug)]
+pub(crate) enum SummaryError {
+    Command {
+        repo: String,
+        command: String,
+        exit: Option<i32>,
+        detail: String,
+    },
+    Incomplete(String),
+    Limit { what: String, bytes: usize },
+}
+
+impl std::fmt::Display for SummaryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Command { repo, command, exit, detail } => {
+                write!(formatter, "{repo}: `{command}` ")?;
+                match exit {
+                    Some(code) => write!(formatter, "exit {code}: {detail}"),
+                    None => write!(formatter, "failed: {detail}"),
+                }
+            }
+            Self::Incomplete(detail) => write!(formatter, "{detail}"),
+            Self::Limit { what, bytes } => {
+                write!(formatter, "{what} exceeded {bytes} bytes")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SummaryError {}
+
+
+
 
 /// One line inside a unified diff hunk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -606,6 +757,1518 @@ pub fn review_repository_root(
     }
     Ok(canonical)
 }
+
+const MAX_WORKSPACE_REPOS: usize = 1_600;
+const MAX_WORKSPACE_DIRECTORY_WORK: usize = 100_000;
+const MAX_DISCOVERY_REASON_CHARS: usize = 256;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RepositoryDiscoveryScope {
+    /// Workspace overview: every authorized root, repositories included in the
+    /// traversal like any other directory.
+    Workspace,
+    /// Commit-child search: the walk stops at every found repository, so a
+    /// repository's interior is never candidate territory.
+    Children,
+}
+
+pub(crate) enum WorkspaceRepositoryDiscovery {
+    Complete(Vec<PathBuf>),
+    /// Truncated traversal. `found` is not the candidate set. `reason` is the
+    /// first stop, with any path bounded and relative to a requested root.
+    Incomplete { found: Vec<PathBuf>, reason: String },
+}
+
+pub(crate) fn collect_workspace_repositories(
+    generation: &pi_coding::ApplicationGeneration,
+    roots: &[PathBuf],
+    scope: RepositoryDiscoveryScope,
+) -> WorkspaceRepositoryDiscovery {
+    collect_workspace_repositories_iterative(
+        generation,
+        roots,
+        scope,
+        DiscoveryLimits {
+            max_repos: MAX_WORKSPACE_REPOS,
+            max_directory_work: MAX_WORKSPACE_DIRECTORY_WORK,
+        },
+    )
+}
+
+struct DiscoveryLimits {
+    max_repos: usize,
+    max_directory_work: usize,
+}
+
+struct DiscoveryFrame {
+    root_index: usize,
+    dir: PathBuf,
+}
+
+fn collect_workspace_repositories_iterative(
+    generation: &pi_coding::ApplicationGeneration,
+    roots: &[PathBuf],
+    scope: RepositoryDiscoveryScope,
+    limits: DiscoveryLimits,
+) -> WorkspaceRepositoryDiscovery {
+    let mut found = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut queued: Vec<DiscoveryFrame> = Vec::new();
+    let mut directory_work = 0usize;
+    let mut reason = None;
+    for (root_index, root) in roots.iter().enumerate() {
+        if directory_work >= limits.max_directory_work {
+            reason = Some(format!(
+                "directory work budget of {} exhausted before {}",
+                limits.max_directory_work,
+                bounded_discovery_path(roots, root_index, root)
+            ));
+            break;
+        }
+        directory_work += 1;
+        queued.push(DiscoveryFrame {
+            root_index,
+            dir: root.clone(),
+        });
+    }
+    while reason.is_none() {
+        let Some(frame) = queued.pop() else { break };
+        if let Some(stop) = visit_workspace_directory(
+            generation,
+            roots,
+            scope,
+            &limits,
+            &frame,
+            &mut found,
+            &mut seen,
+            &mut queued,
+            &mut directory_work,
+        ) {
+            reason = Some(stop);
+        }
+    }
+    found.sort();
+    match reason {
+        Some(reason) => WorkspaceRepositoryDiscovery::Incomplete { found, reason },
+        None => WorkspaceRepositoryDiscovery::Complete(found),
+    }
+}
+
+fn visit_workspace_directory(
+    generation: &pi_coding::ApplicationGeneration,
+    roots: &[PathBuf],
+    scope: RepositoryDiscoveryScope,
+    limits: &DiscoveryLimits,
+    frame: &DiscoveryFrame,
+    found: &mut Vec<PathBuf>,
+    seen: &mut BTreeSet<PathBuf>,
+    queued: &mut Vec<DiscoveryFrame>,
+    directory_work: &mut usize,
+) -> Option<String> {
+    let located = bounded_discovery_path(roots, frame.root_index, &frame.dir);
+    match generation.inspect_directory(&frame.dir) {
+        Ok(_) => {}
+        Err(error) if is_policy_denial(&error) => return None,
+        Err(_) => return Some(format!("reading {located} failed")),
+    }
+    let git = match probe_git_marker(&frame.dir.join(".git")) {
+        Ok(GitMarker::RepositoryDir | GitMarker::GitFile) => true,
+        Ok(GitMarker::Absent) => false,
+        Err(_) => return Some(format!("reading {located} failed")),
+    };
+    if git {
+        match std::fs::canonicalize(&frame.dir) {
+            Ok(canonical) if !seen.contains(&canonical) => {
+                if found.len() >= limits.max_repos {
+                    return Some(format!(
+                        "repository budget of {} exhausted at {located}",
+                        limits.max_repos
+                    ));
+                }
+                seen.insert(canonical.clone());
+                found.push(canonical);
+            }
+            Ok(_) => return None,
+            Err(_) => return Some(format!("reading {located} failed")),
+        }
+        if scope == RepositoryDiscoveryScope::Children {
+            // The commit-child search stops at every found repository: a
+            // repository's interior is never candidate territory.
+            return None;
+        }
+    } else {
+        match std::fs::canonicalize(&frame.dir) {
+            Ok(canonical) => {
+                if !seen.insert(canonical) {
+                    return None;
+                }
+            }
+            Err(_) => return Some(format!("canonicalizing {located} failed")),
+        }
+    }
+    let mut read = match fs::read_dir(&frame.dir) {
+        Ok(read) => read,
+        Err(_) => return Some(format!("reading {located} failed")),
+    };
+    let mut children = Vec::new();
+    loop {
+        let entry = match read.next() {
+            Some(Ok(entry)) => entry,
+            Some(Err(_)) => return Some(format!("reading {located} failed")),
+            None => break,
+        };
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => return Some(format!("reading {located} failed")),
+        };
+        if !file_type.is_dir() || file_type.is_symlink() {
+            continue;
+        }
+        if is_excluded_directory_name(&entry.file_name().to_string_lossy()) {
+            continue;
+        }
+        let child = entry.path();
+        if directory_work.saturating_add(children.len()) >= limits.max_directory_work {
+            return Some(format!(
+                "directory work budget of {} exhausted before {}",
+                limits.max_directory_work,
+                bounded_discovery_path(roots, frame.root_index, &child)
+            ));
+        }
+        children.push(child);
+    }
+    children.sort();
+    for child in children.into_iter().rev() {
+        *directory_work += 1;
+        queued.push(DiscoveryFrame {
+            root_index: frame.root_index,
+            dir: child,
+        });
+    }
+    None
+}
+
+fn bounded_discovery_path(roots: &[PathBuf], root_index: usize, path: &Path) -> String {
+    let relative = roots
+        .get(root_index)
+        .and_then(|root| path.strip_prefix(root).ok())
+        .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+        .filter(|relative| !relative.is_empty());
+    let display = match relative {
+        Some(relative) => format!("root{root_index}/{relative}"),
+        None => format!("root{root_index}"),
+    };
+    let mut bounded: String = display.chars().take(MAX_DISCOVERY_REASON_CHARS).collect();
+    if display.chars().count() > MAX_DISCOVERY_REASON_CHARS {
+        bounded.push_str("...");
+    }
+    bounded
+}
+
+/// Exact sandbox-policy denials only; any other error marks discovery incomplete.
+fn is_policy_denial(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<pi_coding::FsError>(),
+        Some(pi_coding::FsError::Denied | pi_coding::FsError::OutsideCapability)
+    )
+}
+
+fn is_excluded_directory_name(name: &str) -> bool {
+    name.starts_with('.') || matches!(name, "node_modules" | "target" | "dist" | "vendor")
+}
+
+enum GitMarker {
+    RepositoryDir,
+    GitFile,
+    Absent,
+}
+
+fn probe_git_marker(marker: &Path) -> Result<GitMarker, String> {
+    let file_type = match fs::symlink_metadata(marker) {
+        Ok(metadata) => metadata.file_type(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(GitMarker::Absent);
+        }
+        Err(error) => return Err(format!("reading .git metadata: {error}")),
+    };
+    let file_type = if file_type.is_symlink() {
+        match fs::metadata(marker) {
+            Ok(metadata) => metadata.file_type(),
+            Err(error) => return Err(format!("reading .git metadata: {error}")),
+        }
+    } else {
+        file_type
+    };
+    if file_type.is_dir() {
+        Ok(GitMarker::RepositoryDir)
+    } else if file_type.is_file() {
+        Ok(GitMarker::GitFile)
+    } else {
+        Err(format!("unsupported .git entry: {}", marker.display()))
+    }
+}
+
+fn is_bare_hex_token(revision: &str) -> bool {
+    (4..=64).contains(&revision.len()) && revision.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+enum CandidateCommit {
+    Contained,
+    Absent,
+    Indeterminate(String),
+}
+
+/// Only git's own unknown-revision answer marks the commit absent; anything else fails the search.
+fn candidate_contains_commit(candidate: &Path, revision: &str) -> CandidateCommit {
+    let commit = format!("{revision}^{{commit}}");
+    match git_rev_parse(candidate, &["--verify", "--end-of-options", &commit], None) {
+        Ok(_) => CandidateCommit::Contained,
+        Err(cause) => match classify_rev_parse_failure(&sanitize_display(&cause)) {
+            RevisionResolution::Unknown => CandidateCommit::Absent,
+            resolution => CandidateCommit::Indeterminate(match resolution {
+                RevisionResolution::NotACommit => format!(
+                    "'{}' resolves to an object that is not a commit",
+                    bounded_echo(revision)
+                ),
+                _ => format!("git rev-parse failed: {}", sanitize_display(&cause)),
+            }),
+        },
+    }
+}
+
+/// Explicit repo wins; otherwise a bare hex commit token from a genuine parent
+/// non-repository selects the unique child containing it.
+pub fn resolve_review_repository_root(
+    application: &pi_coding::Application,
+    repo: Option<&str>,
+    revision: Option<&str>,
+) -> anyhow::Result<PathBuf> {
+    if let Some(repo) = repo {
+        return review_repository_root(application, Some(repo));
+    }
+    let workspace_root = application.session().cwd().to_path_buf();
+    let Some(revision) = revision else {
+        return Ok(workspace_root);
+    };
+    if !is_bare_hex_token(revision) {
+        return Ok(workspace_root);
+    }
+    match RepositoryLayout::discover_typed(&workspace_root) {
+        Ok(repository) => return Ok(repository.root),
+        Err(RepositoryDiscoveryError::NotRepository) => {}
+        Err(RepositoryDiscoveryError::Failed(message)) => {
+            return Err(anyhow::anyhow!(
+                "code review repository discovery failed: {message}"
+            ));
+        }
+    }
+    let generation = application.capture_generation();
+    let (found, complete, reason) = match collect_workspace_repositories(
+        &generation,
+        &[workspace_root.clone()],
+        RepositoryDiscoveryScope::Children,
+    ) {
+        WorkspaceRepositoryDiscovery::Complete(found) => (found, true, None),
+        WorkspaceRepositoryDiscovery::Incomplete { found, reason } => {
+            (found, false, Some(reason))
+        }
+    };
+    let token = bounded_echo(revision);
+    if !complete {
+        let reason = reason.expect("an incomplete discovery carries its first stop");
+        return Err(anyhow::anyhow!(
+            "code review repository discovery was incomplete ({reason}); refusing to resolve \
+             commit '{token}' from a partial scan of the workspace"
+        ));
+    }
+    let mut matches: Vec<PathBuf> = Vec::new();
+    for candidate in &found {
+        match candidate_contains_commit(candidate, revision) {
+            CandidateCommit::Contained => matches.push(candidate.clone()),
+            CandidateCommit::Absent => {}
+            CandidateCommit::Indeterminate(cause) => {
+                return Err(anyhow::anyhow!(
+                    "failed to resolve commit '{token}' in {}: {cause}",
+                    bounded_echo(&candidate.display().to_string())
+                ));
+            }
+        }
+    }
+    match matches.as_slice() {
+        [] => Err(anyhow::anyhow!(
+            "no reachable repository contains commit '{token}'"
+        )),
+        [only] => Ok(only.clone()),
+        multiple => {
+            let names = multiple
+                .iter()
+                .map(|repo| bounded_echo(&repo.display().to_string()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(anyhow::anyhow!(
+                "commit '{token}' is ambiguous; it exists in more than one workspace \
+                 repository: {names}"
+            ))
+        }
+    }
+}
+/// Every authorized repository under `roots`, or a typed failure. Discovery
+/// that stops early, a command that does not finish, or a malformed record
+/// fails: none of them publish a partial overview. Git calls and patches are
+/// bounded per call/file; retained patch bodies share one workspace-wide
+/// [`MAX_SUMMARY_PATCH_BYTES`] budget that fails closed and never trims.
+pub(crate) fn collect_summary_facts(
+    generation: &pi_coding::ApplicationGeneration,
+    roots: &[PathBuf],
+) -> Result<WorkspaceSummaryFacts, SummaryError> {
+    let discovered = match collect_workspace_repositories(
+        generation,
+        roots,
+        RepositoryDiscoveryScope::Workspace,
+    ) {
+        WorkspaceRepositoryDiscovery::Complete(found) => found,
+        WorkspaceRepositoryDiscovery::Incomplete { reason, .. } => {
+            return Err(SummaryError::Incomplete(format!(
+                "repository discovery was incomplete: {reason}"
+            )));
+        }
+    };
+    let mut retained = 0usize;
+    let mut repositories = Vec::with_capacity(discovered.len());
+    for root in discovered {
+        repositories.push(collect_repository_summary(generation, roots, &root, &mut retained)?);
+    }
+    Ok(WorkspaceSummaryFacts { repositories })
+}
+
+/// Charges one assembled patch body against the single workspace-wide
+/// summary budget. The measured running total and the exact limit are both
+/// reported on failure; nothing is trimmed and overflow fails closed.
+fn summary_patch_charge(
+    retained: &mut usize,
+    label: &str,
+    bytes: usize,
+) -> Result<(), SummaryError> {
+    let Some(next) = retained.checked_add(bytes) else {
+        return Err(SummaryError::Limit {
+            what: format!(
+                "{label}: summary patch bodies overflow the {MAX_SUMMARY_PATCH_BYTES}-byte retained budget"
+            ),
+            bytes: MAX_SUMMARY_PATCH_BYTES,
+        });
+    };
+    if next > MAX_SUMMARY_PATCH_BYTES {
+        return Err(SummaryError::Limit {
+            what: format!(
+                "{label}: summary patch bodies total {next} bytes across the workspace, \
+                 beyond the {MAX_SUMMARY_PATCH_BYTES}-byte retained budget"
+            ),
+            bytes: MAX_SUMMARY_PATCH_BYTES,
+        });
+    }
+    *retained = next;
+    Ok(())
+}
+
+fn repository_label(roots: &[PathBuf], root: &Path) -> Result<(usize, String), SummaryError> {
+    for (index, discovery_root) in roots.iter().enumerate() {
+        let Ok(base) = fs::canonicalize(discovery_root) else {
+            continue;
+        };
+        if root == base {
+            return Ok((index, format!("root{index}")));
+        }
+        if let Ok(relative) = root.strip_prefix(&base) {
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            if !relative.is_empty() {
+                return Ok((index, format!("root{index}/{relative}")));
+            }
+        }
+    }
+    Err(SummaryError::Incomplete(format!(
+        "discovered repository is not under a requested root: {}",
+        sanitize_display(&root.display().to_string())
+    )))
+}
+
+struct SummaryGit<'a> {
+    label: &'a str,
+    root: &'a Path,
+    isolated: IsolatedGitEnvironment<'a>,
+}
+
+impl SummaryGit<'_> {
+    fn run(&mut self, args: &[&str], max: usize) -> Result<GitOutput, SummaryError> {
+        let command = args.join(" ");
+        let output = run_git_bounded(self.root, args, max, Some(self.isolated)).map_err(|detail| {
+            SummaryError::Command {
+                repo: self.label.to_owned(),
+                command: command.clone(),
+                exit: None,
+                detail,
+            }
+        })?;
+        if output.truncated {
+            return Err(SummaryError::Limit {
+                what: format!("{}: {command}", self.label),
+                bytes: max,
+            });
+        }
+        Ok(output)
+    }
+
+    fn require(&mut self, args: &[&str], max: usize) -> Result<Vec<u8>, SummaryError> {
+        let command = args.join(" ");
+        let output = self.run(args, max)?;
+        if output.exit_code == Some(0) && output.error.is_none() {
+            return Ok(output.stdout);
+        }
+        Err(SummaryError::Command {
+            repo: self.label.to_owned(),
+            command,
+            exit: output.exit_code,
+            detail: output.error.unwrap_or_else(|| "git command failed".to_owned()),
+        })
+    }
+    fn require_os(&mut self, args: &[OsString], max: usize) -> Result<Vec<u8>, SummaryError> {
+        let output = run_git_bounded_os(self.root, args, max, Some(self.isolated)).map_err(|detail| {
+            SummaryError::Command {
+                repo: self.label.to_owned(),
+                command: "diff".to_owned(),
+                exit: None,
+                detail,
+            }
+        })?;
+        if output.truncated {
+            return Err(SummaryError::Limit {
+                what: format!("{}: diff", self.label),
+                bytes: max,
+            });
+        }
+        if output.exit_code == Some(0) && output.error.is_none() {
+            return Ok(output.stdout);
+        }
+        Err(SummaryError::Command {
+            repo: self.label.to_owned(),
+            command: "diff".to_owned(),
+            exit: output.exit_code,
+            detail: output.error.unwrap_or_else(|| "git command failed".to_owned()),
+        })
+    }
+
+
+    fn metadata(&mut self, args: &[&str]) -> Result<Vec<u8>, SummaryError> {
+        self.require(args, MAX_GIT_METADATA_BYTES)
+    }
+
+    fn text(&mut self, args: &[&str]) -> Result<String, SummaryError> {
+        let stdout = self.metadata(args)?;
+        String::from_utf8(stdout).map_err(|_| SummaryError::Incomplete(format!(
+            "{}: `{}` stdout is not UTF-8",
+            self.label,
+            args.join(" ")
+        )))
+    }
+}
+
+fn collect_repository_summary(
+    generation: &pi_coding::ApplicationGeneration,
+    roots: &[PathBuf],
+    root: &Path,
+    retained: &mut usize,
+) -> Result<RepositorySummaryFacts, SummaryError> {
+    let (root_index, label) = repository_label(roots, root)?;
+    let sandbox = IsolatedGitSandbox::discover(root).map_err(|detail| SummaryError::Command {
+        repo: label.clone(),
+        command: "discover".to_owned(),
+        exit: None,
+        detail,
+    })?;
+    if sandbox.work_tree() != root {
+        return Err(SummaryError::Incomplete(format!(
+            "{label} is not the repository root"
+        )));
+    }
+    let isolated = sandbox.environment();
+    let has_origin = repository_has_origin(root, &label)?;
+    let mut git = SummaryGit { label: &label, root, isolated };
+    let head = read_summary_head(&mut git)?;
+    let upstream = read_summary_upstream(root, &label, &head)?;
+    seed_origin_ref(&label, root, &sandbox, branch_name(&head))?;
+    let origin = compare_origin(&mut git, &head, has_origin)?;
+    let commits = collect_origin_commits(&mut git, generation, &origin, retained)?;
+    let staged = collect_layer(&mut git, generation, Layer::Staged, head_oid(&head), retained)?;
+    let unstaged = collect_layer(&mut git, generation, Layer::Unstaged, None, retained)?;
+    let untracked = collect_untracked(&mut git, generation, retained)?;
+    let counts = GitCounts {
+        staged: staged.len(),
+        unstaged: unstaged.len(),
+        untracked: untracked.len(),
+        commits: commits.len(),
+    };
+    Ok(RepositorySummaryFacts {
+        root_index,
+        label,
+        overview: RepositoryOverview { head, upstream, counts },
+        origin,
+        commits,
+        staged,
+        unstaged,
+        untracked,
+    })
+}
+
+
+fn head_oid(head: &HeadState) -> Option<&str> {
+    match head {
+        HeadState::Branch { oid, .. } => oid.as_deref(),
+        HeadState::Detached { oid } => Some(oid),
+        HeadState::Unborn { .. } => None,
+    }
+}
+
+fn branch_name(head: &HeadState) -> Option<&str> {
+    match head {
+        HeadState::Branch { name, .. } | HeadState::Unborn { name } => Some(name),
+        HeadState::Detached { .. } => None,
+    }
+}
+
+fn is_oid(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn one_line(stdout: &str) -> &str {
+    strip_output_line_ending(stdout.trim())
+}
+
+fn read_summary_head(git: &mut SummaryGit<'_>) -> Result<HeadState, SummaryError> {
+    let symbolic = git.run(
+        &["symbolic-ref", "-q", "--", "HEAD"],
+        MAX_GIT_METADATA_BYTES,
+    )?;
+    // Exit 1 with empty stdout is git's documented "HEAD is not symbolic".
+    // The runner records an error string for every nonzero exit, so that
+    // string is not part of the classification.
+    if symbolic.exit_code == Some(1) && symbolic.stdout.is_empty() {
+        let oid = one_line(&git.text(&["rev-parse", "--verify", "--end-of-options", "HEAD"])?).to_owned();
+        if !is_oid(&oid) {
+            return Err(SummaryError::Incomplete(format!(
+                "{}: detached HEAD is not an object id",
+                git.label
+            )));
+        }
+        return Ok(HeadState::Detached { oid });
+    }
+    if symbolic.exit_code != Some(0) || symbolic.error.is_some() {
+        return Err(SummaryError::Command {
+            repo: git.label.to_owned(),
+            command: "symbolic-ref -q -- HEAD".to_owned(),
+            exit: symbolic.exit_code,
+            detail: symbolic.error.unwrap_or_else(|| "git command failed".to_owned()),
+        });
+    }
+    let reference = String::from_utf8(symbolic.stdout).map_err(|_| {
+        SummaryError::Incomplete(format!("{}: symbolic HEAD is not UTF-8", git.label))
+    })?;
+    let reference = one_line(&reference);
+    let name = reference.strip_prefix("refs/heads/").filter(|name| !name.is_empty()).ok_or_else(|| {
+        SummaryError::Incomplete(format!("{}: symbolic HEAD is not a branch", git.label))
+    })?.to_owned();
+    let absent = git.run(
+        &["show-ref", "--verify", "--quiet", "--", reference],
+        MAX_GIT_METADATA_BYTES,
+    )?;
+    // Exit 1 is the documented "ref does not exist". Anything else, including
+    // 128, is a command failure.
+    if absent.exit_code == Some(1) && absent.stdout.is_empty() {
+        return Ok(HeadState::Unborn { name });
+    }
+    if absent.exit_code != Some(0) {
+        return Err(SummaryError::Command {
+            repo: git.label.to_owned(),
+            command: format!("show-ref --verify --quiet -- {reference}"),
+            exit: absent.exit_code,
+            detail: absent.error.unwrap_or_else(|| "git command failed".to_owned()),
+        });
+    }
+    let resolved = git.run(
+        &["rev-parse", "--verify", "--end-of-options", reference],
+        MAX_GIT_METADATA_BYTES,
+    )?;
+    if resolved.exit_code != Some(0) || resolved.error.is_some() {
+        return Err(SummaryError::Command {
+            repo: git.label.to_owned(),
+            command: format!("rev-parse --verify --end-of-options {reference}"),
+            exit: resolved.exit_code,
+            detail: resolved.error.unwrap_or_else(|| "git command failed".to_owned()),
+        });
+    }
+    let oid = String::from_utf8(resolved.stdout).map_err(|_| {
+        SummaryError::Incomplete(format!("{}: branch oid is not UTF-8", git.label))
+    })?;
+    let oid = one_line(&oid).to_owned();
+    if !is_oid(&oid) {
+        return Err(SummaryError::Incomplete(format!(
+            "{}: branch oid is not an object id",
+            git.label
+        )));
+    }
+    Ok(HeadState::Branch { name, oid: Some(oid) })
+}
+
+fn read_summary_upstream(
+    root: &Path,
+    label: &str,
+    head: &HeadState,
+) -> Result<Option<String>, SummaryError> {
+    let Some(name) = branch_name(head) else {
+        return Ok(None);
+    };
+    let reference = format!("refs/heads/{name}");
+    let output = run_git_bounded(
+        root,
+        &["for-each-ref", "--format=%(upstream:short)", "--", &reference],
+        MAX_GIT_METADATA_BYTES,
+        None,
+    ).map_err(|detail| SummaryError::Command {
+        repo: label.to_owned(),
+        command: "for-each-ref".to_owned(),
+        exit: None,
+        detail: sanitize_display(&detail),
+    })?;
+    if output.truncated {
+        return Err(SummaryError::Limit {
+            what: format!("{label}: upstream"),
+            bytes: MAX_GIT_METADATA_BYTES,
+        });
+    }
+    if output.exit_code != Some(0) || output.error.is_some() {
+        return Err(SummaryError::Command {
+            repo: label.to_owned(),
+            command: "for-each-ref".to_owned(),
+            exit: output.exit_code,
+            detail: output.error.unwrap_or_else(|| "git command failed".to_owned()),
+        });
+    }
+    let text = String::from_utf8(output.stdout).map_err(|_| {
+        SummaryError::Incomplete(format!("{label}: upstream name is not UTF-8"))
+    })?;
+    let upstream = one_line(&text);
+    if upstream.is_empty() { Ok(None) } else { Ok(Some(sanitize_display(upstream))) }
+}
+
+fn repository_has_origin(root: &Path, label: &str) -> Result<bool, SummaryError> {
+    let layout = RepositoryLayout::discover(root).map_err(|detail| SummaryError::Command {
+        repo: label.to_owned(),
+        command: "discover".to_owned(),
+        exit: None,
+        detail: sanitize_display(&detail),
+    })?;
+    let bytes = read_small_file(&layout.common_dir.join("config"), MAX_GIT_METADATA_BYTES)
+        .map_err(|detail| SummaryError::Command {
+            repo: label.to_owned(),
+            command: "read config".to_owned(),
+            exit: None,
+            detail: sanitize_display(&detail),
+        })?;
+    let config = String::from_utf8(bytes).map_err(|_| {
+        SummaryError::Incomplete(format!("{label}: git config is not UTF-8"))
+    })?;
+    Ok(config.lines().any(|line| line.trim().eq_ignore_ascii_case("[remote \"origin\"]")))
+}
+
+fn seed_origin_ref(
+    label: &str,
+    root: &Path,
+    sandbox: &IsolatedGitSandbox,
+    branch: Option<&str>,
+) -> Result<(), SummaryError> {
+    let Some(branch) = branch else {
+        return Ok(());
+    };
+    let reference = format!("refs/remotes/origin/{branch}");
+    if reference.contains("..") || reference.contains('\\') {
+        return Err(SummaryError::Incomplete(
+            "origin branch name is not a safe ref".to_owned(),
+        ));
+    }
+    let layout = RepositoryLayout::discover(root).map_err(|detail| SummaryError::Command {
+        repo: label.to_owned(),
+        command: "discover".to_owned(),
+        exit: None,
+        detail: sanitize_display(&detail),
+    })?;
+    let loose = layout.common_dir.join(&reference);
+    if loose.is_file() {
+        let destination = sandbox.environment().git_dir.join(&reference);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(|_| SummaryError::Command {
+                repo: label.to_owned(),
+                command: "seed origin ref".to_owned(),
+                exit: None,
+                detail: "could not create the isolated origin ref".to_owned(),
+            })?;
+        }
+        fs::copy(&loose, &destination).map_err(|_| SummaryError::Command {
+            repo: label.to_owned(),
+            command: "seed origin ref".to_owned(),
+            exit: None,
+            detail: "could not copy the origin ref".to_owned(),
+        })?;
+    }
+    let packed = layout.common_dir.join("packed-refs");
+    if packed.is_file() {
+        fs::copy(&packed, sandbox.environment().git_dir.join("packed-refs")).map_err(|_| {
+            SummaryError::Command {
+                repo: label.to_owned(),
+                command: "seed origin ref".to_owned(),
+                exit: None,
+                detail: "could not copy packed refs".to_owned(),
+            }
+        })?;
+    }
+    Ok(())
+}
+
+fn compare_origin(
+    git: &mut SummaryGit<'_>,
+    head: &HeadState,
+    has_origin: bool,
+) -> Result<OriginOutcome, SummaryError> {
+    let (branch, head_oid) = match head {
+        HeadState::Detached { .. } => return Ok(OriginOutcome::Detached),
+        HeadState::Unborn { .. } => return Ok(OriginOutcome::Unborn),
+        HeadState::Branch { name, oid: None } => return Ok(OriginOutcome::Unborn),
+        HeadState::Branch { name, oid: Some(oid) } => (name.clone(), oid.clone()),
+    };
+    if !has_origin {
+        return Ok(OriginOutcome::NoOrigin);
+    }
+    let spec = format!("refs/remotes/origin/{branch}");
+    let absent = git.run(
+        &["show-ref", "--verify", "--quiet", "--", &spec],
+        MAX_GIT_METADATA_BYTES,
+    )?;
+    if absent.exit_code == Some(1) && absent.stdout.is_empty() {
+        return Ok(OriginOutcome::MissingOriginBranch { branch });
+    }
+    if absent.exit_code != Some(0) {
+        return Err(SummaryError::Command {
+            repo: git.label.to_owned(),
+            command: format!("show-ref --verify --quiet -- {spec}"),
+            exit: absent.exit_code,
+            detail: absent.error.unwrap_or_else(|| "git command failed".to_owned()),
+        });
+    }
+    let resolved = git.run(
+        &["rev-parse", "--verify", "--end-of-options", &spec],
+        MAX_GIT_METADATA_BYTES,
+    )?;
+    if resolved.exit_code != Some(0) || resolved.error.is_some() {
+        return Err(SummaryError::Command {
+            repo: git.label.to_owned(),
+            command: format!("rev-parse --verify --end-of-options {spec}"),
+            exit: resolved.exit_code,
+            detail: resolved.error.unwrap_or_else(|| "git command failed".to_owned()),
+        });
+    }
+    let origin_oid = String::from_utf8(resolved.stdout).map_err(|_| {
+        SummaryError::Incomplete(format!("{}: origin oid is not UTF-8", git.label))
+    })?;
+    let origin_oid = one_line(&origin_oid).to_owned();
+    if !is_oid(&origin_oid) {
+        return Err(SummaryError::Incomplete(format!(
+            "{}: origin ref is not an object id",
+            git.label
+        )));
+    }
+    let ahead = count_commits(git, &origin_oid, &head_oid)?;
+    let behind = count_commits(git, &head_oid, &origin_oid)?;
+    Ok(OriginOutcome::Compared { branch, head_oid, origin_oid, ahead, behind })
+}
+
+fn count_commits(git: &mut SummaryGit<'_>, from: &str, to: &str) -> Result<u32, SummaryError> {
+    let range = format!("{from}..{to}");
+    let stdout = git.text(&["rev-list", "--count", &range])?;
+    let text = one_line(&stdout);
+    text.parse::<u32>().map_err(|_| SummaryError::Incomplete(format!(
+        "{}: rev-list count is not a number",
+        git.label
+    )))
+}
+
+fn collect_origin_commits(
+    git: &mut SummaryGit<'_>,
+    generation: &pi_coding::ApplicationGeneration,
+    origin: &OriginOutcome,
+    retained: &mut usize,
+) -> Result<Vec<CommitFacts>, SummaryError> {
+    let OriginOutcome::Compared { origin_oid, head_oid, .. } = origin else {
+        return Ok(Vec::new());
+    };
+    let range = format!("{origin_oid}..{head_oid}");
+    let stdout = git.metadata(&[
+        "log",
+        "-z",
+        "--pretty=format:%H%x00%s",
+        "--end-of-options",
+        &range,
+    ])?;
+    let text = String::from_utf8_lossy(&stdout);
+    let mut fields: Vec<&str> = Vec::new();
+    let mut commits = Vec::new();
+    for field in text.split('\0') {
+        if field.is_empty() && fields.is_empty() {
+            continue;
+        }
+        fields.push(field);
+        if fields.len() == 2 {
+            let oid = fields[0];
+            if !is_oid(oid) {
+                return Err(SummaryError::Incomplete(format!(
+                    "{}: commit log oid is malformed",
+                    git.label
+                )));
+            }
+            let files = commit_files(git, generation, oid, retained)?;
+            commits.push(CommitFacts {
+                oid: oid.to_owned(),
+                subject: sanitize_display(fields[1]),
+                files,
+            });
+            fields.clear();
+        }
+    }
+    if !fields.is_empty() {
+        return Err(SummaryError::Incomplete(format!(
+            "{}: commit log ended inside a record",
+            git.label
+        )));
+    }
+    Ok(commits)
+}
+
+fn commit_files(
+    git: &mut SummaryGit<'_>,
+    generation: &pi_coding::ApplicationGeneration,
+    oid: &str,
+    retained: &mut usize,
+) -> Result<Vec<ChangedFileFacts>, SummaryError> {
+    let record = git.text(&["rev-list", "--parents", "-n", "1", "--end-of-options", oid])?;
+    let mut ids = one_line(&record).split_whitespace();
+    let found = ids.next();
+    if found != Some(oid) {
+        return Err(SummaryError::Incomplete(format!(
+            "{}: commit parent record does not match {oid}",
+            git.label
+        )));
+    }
+    let left = match ids.next() {
+        Some(parent) => parent.to_owned(),
+        None => empty_tree_hash(git.root).map_err(|detail| SummaryError::Command {
+            repo: git.label.to_owned(),
+            command: "hash-object -t tree --stdin".to_owned(),
+            exit: None,
+            detail,
+        })?,
+    };
+    diff_facts(git, generation, &[&left, oid], retained)
+}
+
+#[derive(Clone, Copy)]
+enum Layer {
+    Staged,
+    Unstaged,
+}
+
+fn collect_layer(
+    git: &mut SummaryGit<'_>,
+    generation: &pi_coding::ApplicationGeneration,
+    layer: Layer,
+    head: Option<&str>,
+    retained: &mut usize,
+) -> Result<Vec<ChangedFileFacts>, SummaryError> {
+    match layer {
+        Layer::Staged => match head {
+            Some(head) => diff_facts(git, generation, &[head, "--cached"], retained),
+            None => diff_facts(git, generation, &["--cached"], retained),
+        },
+        Layer::Unstaged => diff_facts(git, generation, &[], retained),
+    }
+}
+
+fn diff_facts(
+    git: &mut SummaryGit<'_>,
+    generation: &pi_coding::ApplicationGeneration,
+    revisions: &[&str],
+    retained: &mut usize,
+) -> Result<Vec<ChangedFileFacts>, SummaryError> {
+    let mut status_args = vec![
+        "--literal-pathspecs",
+        "diff",
+        "--name-status",
+        "-z",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--find-renames",
+    ];
+    let cached = revisions.contains(&"--cached");
+    let revisions: Vec<&str> = revisions.iter().copied().filter(|arg| *arg != "--cached").collect();
+    if cached {
+        status_args.push("--cached");
+    }
+    status_args.extend_from_slice(&revisions);
+    let status = git.require(&status_args, MAX_CATALOG_BYTES)?;
+    let catalog = name_status_catalog(&status).map_err(|detail| {
+        SummaryError::Incomplete(format!("{}: {detail}", git.label))
+    })?;
+    let mut allowed = BTreeSet::new();
+    let mut pathspecs = BTreeSet::new();
+    for (path, entry) in &catalog {
+        if !summary_path_allowed(generation, git.root, &entry.path_bytes)? {
+            continue;
+        }
+        if let Some(previous) = &entry.previous_path_bytes {
+            if !summary_path_allowed(generation, git.root, previous)? {
+                continue;
+            }
+            pathspecs.insert(os_string_from_git_path(previous.clone()));
+        }
+        pathspecs.insert(os_string_from_git_path(entry.path_bytes.clone()));
+        allowed.insert(path.clone());
+    }
+    let pathspecs: Vec<OsString> = pathspecs.into_iter().collect();
+    let mut numstat_args = vec![
+        OsString::from("--literal-pathspecs"),
+        OsString::from("diff"),
+        OsString::from("--numstat"),
+        OsString::from("-z"),
+        OsString::from("--no-ext-diff"),
+        OsString::from("--no-textconv"),
+        OsString::from("--find-renames"),
+    ];
+    if cached {
+        numstat_args.push(OsString::from("--cached"));
+    }
+    for revision in &revisions {
+        numstat_args.push(OsString::from(*revision));
+    }
+    if !pathspecs.is_empty() {
+        numstat_args.push(OsString::from("--"));
+        numstat_args.extend(pathspecs.iter().cloned());
+    }
+    let numstat = if pathspecs.is_empty() {
+        Vec::new()
+    } else {
+        git.require_os(&numstat_args, MAX_CATALOG_BYTES)?
+    };
+    let stats = numstat_entries(&numstat).map_err(|detail| {
+        SummaryError::Incomplete(format!("{}: {detail}", git.label))
+    })?;
+    let mut files = Vec::new();
+    for (path, entry) in catalog {
+        if !allowed.contains(&path) {
+            continue;
+        }
+        let lines = entry_change_metrics(git.label, &path, stats.get(&path))?;
+        let patch = match lines {
+            LineStats::Binary => None,
+            _ => diff_entry_patch(
+                git,
+                cached,
+                &revisions,
+                &entry.path_bytes,
+                entry.previous_path_bytes.as_deref(),
+                lines,
+            )?,
+        };
+        if let Some(text) = &patch {
+            summary_patch_charge(retained, git.label, text.len())?;
+        }
+        files.push(ChangedFileFacts {
+            path,
+            previous_path: entry.previous_path,
+            status: entry.status,
+            lines,
+            patch,
+        });
+    }
+    Ok(files)
+}
+
+
+/// Fetches one catalog entry's patch with rename-aware pathspecs, bounded by
+/// [`MAX_FILE_DIFF_BYTES`] per file. Resolution is honest: `None` only when
+/// git reports no textual body for a 0/0 metric; malformed or contradictory
+/// output is [`SummaryError::Incomplete`], never swallowed.
+fn diff_entry_patch(
+    git: &mut SummaryGit<'_>,
+    cached: bool,
+    revisions: &[&str],
+    path_bytes: &[u8],
+    previous_path_bytes: Option<&[u8]>,
+    lines: LineStats,
+) -> Result<Option<String>, SummaryError> {
+    let mut args = vec![
+        OsString::from("--literal-pathspecs"),
+        OsString::from("diff"),
+        OsString::from("--no-ext-diff"),
+        OsString::from("--no-textconv"),
+        OsString::from("--no-color"),
+        OsString::from("--find-renames"),
+    ];
+    if cached {
+        args.push(OsString::from("--cached"));
+    }
+    for revision in revisions {
+        args.push(OsString::from(*revision));
+    }
+    args.push(OsString::from("--"));
+    // Both sides of a rename/copy must be named so git pairs the edge inside
+    // this one bounded run instead of reporting delete+add.
+    if let Some(previous) = previous_path_bytes {
+        args.push(os_string_from_git_path(previous.to_vec()));
+    }
+    args.push(os_string_from_git_path(path_bytes.to_vec()));
+    let display = normalize_repo_path(&encode_path_bytes(path_bytes));
+    let output = run_git_bounded_os(git.root, &args, MAX_FILE_DIFF_BYTES, Some(git.isolated))
+        .map_err(|detail| SummaryError::Command {
+            repo: git.label.to_owned(),
+            command: format!("diff -- {display}"),
+            exit: None,
+            detail,
+        })?;
+    if output.truncated {
+        return Err(SummaryError::Limit {
+            what: format!("{}: diff {display}", git.label),
+            bytes: MAX_FILE_DIFF_BYTES,
+        });
+    }
+    if output.exit_code != Some(0) || output.error.is_some() {
+        return Err(SummaryError::Command {
+            repo: git.label.to_owned(),
+            command: format!("diff -- {display}"),
+            exit: output.exit_code,
+            detail: output.error.unwrap_or_else(|| "git command failed".to_owned()),
+        });
+    }
+    entry_patch_body(git.label, &display, lines, &output.stdout)
+}
+
+/// Resolves one entry's change metrics from its numstat row. A catalogued
+/// path without a row means the layer's measurements are inconsistent, so it
+/// fails closed instead of reporting an unavailable guess.
+fn entry_change_metrics(
+    label: &str,
+    display: &str,
+    row: Option<&NumStatEntry>,
+) -> Result<LineStats, SummaryError> {
+    match row {
+        Some(entry) if entry.binary => Ok(LineStats::Binary),
+        Some(entry) => Ok(LineStats::Text { insertions: entry.insertions, deletions: entry.deletions }),
+        None => Err(SummaryError::Incomplete(format!(
+            "{label}: numstat did not report {display}; layer change metrics are incomplete"
+        ))),
+    }
+}
+
+/// Resolves one entry's retained patch body from its bounded diff output.
+/// `None` is honest absence only: a 0/0 metric with no textual body (mode
+/// change, pure rename) or a matched entry with no hunks. Empty or malformed
+/// output that contradicts the counted metrics is [`SummaryError::Incomplete`],
+/// never a silently missing patch.
+fn entry_patch_body(
+    label: &str,
+    display: &str,
+    lines: LineStats,
+    stdout: &[u8],
+) -> Result<Option<String>, SummaryError> {
+    let counted = match lines {
+        LineStats::Text { insertions: 0, deletions: 0 } => String::new(),
+        LineStats::Text { insertions, deletions } => format!("+{insertions}/-{deletions}"),
+        LineStats::Binary => "-/-".to_owned(),
+        LineStats::Unavailable => "no numstat row".to_owned(),
+    };
+    if stdout.is_empty() {
+        return if counted.is_empty() {
+            Ok(None)
+        } else {
+            Err(SummaryError::Incomplete(format!(
+                "{label}: diff for {display} produced no body although numstat counted {counted}"
+            )))
+        };
+    }
+    let parsed = parse_unified_diff(&String::from_utf8_lossy(stdout));
+    let body = parsed
+        .iter()
+        .find(|file| file.path == display)
+        .ok_or_else(|| {
+            SummaryError::Incomplete(format!(
+                "{label}: diff for {display} did not parse into a patch body"
+            ))
+        })?;
+    if body.hunks.is_empty() {
+        return if counted.is_empty() {
+            Ok(None)
+        } else {
+            Err(SummaryError::Incomplete(format!(
+                "{label}: diff for {display} has no patch hunks although numstat counted {counted}"
+            )))
+        };
+    }
+    Ok(Some(
+        body.hunks
+            .iter()
+            .map(DiffHunk::unified_diff)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    ))
+}
+
+fn summary_path_allowed(
+    generation: &pi_coding::ApplicationGeneration,
+    root: &Path,
+    raw: &[u8],
+) -> Result<bool, SummaryError> {
+    let relative_name = os_string_from_git_path(raw.to_vec());
+    let relative = Path::new(&relative_name);
+    if relative.components().any(|component| {
+        matches!(component, std::path::Component::ParentDir | std::path::Component::RootDir)
+    }) {
+        return Err(SummaryError::Incomplete(
+            "changed path escapes the repository".to_owned(),
+        ));
+    }
+    let absolute = root.join(relative);
+    match generation.metadata(&absolute) {
+        Ok(_metadata) => Ok(true),
+        Err(pi_coding::FsError::Denied | pi_coding::FsError::OutsideCapability) => Ok(false),
+        Err(pi_coding::FsError::System { kind, .. }) if kind == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(SummaryError::Incomplete(format!(
+            "authorizing a changed path failed: {error}"
+        ))),
+    }
+}
+
+fn collect_untracked(
+    git: &mut SummaryGit<'_>,
+    generation: &pi_coding::ApplicationGeneration,
+    retained: &mut usize,
+) -> Result<Vec<ChangedFileFacts>, SummaryError> {
+    let listing = git.require(
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+        MAX_UNTRACKED_CATALOG_BYTES,
+    )?;
+    let paths: Vec<&[u8]> = listing.split(|byte| *byte == 0).filter(|path| !path.is_empty()).collect();
+    if paths.len() > MAX_UNTRACKED_FILES {
+        return Err(SummaryError::Limit {
+            what: format!("{}: untracked files", git.label),
+            bytes: MAX_UNTRACKED_FILES,
+        });
+    }
+    let mut files = Vec::new();
+    for path in paths {
+        if !summary_path_allowed(generation, git.root, path)? {
+            continue;
+        }
+        let display = normalize_repo_path(&encode_path_bytes(path));
+        let os_path = os_string_from_git_path(path.to_vec());
+        match fs::symlink_metadata(git.root.join(&os_path)) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => continue,
+            Err(error) => return Err(SummaryError::Incomplete(format!(
+                "{}: untracked {display} metadata failed: {error}",
+                git.label
+            ))),
+        }
+        let args = [
+            OsString::from("diff"),
+            OsString::from("--no-ext-diff"),
+            OsString::from("--no-textconv"),
+            OsString::from("--no-index"),
+            OsString::from("--"),
+            OsString::from(null_device()),
+            os_path,
+        ];
+        let output = run_git_bounded_os(git.root, &args, MAX_FILE_DIFF_BYTES, None).map_err(|detail| {
+            SummaryError::Command {
+                repo: git.label.to_owned(),
+                command: format!("diff --no-index -- {display}"),
+                exit: None,
+                detail,
+            }
+        })?;
+        if output.truncated {
+            return Err(SummaryError::Limit {
+                what: format!("{}: untracked {display}", git.label),
+                bytes: MAX_FILE_DIFF_BYTES,
+            });
+        }
+        // Exit 1 is "differences found", the documented outcome against /dev/null.
+        let differ = output.exit_code == Some(1) && output.error.is_some();
+        if !differ && output.exit_code != Some(0) {
+            return Err(SummaryError::Command {
+                repo: git.label.to_owned(),
+                command: format!("diff --no-index -- {display}"),
+                exit: output.exit_code,
+                detail: output.error.unwrap_or_else(|| "git command failed".to_owned()),
+            });
+        }
+        let parsed = parse_unified_diff(&String::from_utf8_lossy(&output.stdout));
+        let body = parsed.iter().find(|file| file.path == display);
+        let lines = if body.as_ref().is_some_and(|file| file.binary) {
+            LineStats::Binary
+        } else if let Some(file) = body {
+            LineStats::Text { insertions: file.insertions, deletions: file.deletions }
+        } else if output.exit_code == Some(0) {
+            LineStats::Text { insertions: 0, deletions: 0 }
+        } else {
+            return Err(SummaryError::Incomplete(format!(
+                "{}: untracked diff for {display} did not parse",
+                git.label
+            )));
+        };
+        let patch = match lines {
+            LineStats::Binary => None,
+            LineStats::Text { insertions: 0, deletions: 0 } => None,
+            _ => body.filter(|file| !file.hunks.is_empty()).map(|file| {
+                file.hunks.iter().map(DiffHunk::unified_diff).collect::<Vec<_>>().join("\n")
+            }),
+        };
+        if let Some(text) = &patch {
+            summary_patch_charge(retained, git.label, text.len())?;
+        }
+        files.push(ChangedFileFacts {
+            path: display,
+            previous_path: None,
+            status: FileStatus::Added,
+            lines,
+            patch,
+        });
+    }
+    Ok(files)
+}
+/// Host inventory plus the model's purpose text. Every inventory key must be
+/// present, non-blank, and the only key; the document is never trimmed.
+pub(crate) fn render_summary_markdown(
+    facts: &WorkspaceSummaryFacts,
+    purposes: &BTreeMap<PurposeKey, String>,
+) -> Result<String, SummaryError> {
+    let required = summary_purpose_keys(facts);
+    for key in &required {
+        match purposes.get(key).map(String::as_str) {
+            Some(purpose) if !purpose.trim().is_empty() => {}
+            _ => {
+                return Err(SummaryError::Incomplete(
+                    "summary purpose is missing or blank".to_owned(),
+                ));
+            }
+        }
+    }
+    if purposes.len() != required.len() {
+        return Err(SummaryError::Incomplete(
+            "summary purpose response has an unknown key".to_owned(),
+        ));
+    }
+    let mut document = String::new();
+    for repository in &facts.repositories {
+        let purpose = purpose_text(purposes, &PurposeKey::Repository { label: repository.label.clone() })?;
+        document.push_str(&format!(
+            "## {}\n\nPurpose: {}\n\n",
+            summary_cell(&repository.label),
+            summary_cell(purpose)
+        ));
+        document.push_str(&format!(
+            "- head: {}\n- origin: {}\n- counts: {} staged, {} unstaged, {} untracked, {} commits\n\n",
+            summary_cell(&render_head(&repository.overview.head)),
+            summary_cell(&render_origin(&repository.origin)),
+            repository.overview.counts.staged,
+            repository.overview.counts.unstaged,
+            repository.overview.counts.untracked,
+            repository.overview.counts.commits,
+        ));
+        render_commits(&mut document, repository, purposes)?;
+        render_worktree(&mut document, &repository.label, "Staged", &repository.staged, PurposeLayer::Staged, purposes)?;
+        render_worktree(&mut document, &repository.label, "Unstaged", &repository.unstaged, PurposeLayer::Unstaged, purposes)?;
+        render_worktree(&mut document, &repository.label, "Untracked", &repository.untracked, PurposeLayer::Untracked, purposes)?;
+    }
+    if document.len() > MAX_SUMMARY_DOCUMENT_BYTES {
+        return Err(SummaryError::Limit {
+            what: "summary document".to_owned(),
+            bytes: MAX_SUMMARY_DOCUMENT_BYTES,
+        });
+    }
+    Ok(document)
+}
+
+fn summary_purpose_keys(facts: &WorkspaceSummaryFacts) -> BTreeSet<PurposeKey> {
+    let mut keys = BTreeSet::new();
+    for repository in &facts.repositories {
+        keys.insert(PurposeKey::Repository { label: repository.label.clone() });
+        for commit in &repository.commits {
+            keys.insert(PurposeKey::Commit { label: repository.label.clone(), oid: commit.oid.clone() });
+            for file in &commit.files {
+                keys.insert(PurposeKey::CommittedFile {
+                    label: repository.label.clone(),
+                    oid: commit.oid.clone(),
+                    path: file.path.clone(),
+                });
+            }
+        }
+        for file in &repository.staged {
+            keys.insert(PurposeKey::StagedFile { label: repository.label.clone(), path: file.path.clone() });
+        }
+        for file in &repository.unstaged {
+            keys.insert(PurposeKey::UnstagedFile { label: repository.label.clone(), path: file.path.clone() });
+        }
+        for file in &repository.untracked {
+            keys.insert(PurposeKey::UntrackedFile { label: repository.label.clone(), path: file.path.clone() });
+        }
+    }
+    keys
+}
+
+fn render_head(head: &HeadState) -> String {
+    match head {
+        HeadState::Branch { name, oid: Some(oid) } => format!("branch {name} {oid}"),
+        HeadState::Branch { name, oid: None } => format!("branch {name}"),
+        HeadState::Detached { oid } => format!("detached {oid}"),
+        HeadState::Unborn { name } => format!("unborn {name}"),
+    }
+}
+
+fn render_origin(origin: &OriginOutcome) -> String {
+    match origin {
+        OriginOutcome::Compared { branch, head_oid, origin_oid, ahead, behind } => {
+            format!("origin/{branch} ahead {ahead} behind {behind} ({head_oid} / {origin_oid})")
+        }
+        OriginOutcome::NoOrigin => "no origin".to_owned(),
+        OriginOutcome::MissingOriginBranch { branch } => format!("missing origin/{branch}"),
+        OriginOutcome::Detached => "detached".to_owned(),
+        OriginOutcome::Unborn => "unborn".to_owned(),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PurposeLayer {
+    Staged,
+    Unstaged,
+    Untracked,
+}
+
+fn render_commits(
+    document: &mut String,
+    repository: &RepositorySummaryFacts,
+    purposes: &BTreeMap<PurposeKey, String>,
+) -> Result<(), SummaryError> {
+    if repository.commits.is_empty() {
+        return Ok(());
+    }
+    document.push_str("### Commits\n\n");
+    for commit in &repository.commits {
+        let purpose = purpose_text(purposes, &PurposeKey::Commit {
+            label: repository.label.clone(),
+            oid: commit.oid.clone(),
+        })?;
+        document.push_str(&format!("- `{}` {}\n  Purpose: {}\n", summary_cell(&commit.oid), summary_cell(&commit.subject), summary_cell(purpose)));
+        render_committed(&mut *document, &repository.label, &commit.oid, &commit.files, purposes)?;
+    }
+    Ok(())
+}
+
+fn render_worktree(
+    document: &mut String,
+    label: &str,
+    title: &str,
+    files: &[ChangedFileFacts],
+    layer: PurposeLayer,
+    purposes: &BTreeMap<PurposeKey, String>,
+) -> Result<(), SummaryError> {
+    render_files(document, title, files, purposes, |file| match layer {
+        PurposeLayer::Staged => PurposeKey::StagedFile { label: label.to_owned(), path: file.path.clone() },
+        PurposeLayer::Unstaged => PurposeKey::UnstagedFile { label: label.to_owned(), path: file.path.clone() },
+        PurposeLayer::Untracked => PurposeKey::UntrackedFile { label: label.to_owned(), path: file.path.clone() },
+    })
+}
+
+fn render_committed(
+    document: &mut String,
+    label: &str,
+    oid: &str,
+    files: &[ChangedFileFacts],
+    purposes: &BTreeMap<PurposeKey, String>,
+) -> Result<(), SummaryError> {
+    render_files(document, "Files", files, purposes, |file| PurposeKey::CommittedFile {
+        label: label.to_owned(),
+        oid: oid.to_owned(),
+        path: file.path.clone(),
+    })
+}
+
+fn purpose_text<'a>(
+    purposes: &'a BTreeMap<PurposeKey, String>,
+    key: &PurposeKey,
+) -> Result<&'a str, SummaryError> {
+    purposes.get(key).map(String::as_str).ok_or_else(|| {
+        SummaryError::Incomplete("summary purpose is missing or blank".to_owned())
+    })
+}
+
+fn render_files(
+    document: &mut String,
+    title: &str,
+    files: &[ChangedFileFacts],
+    purposes: &BTreeMap<PurposeKey, String>,
+    key_for: impl Fn(&ChangedFileFacts) -> PurposeKey,
+) -> Result<(), SummaryError> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    document.push_str(&format!("### {title}\n\n"));
+    for file in files {
+        let purpose = purpose_text(purposes, &key_for(file))?;
+        let previous = file.previous_path.as_ref().map(|previous| format!("{} -> ", summary_cell(previous))).unwrap_or_default();
+        document.push_str(&format!(
+            "- {} {}{} {}\n  Purpose: {}\n",
+            file.status.as_str(),
+            previous,
+            summary_cell(&file.path),
+            render_lines(file.lines),
+            summary_cell(purpose)
+        ));
+    }
+    document.push('\n');
+    Ok(())
+}
+
+fn render_lines(lines: LineStats) -> String {
+    match lines {
+        LineStats::Text { insertions, deletions } => format!("+{insertions}/-{deletions}"),
+        LineStats::Binary => "binary".to_owned(),
+        LineStats::Unavailable => "unavailable".to_owned(),
+    }
+}
+fn summary_cell(value: &str) -> String {
+    let mut escaped = String::new();
+    for ch in value.chars() {
+        match ch {
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            other if other.is_control() => escaped.push(' '),
+            other if matches!(other, '\\' | '`' | '*' | '_' | '{' | '}' | '[' | ']' | '(' | ')' | '#' | '+' | '-' | '.' | '!' | '|' | '<' | '>' | '&') => {
+                escaped.push('\\');
+                escaped.push(other);
+            }
+            other => escaped.push(other),
+        }
+    }
+    escaped
+}
+
+
+
+
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ReviewPagingState {
@@ -1352,7 +3015,15 @@ fn load_pinned_revision_diff(
             );
         }
     };
-    let catalog = name_status_catalog(&catalog_output.stdout);
+    let catalog = match name_status_catalog(&catalog_output.stdout) {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            return (
+                ReviewSnapshot::empty_for_scope_error(root, scope, error),
+                ReviewPagingState::default(),
+            );
+        }
+    };
     let paging = ReviewPagingState {
         working_tree: None,
         revisions: Some(PinnedRevisions {
@@ -2224,7 +3895,10 @@ fn snapshot_from_diff_output(
         Ok(numstat) => numstat,
         Err(error) => return ReviewSnapshot::empty_for_scope_error(root, scope, error),
     };
-    let catalog = catalog_output.map(|output| name_status_catalog(&output.stdout));
+    let catalog = match catalog_output.map(|output| name_status_catalog(&output.stdout)).transpose() {
+        Ok(catalog) => catalog,
+        Err(error) => return ReviewSnapshot::empty_for_scope_error(root, scope, error),
+    };
     let catalog_bytes = catalog_output.map(|output| output.stdout.as_slice());
     let snapshot_id = review_snapshot_identity(
         &root,
@@ -2342,6 +4016,7 @@ fn working_tree_gitlink_output(
                 stdout: Vec::new(),
                 truncated: false,
                 error: None,
+                exit_code: None,
             },
             gitlink_paths,
         ));
@@ -2551,6 +4226,7 @@ fn replace_gitlink_blocks(
         stdout,
         truncated: captured.truncated || working_tree_gitlinks.truncated || exceeded,
         error: captured.error.clone().or_else(|| working_tree_gitlinks.error.clone()),
+        exit_code: None,
     }
 }
 
@@ -2824,6 +4500,7 @@ fn expand_changed_gitlink_diffs(
             stdout,
             truncated: output.truncated || expansion_truncated || dropped_preview,
             error: None,
+            exit_code: None,
         },
         expanded_paths,
         expanded_gitlinks,
@@ -2934,6 +4611,7 @@ fn expand_gitlink_block(
         stdout: Vec::new(),
         truncated: false,
         error: None,
+        exit_code: None,
     };
     if !pathspecs.is_empty() {
         if stage_tracked_working_tree_paths(&submodule_dir, sandbox.environment(), &pathspecs)
@@ -2980,6 +4658,7 @@ fn expand_gitlink_block(
                 stdout: Vec::new(),
                 truncated: false,
                 error: None,
+                exit_code: None,
             },
             BTreeSet::new(),
         ),
@@ -3917,68 +5596,62 @@ struct CatalogEntry {
 
 /// Parse `git diff --name-status -z --find-renames` output (NUL-separated
 /// `STATUS\0PATH` records, `R/C<score>\0OLD\0NEW` for renames/copies) into a
-/// catalog keyed by normalized destination path. Keys round-trip through the
-/// same `encode_path_bytes` + `normalize_repo_path` pipeline as parsed diff
-/// paths, so non-UTF-8 and backslash/tab paths compare byte-for-byte against
-/// parsed [`DiffFile`]s.
-fn name_status_catalog(stdout: &[u8]) -> BTreeMap<String, CatalogEntry> {
-    let fields = stdout
-        .split(|byte| *byte == 0)
-        .filter(|field| !field.is_empty())
-        .collect::<Vec<_>>();
+/// catalog keyed by normalized destination path. A truncated, empty, or
+/// unknown record fails; it is never dropped or folded into Modified.
+fn name_status_catalog(stdout: &[u8]) -> Result<BTreeMap<String, CatalogEntry>, String> {
+    if !stdout.is_empty() && stdout[stdout.len() - 1] != 0 {
+        return Err("name-status record is unterminated".to_owned());
+    }
+    let fields: Vec<&[u8]> = stdout.split(|byte| *byte == 0).collect();
+    let body: &[&[u8]] = if stdout.is_empty() { &[] } else { &fields[..fields.len() - 1] };
     let mut catalog = BTreeMap::new();
     let mut index = 0usize;
-    while index < fields.len() {
-        let status = fields[index];
+    while index < body.len() {
+        let status = body[index];
         index += 1;
-        if index >= fields.len() {
-            break;
-        }
-        if status
-            .first()
-            .is_some_and(|prefix| matches!(prefix, b'R' | b'C'))
-        {
-            let previous = fields[index];
-            index += 1;
-            if index >= fields.len() {
-                break;
+        let rename = status.first().is_some_and(|prefix| matches!(prefix, b'R' | b'C'));
+        if rename {
+            let (Some(previous), Some(destination)) = (body.get(index), body.get(index + 1)) else {
+                return Err("name-status rename record is truncated".to_owned());
+            };
+            if previous.is_empty() || destination.is_empty() {
+                return Err("name-status path is empty".to_owned());
             }
-            let destination = fields[index];
-            index += 1;
-            catalog.insert(
-                normalize_repo_path(&encode_path_bytes(destination)),
-                CatalogEntry {
-                    status: if status.first() == Some(&b'R') {
-                        FileStatus::Renamed
-                    } else {
-                        FileStatus::Copied
-                    },
+            index += 2;
+            catalog.entry(normalize_repo_path(&encode_path_bytes(destination))).or_insert(CatalogEntry {
+                    status: if status.first() == Some(&b'R') { FileStatus::Renamed } else { FileStatus::Copied },
                     previous_path: Some(normalize_repo_path(&encode_path_bytes(previous))),
                     path_bytes: destination.to_vec(),
                     previous_path_bytes: Some(previous.to_vec()),
-                },
-            );
+                });
         } else {
-            let destination = fields[index];
-            index += 1;
-            let status = match status.first().copied() {
-                Some(b'A') => FileStatus::Added,
-                Some(b'D') => FileStatus::Deleted,
-                Some(b'X') => FileStatus::Unknown,
-                _ => FileStatus::Modified,
+            let Some(destination) = body.get(index) else {
+                return Err("name-status record is truncated".to_owned());
             };
-            catalog.insert(
-                normalize_repo_path(&encode_path_bytes(destination)),
-                CatalogEntry {
-                    status,
+            if destination.is_empty() {
+                return Err("name-status path is empty".to_owned());
+            }
+            index += 1;
+            let parsed = match status {
+                b"A" => FileStatus::Added,
+                b"D" => FileStatus::Deleted,
+                b"M" | b"T" => FileStatus::Modified,
+                b"U" => FileStatus::Unmerged,
+                b"X" => FileStatus::Unknown,
+                _ => return Err(format!(
+                    "name-status code is not a known status: {}",
+                    sanitize_display(&String::from_utf8_lossy(status))
+                )),
+            };
+            catalog.entry(normalize_repo_path(&encode_path_bytes(destination))).or_insert(CatalogEntry {
+                    status: parsed,
                     previous_path: None,
                     path_bytes: destination.to_vec(),
                     previous_path_bytes: None,
-                },
-            );
+                });
         }
     }
-    catalog
+    Ok(catalog)
 }
 
 /// Backfill placeholder [`DiffFile`] entries for every catalogued path the
@@ -4136,50 +5809,88 @@ struct RepositoryLayout {
     common_dir: PathBuf,
 }
 
+/// Typed discovery outcome at the [`RepositoryLayout`] boundary:
+/// [`RepositoryDiscoveryError::NotRepository`] is exactly the terminal "no
+/// ancestor contains a git repository" result; every other failure carries its
+/// verbatim diagnostic.
+pub(crate) enum RepositoryDiscoveryError {
+    NotRepository,
+    Failed(String),
+}
+
+impl RepositoryDiscoveryError {
+    fn into_message(self) -> String {
+        match self {
+            Self::NotRepository => "not a git repository".to_owned(),
+            Self::Failed(message) => message,
+        }
+    }
+}
+
+/// Canonical root of the nearest repository enclosing `cwd`.
+pub(crate) fn discover_enclosing_repository_root(
+    cwd: &Path,
+) -> Result<PathBuf, RepositoryDiscoveryError> {
+    Ok(RepositoryLayout::discover_typed(cwd)?.root)
+}
+
 impl RepositoryLayout {
     fn discover(cwd: &Path) -> Result<Self, String> {
-        let start = fs::canonicalize(cwd)
-            .map_err(|error| format!("resolving working directory: {error}"))?;
+        Self::discover_typed(cwd).map_err(RepositoryDiscoveryError::into_message)
+    }
+
+    fn discover_typed(cwd: &Path) -> Result<Self, RepositoryDiscoveryError> {
+        let start = fs::canonicalize(cwd).map_err(|error| {
+            RepositoryDiscoveryError::Failed(format!("resolving working directory: {error}"))
+        })?;
         if !start.is_dir() {
-            return Err("working directory is not a directory".to_owned());
+            return Err(RepositoryDiscoveryError::Failed(
+                "working directory is not a directory".to_owned(),
+            ));
         }
         for root in start.ancestors() {
             let marker = root.join(".git");
-            let metadata = match fs::metadata(&marker) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(format!("reading .git metadata: {error}")),
-            };
-            let git_dir = if metadata.is_dir() {
-                fs::canonicalize(&marker)
-                    .map_err(|error| format!("resolving git directory: {error}"))?
-            } else if metadata.is_file() {
-                let contents = read_small_file(&marker, MAX_GIT_METADATA_BYTES)?;
-                let contents = std::str::from_utf8(&contents)
-                    .map_err(|_| ".git file is not valid UTF-8".to_owned())?;
-                let line = strip_output_line_ending(contents);
-                let value = line
-                    .strip_prefix("gitdir:")
-                    .map(str::trim_start)
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| "invalid .git file".to_owned())?;
-                let path = Path::new(value);
-                let path = if path.is_absolute() {
-                    path.to_path_buf()
-                } else {
-                    root.join(path)
-                };
-                fs::canonicalize(path)
-                    .map_err(|error| format!("resolving git directory: {error}"))?
-            } else {
-                continue;
+            let git_dir = match probe_git_marker(&marker) {
+                Ok(GitMarker::RepositoryDir) => fs::canonicalize(&marker).map_err(|error| {
+                    RepositoryDiscoveryError::Failed(format!("resolving git directory: {error}"))
+                })?,
+                Ok(GitMarker::GitFile) => {
+                    let contents = read_small_file(&marker, MAX_GIT_METADATA_BYTES)
+                        .map_err(RepositoryDiscoveryError::Failed)?;
+                    let contents = std::str::from_utf8(&contents).map_err(|_| {
+                        RepositoryDiscoveryError::Failed(".git file is not valid UTF-8".to_owned())
+                    })?;
+                    let line = strip_output_line_ending(contents);
+                    let value = line
+                        .strip_prefix("gitdir:")
+                        .map(str::trim_start)
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| {
+                            RepositoryDiscoveryError::Failed("invalid .git file".to_owned())
+                        })?;
+                    let path = Path::new(value);
+                    let path = if path.is_absolute() {
+                        path.to_path_buf()
+                    } else {
+                        root.join(path)
+                    };
+                    fs::canonicalize(path).map_err(|error| {
+                        RepositoryDiscoveryError::Failed(format!(
+                            "resolving git directory: {error}"
+                        ))
+                    })?
+                }
+                Ok(GitMarker::Absent) => continue,
+                Err(cause) => return Err(RepositoryDiscoveryError::Failed(cause)),
             };
 
             let common_file = git_dir.join("commondir");
             let common_dir = if common_file.is_file() {
-                let contents = read_small_file(&common_file, MAX_GIT_METADATA_BYTES)?;
-                let contents = std::str::from_utf8(&contents)
-                    .map_err(|_| "git commondir is not valid UTF-8".to_owned())?;
+                let contents = read_small_file(&common_file, MAX_GIT_METADATA_BYTES)
+                    .map_err(RepositoryDiscoveryError::Failed)?;
+                let contents = std::str::from_utf8(&contents).map_err(|_| {
+                    RepositoryDiscoveryError::Failed("git commondir is not valid UTF-8".to_owned())
+                })?;
                 let value = strip_output_line_ending(contents);
                 let path = Path::new(value);
                 let path = if path.is_absolute() {
@@ -4187,8 +5898,11 @@ impl RepositoryLayout {
                 } else {
                     git_dir.join(path)
                 };
-                fs::canonicalize(path)
-                    .map_err(|error| format!("resolving common git directory: {error}"))?
+                fs::canonicalize(path).map_err(|error| {
+                    RepositoryDiscoveryError::Failed(format!(
+                        "resolving common git directory: {error}"
+                    ))
+                })?
             } else {
                 git_dir.clone()
             };
@@ -4200,7 +5914,7 @@ impl RepositoryLayout {
             });
         }
 
-        Err("not a git repository".to_owned())
+        Err(RepositoryDiscoveryError::NotRepository)
     }
 
     fn from_git_dir(git_dir: PathBuf) -> Result<Self, String> {
@@ -4424,6 +6138,14 @@ impl IsolatedGitSandbox {
     pub(crate) fn discover(cwd: &Path) -> Result<Self, String> {
         Self::from_layout(RepositoryLayout::discover(cwd)?)
     }
+    /// Same nearest-ancestor discovery as [`Self::discover`], but absence stays
+    /// [`RepositoryDiscoveryError::NotRepository`] and every sandbox failure
+    /// stays [`RepositoryDiscoveryError::Failed`].
+    pub(crate) fn discover_typed(cwd: &Path) -> Result<Self, RepositoryDiscoveryError> {
+        let layout = RepositoryLayout::discover_typed(cwd)?;
+        Self::from_layout(layout).map_err(RepositoryDiscoveryError::Failed)
+    }
+
 
     fn from_git_dir(git_dir: &Path) -> Result<Self, String> {
         let git_dir = fs::canonicalize(git_dir)
@@ -5354,6 +7076,7 @@ fn ingest_untracked_paths(
                 stdout: output.stdout,
                 truncated: output.truncated,
                 error: None,
+                exit_code: output.exit_code,
             }
         };
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -5436,11 +7159,14 @@ fn pin_untracked_copy(pin_dir: &Path, pin_index: usize, source: &Path) -> Option
     Some(destination)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct GitOutput {
     pub(crate) stdout: Vec<u8>,
     pub(crate) truncated: bool,
     pub(crate) error: Option<String>,
+    /// Process exit code. `None` when the status has no code (signal). Spawn,
+    /// timeout, and reader failures never produce a [`GitOutput`].
+    pub(crate) exit_code: Option<i32>,
 }
 
 /// Run git with fixed argv, no shell, bounded output, isolated config, and a
@@ -5605,6 +7331,7 @@ fn run_git_bounded_os_timeout(
         stdout: stdout_result.0,
         truncated: stdout_result.1,
         error,
+        exit_code: status.code(),
     })
 }
 
@@ -6531,6 +8258,7 @@ impl FileDiff {
                                         stdout: bytes.clone(),
                                         truncated: *truncated,
                                         error: None,
+                                        exit_code: None,
                                     },
                                 )
                             }
@@ -8430,6 +10158,7 @@ deleted file mode 100644
             stdout: gitlink_block.clone().into_bytes(),
             truncated: false,
             error: None,
+            exit_code: None,
         };
         (gitlink_block, output)
     }
@@ -8913,6 +10642,7 @@ deleted file mode 100644
             stdout: escape_block.clone().into_bytes(),
             truncated: false,
             error: None,
+            exit_code: None,
         };
         let (kept, paths, _, _, _) = expand_changed_gitlink_diffs(
             &output,
@@ -9847,16 +11577,19 @@ deleted file mode 100644
                 stdout: patch,
                 truncated: true,
                 error: None,
+                exit_code: None,
             },
             Some(&GitOutput {
                 stdout: b"M\0aa.txt\0M\0ext\0".to_vec(),
                 truncated: false,
                 error: None,
+                exit_code: None,
             }),
             &GitOutput {
                 stdout: b"1\t1\taa.txt\01\t1\text\0".to_vec(),
                 truncated: false,
                 error: None,
+                exit_code: None,
             },
             None,
             None,
@@ -10345,6 +12078,7 @@ deleted file mode 100644
             stdout: bytes,
             truncated: true,
             error: None,
+            exit_code: None,
         };
 
         let (expanded, paths, gitlinks, files, _) = expand_gitlink_diffs(
@@ -10387,6 +12121,7 @@ deleted file mode 100644
             stdout: gitlink_block.clone().into_bytes(),
             truncated: false,
             error: None,
+            exit_code: None,
         };
 
         let (kept, paths, _, _, _) = expand_gitlink_diffs(
@@ -10441,6 +12176,7 @@ deleted file mode 100644
             stdout: escape_block.clone().into_bytes(),
             truncated: false,
             error: None,
+            exit_code: None,
         };
 
         let (kept, paths, _, _, _) = expand_gitlink_diffs(
@@ -10466,6 +12202,7 @@ deleted file mode 100644
             stdout: gitlink_block.clone().into_bytes(),
             truncated: false,
             error: None,
+            exit_code: None,
         };
 
         let (kept, paths, _, _, _) = expand_gitlink_diffs(
@@ -10491,6 +12228,7 @@ deleted file mode 100644
             stdout: added_block.clone().into_bytes(),
             truncated: false,
             error: None,
+            exit_code: None,
         };
 
         let (kept, paths, _, _, _) = expand_gitlink_diffs(
@@ -10523,6 +12261,7 @@ deleted file mode 100644
             stdout: gitlink_block.clone().into_bytes(),
             truncated: false,
             error: None,
+            exit_code: None,
         };
 
         let (expanded, paths, _, _, _) = expand_gitlink_diffs(
@@ -10557,12 +12296,14 @@ deleted file mode 100644
                 stdout: normal.as_bytes().to_vec(),
                 truncated: false,
                 error: None,
+                exit_code: None,
             },
             &authority,
             &GitOutput {
                 stdout: gitlink.as_bytes().to_vec(),
                 truncated: false,
                 error: None,
+                exit_code: None,
             },
             MAX_DIFF_BYTES,
         );
@@ -10613,12 +12354,14 @@ deleted file mode 100644
                 stdout: blob_to_gitlink.as_bytes().to_vec(),
                 truncated: false,
                 error: None,
+                exit_code: None,
             },
             &authority,
             &GitOutput {
                 stdout: blob_to_gitlink.as_bytes().to_vec(),
                 truncated: false,
                 error: None,
+                exit_code: None,
             },
             MAX_DIFF_BYTES,
         );
@@ -10638,12 +12381,14 @@ deleted file mode 100644
                 stdout: gitlink_to_blob.as_bytes().to_vec(),
                 truncated: false,
                 error: None,
+                exit_code: None,
             },
             &authority,
             &GitOutput {
                 stdout: gitlink_to_blob.as_bytes().to_vec(),
                 truncated: false,
                 error: None,
+                exit_code: None,
             },
             MAX_DIFF_BYTES,
         );
@@ -11581,6 +13326,7 @@ deleted file mode 100644
             stdout: b"diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-old\n+new\n".to_vec(),
             truncated: false,
             error: Some("fatal: later path failed".to_owned()),
+            exit_code: None,
         };
         let snapshot = snapshot_from_diff_output(
             PathBuf::from("repo"),
@@ -12047,6 +13793,7 @@ deleted file mode 100644
             stdout: Vec::new(),
             truncated: false,
             error: None,
+            exit_code: None,
         }
     }
 
@@ -13932,7 +15679,7 @@ deleted file mode 100644
     fn name_status_catalog_parses_statuses_and_rename_provenance() {
         let stdout =
             b"M\0src/a.rs\0A\0new.txt\0D\0gone.txt\0R100\0old.txt\0renamed.txt\0C50\0src/orig.rs\0src/copy.rs\0T\0typechange.txt\0";
-        let catalog = name_status_catalog(stdout);
+        let catalog = name_status_catalog(stdout).expect("catalog");
         assert_eq!(catalog.len(), 6);
         assert_eq!(catalog["src/a.rs"].status, FileStatus::Modified);
         assert_eq!(catalog["src/a.rs"].previous_path, None);
@@ -13987,6 +15734,7 @@ deleted file mode 100644
             stdout: b"1\t1\ta.txt\0".to_vec(),
             truncated: true,
             error: None,
+            exit_code: None,
         };
         let snapshot = snapshot_from_diff_output(
             PathBuf::from("repo"),
@@ -13996,6 +15744,7 @@ deleted file mode 100644
                 stdout: patch.clone(),
                 truncated: false,
                 error: None,
+                exit_code: None,
             },
             None,
             &truncated_numstat,
@@ -14009,6 +15758,7 @@ deleted file mode 100644
             stdout: Vec::new(),
             truncated: false,
             error: Some("numstat failed".to_owned()),
+            exit_code: None,
         };
         let snapshot = snapshot_from_diff_output(
             PathBuf::from("repo"),
@@ -14018,6 +15768,7 @@ deleted file mode 100644
                 stdout: patch,
                 truncated: false,
                 error: None,
+                exit_code: None,
             },
             None,
             &failing_numstat,
@@ -14034,16 +15785,19 @@ deleted file mode 100644
             stdout: patch,
             truncated: true,
             error: None,
+            exit_code: None,
         };
         let catalog = GitOutput {
             stdout: b"M\0src/a.rs\0M\0src/b.rs\0R100\0old2.txt\0new2.txt\0D\0old2.txt\0A\0added.txt\0D\0deleted.txt\0".to_vec(),
             truncated: false,
             error: None,
+            exit_code: None,
         };
         let numstat = GitOutput {
             stdout: b"2\t1\tsrc/a.rs\00\t0\t\0old2.txt\0new2.txt\00\t1\tsrc/b.rs\05\t0\tadded.txt\00\t1\tdeleted.txt\0".to_vec(),
             truncated: false,
             error: None,
+            exit_code: None,
         };
         let snapshot = snapshot_from_diff_output(
             PathBuf::from("repo"),
@@ -14129,12 +15883,14 @@ deleted file mode 100644
                 stdout: patch,
                 truncated: false,
                 error: None,
+                exit_code: None,
             },
             None,
             &GitOutput {
                 stdout: b"6479\t151\tsmall.txt\0".to_vec(),
                 truncated: false,
                 error: None,
+                exit_code: None,
             },
             None,
             None,
@@ -14182,6 +15938,7 @@ deleted file mode 100644
                 stdout: patch,
                 truncated: false,
                 error: None,
+                exit_code: None,
             },
         );
         assert!(served.error.is_none(), "{:?}", served.error);
@@ -14217,6 +15974,7 @@ deleted file mode 100644
                 stdout: patch,
                 truncated: false,
                 error: None,
+                exit_code: None,
             },
         );
         assert!(served.error.is_some(), "{:?}", served.error);
@@ -14245,6 +16003,7 @@ deleted file mode 100644
                 stdout: patch,
                 truncated: false,
                 error: None,
+                exit_code: None,
             },
         );
         assert!(served.error.is_none(), "{:?}", served.error);
@@ -14266,6 +16025,7 @@ deleted file mode 100644
                 stdout: multi,
                 truncated: false,
                 error: None,
+                exit_code: None,
             },
         );
         assert!(rejected.error.is_some(), "{:?}", rejected.error);
@@ -14280,16 +16040,19 @@ deleted file mode 100644
                     .to_vec(),
             truncated: true,
             error: None,
+            exit_code: None,
         };
         let catalog_a = GitOutput {
             stdout: b"A\0a.txt\0M\0b.txt\0".to_vec(),
             truncated: false,
             error: None,
+            exit_code: None,
         };
         let catalog_b = GitOutput {
             stdout: b"A\0a.txt\0M\0b.txt\0A\0c.txt\0".to_vec(),
             truncated: false,
             error: None,
+            exit_code: None,
         };
         let snapshot_a = snapshot_from_diff_output(
             PathBuf::from("repo"),
@@ -14710,4 +16473,1082 @@ deleted file mode 100644
         toggled.toggle_collapse(file_idx);
         assert_eq!(toggled.visible_rows().len(), 5);
     }
+
+    #[test]
+    fn summary_name_status_rejects_truncated_record() {
+        let error = name_status_catalog(b"M\0src/a.rs").expect_err("unterminated");
+        assert!(error.contains("unterminated"), "{error}");
+        let error = name_status_catalog(b"R100\0old\0").expect_err("truncated rename");
+        assert!(error.contains("truncated"), "{error}");
+        let error = name_status_catalog(b"Q\0src/a.rs\0").expect_err("unknown");
+        assert!(error.contains("not a known status"), "{error}");
+        let known = name_status_catalog(b"X\0src/a.rs\0").expect("documented unknown");
+        assert_eq!(known["src/a.rs"].status, FileStatus::Unknown);
+        let conflict = name_status_catalog(b"U\0a\0M\0a\0").expect("conflict");
+        assert_eq!(conflict["a"].status, FileStatus::Unmerged);
+    }
+    fn commit_file(repo: &Path, name: &str, body: &str, message: &str) {
+        write(repo.join(name).as_path(), body);
+        git(repo, &["add", name]);
+        git(repo, &["commit", "-m", message]);
+    }
+
+    fn head_oid_of(repo: &Path) -> String {
+        String::from_utf8(git_output(repo, &["rev-parse", "HEAD"]))
+            .expect("oid")
+            .trim()
+            .to_owned()
+    }
+
+    fn purposes_for(facts: &WorkspaceSummaryFacts) -> BTreeMap<PurposeKey, String> {
+        summary_purpose_keys(facts)
+            .into_iter()
+            .map(|key| (key, "purpose".to_owned()))
+            .collect()
+    }
+
+    struct SummaryFixture {
+        app: pi_coding::Application,
+        _agent: tempfile::TempDir,
+    }
+
+    async fn summary_app(cwd: &Path) -> SummaryFixture {
+        summary_app_with_settings(cwd, "{}").await
+    }
+
+    async fn summary_app_with_roots(cwd: &Path, additional: &[PathBuf]) -> SummaryFixture {
+        summary_app_with_roots_and_settings(cwd, additional, "{}").await
+    }
+
+    async fn summary_app_with_settings(cwd: &Path, settings: &str) -> SummaryFixture {
+        summary_app_with_roots_and_settings(cwd, &[], settings).await
+    }
+
+    async fn summary_app_with_roots_and_settings(
+        cwd: &Path,
+        additional: &[PathBuf],
+        settings: &str,
+    ) -> SummaryFixture {
+        use pi_agent::ThinkingLevel;
+        use pi_coding::{
+            ResourceDiscovery, ResourceManager, ResourceManagerOptions, SessionOptions, ToolSelection,
+            WorkspaceRoots,
+        };
+        pi_ai::providers::register_default_faux();
+        let model = pi_ai::get_model("faux", "faux-1").expect("faux");
+        let workspace = WorkspaceRoots::new(cwd, additional.iter().cloned()).expect("roots");
+        let session = pi_coding::Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
+            SessionOptions {
+                model: Some(model),
+                cwd: cwd.to_path_buf(),
+                system_prompt: String::new(),
+                thinking_level: ThinkingLevel::Off,
+                api_key: "faux".into(),
+                compaction: None,
+                stream_options: Default::default(),
+                tools: Some(Vec::new()),
+                before_tool_call: None,
+                after_tool_call: None,
+                stream_fn: None,
+                auth_resolver: None,
+                auth_manager: None,
+            },
+            Vec::new(),
+            ToolSelection::default(),
+            ResourceDiscovery::Disabled,
+            workspace,
+            None,
+        )
+        .expect("session");
+        let agent = tempfile::tempdir().expect("agent");
+        fs::write(agent.path().join("settings.json"), settings).expect("settings");
+        fs::create_dir_all(cwd.join(".pi-test-sessions")).expect("sessions");
+        session.set_session_dir(cwd.join(".pi-test-sessions"));
+        let mut options = ResourceManagerOptions::new(cwd);
+        options.agent_dir = agent.path().to_path_buf();
+        options.project_trust_override = Some(true);
+        options.disable_extensions = true;
+        options.disable_skills = true;
+        options.disable_prompt_templates = true;
+        options.disable_themes = true;
+        options.disable_context_files = true;
+        session
+            .attach_resources(ResourceManager::new(options).expect("resources"))
+            .await
+            .expect("attach");
+        let app = pi_coding::Application::from_runtime_candidate(
+            pi_coding::ApplicationRuntimeCandidate::new(session),
+        )
+        .await
+        .expect("application");
+        SummaryFixture { app, _agent: agent }
+    }
+
+    #[tokio::test]
+    async fn summary_collects_aggregate_worktree_diff_beyond_the_combined_cap() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        git(cwd.path(), &["init", "-b", "main"]);
+        for name in ["left.txt", "right.txt"] {
+            commit_file(cwd.path(), name, "base\n", "base");
+        }
+        // Each file is ~1.1 MiB with a tail marker, so a complete patch must end
+        // at the marker. Two files exceed the 2 MiB aggregate while every single
+        // file record stays under the existing prompt bound.
+        let body = |tag: &str| {
+            let mut body = (0..18_500)
+                .map(|index| format!("{tag}-{index:05} {}\n", "x".repeat(48)))
+                .collect::<String>();
+            body.push_str(&format!("{tag}-TAIL-MARKER\n"));
+            body
+        };
+        write(&cwd.path().join("left.txt"), &body("LEFT"));
+        write(&cwd.path().join("right.txt"), &body("RIGHT"));
+        let fixture = summary_app(cwd.path()).await;
+        let facts = collect_summary_facts(
+            &fixture.app.capture_generation(),
+            &[cwd.path().to_path_buf()],
+        )
+        .expect("aggregate diff over MAX_DIFF_BYTES is still reviewable");
+        assert_eq!(facts.repositories.len(), 1);
+        let repo = &facts.repositories[0];
+        assert_eq!(repo.unstaged.len(), 2, "{:?}", repo.unstaged.iter().map(|file| &file.path).collect::<Vec<_>>());
+        let mut combined = 0usize;
+        for file in &repo.unstaged {
+            let tag = if file.path == "left.txt" { "LEFT" } else { "RIGHT" };
+            let patch = file.patch.as_deref().expect("text patch");
+            combined += patch.len();
+            assert!(
+                patch.trim_end().ends_with(&format!("+{tag}-TAIL-MARKER")),
+                "{} patch is not complete (tail marker missing): {} bytes",
+                file.path,
+                patch.len()
+            );
+            assert!(patch.len() < MAX_DIFF_BYTES, "{} patch {}", file.path, patch.len());
+            let record = serde_json::to_string(file).expect("record json");
+            assert!(
+                record.len() <= MAX_SUMMARY_DOCUMENT_BYTES,
+                "{} record {} exceeds the prompt bound",
+                file.path,
+                record.len()
+            );
+        }
+        assert!(
+            combined > MAX_DIFF_BYTES,
+            "combined patches {combined} did not exceed the cap"
+        );
+    }
+
+    #[test]
+    fn summary_patch_budget_is_shared_across_repositories() {
+        let half = MAX_SUMMARY_PATCH_BYTES / 2;
+        let mut retained = 0usize;
+        summary_patch_charge(&mut retained, "root0", half).expect("first repository within budget");
+        summary_patch_charge(&mut retained, "root1", half)
+            .expect("second repository fills the shared budget exactly");
+        assert_eq!(retained, MAX_SUMMARY_PATCH_BYTES);
+        let error = summary_patch_charge(&mut retained, "root1", 1)
+            .expect_err("the shared workspace budget fails closed across repositories");
+        let SummaryError::Limit { what, bytes } = &error else {
+            panic!("expected Limit, got {error:?}");
+        };
+        assert_eq!(*bytes, MAX_SUMMARY_PATCH_BYTES);
+        assert!(what.contains("across the workspace"), "{what}");
+        assert!(what.contains(&(retained + 1).to_string()), "{what}");
+        let mut saturated = usize::MAX;
+        let error = summary_patch_charge(&mut saturated, "root0", 1).expect_err("overflow fails closed");
+        assert!(
+            matches!(error, SummaryError::Limit { bytes: MAX_SUMMARY_PATCH_BYTES, .. }),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn summary_entry_patch_body_is_honest_about_missing_bodies() {
+        let diffed = b"diff --git a/f.rs b/f.rs\nindex 111..222 100644\n--- a/f.rs\n+++ b/f.rs\n@@ -1 +1,2 @@\n-base\n+base\n+new\n";
+        let body = entry_patch_body("root0", "f.rs", LineStats::Text { insertions: 2, deletions: 1 }, diffed)
+            .expect("matched hunks");
+        assert!(body.as_ref().is_some_and(|text| text.contains("+new")), "{body:?}");
+        let mode_only = b"diff --git a/m.sh b/m.sh\nold mode 100644\nnew mode 100755\n";
+        assert_eq!(
+            entry_patch_body("root0", "m.sh", LineStats::Text { insertions: 0, deletions: 0 }, mode_only)
+                .expect("mode-only is an honest None"),
+            None
+        );
+        let error = entry_patch_body("root0", "m.sh", LineStats::Text { insertions: 2, deletions: 1 }, mode_only)
+            .expect_err("no hunks with counted changes fails closed");
+        assert!(
+            matches!(&error, SummaryError::Incomplete(message) if message.contains("no patch hunks")),
+            "{error:?}"
+        );
+        assert_eq!(
+            entry_patch_body("root0", "f.rs", LineStats::Text { insertions: 0, deletions: 0 }, b"")
+                .expect("empty body with a 0/0 metric is an honest None"),
+            None
+        );
+        let error = entry_patch_body("root0", "f.rs", LineStats::Text { insertions: 3, deletions: 1 }, b"")
+            .expect_err("empty body with counted changes fails closed");
+        assert!(
+            matches!(&error, SummaryError::Incomplete(message) if message.contains("produced no body")),
+            "{error:?}"
+        );
+        let other = b"diff --git a/other.rs b/other.rs\n--- a/other.rs\n+++ b/other.rs\n@@ -1 +1 @@\n-a\n+b\n";
+        let error = entry_patch_body("root0", "f.rs", LineStats::Text { insertions: 1, deletions: 1 }, other)
+            .expect_err("output that never resolves to the entry path fails closed");
+        assert!(
+            matches!(&error, SummaryError::Incomplete(message) if message.contains("did not parse")),
+            "{error:?}"
+        );
+        let error = entry_patch_body("root0", "f.rs", LineStats::Text { insertions: 1, deletions: 1 }, b"garbage")
+            .expect_err("malformed diff fails closed");
+        assert!(
+            matches!(&error, SummaryError::Incomplete(message) if message.contains("did not parse")),
+            "{error:?}"
+        );
+        let body = entry_patch_body("root0", "f.rs", LineStats::Text { insertions: 0, deletions: 0 }, diffed)
+            .expect("0/0 metric with real hunks keeps its text");
+        assert!(body.as_ref().is_some_and(|text| text.contains("+new")), "{body:?}");
+    }
+
+    #[test]
+    fn summary_change_metrics_fail_closed_without_numstat_row() {
+        let error = entry_change_metrics("root0", "gone.txt", None).expect_err("missing numstat row");
+        assert!(
+            matches!(&error, SummaryError::Incomplete(message) if message.contains("numstat did not report gone.txt")),
+            "{error:?}"
+        );
+        assert_eq!(
+            entry_change_metrics(
+                "root0",
+                "a.rs",
+                Some(&NumStatEntry { insertions: 2, deletions: 1, binary: false }),
+            )
+            .expect("counts"),
+            LineStats::Text { insertions: 2, deletions: 1 }
+        );
+        assert_eq!(
+            entry_change_metrics(
+                "root0",
+                "b.bin",
+                Some(&NumStatEntry { insertions: 0, deletions: 0, binary: true }),
+            )
+            .expect("binary"),
+            LineStats::Binary
+        );
+    }
+
+    #[tokio::test]
+    async fn summary_keeps_pure_renames_and_mode_only_without_fake_patches() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let repo = cwd.path().join("repo");
+        fs::create_dir(&repo).expect("repo");
+        let origin = cwd.path().join("origin.git");
+        git(cwd.path(), &["init", "--bare", "origin.git"]);
+        git(&repo, &["init", "-b", "main"]);
+        commit_file(&repo, "script.sh", "x\n", "base");
+        commit_file(&repo, "before.txt", "one\n", "add before");
+        git(&repo, &["remote", "add", "origin", origin.to_str().expect("origin")]);
+        git(&repo, &["push", "-u", "origin", "main"]);
+        git(&repo, &["mv", "before.txt", "after.txt"]);
+        git(&repo, &["commit", "-m", "pure rename"]);
+        fs::set_permissions(
+            repo.join("script.sh"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("chmod");
+        let fixture = summary_app(cwd.path()).await;
+        let facts = collect_summary_facts(
+            &fixture.app.capture_generation(),
+            &[cwd.path().to_path_buf()],
+        )
+        .expect("clean metadata-only worktree collects");
+        let repo_facts = facts.repositories.iter().find(|item| item.label == "root0/repo").expect("repo");
+        let mode_only = repo_facts
+            .unstaged
+            .iter()
+            .find(|file| file.path == "script.sh")
+            .expect("mode-only entry");
+        assert_eq!(mode_only.lines, LineStats::Text { insertions: 0, deletions: 0 });
+        assert_eq!(mode_only.patch, None);
+        let renamed = repo_facts
+            .commits
+            .iter()
+            .find(|commit| commit.subject == "pure rename")
+            .expect("rename commit");
+        let renamed_file = renamed.files.iter().find(|file| file.path == "after.txt").expect("renamed file");
+        assert_eq!(renamed_file.status, FileStatus::Renamed);
+        assert_eq!(renamed_file.previous_path.as_deref(), Some("before.txt"));
+    }
+
+    fn git_allow_failure(cwd: &Path, args: &[&str]) {
+        Command::new("git")
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "Pi Test")
+            .env("GIT_AUTHOR_EMAIL", "pi@example.test")
+            .env("GIT_COMMITTER_NAME", "Pi Test")
+            .env("GIT_COMMITTER_EMAIL", "pi@example.test")
+            .output()
+            .expect("git");
+    }
+
+    #[tokio::test]
+    async fn summary_fails_closed_on_unmerged_worktree_instead_of_faking_metrics() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let repo = cwd.path().join("repo");
+        fs::create_dir(&repo).expect("repo");
+        git(&repo, &["init", "-b", "main"]);
+        commit_file(&repo, "base.txt", "base\n", "base");
+        git(&repo, &["checkout", "-b", "feature"]);
+        commit_file(&repo, "clash.txt", "feature\n", "feature side");
+        git(&repo, &["checkout", "main"]);
+        commit_file(&repo, "clash.txt", "main\n", "main side");
+        git_allow_failure(&repo, &["merge", "feature"]);
+        git(&repo, &["update-index", "--add", "--cacheinfo", "160000,0123456789012345678901234567890123456789,link.bin"]);
+        let fixture = summary_app(cwd.path()).await;
+        let error = collect_summary_facts(
+            &fixture.app.capture_generation(),
+            &[cwd.path().to_path_buf()],
+        )
+        .expect_err("unmerged worktree fails closed instead of faking metrics");
+        let SummaryError::Incomplete(_) = &error else {
+            panic!("expected Incomplete, got {error:?}");
+        };
+    }
+
+    #[tokio::test]
+    async fn summary_collects_origin_ahead_layers_renames_and_distinct_roots() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let origin = cwd.path().join("origin.git");
+        git(cwd.path(), &["init", "--bare", "origin.git"]);
+        let repo = cwd.path().join("repo");
+        fs::create_dir(&repo).expect("repo");
+        git(&repo, &["init", "-b", "main"]);
+        commit_file(&repo, "README.md", "base\n", "initial");
+        git(&repo, &["remote", "add", "origin", origin.to_str().expect("origin")]);
+        git(&repo, &["push", "-u", "origin", "main"]);
+        commit_file(&repo, "kept.rs", "fn kept() {}\n", "add kept");
+        git(&repo, &["mv", "README.md", "guide.md"]);
+        git(&repo, &["commit", "-m", "rename readme"]);
+        commit_file(&repo, "both.rs", "base\n", "track both");
+        write(repo.join("both.rs").as_path(), "base\nstaged\n");
+        git(&repo, &["add", "both.rs"]);
+        write(repo.join("both.rs").as_path(), "base\nstaged\nunstaged\n");
+        write(repo.join("note.md").as_path(), "");
+        fs::write(repo.join("blob.bin"), [0, 1, 2, 3]).expect("binary");
+        let other = cwd.path().join("other");
+        fs::create_dir(&other).expect("other");
+        git(&other, &["init", "-b", "main"]);
+        commit_file(&other, "README.md", "other\n", "other");
+        let fixture = summary_app(cwd.path()).await;
+        let facts = collect_summary_facts(&fixture.app.capture_generation(), &[cwd.path().to_path_buf()]).expect("facts");
+        let repo_facts = facts.repositories.iter().find(|item| item.label == "root0/repo").expect("repo");
+        assert!(matches!(repo_facts.origin, OriginOutcome::Compared { ahead: 3, behind: 0, .. }));
+        assert_eq!(repo_facts.overview.upstream.as_deref(), Some("origin/main"));
+        assert!(repo_facts.commits.iter().any(|commit| commit.files.iter().any(|file| {
+            file.status == FileStatus::Renamed && file.path == "guide.md" && file.previous_path.as_deref() == Some("README.md")
+        })));
+        let staged = repo_facts.staged.iter().find(|file| file.path == "both.rs").expect("staged both");
+        let unstaged = repo_facts.unstaged.iter().find(|file| file.path == "both.rs").expect("unstaged both");
+        assert_eq!(staged.lines, LineStats::Text { insertions: 1, deletions: 0 });
+        assert_eq!(unstaged.lines, LineStats::Text { insertions: 1, deletions: 0 });
+        assert!(staged.patch.as_deref().is_some_and(|patch| patch.contains("+staged")));
+        assert!(unstaged.patch.as_deref().is_some_and(|patch| patch.contains("+unstaged")));
+        assert!(repo_facts.untracked.iter().any(|file| file.path == "note.md" && file.lines == LineStats::Text { insertions: 0, deletions: 0 }));
+        assert!(repo_facts.untracked.iter().any(|file| file.path == "blob.bin" && file.patch.is_none()));
+        assert!(facts.repositories.iter().any(|item| item.label == "root0/other"));
+        let rendered = render_summary_markdown(&facts, &purposes_for(&facts)).expect("render");
+        assert!(!rendered.contains(&published_absolute(cwd.path())));
+    }
+
+    fn published_absolute(path: &Path) -> String {
+        path.canonicalize().expect("canonical").display().to_string()
+    }
+
+    #[tokio::test]
+    async fn summary_distinguishes_absent_origin_states() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        for name in ["plain", "unborn", "detached", "missing"] {
+            fs::create_dir(cwd.path().join(name)).expect(name);
+            git(&cwd.path().join(name), &["init", "-b", "main"]);
+        }
+        commit_file(&cwd.path().join("plain"), "README.md", "base\n", "initial");
+        commit_file(&cwd.path().join("plain"), "second.md", "more\n", "second");
+        write(cwd.path().join("plain").join("README.md").as_path(), "base\nstaged\n");
+        git(&cwd.path().join("plain"), &["add", "README.md"]);
+        write(cwd.path().join("plain").join("README.md").as_path(), "base\nstaged\nunstaged\n");
+        write(cwd.path().join("plain").join("note.md").as_path(), "loose\n");
+        commit_file(&cwd.path().join("detached"), "README.md", "base\n", "initial");
+        git(&cwd.path().join("detached"), &["checkout", "--detach"]);
+        commit_file(&cwd.path().join("missing"), "README.md", "base\n", "initial");
+        commit_file(&cwd.path().join("missing"), "second.md", "more\n", "second");
+        git(&cwd.path().join("missing"), &["remote", "add", "origin", cwd.path().join("nowhere.git").to_str().expect("url")]);
+        let fixture = summary_app(cwd.path()).await;
+        let facts = collect_summary_facts(&fixture.app.capture_generation(), &[cwd.path().to_path_buf()]).expect("facts");
+        let repo = |name: &str| facts.repositories.iter().find(|item| item.label.ends_with(name)).expect(name);
+        let plain = repo("plain");
+        let detached = repo("detached");
+        let missing = repo("missing");
+        assert!(matches!(plain.origin, OriginOutcome::NoOrigin));
+        assert!(matches!(repo("unborn").origin, OriginOutcome::Unborn));
+        assert!(matches!(detached.origin, OriginOutcome::Detached));
+        assert!(matches!(missing.origin, OriginOutcome::MissingOriginBranch { .. }));
+        assert!(plain.commits.is_empty() && missing.commits.is_empty() && detached.commits.is_empty() && repo("unborn").commits.is_empty());
+        assert!(matches!(&plain.overview.head, HeadState::Branch { name, oid: Some(oid), .. } if name == "main" && oid.len() == 40));
+        assert!(matches!(&missing.overview.head, HeadState::Branch { oid: Some(oid), .. } if oid.len() == 40));
+        assert!(plain.staged.iter().any(|file| file.path == "README.md"));
+        assert!(plain.unstaged.iter().any(|file| file.path == "README.md"));
+        assert!(plain.untracked.iter().any(|file| file.path == "note.md"));
+        let keys = purposes_for(&facts);
+        let absent = ["plain", "missing", "detached", "unborn"];
+        assert!(keys.keys().all(|key| match key {
+            PurposeKey::Commit { label, .. } | PurposeKey::CommittedFile { label, .. } => {
+                absent.iter().all(|name| !label.ends_with(name))
+            }
+            _ => true,
+        }));
+        assert!(keys.keys().any(|key| matches!(key, PurposeKey::StagedFile { label, path } if label.ends_with("plain") && path == "README.md")));
+        assert!(keys.keys().any(|key| matches!(key, PurposeKey::UnstagedFile { label, path } if label.ends_with("plain") && path == "README.md")));
+        assert!(keys.keys().any(|key| matches!(key, PurposeKey::UntrackedFile { label, path } if label.ends_with("plain") && path == "note.md")));
+    }
+    #[tokio::test]
+    async fn summary_missing_ref_is_absence_and_corrupt_ref_is_command_failure() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let missing = cwd.path().join("missing-ref");
+        fs::create_dir(&missing).expect("missing");
+        git(&missing, &["init", "-b", "main"]);
+        commit_file(&missing, "README.md", "base\n", "initial");
+        git(&missing, &["remote", "add", "origin", "named-only"]);
+        let fixture = summary_app(cwd.path()).await;
+        let facts = collect_summary_facts(&fixture.app.capture_generation(), &[missing.clone()]).expect("missing ref is absence");
+        assert!(matches!(facts.repositories[0].origin, OriginOutcome::MissingOriginBranch { .. }));
+        let corrupt = cwd.path().join("corrupt-ref");
+        fs::create_dir(&corrupt).expect("corrupt");
+        git(&corrupt, &["init", "-b", "main"]);
+        commit_file(&corrupt, "README.md", "base\n", "initial");
+        fs::write(corrupt.join(".git/refs/heads/main"), "not-an-oid\n").expect("corrupt ref");
+        let corrupt_only = collect_summary_facts(&fixture.app.capture_generation(), &[corrupt]);
+        match corrupt_only {
+            Err(SummaryError::Command { exit, detail, command, .. }) => {
+                assert_ne!(exit, Some(1), "corrupt ref must not use the absence exit: {command} {detail}");
+                assert!(!detail.contains("named-only") && !command.contains("named-only"), "{command} {detail}");
+            }
+            other => panic!("corrupt ref must be a command failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn summary_omits_denied_paths_and_keeps_allowed_renames() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let hidden = cwd.path().join("target").join("nested");
+        fs::create_dir_all(&hidden).expect("hidden");
+        git(&hidden, &["init", "-b", "main"]);
+        commit_file(&hidden, "README.md", "hidden\n", "hidden");
+        let visible = cwd.path().join("visible");
+        fs::create_dir(&visible).expect("visible");
+        git(&visible, &["init", "-b", "main"]);
+        commit_file(&visible, "README.md", "visible\n", "visible");
+        commit_file(&visible, "old.txt", "old\n", "track old");
+        git(&visible, &["mv", "old.txt", "new.txt"]);
+        let settings = format!(
+            "{{\"sandbox\":{{\"mode\":\"workspace-write\",\"deniedPaths\":[\"{}\"]}}}}",
+            visible.join("old.txt").display()
+        );
+        let fixture = summary_app_with_settings(cwd.path(), &settings).await;
+        let facts = collect_summary_facts(&fixture.app.capture_generation(), &[cwd.path().to_path_buf()]).expect("facts");
+        assert!(facts.repositories.iter().all(|item| !item.label.contains("target")));
+        let repo = facts.repositories.iter().find(|item| item.label == "root0/visible").expect("visible");
+        assert!(repo.staged.iter().all(|file| file.path != "new.txt" && file.previous_path.as_deref() != Some("old.txt")));
+        assert!(repo.staged.iter().all(|file| file.patch.as_deref().is_none_or(|patch| !patch.contains("old"))));
+    }
+
+
+    #[test]
+    fn summary_document_over_budget_fails_instead_of_trimming() {
+        let facts = WorkspaceSummaryFacts {
+            repositories: vec![RepositorySummaryFacts {
+                root_index: 0,
+                label: "root0".to_owned(),
+                overview: RepositoryOverview {
+                    head: HeadState::Unborn { name: "main".to_owned() },
+                    upstream: None,
+                    counts: GitCounts { staged: 0, unstaged: 0, untracked: 0, commits: 0 },
+                },
+                origin: OriginOutcome::Unborn,
+                commits: Vec::new(),
+                staged: Vec::new(),
+                unstaged: Vec::new(),
+                untracked: Vec::new(),
+            }],
+        };
+        let mut purposes = purposes_for(&facts);
+        purposes.insert(
+            PurposeKey::Repository { label: "root0".to_owned() },
+            "x".repeat(MAX_SUMMARY_DOCUMENT_BYTES),
+        );
+        let error = render_summary_markdown(&facts, &purposes).expect_err("budget");
+        assert!(matches!(error, SummaryError::Limit { .. }), "{error}");
+    }
+    #[test]
+    fn summary_renderer_escapes_adversarial_purpose_and_path() {
+        let facts = WorkspaceSummaryFacts {
+            repositories: vec![RepositorySummaryFacts {
+                root_index: 0,
+                label: "root0".to_owned(),
+                overview: RepositoryOverview {
+                    head: HeadState::Branch { name: "main[forged]".to_owned(), oid: Some("abc".to_owned()) },
+                    upstream: None,
+                    counts: GitCounts { staged: 1, unstaged: 0, untracked: 0, commits: 0 },
+                },
+                origin: OriginOutcome::MissingOriginBranch { branch: "main*forged*".to_owned() },
+                commits: Vec::new(),
+                staged: vec![ChangedFileFacts {
+                    path: "a[b].rs".to_owned(),
+                    previous_path: None,
+                    status: FileStatus::Modified,
+                    lines: LineStats::Text { insertions: 1, deletions: 0 },
+                    patch: Some("+secret\n- counts: 99".to_owned()),
+                }],
+                unstaged: Vec::new(),
+                untracked: Vec::new(),
+            }],
+        };
+        let mut purposes = purposes_for(&facts);
+        purposes.insert(PurposeKey::Repository { label: "root0".to_owned() }, "ok\n\n- counts: 99 forged".to_owned());
+        purposes.insert(PurposeKey::StagedFile { label: "root0".to_owned(), path: "a[b].rs".to_owned() }, "### forged".to_owned());
+        let rendered = render_summary_markdown(&facts, &purposes).expect("render");
+        assert!(rendered.contains("Purpose: ok\\n\\n"));
+        assert!(!rendered.contains("### forged") && !rendered.contains("\n- counts: 99"));
+        assert!(rendered.contains("\\[") && rendered.contains("\\*"));
+        assert!(rendered.contains("M a\\[b\\]\\.rs"));
+        assert!(!rendered.contains("Ma\\[b\\]"));
+    }
+
+    #[test]
+    fn summary_renderer_keeps_inventory_and_omits_patch_body() {
+        let sentinel = "PATCH-SENTINEL-not-inventory";
+        let facts = WorkspaceSummaryFacts {
+            repositories: vec![RepositorySummaryFacts {
+                root_index: 0,
+                label: "root0".to_owned(),
+                overview: RepositoryOverview {
+                    head: HeadState::Branch { name: "main".to_owned(), oid: Some("abc".to_owned()) },
+                    upstream: None,
+                    counts: GitCounts { staged: 1, unstaged: 0, untracked: 0, commits: 0 },
+                },
+                origin: OriginOutcome::NoOrigin,
+                commits: Vec::new(),
+                staged: vec![ChangedFileFacts {
+                    path: "guide.md".to_owned(),
+                    previous_path: Some("README.md".to_owned()),
+                    status: FileStatus::Renamed,
+                    lines: LineStats::Text { insertions: 2, deletions: 1 },
+                    patch: Some(format!("@@ -1 +1 @@\n-{sentinel}\n+kept\n")),
+                }],
+                unstaged: Vec::new(),
+                untracked: Vec::new(),
+            }],
+        };
+        let purposes = purposes_for(&facts);
+        let rendered = render_summary_markdown(&facts, &purposes).expect("render");
+        let visible = pi_coding::markdown::render_markdown(
+            &rendered,
+            &pi_coding::markdown::MarkdownRenderOptions { width: 120, ..pi_coding::markdown::MarkdownRenderOptions::default() },
+        ).plain_text();
+        assert!(visible.contains("R README.md -> guide.md +2/-1"), "{visible}");
+        assert!(visible.contains("Purpose: purpose"), "{visible}");
+        assert!(!visible.contains(sentinel), "{visible}");
+        assert_eq!(facts.repositories[0].staged[0].patch.as_deref().unwrap().matches(sentinel).count(), 1);
+    }
+
+    fn init_marker_repo(dir: &Path, file: &str) {
+        fs::create_dir_all(dir).expect("repo dir");
+        write(dir.join(file).as_path(), "marker\n");
+        git(dir, &["init", "-b", "main"]);
+        git(dir, &["add", file]);
+        git(dir, &["commit", "-m", "marker"]);
+    }
+
+    /// Workspace overview must name every authorized repository, including a
+    /// catalog larger than the old 16-repo cap and a repository nested past the
+    /// old depth-3 cutoff, while an ordinary 12-level source tree stays inside
+    /// its enclosing repository. Overlapping roots canonicalize to one identity.
+    #[tokio::test]
+    async fn workspace_discovery_completes_past_depth_three_and_sixteen_repos() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let mut expected = Vec::new();
+        for index in 0..23 {
+            let repo = cwd.path().join(format!("r{index:02}"));
+            init_marker_repo(&repo, "README.md");
+            expected.push(repo.canonicalize().expect("canonical sibling"));
+        }
+        let mut nested = cwd.path().to_path_buf();
+        for name in ["n0", "n1", "n2", "n3", "leaf"] {
+            nested.push(name);
+        }
+        init_marker_repo(&nested, "README.md");
+        expected.push(nested.canonicalize().expect("canonical nested"));
+        let inside = cwd.path().join("r00").join("inner");
+        init_marker_repo(&inside, "README.md");
+        expected.push(inside.canonicalize().expect("canonical inner"));
+        let mut ordinary = cwd.path().join("r00");
+        for level in 0..12 {
+            ordinary.push(format!("src{level}"));
+            fs::create_dir(&ordinary).expect("ordinary source dir");
+            write(ordinary.join("lib.rs").as_path(), "fn marker() {}\n");
+        }
+        let elsewhere = tempfile::tempdir().expect("disjoint root");
+        let beta = elsewhere.path().join("beta");
+        init_marker_repo(&beta, "README.md");
+        expected.push(beta.canonicalize().expect("canonical disjoint"));
+        expected.sort();
+        let fixture = summary_app_with_roots(cwd.path(), &[elsewhere.path().to_path_buf()]).await;
+        let generation = fixture.app.capture_generation();
+        let roots = [
+            cwd.path().to_path_buf(),
+            cwd.path().join("r00"),
+            elsewhere.path().to_path_buf(),
+        ];
+        match collect_workspace_repositories(&generation, &roots, RepositoryDiscoveryScope::Workspace) {
+            WorkspaceRepositoryDiscovery::Complete(found) => {
+                assert_eq!(found, expected, "workspace overview must list each repository once");
+            }
+            WorkspaceRepositoryDiscovery::Incomplete { found, reason } => {
+                panic!(
+                    "workspace overview truncated at {} of {} repositories ({reason}): {found:?}",
+                    found.len(),
+                    expected.len()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_discovery_repo_budget_names_first_unlisted_repository() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        for index in 0..3 {
+            init_marker_repo(&cwd.path().join(format!("r{index}")), "README.md");
+        }
+        let fixture = summary_app(cwd.path()).await;
+        let discovery = collect_workspace_repositories_iterative(
+            &fixture.app.capture_generation(),
+            &[cwd.path().to_path_buf()],
+            RepositoryDiscoveryScope::Workspace,
+            DiscoveryLimits {
+                max_repos: 2,
+                max_directory_work: 100,
+            },
+        );
+        match discovery {
+            WorkspaceRepositoryDiscovery::Incomplete { found, reason } => {
+                let mut expected = Vec::new();
+                for name in ["r0", "r1"] {
+                    expected.push(cwd.path().join(name).canonicalize().expect(name));
+                }
+                expected.sort();
+                assert_eq!(found, expected);
+                assert_eq!(reason, "repository budget of 2 exhausted at root0/r2");
+            }
+            WorkspaceRepositoryDiscovery::Complete(found) => {
+                panic!("two-repository budget must not publish {found:?}");
+            }
+        }
+    }
+
+    fn workspace_limited(
+        generation: &pi_coding::ApplicationGeneration,
+        roots: &[PathBuf],
+        max_repos: usize,
+        max_directory_work: usize,
+    ) -> WorkspaceRepositoryDiscovery {
+        collect_workspace_repositories_iterative(
+            generation,
+            roots,
+            RepositoryDiscoveryScope::Workspace,
+            DiscoveryLimits {
+                max_repos,
+                max_directory_work,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn workspace_discovery_directory_budget_counts_each_directory_once_across_roots() {
+        let left = tempfile::tempdir().expect("left");
+        let right = tempfile::tempdir().expect("right");
+        fs::create_dir(left.path().join("a")).expect("a");
+        fs::create_dir(left.path().join("b")).expect("b");
+        fs::create_dir(right.path().join("c")).expect("c");
+        let fixture = summary_app_with_roots(left.path(), &[right.path().to_path_buf()]).await;
+        let generation = fixture.app.capture_generation();
+        let roots = [left.path().to_path_buf(), right.path().to_path_buf()];
+        assert!(
+            matches!(
+                workspace_limited(&generation, &roots, 160, 5),
+                WorkspaceRepositoryDiscovery::Complete(found) if found.is_empty()
+            ),
+            "root, a, b, root, c is exactly five admitted directories"
+        );
+        match workspace_limited(&generation, &roots, 160, 4) {
+            WorkspaceRepositoryDiscovery::Incomplete { found, reason } => {
+                assert!(found.is_empty(), "{found:?}");
+                let unadmitted = reason
+                    .strip_prefix("directory work budget of 4 exhausted before root0/")
+                    .unwrap_or_else(|| panic!("{reason}"));
+                assert!(matches!(unadmitted, "a" | "b"), "{reason}");
+            }
+            WorkspaceRepositoryDiscovery::Complete(found) => {
+                panic!("a left-root child must stay unadmitted: {found:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_discovery_wide_directory_stops_at_the_unadmitted_child() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        for name in ["a", "b", "c"] {
+            fs::create_dir(cwd.path().join(name)).expect(name);
+        }
+        let fixture = summary_app(cwd.path()).await;
+        let generation = fixture.app.capture_generation();
+        let roots = [cwd.path().to_path_buf()];
+        assert!(
+            matches!(
+                workspace_limited(&generation, &roots, 160, 4),
+                WorkspaceRepositoryDiscovery::Complete(found) if found.is_empty()
+            ),
+            "the root plus three children is exactly four admitted directories"
+        );
+        match workspace_limited(&generation, &roots, 160, 3) {
+            WorkspaceRepositoryDiscovery::Incomplete { found, reason } => {
+                assert!(found.is_empty(), "{found:?}");
+                let unadmitted = reason
+                    .strip_prefix("directory work budget of 3 exhausted before root0/")
+                    .unwrap_or_else(|| panic!("{reason}"));
+                assert!(matches!(unadmitted, "a" | "b" | "c"), "{reason}");
+            }
+            WorkspaceRepositoryDiscovery::Complete(found) => {
+                panic!("the third child must stay unadmitted: {found:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_discovery_repo_budget_is_shared_and_names_the_unlisted_repository() {
+        let left = tempfile::tempdir().expect("left");
+        let right = tempfile::tempdir().expect("right");
+        let one = left.path().join("one");
+        let two = right.path().join("two");
+        init_marker_repo(&one, "README.md");
+        init_marker_repo(&two, "README.md");
+        let fixture = summary_app_with_roots(left.path(), &[right.path().to_path_buf()]).await;
+        match workspace_limited(
+            &fixture.app.capture_generation(),
+            &[left.path().to_path_buf(), right.path().to_path_buf()],
+            1,
+            100,
+        ) {
+            WorkspaceRepositoryDiscovery::Incomplete { found, reason } => {
+                assert_eq!(found, vec![two.canonicalize().expect("two")]);
+                assert_eq!(reason, "repository budget of 1 exhausted at root0/one");
+            }
+            WorkspaceRepositoryDiscovery::Complete(found) => {
+                panic!("the second root's repository is outside the shared budget: {found:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn workspace_discovery_reason_bounds_a_long_root_relative_path() {
+        let mut path = PathBuf::from("/workspace");
+        for index in 0..40 {
+            path.push(format!("segment{index:02}"));
+        }
+        let bounded = bounded_discovery_path(&[PathBuf::from("/workspace")], 0, &path);
+        assert!(bounded.starts_with("root0/segment00/"), "{bounded}");
+        assert!(bounded.ends_with("..."), "{bounded}");
+        assert_eq!(bounded.chars().count(), MAX_DISCOVERY_REASON_CHARS + 3);
+        assert!(!bounded.contains("/workspace"), "{bounded}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_discovery_denied_directory_is_absent_and_unreadable_directory_is_incomplete() {
+        use std::os::unix::fs::PermissionsExt;
+        let cwd = tempfile::tempdir().expect("cwd");
+        let denied = cwd.path().join("denied");
+        fs::create_dir(&denied).expect("denied");
+        init_marker_repo(&denied.join("hidden"), "README.md");
+        let allowed = cwd.path().join("allowed");
+        init_marker_repo(&allowed, "README.md");
+        let settings = format!(
+            "{{\"sandbox\":{{\"mode\":\"workspace-write\",\"deniedPaths\":[\"{}\"]}}}}",
+            denied.display()
+        );
+        let fixture = summary_app_with_settings(cwd.path(), &settings).await;
+        let generation = fixture.app.capture_generation();
+        let roots = [cwd.path().to_path_buf()];
+        match collect_workspace_repositories(&generation, &roots, RepositoryDiscoveryScope::Workspace) {
+            WorkspaceRepositoryDiscovery::Complete(found) => {
+                assert_eq!(found, vec![allowed.canonicalize().expect("allowed")]);
+            }
+            WorkspaceRepositoryDiscovery::Incomplete { reason, .. } => {
+                panic!("an exact denial is absence, not {reason}");
+            }
+        }
+        let blocked = cwd.path().join("blocked");
+        fs::create_dir(&blocked).expect("blocked");
+        fs::create_dir(blocked.join("child")).expect("child");
+        struct RestoreMode<'a>(&'a Path);
+        impl Drop for RestoreMode<'_> {
+            fn drop(&mut self) {
+                let mut permissions = fs::metadata(self.0).expect("metadata").permissions();
+                permissions.set_mode(0o700);
+                fs::set_permissions(self.0, permissions).expect("restore");
+            }
+        }
+        let _restore = RestoreMode(&blocked);
+        let mut permissions = fs::metadata(&blocked).expect("metadata").permissions();
+        permissions.set_mode(0o000);
+        fs::set_permissions(&blocked, permissions).expect("chmod");
+        match fs::read_dir(&blocked) {
+            Ok(_) => {
+                eprintln!("skipping unreadable-directory discovery: mode 000 is still readable");
+                return;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+            Err(error) => panic!("mode 000 must be unreadable or permission-denied, got {error}"),
+        }
+        let discovery = collect_workspace_repositories(&generation, &roots, RepositoryDiscoveryScope::Workspace);
+        match discovery {
+            WorkspaceRepositoryDiscovery::Incomplete { reason, .. } => {
+                assert_eq!(reason, "reading root0/blocked failed");
+            }
+            WorkspaceRepositoryDiscovery::Complete(found) => {
+                panic!("an unreadable directory must not publish {found:?}");
+            }
+        }
+    }
+
+    /// `/show <hex>` with a non-repository session workspace: the commit-child
+    /// search must be a COMPLETE bounded enumeration — every real child
+    /// repository is a candidate regardless of count, and the unique
+    /// containing repository resolves. Seventeen real repositories with
+    /// pairwise-distinct commits; the target sha is derived from r07, never a
+    /// literal.
+    #[tokio::test]
+    async fn show_commit_child_search_resolves_unique_real_commit_across_seventeen_repositories() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        for index in 0..17 {
+            let name = format!("r{index:02}");
+            let repo = cwd.path().join(&name);
+            fs::create_dir_all(&repo).expect("repo dir");
+            write(repo.join("content.txt").as_path(), &format!("unique content for {name}\n"));
+            git(&repo, &["init"]);
+            git(&repo, &["add", "content.txt"]);
+            git(&repo, &["commit", "-m", &format!("baseline {name}")]);
+        }
+        let target = head_id(&cwd.path().join("r07"));
+        let fixture = summary_app(cwd.path()).await;
+        let resolved = resolve_review_repository_root(&fixture.app, None, Some(target.as_str()))
+            .expect("the unique containing repository must resolve");
+        assert_eq!(
+            resolved,
+            cwd.path().join("r07").canonicalize().expect("r07"),
+            "the real r07 commit must resolve to exactly its own repository"
+        );
+    }
+
+    /// A real repository four directories below a non-repository workspace
+    /// root must still be reachable for `/show <hex>`: depth is bounded by
+    /// the shared discovery budget, never by a fixed level cap.
+    #[tokio::test]
+    async fn show_commit_child_search_resolves_real_commit_beyond_depth_three() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let repo = cwd.path().join("a").join("b").join("c").join("deep");
+        fs::create_dir_all(&repo).expect("repo dir");
+        git(&repo, &["init"]);
+        write(repo.join("content.txt").as_path(), "unique deep content\n");
+        git(&repo, &["add", "content.txt"]);
+        git(&repo, &["commit", "-m", "deep baseline"]);
+        let target = head_id(&repo);
+        let fixture = summary_app(cwd.path()).await;
+        let resolved = resolve_review_repository_root(&fixture.app, None, Some(target.as_str()))
+            .expect("the depth-4 repository must resolve");
+        assert_eq!(
+            resolved,
+            repo.canonicalize().expect("deep"),
+            "the real deep-repo commit must resolve to exactly that repository"
+        );
+    }
+
+    /// A Children-scope scan stopped by an injected low repository budget is
+    /// Incomplete with the precise root-relative stop point, and its `found`
+    /// stays a partial set — never the candidate set a commit search may
+    /// consume (same helper shape as the Workspace budget tests above).
+    #[tokio::test]
+    async fn children_scope_low_repository_budget_reports_partial_found_with_precise_reason() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        for index in 0..3 {
+            let name = format!("r{index:02}");
+            let repo = cwd.path().join(&name);
+            fs::create_dir_all(&repo).expect("repo dir");
+            write(repo.join("content.txt").as_path(), &format!("unique content for {name}\n"));
+            git(&repo, &["init"]);
+            git(&repo, &["add", "content.txt"]);
+            git(&repo, &["commit", "-m", &format!("baseline {name}")]);
+        }
+        let fixture = summary_app(cwd.path()).await;
+        let discovery = collect_workspace_repositories_iterative(
+            &fixture.app.capture_generation(),
+            &[cwd.path().to_path_buf()],
+            RepositoryDiscoveryScope::Children,
+            DiscoveryLimits {
+                max_repos: 2,
+                max_directory_work: 100,
+            },
+        );
+        match discovery {
+            WorkspaceRepositoryDiscovery::Incomplete { found, reason } => {
+                let mut expected = Vec::new();
+                for name in ["r00", "r01"] {
+                    expected.push(cwd.path().join(name).canonicalize().expect(name));
+                }
+                assert_eq!(found, expected);
+                assert_eq!(reason, "repository budget of 2 exhausted at root0/r02");
+            }
+            WorkspaceRepositoryDiscovery::Complete(found) => {
+                panic!("a two-repository budget must not publish {found:?}");
+            }
+        }
+    }
+
+    /// The `/show` refusal stays end-to-end: one unreadable directory stops
+    /// the Children scan even though an authorized sibling repository holds
+    /// the real target commit, and the error carries the walker's precise
+    /// stop reason instead of the old constant text. Skipped when mode 000 is
+    /// still readable (root).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn show_commit_refuses_partial_scan_and_names_the_stop_reason() {
+        use std::os::unix::fs::PermissionsExt;
+        let cwd = tempfile::tempdir().expect("cwd");
+        let blocked = cwd.path().join("blocked");
+        fs::create_dir(&blocked).expect("blocked");
+        fs::create_dir(blocked.join("child")).expect("child");
+        let repo = cwd.path().join("r00");
+        fs::create_dir_all(&repo).expect("repo dir");
+        write(repo.join("content.txt").as_path(), "unique content for r00\n");
+        git(&repo, &["init"]);
+        git(&repo, &["add", "content.txt"]);
+        git(&repo, &["commit", "-m", "baseline r00"]);
+        let target = head_id(&repo);
+        let fixture = summary_app(cwd.path()).await;
+        struct RestoreMode<'a>(&'a Path);
+        impl Drop for RestoreMode<'_> {
+            fn drop(&mut self) {
+                let mut permissions = fs::metadata(self.0).expect("metadata").permissions();
+                permissions.set_mode(0o700);
+                fs::set_permissions(self.0, permissions).expect("restore");
+            }
+        }
+        let _restore = RestoreMode(&blocked);
+        let mut permissions = fs::metadata(&blocked).expect("metadata").permissions();
+        permissions.set_mode(0o000);
+        fs::set_permissions(&blocked, permissions).expect("chmod");
+        match fs::read_dir(&blocked) {
+            Ok(_) => {
+                eprintln!("skipping unreadable-directory refusal: mode 000 is still readable");
+                return;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+            Err(error) => panic!("mode 000 must be unreadable or permission-denied, got {error}"),
+        }
+        let error = resolve_review_repository_root(&fixture.app, None, Some(target.as_str()))
+            .expect_err("a partial scan must refuse to resolve even a held commit");
+        let message = error.to_string();
+        assert!(message.contains("code review repository discovery was incomplete"), "{message}");
+        assert!(message.contains("refusing to resolve commit"), "{message}");
+        assert!(message.contains(&target), "{message}");
+        assert!(message.contains("partial scan"), "{message}");
+        assert!(
+            message.contains("reading root0/blocked failed"),
+            "the refusal must carry the walker's precise stop reason: {message}"
+        );
+    }
+
+    /// One real commit present in TWO sibling repositories (fetched into the
+    /// second's object database) is ambiguous: `/show` must refuse instead of
+    /// silently picking the first match.
+    #[tokio::test]
+    async fn show_commit_child_search_reports_a_real_shared_commit_as_ambiguous() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        for name in ["left", "right"] {
+            let repo = cwd.path().join(name);
+            fs::create_dir_all(&repo).expect("repo dir");
+            write(repo.join("content.txt").as_path(), &format!("unique content for {name}\n"));
+            git(&repo, &["init"]);
+            git(&repo, &["add", "content.txt"]);
+            git(&repo, &["commit", "-m", &format!("baseline {name}")]);
+        }
+        let shared = head_id(&cwd.path().join("left"));
+        git(&cwd.path().join("right"), &["fetch", "../left", "main"]);
+        let fixture = summary_app(cwd.path()).await;
+        let error = resolve_review_repository_root(&fixture.app, None, Some(shared.as_str()))
+            .expect_err("a commit in two repositories must not silently pick one");
+        let message = error.to_string();
+        assert!(message.contains("is ambiguous"), "{message}");
+        assert!(message.contains("left"), "{message}");
+        assert!(message.contains("right"), "{message}");
+    }
+
+    /// The Children scan stops at every found repository on the unified
+    /// walker: a nested repository inside a found one is never a candidate,
+    /// so a nested-only real commit reports absence instead of misresolving
+    /// into the outer repository. Workspace-scope nested descent stays pinned
+    /// by workspace_discovery_completes_past_depth_three_and_sixteen_repos.
+    #[tokio::test]
+    async fn children_scope_stops_at_found_repositories_so_nested_interiors_stay_out_of_scope() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let outer = cwd.path().join("outer");
+        fs::create_dir_all(&outer).expect("outer");
+        git(&outer, &["init"]);
+        write(outer.join("content.txt").as_path(), "unique content for outer\n");
+        git(&outer, &["add", "content.txt"]);
+        git(&outer, &["commit", "-m", "baseline outer"]);
+        let nested = outer.join("inner");
+        fs::create_dir_all(&nested).expect("nested");
+        git(&nested, &["init"]);
+        write(nested.join("content.txt").as_path(), "unique content for inner\n");
+        git(&nested, &["add", "content.txt"]);
+        git(&nested, &["commit", "-m", "baseline inner"]);
+        let nested_only = head_id(&nested);
+        let fixture = summary_app(cwd.path()).await;
+        let generation = fixture.app.capture_generation();
+        let roots = [cwd.path().to_path_buf()];
+        match collect_workspace_repositories(&generation, &roots, RepositoryDiscoveryScope::Children) {
+            WorkspaceRepositoryDiscovery::Complete(found) => {
+                assert_eq!(found, vec![outer.canonicalize().expect("outer")]);
+            }
+            WorkspaceRepositoryDiscovery::Incomplete { found, reason } => {
+                panic!("the child search must complete at the outer boundary: {reason} {found:?}");
+            }
+        }
+        let error = resolve_review_repository_root(&fixture.app, None, Some(nested_only.as_str()))
+            .expect_err("a nested-only commit is outside the child-search territory");
+        assert!(
+            error.to_string().contains("no reachable repository contains commit"),
+            "{error}"
+        );
+    }
+
+
+
+
+
+
+
+
 }

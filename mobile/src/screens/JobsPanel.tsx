@@ -4,6 +4,8 @@ import {
   applyJobUpdated,
   elapsedMs,
   formatDuration,
+  isLiveJobStatus,
+  jobStatusLabel,
   parseJobList,
   subagentJobBucket,
   SUBAGENT_FILTER_LABEL,
@@ -15,16 +17,41 @@ import {
   parseHubSendResult,
   parseJobOutput,
   parseTaskSpawnSpawns,
+  type AgentHistoryData,
   type JobWire as JobOutputWire,
   type RunnerCommand,
 } from '../protocol';
 import { redactSecrets } from '../redact';
 import type { RunnerClient } from '../runnerClient';
+import { messagesToItems } from '../transcriptItems';
+import { TranscriptItemView } from '../TranscriptItemView';
 import { AppBar, styles, type Palette } from '../ui';
 
 const FILTERS: SubagentJobFilter[] = ['running', 'completed'];
-const HISTORY_LINES = 200;
+const HISTORY_LIMIT = 200;
 const HISTORY_POLL_MS = 2000;
+
+/** Per-agent details history lifecycle: loading on first open, error when a
+ *  load failed without last-good data, ready once rows landed. */
+type HistoryEntry = { status: 'loading' } | { status: 'error' } | { status: 'ready'; data: AgentHistoryData };
+
+/** Explicit account of withheld history rows; null when nothing was omitted.
+ *  An empty transcript over the size budget names the limit instead of
+ *  posing as ordinary empty history. */
+function historyTruncationText(data: AgentHistoryData): string | null {
+  const { omittedRows, reason } = data.truncation;
+  if (reason === 'none' && omittedRows === 0) return null;
+  const unit = `${omittedRows} message${omittedRows === 1 ? '' : 's'}`;
+  if (data.messages.length === 0 && (reason === 'bytes' || reason === 'limit_and_bytes')) {
+    return `Messages exceed the history size limit — ${unit} withheld, nothing to show.`;
+  }
+  if (reason === 'none') return `${unit} omitted from the loaded history.`;
+  const cause = reason === 'limit'
+    ? 'the history limit'
+    : reason === 'bytes' ? 'the history size limit' : 'the history limit and the size limit';
+  return `${unit} omitted by ${cause}.`;
+}
+
 const MESSAGE_LIMIT = 64;
 const OUTPUT_LIMIT = 800;
 
@@ -151,7 +178,7 @@ export function JobsPanel(props: {
   const [outputJobId, setOutputJobId] = useState<string | null>(null);
   const [outputs, setOutputs] = useState<Record<string, JobOutputWire>>({});
   const [detailsJobId, setDetailsJobId] = useState<string | null>(null);
-  const [historyByAgent, setHistoryByAgent] = useState<Record<string, string>>({});
+  const [historyByAgent, setHistoryByAgent] = useState<Record<string, HistoryEntry>>({});
 
   if (owner.current.sessionId !== props.sessionId) {
     retireOwner(owner.current);
@@ -237,18 +264,29 @@ export function JobsPanel(props: {
   }, [props.client]);
 
   const detailsJob = detailsJobId === null ? null : (jobs ?? []).find((job) => job.id === detailsJobId) ?? null;
-  const detailsLive = detailsJob !== null
-    && (detailsJob.status === 'queued' || detailsJob.status === 'running');
+  const detailsLive = detailsJob !== null && isLiveJobStatus(detailsJob.status);
 
   const loadHistory = useCallback(async (agentId: string, requestSeq: number): Promise<void> => {
     const current = owner.current;
     try {
-      const parsed = parseAgentHistory(await rpc({ type: 'agent_history', agentId, lines: HISTORY_LINES }, current.sessionId));
+      const parsed = parseAgentHistory(await rpc({ type: 'agent_history', agentId, limit: HISTORY_LIMIT }, current.sessionId));
       if (!owns(current) || current.historySeq !== requestSeq) return;
       if (!parsed || parsed.agentId !== agentId) throw new Error('invalid agent_history');
-      setHistoryByAgent((prev) => (prev[agentId] === parsed.text ? prev : { ...prev, [agentId]: parsed.text }));
+      // Identity-stable across polls: an unchanged transcript keeps the same
+      // ready entry (and projected items), so folds and copy state survive.
+      const next = JSON.stringify({ messages: parsed.messages, truncation: parsed.truncation });
+      setHistoryByAgent((prev) => {
+        const previous = prev[agentId];
+        if (previous?.status === 'ready' && JSON.stringify({ messages: previous.data.messages, truncation: previous.data.truncation }) === next) return prev;
+        return { ...prev, [agentId]: { status: 'ready', data: parsed } };
+      });
     } catch (error) {
-      if (owns(current) && current.historySeq === requestSeq) report('History', error);
+      if (owns(current) && current.historySeq === requestSeq) {
+        // Last-good history stays on screen; only a first load that failed
+        // downgrades to the error marker (the message itself is central).
+        setHistoryByAgent((prev) => (prev[agentId]?.status === 'loading' ? { ...prev, [agentId]: { status: 'error' } } : prev));
+        report('History', error);
+      }
     }
   }, [props.client, props.onError]);
 
@@ -259,6 +297,9 @@ export function JobsPanel(props: {
     const current = owner.current;
     current.historySeq += 1;
     const seq = current.historySeq;
+    // First open shows the loading marker; last-good data stays while a poll
+    // refreshes it in place.
+    setHistoryByAgent((prev) => (prev[agentId]?.status === 'ready' ? prev : { ...prev, [agentId]: { status: 'loading' } }));
     void loadHistory(agentId, seq);
     if (!detailsLive) return;
     const timer = setInterval(() => {
@@ -273,6 +314,14 @@ export function JobsPanel(props: {
     if (!jobs) return [];
     return jobs.filter((job) => subagentJobBucket(job.status) === filter);
   }, [jobs, filter]);
+
+  const detailsAgentId = detailsJob?.agentId ?? null;
+  const detailsHistory = detailsAgentId !== null ? historyByAgent[detailsAgentId] : undefined;
+  const detailsItems = useMemo(
+    () => (detailsHistory?.status === 'ready' ? messagesToItems(detailsHistory.data.messages) : []),
+    [detailsHistory],
+  );
+  const detailsTruncation = detailsHistory?.status === 'ready' ? historyTruncationText(detailsHistory.data) : null;
 
   const spawn = async () => {
     const current = owner.current;
@@ -465,8 +514,7 @@ export function JobsPanel(props: {
               const elapsed = elapsedMs(job, now);
               const label = redactSecrets(job.description || job.agent || job.id);
               const output = outputs[job.id];
-              const history = historyByAgent[job.agentId] ?? '';
-              const live = job.status === 'running' || job.status === 'queued';
+              const live = isLiveJobStatus(job.status);
               return (
                 <View key={job.id} style={[styles.listRow, { backgroundColor: palette.surface, borderBottomColor: palette.border, flexDirection: 'column', alignItems: 'stretch' }]}>
                   <View style={row}>
@@ -479,7 +527,7 @@ export function JobsPanel(props: {
                         {label}
                       </Text>
                       <Text style={[styles.rowSub, { color: palette.muted }]}>
-                        {job.status}{elapsed != null ? ` · ${formatDuration(elapsed)}` : ''}
+                        {jobStatusLabel(job.status)}{elapsed != null ? ` · ${formatDuration(elapsed)}` : ''}
                       </Text>
                     </View>
                     {live && (
@@ -506,9 +554,27 @@ export function JobsPanel(props: {
                     </Text>
                   )}
                   {detailsJobId === job.id && (
-                    <Text style={[styles.rowSub, { color: palette.fg }]} accessibilityLabel={`History ${job.id}`}>
-                      {history ? redactSecrets(history) : '--'}
-                    </Text>
+                    <View style={{ gap: 4 }} accessibilityLabel={`History ${job.id}`}>
+                      {(detailsHistory === undefined || detailsHistory.status === 'loading') && (
+                        <Text style={[styles.rowSub, { color: palette.muted }]} accessibilityLabel={`History loading ${job.id}`}>…</Text>
+                      )}
+                      {detailsHistory?.status === 'error' && (
+                        <Text style={[styles.rowSub, { color: palette.muted }]} accessibilityLabel={`History empty ${job.id}`}>--</Text>
+                      )}
+                      {detailsHistory?.status === 'ready' && (
+                        <>
+                          {detailsTruncation !== null && (
+                            <Text style={[styles.rowSub, { color: palette.muted }]} accessibilityLabel={`History notice ${job.id}`}>
+                              {detailsTruncation}
+                            </Text>
+                          )}
+                          {detailsItems.length === 0 && detailsTruncation === null && (
+                            <Text style={[styles.rowSub, { color: palette.muted }]} accessibilityLabel={`History empty ${job.id}`}>--</Text>
+                          )}
+                          {detailsItems.map((item) => <TranscriptItemView key={item.id} item={item} palette={palette} />)}
+                        </>
+                      )}
+                    </View>
                   )}
                   <TextInput
                     style={[styles.input, { backgroundColor: palette.bg, borderColor: palette.border, color: palette.fg }]}

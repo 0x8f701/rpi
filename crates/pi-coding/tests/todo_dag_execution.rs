@@ -66,7 +66,7 @@ fn definition() -> AgentDefinition {
 
 fn parent_session(cwd: &std::path::Path, model: Model) -> Session {
     let session = Session::new(SessionOptions {
-        model,
+        model: Some(model),
         cwd: cwd.to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,
@@ -223,7 +223,7 @@ fn controlled_dag(
                 })
             });
             Session::new(SessionOptions {
-                model: request.model,
+                model: Some(request.model),
                 cwd: std::env::current_dir().expect("cwd"),
                 system_prompt: request.system_prompt,
                 thinking_level: ThinkingLevel::Off,
@@ -244,7 +244,7 @@ fn controlled_dag(
         OrchestrationConfig::new(AgentCatalog::from_agents(vec![definition()]), artifact_dir);
     config.max_concurrency = max_concurrency;
     config.idle_ttl = None;
-    config.parent_model = model;
+    config.parent_model = Some(model);
     ControlledDag {
         runtime: OrchestrationRuntime::new(config, factory).expect("orchestration runtime"),
         started,
@@ -348,7 +348,7 @@ async fn todo_tool_in_normal_session_auto_arms_subagent_jobs() {
     let (model, _dag_provider) = registered_dag_model();
     let session = Session::new_with_todo_and_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model,
+            model: Some(model),
             cwd: root.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -563,7 +563,8 @@ async fn failed_and_cancelled_owners_stay_open_and_terminal_reconciliation_is_id
     assert_eq!(
         controlled
             .runtime
-            .cancel_jobs(std::slice::from_ref(&cancel_job.id)),
+            .cancel_jobs_result(std::slice::from_ref(&cancel_job.id))
+            .expect("cancel todo owner"),
         vec![cancel_job.id.clone()]
     );
     let settled = wait_all_settled(&controlled.runtime, 2).await;
@@ -650,7 +651,7 @@ fn agent_routing_dag(
                 })
             });
             Session::new(SessionOptions {
-                model: request.model,
+                model: Some(request.model),
                 cwd: std::env::current_dir().expect("cwd"),
                 system_prompt: request.system_prompt,
                 thinking_level: ThinkingLevel::Off,
@@ -670,7 +671,7 @@ fn agent_routing_dag(
     let mut config = OrchestrationConfig::new(AgentCatalog::from_agents(agents), artifact_dir);
     config.max_concurrency = 4;
     config.idle_ttl = None;
-    config.parent_model = model;
+    config.parent_model = Some(model);
     config.default_agent = "writer".to_owned();
     OrchestrationRuntime::new(config, factory).expect("orchestration runtime")
 }

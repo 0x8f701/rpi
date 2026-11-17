@@ -113,7 +113,7 @@ fn faux_session_in(
         error_message: None,
     }]);
     let session = Session::new(SessionOptions {
-        model,
+        model: Some(model),
         cwd,
         system_prompt: String::new(),
         thinking_level: pi_agent::ThinkingLevel::Off,
@@ -456,7 +456,7 @@ async fn spawn_app(tools: &str, disallowed: Option<&str>) -> SpawnApp {
         cwd.join("artifacts"),
     );
     config.idle_ttl = None;
-    config.parent_model = session.model().expect("parent model");
+    config.parent_model = Some(session.model().expect("parent model"));
 
     let (sender, children) = tokio::sync::mpsc::unbounded_channel();
     let inner =

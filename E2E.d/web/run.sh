@@ -339,7 +339,7 @@
 #                                        same way, zero browser errors
 #   realtime_rpc realtime_rpc.sh         user-visible realtime
 #                                        start/error/stop against the REAL
-#                                        Rust proxy: #mic-btn dispatches
+#                                        Rust proxy: #live-btn dispatches
 #                                        realtime_create_call + mock validates
 #                                        the JSON sdp and complete session,
 #                                        live overlay ("realtime voice" +
@@ -354,6 +354,16 @@
 #                                        stable transcript surface) + mobile
 #                                        390x844 flush edges with zero
 #                                        horizontal overflow
+#   compact_badge compact_badge.sh         real post-turn threshold
+#                                        compaction: the page's own stream
+#                                        watchdog state read paints
+#                                        #compact-badge (--accent token,
+#                                        dark + light, reduced motion,
+#                                        390x844 in flight and after the
+#                                        end), the real compaction_end + an
+#                                        idle authority hide it promptly,
+#                                        with no false get_state snapshot
+#                                        before the hide
 #   personas  personas.sh                persistent persona definitions:
 #                                        list with memory/session counts,
 #                                        view definition, select as
@@ -379,7 +389,8 @@
 #                                        with no transcript
 #   chat      chat.sh                    durable /chat runner registry against
 #                                        two real isolated listeners: scoped
-#                                        auth, probe, reload, independent
+#                                        auth, probe, reload, pagehide/pageshow
+#                                        original-session /goal, independent
 #                                        reconnect, and deletion cleanup
 #   todo_child_session todo_child_session.sh
 #                                        real Todo-child Web session
@@ -427,6 +438,17 @@
 #                                        selection, remains selected (idle +
 #                                        streaming), per-session levels across
 #                                        switches and reload/bootstrap restores
+#   reply_actions reply_actions.sh    reply row favorite/copy-markdown/save.md
+#                                        (frozen data-reply-action interface):
+#                                        byte-exact clipboard + UTF-8 download
+#                                        of the EXISTING rich mock constants,
+#                                        stable filename (summary <=30 unicode
+#                                        points + local YYYYMMDD-HHmmss)
+#                                        across two saves + reload + phone,
+#                                        vertical three-button stack (star
+#                                        topmost), always-visible >=44px
+#                                        touch, copy-fail central toast, blob
+#                                        create/revoke 1:1, /chat hard leg
 #
 # Every lane is a playwright-only hard gate: it requires node and a usable
 # Chromium path (system Chrome/Chromium or playwright's bundled chromium) and
@@ -455,7 +477,7 @@ export RPI_WEB_PLAYWRIGHT_DIR RPI_WEB_PLAYWRIGHT_READY
 
 
 # Every lane script in the suite (core.sh = the shared core lane).
-LANES="core goal xss abort scroll reconnect readygate switch mobile auth auth_tokenless extras sessions sessions_workflow session_restore session_ux sidebar_menu_rename sidebar_rail projects commands_review loop_goal attachments slowclient external_sessions files_latency switch_catalog_identity session_move_delete presentation turn_error panel_chrome realtime_webrtc readygate_spawn code_review_paging code_review_side_chat code_review_reply_lifecycle skill_completion realtime_rpc appborder personas stt_rpc chat chat_mermaid todo_child_session mermaid_viewer runtime_matrix session_path_complete thinking_level code_review_expand code_review_submodule code_review_operations plugin_command processes"
+LANES="core goal xss abort scroll reconnect readygate switch mobile auth auth_tokenless extras sessions sessions_workflow session_restore session_ux sidebar_menu_rename sidebar_rail projects commands_review loop_goal attachments slowclient external_sessions files_latency switch_catalog_identity session_move_delete presentation turn_error compact_badge panel_chrome realtime_webrtc readygate_spawn code_review_paging code_review_side_chat code_review_reply_lifecycle skill_completion realtime_rpc appborder personas stt_rpc chat chat_mermaid todo_child_session mermaid_viewer runtime_matrix session_path_complete thinking_level code_review_expand code_review_submodule code_review_operations plugin_command processes reply_actions"
 # Coverage collection and pressure/stress/resource-sensitive lanes stay
 # serial even when ordinary independent UI lanes overlap. Same-port
 # kill/respawn and multi-phase discovery/media lanes are not overlapped.

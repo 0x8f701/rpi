@@ -72,10 +72,17 @@
 //   S7.1 pre-switch unpin registered (session A is genuinely unpinned)
 //   S7.2 a new session activates with its own empty view + echo round-trip
 //   S7.3 switching back restores the saved unpinned viewport without bottom pinning
+//   S8.1 desktop: the real scroll-to-bottom control is opacity 0 until hover,
+//        a 44px transparent circle, and it does not cover the native thumb
+//        or the composer
+//   S8.2 keyboard focus makes that control visible
+//   S8.3 click reaches gap 0; the next real reply stays visible there; a wheel-up is adopted only after remaining stays above the pin tolerance for two frames, then another turn is not pulled back
+//   S8.4 mobile 390x844 touch keeps the same control visible
 
 import { chromium } from 'playwright';
 import fs from 'node:fs';
-import { createFreshSessionViaManage } from './lib/session-lifecycle.mjs';
+import { closeManageSession, createFreshSessionViaManage } from './lib/session-lifecycle.mjs';
+import { openSessionsDrawer } from './lib/feature-menu.mjs';
 
 const url = process.env.RPI_URL;
 const token = process.env.RPI_TOKEN || '';
@@ -267,6 +274,7 @@ const DOCUMENTED_IDS = [
   'S5.1', 'S5.2',
   'S6.1', 'S6.3', 'S6.2',
   'S7.1', 'S7.2', 'S7.3',
+  'S8.1', 'S8.2', 'S8.3', 'S8.4',
 ];
 const executed = new Map(); // id -> exact execution count (per-ID ledger, no Set erasure)
 const assertionsLog = [];
@@ -791,8 +799,8 @@ async function main() {
     }
     record('S7.1');
     await markPhase('S7-switch');
-    if (await page.locator('#sidebar-toggle-btn').getAttribute('aria-pressed') !== 'true') {
-      await page.click('#sidebar-toggle-btn');
+    if (!await page.evaluate(() => document.querySelector('.app-layout')?.classList.contains('app-layout--drawer-open') === true)) {
+      await openSessionsDrawer(page);
     }
 
     await createFreshSessionViaManage(page, waitFor, 'S7.2', { closePanel: true });
@@ -872,6 +880,112 @@ async function main() {
     }
     record('S7.3');
     await page.screenshot({ path: `${evidence}/scroll-s7-switched-back.png`, fullPage: true });
+    /* ---------------- S8: real scroll-to-bottom control ---------------- */
+    await closeManageSession(page, waitFor, 'S8');
+    const scrollBtn = page.locator('button.transcript-scroll-bottom');
+    const bottomControl = () => {
+      const btn = document.querySelector('button.transcript-scroll-bottom');
+      const port = btn?.closest('.transcript-scrollport') ?? null;
+      const transcript = document.getElementById('transcript');
+      const footer = document.querySelector('.app-main > footer');
+      if (!btn || !port || !transcript || !footer) return null;
+      const style = getComputedStyle(btn);
+      const box = btn.getBoundingClientRect();
+      const portBox = port.getBoundingClientRect();
+      const footBox = footer.getBoundingClientRect();
+      const gutter = transcript.offsetWidth - transcript.clientWidth;
+      return {
+        label: btn.getAttribute('aria-label'),
+        opacity: style.opacity,
+        radius: style.borderRadius,
+        background: style.backgroundColor,
+        w: box.width,
+        h: box.height,
+        rightGap: portBox.right - box.right,
+        gutter,
+        aboveFooter: box.bottom <= footBox.top + 1,
+        tabIndex: btn.tabIndex,
+      };
+    };
+    await page.mouse.move(8, 8);
+    const idle = await page.evaluate(bottomControl);
+    if (!idle) fail('S8.1: transcript scrollport or scroll-to-bottom control missing');
+    if (idle.label !== 'Scroll to bottom') fail(`S8.1: aria-label is ${JSON.stringify(idle.label)}`);
+    if (Number(idle.opacity) !== 0) fail(`S8.1: desktop idle opacity is ${idle.opacity}, expected 0`);
+    if (idle.w < 44 || idle.h < 44) fail(`S8.1: control is ${idle.w}x${idle.h}, expected a 44px target`);
+    if (idle.radius !== '50%') fail(`S8.1: control is not circular (border-radius ${idle.radius})`);
+    if (!/rgba\(0,\s*0,\s*0,\s*0\)|transparent/.test(idle.background)) {
+      fail(`S8.1: control background is not transparent (${idle.background})`);
+    }
+    if (!(idle.rightGap > idle.gutter)) {
+      fail(`S8.1: control covers the native thumb (right gap ${idle.rightGap}px, gutter ${idle.gutter}px)`);
+    }
+    if (!idle.aboveFooter) fail('S8.1: control overlaps the composer');
+    record('S8.1');
+
+    await scrollBtn.hover();
+    await waitFor(page, () => getComputedStyle(document.querySelector('button.transcript-scroll-bottom')).opacity === '1', 'S8.1: hover opacity did not settle to 1');
+    const hovered = await page.evaluate(bottomControl);
+    if (!hovered || Number(hovered.opacity) === 0) fail(`S8.1: hover left the control invisible (${hovered?.opacity})`);
+    if (hovered.w < 44 || hovered.h < 44) fail(`S8.1: hovered control is ${hovered.w}x${hovered.h}`);
+    if (!/rgba\(0,\s*0,\s*0,\s*0\)|transparent/.test(hovered.background)) {
+      fail(`S8.1: hovered control background is not transparent (${hovered.background})`);
+    }
+    await page.screenshot({ path: `${evidence}/scroll-s8-hover.png`, fullPage: true });
+
+    await page.mouse.move(8, 8);
+    await waitFor(page, () => getComputedStyle(document.querySelector('button.transcript-scroll-bottom')).opacity === '0', 'S8.2: pointer left but hover opacity stayed');
+    await page.locator('#prompt-input').click();
+    for (let n = 0; n < 8 && await scrollBtn.evaluate((el) => document.activeElement !== el); n++) await page.keyboard.press('Shift+Tab');
+    await waitFor(page, () => { const el = document.querySelector('button.transcript-scroll-bottom'); const s = getComputedStyle(el); return document.activeElement === el && el.matches(':focus-visible') && s.opacity === '1' && s.outlineStyle !== 'none'; }, 'S8.2: keyboard focus-visible did not settle');
+    await page.screenshot({ path: `${evidence}/scroll-s8-focus.png`, fullPage: true });
+    record('S8.2');
+
+    const beforeClick = await transcriptMetrics(page);
+    if (!beforeClick || beforeClick.remaining <= PIN_MAX_REMAINING) fail('S8.3: transcript was not scrolled away before the click');
+    await scrollBtn.click();
+    await waitFor(page, (n) => { const el = document.getElementById('transcript'); return !!el && el.scrollHeight - el.scrollTop - el.clientHeight <= n; }, 'S8.3: click left a gap', 15000, PIN_MAX_REMAINING);
+    await page.fill('#prompt-input', 'scroll-s83-a'); await page.press('#prompt-input', 'Enter');
+    await waitFor(page, (n) => { const el = document.getElementById('transcript'); const row = [...(el?.querySelectorAll('.msg') || [])].find((m) => (m.textContent || '').includes('scroll-unrouted: scroll-s83-a')); if (!el || !row) return false; const vb = el.getBoundingClientRect(), rb = row.getBoundingClientRect(); return el.scrollHeight - el.scrollTop - el.clientHeight <= n && rb.height > 0 && rb.top >= vb.top - n && rb.bottom <= vb.bottom + n; }, 'S8.3: new tail was not pinned and visible', 30000, PIN_MAX_REMAINING);
+    const pinnedTop = (await transcriptMetrics(page)).scrollTop;
+    const at = await page.locator('#transcript').boundingBox();
+    await page.mouse.move(at.x + 30, at.y + at.height / 2);
+    await page.evaluate(() => { window.__s83Wheel = { scrollTop: null, frames: 0 }; });
+    await page.mouse.wheel(0, -400);
+    const awayHandle = await page.waitForFunction((s) => {
+      const el = document.getElementById('transcript');
+      if (!el) return null;
+      const scrollTop = el.scrollTop;
+      const remaining = el.scrollHeight - scrollTop - el.clientHeight;
+      const probe = window.__s83Wheel;
+      const landed = scrollTop < s.top - s.n && remaining > s.n;
+      if (!landed || probe.scrollTop !== scrollTop) {
+        probe.scrollTop = landed ? scrollTop : null;
+        probe.frames = landed ? 1 : 0;
+        return null;
+      }
+      probe.frames += 1;
+      if (probe.frames < 2) return null;
+      return { scrollTop, clientHeight: el.clientHeight, scrollHeight: el.scrollHeight, remaining };
+    }, { top: pinnedTop, n: PIN_MAX_REMAINING }, { timeout: 5000, polling: 'raf' });
+    const away = await awayHandle.jsonValue();
+    await page.fill('#prompt-input', 'scroll-s83-b'); await page.press('#prompt-input', 'Enter');
+    await waitFor(page, (s) => { const el = document.getElementById('transcript'); return !!el && el.textContent.includes('scroll-unrouted: scroll-s83-b') && Math.abs(el.scrollTop - s.top) <= s.n && el.scrollHeight - el.scrollTop - el.clientHeight > s.n; }, 'S8.3: later turn pulled the wheeled view back', 30000, { top: away.scrollTop, n: PIN_MAX_REMAINING });
+    record('S8.3');
+
+    await page.setViewportSize({ width: 390, height: 844 });
+    const cdp = await page.context().newCDPSession(page);
+    await cdp.send('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 1 });
+    await waitFor(page, () => matchMedia('(pointer: coarse)').matches && matchMedia('(hover: none)').matches, 'S8.4: touch media did not match');
+    await page.mouse.move(8, 8);
+    await waitFor(page, () => getComputedStyle(document.querySelector('button.transcript-scroll-bottom')).opacity === '1', 'S8.4: touch opacity did not settle to 1');
+    await page.screenshot({ path: `${evidence}/scroll-s8-touch.png`, fullPage: true });
+    const mobile = await page.evaluate(bottomControl);
+    if (!mobile) fail('S8.4: scroll-to-bottom control missing at 390x844');
+    if (mobile.w < 44 || mobile.h < 44) fail(`S8.4: touch target is ${mobile.w}x${mobile.h}`);
+    record('S8.4');
+    await cdp.send('Emulation.setTouchEmulationEnabled', { enabled: false });
+    await page.setViewportSize({ width: 1280, height: 600 });
 
     /* ---------------- evidence + metrics ---------------- */
     const missing = DOCUMENTED_IDS.filter((id) => !executed.has(id));

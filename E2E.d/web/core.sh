@@ -52,6 +52,7 @@ ABORTED_TAIL="-done"             # never rendered when abort cuts the stream
 # ---------------------------------------------------------------------------
 start_mock() { # root -> prints port
     local root="$1" evidence="$2" port_file="$root/mock-port.txt" deadline port
+    RPI_TASK_BARRIER_DIR="$evidence" \
     python3 "$E2E_DIR/lib/user_mock_server.py" --scenario steering --port-file "$port_file" \
         >"$evidence/mock-server.log" 2>&1 &
     register_pid $!
@@ -144,6 +145,7 @@ run_playwright() {
     cp "$SCRIPT_DIR/playwright_test.mjs" "$work/playwright_test.mjs"
     mkdir -p "$work/lib"
     cp "$SCRIPT_DIR/lib/session-lifecycle.mjs" "$work/lib/session-lifecycle.mjs"
+    cp "$SCRIPT_DIR/lib/feature-menu.mjs" "$work/lib/feature-menu.mjs" || return 1
     # Hard-coverage mode: preload the V8 coverage hook (node --import) and
     # name payloads after this lane so step 6's payload check finds them.
     local -a node_preload=()
@@ -152,6 +154,7 @@ run_playwright() {
     fi
     (cd "$work" && RPI_URL="$url" RPI_TOKEN="$TOKEN" \
     RPI_SLOW_TAIL="$SLOW_TAIL" RPI_FAST_REPLY="$FAST_REPLY" RPI_ABORTED_TAIL="$ABORTED_TAIL" \
+    RPI_TASK_BARRIER_DIR="$evidence" \
     RPI_CHROME="$chrome" RPI_EVIDENCE="$evidence" \
     RPI_COVERAGE_DIR="${RPI_COVERAGE_DIR:-}" RPI_COVERAGE_LANE="core" \
         node "${node_preload[@]}" playwright_test.mjs)

@@ -1098,7 +1098,7 @@ esac
             std::fs::create_dir_all(&session_dir).expect("video test session dir");
             let session = pi_coding::Session::new_with_additional_tools_filtered_and_discovery(
                 pi_coding::SessionOptions {
-                    model,
+                    model: Some(model),
                     cwd: cwd.to_path_buf(),
                     system_prompt: String::new(),
                     thinking_level: pi_agent::ThinkingLevel::Off,

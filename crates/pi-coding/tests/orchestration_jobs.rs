@@ -104,7 +104,7 @@ fn controlled_runtime(artifact_dir: &std::path::Path, max_concurrency: usize) ->
                 })
             });
             Session::new(SessionOptions {
-                model: request.model,
+                model: Some(request.model),
                 cwd: std::env::current_dir().expect("cwd"),
                 system_prompt: request.system_prompt,
                 thinking_level: ThinkingLevel::Off,
@@ -124,13 +124,13 @@ fn controlled_runtime(artifact_dir: &std::path::Path, max_concurrency: usize) ->
         OrchestrationConfig::new(AgentCatalog::from_agents(vec![definition()]), artifact_dir);
     config.max_concurrency = max_concurrency;
     config.idle_ttl = None;
-    config.parent_model = Model {
+    config.parent_model = Some(Model {
         id: "supervision-test".to_owned(),
         name: "Supervision Test".to_owned(),
         api: "supervision-test".to_owned(),
         provider: "supervision-test".to_owned(),
         ..Model::default()
-    };
+    });
     ControlledRuntime {
         runtime: OrchestrationRuntime::new(config, factory).expect("runtime"),
         current,
@@ -371,7 +371,7 @@ async fn hub_cancel_terminates_child_and_retains_cancelled_result() {
     ))
     .await
     .expect("hub cancel");
-    assert_eq!(cancel.details["cancelled"], json!([spawn.job_id]));
+    assert_eq!(cancel.details["cancellationRequested"], json!([spawn.job_id]));
 
     let waited = (hub.execute)(context(
         "wait-cancelled",
@@ -484,7 +484,7 @@ async fn cancellation_settles_when_child_stream_ignores_abort() {
                 })
             });
             Session::new(SessionOptions {
-                model: request.model,
+                model: Some(request.model),
                 cwd: std::env::current_dir().expect("cwd"),
                 system_prompt: request.system_prompt,
                 thinking_level: ThinkingLevel::Off,
@@ -524,7 +524,9 @@ async fn cancellation_settles_when_child_stream_ignores_abort() {
     wait_for_count(&started_count, &started, 1, "abort-ignoring child").await;
 
     assert_eq!(
-        runtime.cancel_jobs(std::slice::from_ref(&spawn.job_id)),
+        runtime
+            .cancel_jobs_result(std::slice::from_ref(&spawn.job_id))
+            .expect("cancel abort-ignoring child"),
         vec![spawn.job_id.clone()]
     );
     let jobs = tokio::time::timeout(
@@ -1464,7 +1466,7 @@ fn scripted_runtime(
                 })
             });
             Session::new(SessionOptions {
-                model: request.model,
+                model: Some(request.model),
                 cwd: std::env::current_dir().expect("cwd"),
                 system_prompt: request.system_prompt,
                 thinking_level: ThinkingLevel::Off,
@@ -1484,13 +1486,13 @@ fn scripted_runtime(
         OrchestrationConfig::new(AgentCatalog::from_agents(vec![definition()]), artifact_dir);
     config.idle_ttl = None;
     config.soft_budget = budget;
-    config.parent_model = Model {
+    config.parent_model = Some(Model {
         id: "soft-budget-test".to_owned(),
         name: "Soft Budget Test".to_owned(),
         api: "soft-budget-test".to_owned(),
         provider: "soft-budget-test".to_owned(),
         ..Model::default()
-    };
+    });
     OrchestrationRuntime::new(config, factory).expect("runtime")
 }
 

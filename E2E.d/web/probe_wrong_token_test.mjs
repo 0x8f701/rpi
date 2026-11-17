@@ -1,5 +1,6 @@
 // Diagnostic probe: wrong-token toast behavior against a given bundle.
 import { chromium } from 'playwright';
+import { clickFeature } from './lib/feature-menu.mjs';
 
 const url = process.env.RPI_URL;
 const wrongToken = process.env.RPI_WRONG_TOKEN || 'definitely-wrong-token';
@@ -19,7 +20,7 @@ await page.waitForFunction(
   { timeout: 15000 }
 );
 console.log('PROBE: empty-hint settled');
-await page.click('#settings-toggle-btn');
+await clickFeature(page, '#settings-toggle-btn');
 await page.waitForFunction(() => document.querySelector('#settings-token-input') !== null, { timeout: 10000 });
 await page.fill('#settings-token-input', wrongToken);
 await page.click('#settings-token-save-btn');

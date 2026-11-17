@@ -186,6 +186,7 @@ fn header_line(panel: &JobsPanel, theme: Theme) -> Line<'static> {
 
 fn job_aggregate(jobs: &[JobCardRows]) -> String {
     let mut running = 0usize;
+    let mut cancelling = 0usize;
     let mut queued = 0usize;
     let mut completed = 0usize;
     let mut failed = 0usize;
@@ -194,6 +195,7 @@ fn job_aggregate(jobs: &[JobCardRows]) -> String {
         match job.job_status {
             JobStatus::Queued => queued += 1,
             JobStatus::Running => running += 1,
+            JobStatus::Cancelling => cancelling += 1,
             JobStatus::Completed => completed += 1,
             JobStatus::Failed => failed += 1,
             JobStatus::Cancelled => cancelled += 1,
@@ -202,6 +204,7 @@ fn job_aggregate(jobs: &[JobCardRows]) -> String {
     let mut parts = Vec::new();
     for (count, label) in [
         (running, "running"),
+        (cancelling, "cancelling"),
         (queued, "queued"),
         (completed, "completed"),
         (failed, "failed"),
@@ -248,7 +251,7 @@ fn job_lines(panel: &JobsPanel, height: u16, width: u16, theme: Theme) -> Vec<Li
             let status = job_status_label(job.job_status);
             let name = pad_to_width(&sanitize(&job.display_name), 16);
             let id = truncate(&sanitize(&job.job_id), 12);
-            let prefix = format!(" {marker} {status:<9} {name} {id}");
+            let prefix = format!(" {marker} {status:<10} {name} {id}");
             let activity = job
                 .progress
                 .as_ref()
@@ -338,6 +341,7 @@ fn job_status_label(status: JobStatus) -> &'static str {
     match status {
         JobStatus::Queued => "queued",
         JobStatus::Running => "running",
+        JobStatus::Cancelling => "Cancelling",
         JobStatus::Completed => "completed",
         JobStatus::Failed => "failed",
         JobStatus::Cancelled => "cancelled",
@@ -389,6 +393,7 @@ mod tests {
             created_at: 1,
             started_at: Some(1),
             finished_at: None,
+            cancellation_cause: None,
             result: None,
             soft_budget_exhausted: false,
         }

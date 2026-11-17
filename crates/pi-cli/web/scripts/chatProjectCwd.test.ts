@@ -394,51 +394,30 @@ const {
 
 // ---- transport lifecycle (mountChatTransports, no DOM needed) ----
 {
-  // StrictMode-safe teardown: setup→cleanup→setup on the same epoch ref must
-  // not stop the stores between setups (disposed transports are not
-  // restartable), pagehide stops synchronously and invalidates a pending
-  // deferred stop, and a real unmount (cleanup with no follow-up setup)
-  // stops once the deferred microtask runs.
   const epoch: ChatTransportEpoch = { current: 0 };
   const started: number[] = [];
   const stopped: number[] = [];
-  const pagehideListeners: Array<() => void> = [];
-  const win = {
-    addEventListener(_type: string, listener: () => void): void {
-      pagehideListeners.push(listener);
-    },
-    removeEventListener(_type: string, listener: () => void): void {
-      const at = pagehideListeners.indexOf(listener);
-      if (at >= 0) pagehideListeners.splice(at, 1);
-    },
-  };
   const start = () => { started.push(started.length); };
   const stop = () => { stopped.push(stopped.length); };
   const flushMicrotasks = () => new Promise<void>((resolve) => queueMicrotask(resolve));
 
-  // StrictMode double-mount: setup -> cleanup -> setup on the same epoch
-  // ref. The cleanup's deferred stop must be cancelled by the follow-up
-  // setup instead of tearing the shared stores down between the setups.
-  const cleanupOne = mountChatTransports(epoch, start, stop, win);
+  const cleanupOne = mountChatTransports(epoch, start, stop);
   check('setup starts the transports', started.length === 1 && stopped.length === 0);
   cleanupOne();
-  const cleanupTwo = mountChatTransports(epoch, start, stop, win);
+  const cleanupTwo = mountChatTransports(epoch, start, stop);
   await flushMicrotasks();
   check('StrictMode setup→cleanup→setup keeps the stores alive',
     started.length === 2 && stopped.length === 0);
   cleanupTwo();
   await flushMicrotasks();
   check('real unmount with no follow-up setup stops the stores', stopped.length === 1);
-
-  // Pagehide path on a fresh lifecycle.
-  const pagehide = mountChatTransports(epoch, start, stop, win);
-  check('setup registers exactly one pagehide listener', pagehideListeners.length === 1);
-  pagehideListeners[0]?.();
-  check('pagehide stops synchronously', stopped.length === 2);
-  pagehide();
-  await flushMicrotasks();
-  check('cleanup after pagehide does not stop again', stopped.length === 2);
-  check('cleanup removed the pagehide listener', pagehideListeners.length === 0);
+  const events: string[] = [];
+  const savedAdd = window.addEventListener;
+  window.addEventListener = ((type: string) => { events.push(type); }) as typeof window.addEventListener;
+  const watched = mountChatTransports(epoch, start, stop);
+  watched();
+  window.addEventListener = savedAdd;
+  check('mount registers no pagehide listener', events.length === 0);
 }
 
 // ---- rendered chat surface (react-dom/server on the real component) ----

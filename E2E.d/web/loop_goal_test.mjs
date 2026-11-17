@@ -25,7 +25,10 @@
 //     complete surfaces the actionable invalid-transition error)
 //   - /goal create|resume dispatch `activate: true` (TUI parity: they start
 //     or queue goal work) and render "Goal work started|queued|already
-//     active · {state}" from the chained goal_get
+//     active · {state}" from the chained goal_get. Create and resume each
+//     start one auto-continuing work turn; the lane pauses immediately after
+//     the activation bubble so later commands are not racing an unbounded
+//     continuation (zero-usage success no longer stops the worker)
 //   - TUI parity streaming guard: /loop update while a turn is running is
 //     rejected locally with "/loop is unavailable while another turn is
 //     running" and dispatches NO RPC; it succeeds once the session is idle
@@ -474,7 +477,9 @@ async function main() {
     /* ---------------- /goal operations (session idle at create) ---------------- */
     // create with activate:true mirrors TUI /goal create: the goal work turn
     // starts immediately (gate free), so the bubble carries the activation
-    // prefix + the chained goal_get state line.
+    // prefix + the chained goal_get state line. Pause as soon as that bubble
+    // lands: the mock charges real tokens and a successful stop auto-continues,
+    // so later /goal and /loop commands must not race an unbounded worker.
     const goalCreated = await runCommand(
       page,
       '/goal create --tokens 42 ship the web goal e2e',
@@ -489,6 +494,13 @@ async function main() {
     }
     record('lg.goal-create-activate');
     await page.screenshot({ path: `${evidence}/loop-goal-goal-create.png`, fullPage: true });
+    const pausedAfterCreate = await runCommand(page, '/goal pause', 'paused (manually paused)', 'goal pause after create');
+    if (!/paused \(manually paused\) · \d+\/42 tokens · ship the web goal e2e/.test(pausedAfterCreate)) {
+      fail(`goal pause bubble missing paused state line (text=${JSON.stringify(pausedAfterCreate)})`);
+    }
+    record('lg.goal-pause');
+    await waitForIdle(page, 'session not idle after pausing the create goal turn');
+    await page.screenshot({ path: `${evidence}/loop-goal-goal-paused.png`, fullPage: true });
     await runCommand(page, '/goal show', 'ship the web goal e2e', 'goal show bubble');
     record('lg.goal-show');
     await runCommand(page, '/goal pin stay focused', 'ship the web goal e2e', 'goal pin bubble');
@@ -509,8 +521,6 @@ async function main() {
       fail(`goal pins bubble must render an ordered list row (got ${JSON.stringify(pinsMarkup)})`);
     }
     record('lg.goal-pins');
-    await runCommand(page, '/goal pause', 'paused (manually paused)', 'goal pause bubble');
-    record('lg.goal-pause');
     const goalResumed = await runCommand(
       page,
       '/goal resume',
@@ -521,18 +531,20 @@ async function main() {
       fail(`goal resume bubble missing activation prefix (text=${JSON.stringify(goalResumed)})`);
     }
     record('lg.goal-resume-activate');
+    await runCommand(page, '/goal pause', 'paused (manually paused)', 'goal pause after resume');
+    await waitForIdle(page, 'session not idle after pausing the resume goal turn');
     await runCommand(page, '/goal complete', /completed · \d+\/42 tokens · ship the web goal e2e/, 'goal complete bubble');
     record('lg.goal-complete');
-    // Drop after complete is an invalid transition -> actionable RPC error.
     await runCommand(page, '/goal drop', 'cannot drop a goal', 'goal drop error bubble');
     await waitForToast(page, 'cannot drop a goal', 'goal drop error toast');
     record('lg.goal-drop-error');
     await page.screenshot({ path: `${evidence}/loop-goal-goal-drop-error.png`, fullPage: true });
 
     /* ---------------- /loop ops once every turn has settled ---------------- */
-    // Both goal-work turns must finish: the create's work replies instantly
-    // ("steering-followup-reply") and the resume's work streams slowly
-    // (a second "chunk-four-done"). With a 1h cadence no further loop fires
+    // Create and resume each started one goal-work turn, then an immediate
+    // pause stopped auto-continue. The steering mock answers the create turn
+    // instantly ("steering-followup-reply") and the resume turn slowly (a
+    // second "chunk-four-done"). With a 1h cadence no further loop fires
     // occur. Transcript tails can land before turn_terminal; wait for the
     // Send control so /loop update is not locally rejected with no RPC.
     await waitForTranscriptCount(page, 'chunk-four-done', 2, 'goal work stream completed');

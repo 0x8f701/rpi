@@ -66,6 +66,13 @@ const IMAGE_MIME_TYPES: Record<string, true> = {
   'image/gif': true,
   'image/webp': true,
 };
+
+/** Image boundary for an external MIME string: exact allowlist membership,
+ *  not a `startsWith('image/')` label. */
+export function isImageMime(mimeType: string): boolean {
+  return IMAGE_MIME_TYPES[mimeType] === true;
+}
+
 const IMAGE_UPLOAD_EXTENSIONS: Record<string, string> = {
   'image/png': 'png',
   'image/jpeg': 'jpg',

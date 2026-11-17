@@ -384,7 +384,7 @@ impl CampaignFactory {
                 });
 
                 Session::new(SessionOptions {
-                    model,
+                    model: Some(model),
                     cwd: workspace,
                     system_prompt,
                     thinking_level: thinking_level.unwrap_or(ThinkingLevel::Off),
@@ -489,7 +489,7 @@ fn build_runtime(
     )
     .with_selector_settings(selector_settings())
     .with_agent_settings(agent_settings)
-    .with_parent_model(model());
+    .with_parent_model(Some(model()));
     config.default_agent = "writer".to_owned();
     config.skills = skills;
     config.max_concurrency = 4;

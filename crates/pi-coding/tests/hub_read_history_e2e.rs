@@ -89,7 +89,7 @@ fn scripted_factory(
                 .expect("registration for child");
             let child_model = registration.model(None).expect("registered child model");
             Session::new(SessionOptions {
-                model: child_model,
+                model: Some(child_model),
                 cwd: std::env::current_dir().expect("cwd"),
                 system_prompt: request.system_prompt,
                 thinking_level: request.thinking_level.unwrap_or(ThinkingLevel::Off),
@@ -250,7 +250,7 @@ async fn beta_reads_alpha_history_through_owned_hub_tool_and_redacts() {
     config.max_concurrency = 2;
     config.mailbox_capacity = 8;
     config.max_recursion_depth = 2;
-    config.parent_model = model;
+    config.parent_model = Some(model);
     let runtime = OrchestrationRuntime::new(
         config,
         scripted_factory(Arc::new(Mutex::new(registrations))),
@@ -436,7 +436,7 @@ async fn read_history_lines_bounds_render_window() {
     config.max_concurrency = 2;
     config.mailbox_capacity = 8;
     config.max_recursion_depth = 2;
-    config.parent_model = model;
+    config.parent_model = Some(model);
     let runtime = OrchestrationRuntime::new(
         config,
         scripted_factory(Arc::new(Mutex::new(registrations))),

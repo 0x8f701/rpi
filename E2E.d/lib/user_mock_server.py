@@ -68,7 +68,16 @@ import time
 import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, cast
+class BarrierFailure(Exception):
+    """Typed task-parent barrier failure: phase + exception class only —
+    never request bodies; handled before the generic mock-reject fallback."""
 
+    def __init__(self, phase: str, detail: str) -> None:
+        super().__init__(f"phase={phase} detail={detail}")
+        self.phase = phase
+        self.detail = detail
+
+SUMMARIZER_SYSTEM = "You are a context summarization assistant"
 SUPERVISOR_RE = re.compile(r"You (?:supervise|plan) workflow\s+([^\s.]+)\.\s*Objective:\s*([^\n<]+)")
 DELEGATED_RE = re.compile(r"<delegated_assignment>\s*(.*?)\s*</delegated_assignment>", re.DOTALL)
 
@@ -90,6 +99,9 @@ SESSION_WORKER_STATS: dict[str, Any] = {
     "assignments": {},
 }
 STEERING_RELEASE = threading.Event()
+# Restart-held Task children stay nonterminal until the reconnect lane has
+# observed queued/running. The listener-kill steering release must not settle them.
+RESTART_TASK_RELEASE = threading.Event()
 STT_RELEASE = threading.Event()
 MIDSTREAM_RELEASE = threading.Event()
 WORKER_RELEASE_PATH = "/__release"
@@ -100,6 +112,7 @@ SESSION_WORKER_STATS_PATH = "/__session-workflow-stats"
 STEERING_RELEASE_PATH = "/__release-steering"
 STT_RELEASE_PATH = "/__release-stt"
 MIDSTREAM_RELEASE_PATH = "/__release-midstream"
+RESTART_TASK_RELEASE_PATH = "/__release-restart-task"
 REALTIME_RELEASE = threading.Event()
 REALTIME_RELEASE_PATH = "/__release-realtime"
 
@@ -207,6 +220,8 @@ async fn decode(packet: Option<Packet<'_>>) -> Result<&str, String> {
 
 Safe link [pi web docs](https://example.org/pi-web) and a blocked
 [evil](javascript:alert(1)) link that must not become a live anchor.
+Coverage links: [pi web query](https://example.org/pi-web?a=1&b=2) and
+[session artifact](https://127.0.0.1/download/session/11111111-1111-4111-8111-111111111111).
 
 Safe image ![pic](data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=)
 and a blocked ![x](data:text/html,<b>hi</b>) image that must stay inert.
@@ -257,6 +272,32 @@ Price 5$/unit (currency, not math) and inline $x^2$ (math).
 ![rel](./images/pic.png) ![http](https://example.org/pic.png) ![blocked](javascript:alert(1))
 
 [mail](mailto:web-e2e@example.org) [rel](../docs/guide.md)
+"""
+
+
+# Permanent browser regression for the Web fence marker-run parser
+# (`extractFences` in pi-cli/web/src/markdown.ts): ONE reply with TWO valid
+# mermaid diagrams where the SECOND fence opens with a four-backtick run.
+# Both must hydrate independently — each host settled (`data-mermaid="done"`),
+# its own SVG, its own id namespace. A real model reply shaped like this
+# rendered as raw diagram text before the marker-run fix.
+FOURTICK_MERMAID = r"""## Two diagrams in one reply
+
+```mermaid
+flowchart LR
+  A[Start] --> B[Done]
+```
+
+| step | state |
+| --- | --- |
+| 1 | ok |
+
+````mermaid
+flowchart TD
+  C[One] --> D[Two]
+````
+
+four-tick-mermaid-done
 """
 
 
@@ -594,6 +635,37 @@ def completed_tool_result_entries(body: dict[str, Any], tool_name: str) -> list[
             results[str(message["tool_call_id"])] = str(message.get("content") or "")
     return [(call_id, results[call_id]) for call_id in calls if call_id in results]
 
+
+def last_tool_result_name(body: dict[str, Any]) -> str | None:
+    """Tool name of the most recent real tool result, resolved through the
+    assistant `tool_calls` id map. The two-call discriminators above only
+    answer "is the last message a tool result"; tool HOPS that share one
+    last_user_text marker (task → hub wait → final text) need to know WHICH
+    tool just returned to pick the next call without matching stale results."""
+    calls: dict[str, str] = {}
+    for message in body.get("messages") or []:
+        if message.get("role") == "assistant":
+            for call in message.get("tool_calls") or []:
+                function = call.get("function") or {}
+                if call.get("id") and function.get("name"):
+                    calls[str(call["id"])] = str(function["name"])
+    for message in reversed(body.get("messages") or []):
+        if message.get("role") == "tool" and message.get("tool_call_id"):
+            return calls.get(str(message["tool_call_id"]))
+        if message.get("role") == "assistant":
+            return None
+        if message.get("role") == "user":
+            content = message.get("content")
+            text = content if isinstance(content, str) else " ".join(
+                str(block.get("text", ""))
+                for block in (content or [])
+                if isinstance(block, dict) and block.get("type") == "text"
+            )
+            if text.lstrip().startswith("<system-reminder>"):
+                continue
+            return None
+    return None
+
 def last_real_message_is_tool_result(body: dict[str, Any]) -> bool:
     """True when the most recent real (non-system-reminder) message in the
     request body is a tool result — i.e. the agent already ran the tool and
@@ -702,6 +774,8 @@ class UserMockServer(BaseHTTPRequestHandler):
             release = STEERING_RELEASE
         elif self.path == MIDSTREAM_RELEASE_PATH and self.scenario == "steering":
             release = MIDSTREAM_RELEASE
+        elif self.path == RESTART_TASK_RELEASE_PATH and self.scenario == "steering":
+            release = RESTART_TASK_RELEASE
         if release is not None:
             release.set()
             body = b'{"released": true}\n'
@@ -899,6 +973,28 @@ class UserMockServer(BaseHTTPRequestHandler):
         )
         try:
             response = self.route(request_number, body)
+        except BarrierFailure as error:
+            # SSE headers may already be flushed: no HTTP error status is
+            # possible. Surface the parser-typed error frame, then close the
+            # stream — never the "mock rejected" success text below.
+            print(
+                f"user-mock scenario={self.scenario} request#{request_number} "
+                f"error=BarrierFailure phase={error.phase} detail={error.detail}",
+                file=sys.stderr,
+                flush=True,
+            )
+            try:
+                self.wfile.write(b'data: {"choices":[{"delta":{},"finish_reason":"error"}]}\n\n')
+                self.wfile.flush()
+            except OSError:
+                print(
+                    f"user-mock scenario={self.scenario} request#{request_number} "
+                    "error=BarrierFailure sse_error_frame_undeliverable",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            self.close_connection = True
+            return None
         except BaseException as error:  # never let a routing bug wedge the client
             # Exception class only: the repr could embed request bodies or
             # paths that must never reach the evidence log.
@@ -916,6 +1012,8 @@ class UserMockServer(BaseHTTPRequestHandler):
             kind = "worker" if self.scenario == "workflow" else "held"
         elif "You plan workflow" in message_text(body):
             kind = "planning"
+        elif type(self).scenario == "sessions" and any(m.get("role") == "system" and SUMMARIZER_SYSTEM in str(m.get("content") or "") for m in body.get("messages") or []):
+            kind = "summary"
         else:
             kind = "other"
         print(
@@ -954,9 +1052,31 @@ class UserMockServer(BaseHTTPRequestHandler):
                         "call-restart-held-task",
                         "task",
                         {
-                            "name": "RestartWorker",
-                            "agent": "writer",
-                            "task": "restart-held-subagent: preserve exact identity across process restart",
+                            "name": None,
+                            "agent": None,
+                            "task": None,
+                            "todoTaskId": None,
+                            "context": (
+                                "Durable reconnect contract: preserve the exact child "
+                                "job, agent, and parent identity across process restart."
+                            ),
+                            "tasks": [
+                                {
+                                    "name": "RestartWorker",
+                                    "agent": "writer",
+                                    "todoTaskId": None,
+                                    "context": None,
+                                    "task": (
+                                        "restart-held-subagent: preserve exact identity "
+                                        "across process restart and deliver the held marker "
+                                        "exactly once."
+                                    ),
+                                    "outputSchema": None,
+                                    "schemaMode": None,
+                                }
+                            ],
+                            "outputSchema": None,
+                            "schemaMode": None,
                         },
                     )
                 ]
@@ -977,7 +1097,7 @@ class UserMockServer(BaseHTTPRequestHandler):
                 request_number,
                 "restart-held-",
                 "subagent identity survived exactly-once",
-                STEERING_RELEASE,
+                RESTART_TASK_RELEASE,
             )
             HELD_STREAMS.append(held)
             return held
@@ -988,6 +1108,16 @@ class UserMockServer(BaseHTTPRequestHandler):
         if scenario == "steering":
             if "render rich content" in last_user_text(body):
                 return stream_response([text_payload(f"user-mock-{request_number}", RICH_TEXT)])
+            if "render workspace citations" in last_user_text(body):
+                # TWO directory citations, one per acceptance breakpoint: an
+                # accepted file open auto-reveals (and caches) its parent
+                # chain, so each breakpoint's directory citation needs its own
+                # never-cited public directory to keep the validate-then-
+                # reveal wire proof cold and deterministic.
+                return stream_response([text_payload(
+                    f"user-mock-{request_number}",
+                    "See `unique.rs`, `deposit_logs.rs`, `daemon.rs`, `prove_bridge.rs`, [psy-node/bridge](psy-node/bridge), and [psy-node-fix/bridge](psy-node-fix/bridge).",
+                )])
             # Web coverage markdown-branch driver: the second rich payload
             # (hr/blockquote/nested-list/unregistered-fence/empty+invalid
             # mermaid/currency/URL-policy). Assertions live in coverage_test.mjs
@@ -1011,6 +1141,11 @@ class UserMockServer(BaseHTTPRequestHandler):
                     f"user-mock-{request_number}",
                     "## Wide diagram\n\n```mermaid\nflowchart LR\n" + wide_stages + "\n```\n",
                 )])
+            # Mermaid viewer lane: TWO valid diagrams in ONE reply, the second
+            # opened with a four-backtick fence (fence marker-run regression;
+            # both hosts must settle with independent ids).
+            if "render four-backtick mermaid" in last_user_text(body):
+                return stream_response([text_payload(f"user-mock-{request_number}", FOURTICK_MERMAID)])
             if "reconnect post restart" in last_user_text(body):
                 payload = text_payload(f"user-mock-{request_number}", "reconnect-post-restart-reply")
                 self.send_response(200)
@@ -1376,6 +1511,125 @@ class UserMockServer(BaseHTTPRequestHandler):
                         )
                     ]
                 )
+            # Real task → hub ids-wait → settle chain (presentation lane).
+            # Reported regression: every child job settled but the parent's
+            # hub {op:"wait", ids:[…]} card stayed running forever. The chain
+            # runs the REAL tools: request 1 emits a real `task` spawn of TWO
+            # children with distinct fixture-chosen `tasks[].name` identities
+            # "Alpha"/"Beta" (the runtime echoes them as TaskSpawn.agent_id,
+            # and jobs.wait matches snapshot.id OR snapshot.agent_id — so the
+            # wait ids are typed and deterministic, never regex-parsed from
+            # the "queued as job …" prose; the typed details live only on
+            # ToolExecutionEnd, which the model-facing tool result does not
+            # carry). Request 2 (last real message = the task result) emits
+            # the real hub wait on BOTH ids with NO timeoutMs — the user's
+            # common wait shape; the lane's own assertion deadlines bound the
+            # test. Request 3 (last real message = the hub wait result) ends
+            # the turn. The children below stream at different cadences so
+            # Alpha settles first while the ids-wait is live, then Beta —
+            # exercising partial-then-full settlement before the tool ends.
+            if "presentation hub wait ids" in last_user_text(body):
+                last_tool = last_tool_result_name(body)
+                if last_tool == "hub":
+                    return stream_response(
+                        [text_payload(f"user-mock-{request_number}", "hub wait ids complete")]
+                    )
+                if last_tool == "task":
+                    return stream_response(
+                        [
+                            tool_call_payload(
+                                f"user-mock-{request_number}",
+                                f"call-presentation-hub-wait-ids-{request_number}",
+                                "hub",
+                                {"op": "wait", "ids": ["Alpha", "Beta"]},
+                            )
+                        ]
+                    )
+                return stream_response(
+                    [
+                        tool_call_payload(
+                            f"user-mock-{request_number}",
+                            f"call-task-waitids-{request_number}",
+                            "task",
+                            {
+                                "context": (
+                                    "# Goal\nExercise the hub ids-wait card\n\n"
+                                    "# Constraints\nSettle quickly"
+                                ),
+                                "tasks": [
+                                    {
+                                        "name": "Alpha",
+                                        "agent": "writer",
+                                        "task": (
+                                            "web-e2e-waitids-alpha: audit the wait ids "
+                                            "fixture and report one line."
+                                        ),
+                                    },
+                                    {
+                                        "name": "Beta",
+                                        "agent": "writer",
+                                        "task": (
+                                            "web-e2e-waitids-beta: audit the wait ids "
+                                            "fixture and report one line."
+                                        ),
+                                    },
+                                ],
+                            },
+                        )
+                    ]
+                )
+            # wait-ids children: each spawned child's assignment carries its
+            # own non-overlapping marker. A single slowly-streamed reply keeps
+            # the job unsettled while the parent's hub ids-wait starts, then
+            # settles it — one request, no tool hops, no seed-file dependency.
+            # Alpha (~5s) settles before Beta (~9s) so the wait stays live
+            # across a partial settlement.
+            if "web-e2e-waitids-alpha" in message_text(body):
+                chunks = ["waitids-", "alpha ", "progress ", "step ", "one ", "complete"]
+                payloads = []
+                for index, chunk in enumerate(chunks):
+                    payloads.append(
+                        {
+                            "id": f"user-mock-{request_number}-{index}",
+                            "model": "user-mock",
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"content": chunk},
+                                    "finish_reason": None if index < len(chunks) - 1 else "stop",
+                                }
+                            ],
+                            "usage": {"prompt_tokens": 8, "completion_tokens": len(chunk), "total_tokens": 8 + len(chunk)},
+                        }
+                    )
+                self.send_response(200)
+                self.send_header("content-type", "text/event-stream")
+                self.end_headers()
+                slow_stream_response(self.wfile, payloads, delay=0.9)
+                return None
+            if "web-e2e-waitids-beta" in message_text(body):
+                chunks = ["waitids-", "beta ", "progress ", "step ", "two ", "three ", "complete"]
+                payloads = []
+                for index, chunk in enumerate(chunks):
+                    payloads.append(
+                        {
+                            "id": f"user-mock-{request_number}-{index}",
+                            "model": "user-mock",
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"content": chunk},
+                                    "finish_reason": None if index < len(chunks) - 1 else "stop",
+                                }
+                            ],
+                            "usage": {"prompt_tokens": 8, "completion_tokens": len(chunk), "total_tokens": 8 + len(chunk)},
+                        }
+                    )
+                self.send_response(200)
+                self.send_header("content-type", "text/event-stream")
+                self.end_headers()
+                slow_stream_response(self.wfile, payloads, delay=1.3)
+                return None
             if "presentation hub wait" in last_user_text(body):
                 if last_real_message_is_tool_result(body):
                     return stream_response([text_payload(f"user-mock-{request_number}", "hub wait complete")])
@@ -1461,13 +1715,20 @@ class UserMockServer(BaseHTTPRequestHandler):
                         )
                     ]
                 )
-            # Details child (`web-e2e-subagent-details` only). Long paragraph,
-            # real read of the >100-char relative fixture, then grep, then a
-            # slow hold. Must precede the short `web-e2e-subagent` marker.
+            # Details child (`web-e2e-subagent-details` only). Five real hops so
+            # the child transcript carries every structured shape the detail
+            # modal renders: reasoning (thinking), markdown prose, read(text),
+            # read(image), grep, bash, then a slow hold so Stop can cancel.
+            # Call-id prefixes stage the sequence — two `read` calls would
+            # collide on a tool-name-only discriminator. Must precede the
+            # short `web-e2e-subagent` marker.
             if "web-e2e-subagent-details" in message_text(body):
-                read_done = completed_tool_results(body, "read")
-                grep_done = completed_tool_results(body, "grep")
-                if read_done and grep_done:
+                last_tool = last_tool_result_name(body)
+                img_done = any(
+                    call_id.startswith("call-read-img-details")
+                    for call_id, _ in completed_tool_result_entries(body, "read")
+                )
+                if last_tool == "bash":
                     prose = (
                         "details-hold paragraph stays running after the long read and the "
                         "grep so Stop can cancel this child before the turn settles. "
@@ -1494,7 +1755,18 @@ class UserMockServer(BaseHTTPRequestHandler):
                     self.end_headers()
                     slow_stream_response(self.wfile, payloads, delay=1.8)
                     return None
-                if read_done:
+                if last_tool == "grep":
+                    return stream_response(
+                        [
+                            tool_call_payload(
+                                f"user-mock-{request_number}",
+                                f"call-bash-details-{request_number}",
+                                "bash",
+                                {"command": "printf 'DETAILSOUTTAIL\\n'"},
+                            )
+                        ]
+                    )
+                if img_done:
                     return stream_response(
                         [
                             tool_call_payload(
@@ -1508,15 +1780,33 @@ class UserMockServer(BaseHTTPRequestHandler):
                             )
                         ]
                     )
+                if last_tool == "read":
+                    return stream_response(
+                        [
+                            tool_call_payload(
+                                f"user-mock-{request_number}",
+                                f"call-read-img-details-{request_number}",
+                                "read",
+                                {"path": "fixtures/subagent-details/detail-image.png"},
+                            )
+                        ]
+                    )
                 paragraph = (
                     "The first assistant paragraph of the details child is one unbroken "
                     "sentence longer than two hundred forty characters so a one hundred "
                     "twenty character history line cannot contain DETAILSTAIL by itself "
-                    "and the readable body keeps the full wording."
+                    "and the readable body keeps the full wording **bold-plan** "
+                    "ending DETAILSTAIL."
                 )
+                thinking = text_payload(f"user-mock-{request_number}-th", "planning the details audit")
+                thinking["choices"][0]["finish_reason"] = None
+                thinking["choices"][0]["delta"] = {"reasoning_content": "subagent-details-thinking-marker plan the long read then grep then bash"}
+                prose = text_payload(f"user-mock-{request_number}-prose", paragraph)
+                prose["choices"][0]["finish_reason"] = None
                 return stream_response(
                     [
-                        text_payload(f"user-mock-{request_number}-prose", paragraph),
+                        thinking,
+                        prose,
                         tool_call_payload(
                             f"user-mock-{request_number}",
                             f"call-read-details-{request_number}",
@@ -1525,22 +1815,39 @@ class UserMockServer(BaseHTTPRequestHandler):
                         ),
                     ]
                 )
+            # Oversized child (`web-e2e-subagent-truncated`): ONE ~350KiB reply
+            # row — larger than the agent_history byte cap — so the bounded
+            # slice comes back EMPTY with a real `bytes` truncation. The
+            # lane's models.json maxTokens must exceed the row or the provider
+            # clamps the stream and the row never exceeds the cap.
+            if "web-e2e-subagent-truncated" in message_text(body):
+                return stream_response(
+                    [text_payload(f"user-mock-{request_number}", "trunc-row-" + "x" * 350000)]
+                )
             # Subagents-panel e2e: the spawned child's prompt carries the
             # marker text. The FIRST request makes the child really call the
             # `read` tool on the fixture's seed.txt (the runtime executes it,
             # so the child transcript carries a concrete `assistant · read
             # seed.txt` action — never a generic-only history); once that tool
-            # result is in the conversation, stream slowly (~16s) so the job
-            # stays running long enough to assert live status, message, view
-            # output, open the running-job detail modal (accessibility +
-            # task/status/activity + recent history carrying the concrete read
-            # target + Refresh + Escape/Close), and cancel deterministically.
-            # The chunk content is unchanged; only the inter-chunk cadence
-            # widens the live window.
+            # result is in the conversation, stream the FINAL REPLY slowly —
+            # a markdown payload (## heading + ```bash fence, chunked at 48
+            # chars on the same 1.8s cadence) — so the job stays running long
+            # enough to assert live status, message, view output, open the
+            # running-job detail modal (accessibility + task/status/activity
+            # + recent history carrying the concrete read target + Refresh +
+            # Escape/Close), and cancel deterministically; the subagents
+            # lane also lets a short-marker child SETTLE and asserts its
+            # rendered markdown output view.
             if "web-e2e-subagent" in message_text(body):
                 if completed_tool_results(body, "read"):
-                    chunks = ["subagent-", "progress ", "step ", "one ", "complete ",
-                              "auditing ", "release ", "notes ", "almost ", "done"]
+                    markdown = (
+                        "## 标题\n\n"
+                        "subagent release-notes audit complete.\n\n"
+                        "```bash\n"
+                        'echo "auditing release notes done"\n'
+                        "```\n"
+                    )
+                    chunks = [markdown[index:index + 48] for index in range(0, len(markdown), 48)]
                     payloads = []
                     for index, chunk in enumerate(chunks):
                         payloads.append(
@@ -1767,7 +2074,62 @@ class UserMockServer(BaseHTTPRequestHandler):
                     self.send_response(200)
                     self.send_header("content-type", "text/event-stream")
                     self.end_headers()
-                    slow_stream_response(self.wfile, payloads, delay=1.0)
+                    # Explicit ready/release FILE barrier (deterministic, no
+                    # timing): flush the FIRST delta with finish_reason None,
+                    # then write the ready marker; until the release marker
+                    # appears only SSE keepalive comments are sent — never a
+                    # stop or [DONE]; after release the remaining deltas and
+                    # [DONE] complete the turn and ONLY then is the success
+                    # marker written. Every failure persists the failure marker
+                    # (request, phase, exception class) and surfaces as typed
+                    # BarrierFailure — never "mock rejected". Without a barrier
+                    # directory the original timed stream is preserved for
+                    # every other lane.
+                    barrier_dir = os.environ.get("RPI_TASK_BARRIER_DIR", "")
+                    if not barrier_dir:
+                        slow_stream_response(self.wfile, payloads, delay=1.0)
+                        return None
+                    phase = "init"
+                    try:
+                        ready_marker = os.path.join(barrier_dir, "task-parent-ready.marker")
+                        release_marker = os.path.join(barrier_dir, "task-parent-release.marker")
+                        success_marker = os.path.join(barrier_dir, "task-parent-success.marker")
+                        phase = "flush-first-delta"
+                        first_payload = payloads[0]
+                        first_payload["choices"][0]["finish_reason"] = None
+                        self.wfile.write(f"data: {json.dumps(first_payload, separators=(',', ':'))}\n\n".encode())
+                        self.wfile.flush()
+                        phase = "write-ready"
+                        with open(ready_marker, "w", encoding="utf-8") as handle:
+                            handle.write(str(request_number))
+                        phase = "await-release"
+                        while not os.path.exists(release_marker):
+                            self.wfile.write(b": keepalive\n\n")
+                            self.wfile.flush()
+                            time.sleep(0.2)
+                        phase = "final-deltas"
+                        for payload in payloads[1:]:
+                            self.wfile.write(f"data: {json.dumps(payload, separators=(',', ':'))}\n\n".encode())
+                            self.wfile.flush()
+                        self.wfile.write(b"data: [DONE]\n\n")
+                        self.wfile.flush()
+                        phase = "write-success"
+                        with open(success_marker, "w", encoding="utf-8") as handle:
+                            handle.write(str(request_number))
+                    except BaseException as error:
+                        failure_phase = "client-disconnected" if isinstance(error, BrokenPipeError) else phase
+                        try:
+                            with open(os.path.join(barrier_dir, "task-parent-failure.marker"), "w", encoding="utf-8") as handle:
+                                handle.write(f"request={request_number} phase={failure_phase} error={type(error).__name__}")
+                        except OSError as marker_error:
+                            print(
+                                f"user-mock scenario={self.scenario} request#{request_number} "
+                                f"error=BarrierFailureMarkerWrite phase={failure_phase} "
+                                f"marker_error={type(marker_error).__name__}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                        raise BarrierFailure(failure_phase, type(error).__name__) from error
                     return None
                 return stream_response(
                     [
@@ -1988,6 +2350,8 @@ class UserMockServer(BaseHTTPRequestHandler):
                 )
             return stream_response([text_payload(f"user-mock-{request_number}", "workflow-extra-reply")])
         if scenario == "sessions":
+            if any(m.get("role") == "system" and SUMMARIZER_SYSTEM in str(m.get("content") or "") for m in body.get("messages") or []):
+                return stream_response([text_payload(f"user-mock-summary-{request_number}", "E2E-COMPACT-SUMMARY")])
             # Multi-session web lane (E2E.d/web/sessions_test.mjs): content-
             # routed, because the mock's request counter is GLOBAL across the
             # concurrently-running session runtimes — request numbers
@@ -2387,6 +2751,7 @@ def main() -> None:
     WORKER_RELEASE.clear()
     SESSION_RELEASE.clear()
     MIDSTREAM_RELEASE.clear()
+    RESTART_TASK_RELEASE.clear()
     HELD_STREAMS.clear()
     UserMockServer.serial = 0
     UserMockServer.scenario = args.scenario

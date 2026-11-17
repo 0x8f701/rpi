@@ -29,27 +29,27 @@
 //        messages are in the transcript must NOT re-render the whole
 //        transcript per delta (max handler cost / long tasks bounded);
 //        sampled deltas stay in order; no close
-//   C4   controlled reader stall: a synthetic main-thread busy loop
-//        overlapping a sustained delta flood must not produce a false 1008
-//        "client is not reading messages" for a TRANSIENT (<=4s) stall
-//        (C4.1/C4.2: turns complete); a SUSTAINED no-read stall (C4.3, >5s
-//        grace) must still surface the real 1008 with the server's reason —
-//        the browser genuinely not reading IS the disconnect cause
+//   C4   controlled renderer stall: a synthetic main-thread busy loop
+//        overlapping a delta flood must not produce a false 1008. Every
+//        combo, including the 7s stall, is below the 15s outbound grace
+//        and is a JS stall, not a TCP no-read. Each turn completes with
+//        no close; the 7s flood also proves exact salted content/order.
+//        Dead-client eviction stays in the Rust TCP/stall tests.
 //   C5   streaming Markdown authority: the real listener's text_delta paints
 //        <strong>, a policy-safe <a>, inline code, and a fenced code block
 //        while #send-btn is Stop generating and before the held real
 //        message_end/turn_terminal frames are delivered; releasing those
 //        frames commits the authoritative final, and a real second session
 //        cannot receive or mutate the first session's stream/item
-//   C6   1008/close toast guard: every non-1000 close the app experiences
-//        MUST surface as a "connection closed (code N...)" toast — the
-//        slow-client handling never hides a real close (incl. a genuine
-//        1008)
-//   C7   accurate close cause: the close toast carries the server's reason,
-//        and a mid-flight pending command is NOT left to its 30s timer or
-//        mislabeled "connection replaced" — after a close no misleading
-//        "send failed: connection replaced"/"command timed out" toast may
-//        appear; the accurate close toast is the surface
+//   C6   close toast guard: a test-owned reverse proxy holds one real
+//        side_chat_list response, then sends a server 1008 close and
+//        finishes the handshake. The app MUST surface that close as a
+//        "connection closed (code 1008...)" toast. This is close-surface
+//        evidence, not dead-client eviction.
+//   C7   close surface: the toast carries the controlled 1008 reason, and
+//        the same side_chat_list response was not delivered through the
+//        close handler. This does not observe the product pending-registry
+//        reject; that remains the existing pending unit test.
 // Evidence: the lane always writes <evidence>/slowclient-metrics.json with
 // per-step wire-receive frames (CDP), JS-handler timestamps/costs, longtask
 // records, close codes/reasons, drain times, and message-order proofs — the
@@ -57,7 +57,10 @@
 
 import { chromium } from 'playwright';
 import fs from 'node:fs';
+import http from 'node:http';
+import WebSocket, { WebSocketServer } from 'ws';
 import { createFreshSessionViaManage } from './lib/session-lifecycle.mjs';
+import { clickFeature } from './lib/feature-menu.mjs';
 
 const url = process.env.RPI_URL;
 const token = process.env.RPI_TOKEN || '';
@@ -77,7 +80,7 @@ const DOCUMENTED_IDS = [
   'C1.1', 'C1.2', 'C1.3',
   'C2.1',
   'C3.1', 'C3.2', 'C3.3',
-  'C4.1', 'C4.2', 'C4.3', 'C4.4',
+  'C4.1', 'C4.2', 'C4.3',
   'C5.1', 'C5.2', 'C5.3',
   'C6.1',
   'C7.1', 'C7.2',
@@ -188,6 +191,16 @@ function percentile(sorted, p) {
   const idx = Math.min(sorted.length - 1, Math.max(0, Math.floor((p / 100) * sorted.length)));
   return sorted[idx];
 }
+/** Counts plus first/last 50 numeric samples. No payload strings. */
+function boundSamples(items, pick) {
+  const samples = items.map(pick);
+  return {
+    count: samples.length,
+    first50: samples.slice(0, 50),
+    last50: samples.slice(-50),
+  };
+}
+
 
 /** Per-step metrics snapshot from the page instrumentation + wire frames.
  *  `base` is a baseline captured at step start ({msgs, longtasks, closes,
@@ -268,6 +281,7 @@ async function main() {
       const heldSockets = new Set();
       window.__slowclient = {
         messages: [], closes: [], closeToasts: [], longtasks: [], opens: 0,
+        settlements: [],
         holdMessageEndMarker: '',
         heldFrames: 0,
         releaseHeldFrames() {
@@ -311,6 +325,18 @@ async function main() {
             get() { return this.__scHandlers.error; },
             set(fn) { this.__scHandlers.error = fn; },
           });
+          const nativeSend = this.send.bind(this);
+          this.send = (data, ...sendArgs) => {
+            try {
+              const frame = JSON.parse(String(data));
+              if (frame && typeof frame.id === 'string' && frame.type === 'side_chat_list') {
+                window.__slowclient.settlements.push({ id: frame.id, kind: 'sent', type: frame.type });
+              }
+            } catch {
+              /* non-JSON send: not an RPC command */
+            }
+            return nativeSend(data, ...sendArgs);
+          };
           super.addEventListener('message', (ev) => {
             const deliver = () => {
               const t0 = performance.now();
@@ -326,20 +352,23 @@ async function main() {
                 });
               }
             };
-            if (!this.__scHolding && window.__slowclient.holdMessageEndMarker) {
-              try {
-                const frame = JSON.parse(String(ev.data));
-                // User MessageEnd carries the same prompt marker and precedes assistant deltas.
-                if (
-                  frame?.type === 'message_end'
-                  && frame?.message?.role === 'assistant'
-                  && JSON.stringify(frame.message || {}).includes(window.__slowclient.holdMessageEndMarker)
-                ) {
-                  this.__scHolding = true;
-                  heldSockets.add(this);
-                }
-              } catch {
-                /* non-JSON frame: deliver normally */
+            let parsed = null;
+            try { parsed = JSON.parse(String(ev.data)); } catch { parsed = null; }
+            if (parsed && parsed.type === 'response' && typeof parsed.id === 'string') {
+              window.__slowclient.settlements.push({
+                id: parsed.id,
+                kind: parsed.success === false ? 'response-failure' : 'response',
+                command: parsed.command || '',
+              });
+            }
+            if (!this.__scHolding && window.__slowclient.holdMessageEndMarker && parsed) {
+              if (
+                parsed.type === 'message_end'
+                && parsed.message?.role === 'assistant'
+                && JSON.stringify(parsed.message || {}).includes(window.__slowclient.holdMessageEndMarker)
+              ) {
+                this.__scHolding = true;
+                heldSockets.add(this);
               }
             }
             if (this.__scHolding) {
@@ -369,7 +398,22 @@ async function main() {
               });
             }, 120);
             const h = this.__scHandlers.close;
-            if (h) h(ev);
+            if (h) {
+              const before = window.__slowclient.settlements.length;
+              try {
+                h(ev);
+              } finally {
+                window.__slowclient.settlements.push({
+                  id: '',
+                  kind: 'close-handler',
+                  code: ev.code,
+                  reason: ev.reason || '',
+                  responsesDuringClose: window.__slowclient.settlements
+                    .slice(before)
+                    .filter((row) => row.kind === 'response' || row.kind === 'response-failure').length,
+                });
+              }
+            }
           });
           super.addEventListener('open', () => {
             window.__slowclient.opens += 1;
@@ -702,29 +746,17 @@ async function main() {
       record('C3.3');
     }
 
-    /* ---------------- C4: controlled reader stall vs sustained flood ------- */
+    /* ---------------- C4: renderer stall must not false-close ---------- */
     {
       const combos = [];
       if (BURST_N > 0) {
-        // Investigative override: a single user-specified combo.
         combos.push({ n: BURST_N, bytes: 64, stallMs: STALL_MS || 3000, expect: 'no-close' });
       } else {
-        // Transient stalls (<=4s) are below the server's outbound grace and
-        // must NOT disconnect; the sustained combo exceeds the grace and must
-        // surface the REAL 1008 (the browser genuinely not reading). Flood
-        // sizes stay under Chromium's WS receive quota (~16MB) so the
-        // transient combos cannot trip the browser-side abnormal-close (1006)
-        // path instead of exercising the server's queue policy. The transient
-        // floods are also small enough that the post-stall drain (DOM text
-        // growth + scroll-pin layout) completes well inside the outcome wait.
+        // Renderer busy loops, not paused TCP sockets. Every duration is
+        // below the 15s outbound grace, so none may disconnect.
         combos.push({ n: 8000, bytes: 64, stallMs: 2500, expect: 'no-close' });
         combos.push({ n: 8000, bytes: 64, stallMs: 4000, expect: 'no-close' });
-        // Sustained no-read: 40000 chunks (~10.5MB) keeps the flood under
-        // Chromium's independent receive-abort threshold (~31MB), so the
-        // grace-expired queue-full 1008 (not the browser's 1006) is what
-        // surfaces — verifying the server grace/1008 policy rather than the
-        // browser quota.
-        combos.push({ n: 40000, bytes: 64, stallMs: 7000, expect: '1008' });
+        combos.push({ n: 40000, bytes: 64, stallMs: 7000, expect: 'no-close' });
       }
       metrics.run.stallCombos = combos;
       for (const combo of combos) {
@@ -778,17 +810,29 @@ async function main() {
           );
           res = await outcome.jsonValue();
         } catch (err) {
-          const diag = await page.evaluate((pfx) => {
-            return {
-              markerInBody: document.body.textContent.includes(pfx),
-              sendBtnLabel: document.getElementById('send-btn')?.getAttribute('aria-label') ?? null,
-              closes: window.__slowclient.closes.map((c) => ({ code: c.code, reason: c.reason })),
-              totalMessages: window.__slowclient.messages.length,
-              lastMsgDur: window.__slowclient.messages.slice(-1)[0]?.dur,
-              streamingNodes: [...document.querySelectorAll('.msg--assistant .assistant-text')].map((el) => el.textContent?.length ?? 0),
+          const timeoutAt = Date.now();
+          const diag = await page.evaluate((arg) => {
+            const sc = window.__slowclient;
+            const msgs = sc.messages.slice(arg.msgs);
+            const longtasks = sc.longtasks.slice(arg.longtasks);
+            const sample = (items, pick) => {
+              const samples = items.map(pick);
+              return { count: samples.length, first50: samples.slice(0, 50), last50: samples.slice(-50) };
             };
-          }, `slowclient-done-${combo.n}-${salt}`);
-          metrics.steps[`C4-flood-${combo.n}-${combo.stallMs}ms`] = { timeoutDiag: diag, stallMs: combo.stallMs };
+            return {
+              markerInBody: document.body.textContent.includes(arg.marker),
+              sendBtnLabel: document.getElementById('send-btn')?.getAttribute('aria-label') ?? null,
+              closes: sc.closes.map((c) => ({ code: c.code, reason: c.reason })),
+              totalMessages: sc.messages.length,
+              lastMsgDur: sc.messages.slice(-1)[0]?.dur,
+              streamingNodes: [...document.querySelectorAll('.msg--assistant .assistant-text')].map((el) => el.textContent?.length ?? 0),
+              message: sample(msgs, (m) => ({ t0: m.t0, len: m.len, dur: m.dur })),
+              longtasks: sample(longtasks, (t) => ({ start: t.start, dur: t.dur })),
+            };
+          }, { marker: `slowclient-done-${combo.n}-${salt}`, msgs: base.msgs, longtasks: base.longtasks });
+          const stepFrames = wireFrames.filter((f) => f.t >= base.wall && f.t <= timeoutAt);
+          diag.wire = boundSamples(stepFrames, (f) => ({ t: f.t, len: f.len }));
+          metrics.steps[`C4-flood-${combo.n}-${combo.stallMs}ms`] = { timeoutDiag: diag, stallMs: combo.stallMs, timedOut: true };
           fail(`C4: combo (n=${combo.n}, stall=${combo.stallMs}ms) outcome timed out: ${JSON.stringify(diag)}`);
         }
         const stepKey = `C4-flood-${combo.n}-${combo.stallMs}ms`;
@@ -798,48 +842,38 @@ async function main() {
         s.completed = !!res.done;
         s.closeDuring = res.closed;
         s.drainMs = Date.now() - t0;
-        if (combo.expect === 'no-close') {
-          assertBound(
-            !res.closed,
-            `C4: transient ${combo.stallMs}ms stall + flood closed ${res.closed ? `${res.closed.code} "${res.closed.reason}"` : ''} (n=${combo.n})`
-          );
-          assertBound(!!res.done, `C4: turn never completed after ${combo.stallMs}ms stall (n=${combo.n})`);
-          if (res.closed && res.closed.code === 1008) {
-            // The false-positive reproduction (pre-grace builds): a transient
-            // reader stall is enough to trip the instant-disconnect policy.
-            metrics.run.reproducedFalse1008 = { n: combo.n, stallMs: combo.stallMs, reason: res.closed.reason };
-          }
-          record('C4.2');
-        } else {
-          // Sustained no-read: the connection MUST drop with an accurate
-          // close — either the server's policy 1008 ("client is not reading
-          // messages", reachable with a stalled-but-not-aborting client) or
-          // Chromium's own abnormal 1006 (empty reason) when the renderer
-          // pipe stays full long enough for the browser to abort before the
-          // grace-expired 1008 can fire. Both are genuine sustained-no-read
-          // semantics; the Rust tests own the deterministic server 1008, real
-          // Chromium owns the 1006.
-          assertBound(!!res.closed, `C4: sustained ${combo.stallMs}ms no-read did NOT close (n=${combo.n})`);
-          const closed = res.closed;
-          const serverPolicy1008 = closed && closed.code === 1008 && /not reading/i.test(closed.reason || '');
-          const browserAbort1006 = closed && closed.code === 1006 && (closed.reason || '') === '';
-          assertBound(
-            serverPolicy1008 || browserAbort1006,
-            `C4: sustained no-read closed ${closed ? `${closed.code} "${closed.reason}"` : 'nothing'} — expected 1008 "not reading" or 1006 browser abort (n=${combo.n})`
-          );
-          metrics.run.sustainedClose = closed
-            ? { n: combo.n, stallMs: combo.stallMs, code: closed.code, reason: closed.reason }
-            : null;
-          record('C4.4');
+        assertBound(
+          !res.closed,
+          `C4: ${combo.stallMs}ms renderer stall + flood closed ${res.closed ? `${res.closed.code} "${res.closed.reason}"` : ''} (n=${combo.n})`
+        );
+        assertBound(!!res.done, `C4: turn never completed after ${combo.stallMs}ms renderer stall (n=${combo.n})`);
+        if (res.closed && res.closed.code === 1008) {
+          metrics.run.reproducedFalse1008 = { n: combo.n, stallMs: combo.stallMs, reason: res.closed.reason };
         }
-        // Every combo can leave the turn streaming server-side (a closed
-        // combo replays it after reconnect; a completed combo can retain a
-        // writing mock flood). Use the unified Stop control and wait for
-        // quiescence so the next prompt cannot steer into the previous run.
-        // The continuing turn (if any) replays onto the reconnected socket;
-        // its flood can starve the bootstrap, so do NOT require the Send
-        // button to be enabled here. Wait briefly for #send-btn to show Stop generating on the
-        // resumed turn, Stop it, then wait for quiescence.
+        if (combo.n === 40000 && combo.stallMs === 7000) {
+          const marker = `slowclient-done-${combo.n}-${salt}`;
+          const exact = await page.evaluate(({ pfx, count, bytes, marker: done }) => {
+            const pad = (value) => (value.length >= bytes ? value : value + 'x'.repeat(bytes - value.length));
+            let expected = '';
+            for (let i = 0; i < count - 1; i += 1) expected += pad(`${pfx}${i}/`);
+            expected += pad(done);
+            const nodes = [...document.querySelectorAll('.msg--assistant .assistant-text')];
+            const matches = nodes.filter((el) => (el.textContent || '') === expected);
+            if (matches.length !== 1) {
+              return {
+                ok: false,
+                reason: `expected one exact salted assistant item, found ${matches.length}`,
+                expectedLen: expected.length,
+              };
+            }
+            return { ok: true, chunks: count, bytes: expected.length };
+          }, { pfx: `s${combo.n}:${salt}:`, count: combo.n, bytes: combo.bytes, marker });
+          assertBound(exact.ok, `C4: 7s flood content/order failed: ${exact.reason}`);
+          s.exactChunks = exact.chunks || 0;
+        }
+        record('C4.2');
+        // A completed combo can retain a writing mock flood. Stop it so the
+        // next prompt cannot steer into the previous run.
         try {
           await waitFor(
             page,
@@ -872,113 +906,116 @@ async function main() {
       record('C4.3');
     }
 
-    /* ---------------- C6: close toast guard ---------------- */
+    /* ---------------- C6/C7: held RPC + server close handshake ---------- */
     {
-      const closes = await page.evaluate(() => window.__slowclient.closes);
-      const closeToasts = await page.evaluate(() => window.__slowclient.closeToasts);
-      const unexpected = closes.filter((c) => c.code !== 1000);
-      metrics.run.allCloses = closes.map((c) => ({ code: c.code, reason: c.reason }));
-      metrics.run.allCloseToasts = closeToasts;
-      for (const c of unexpected) {
-        // The app MUST surface every non-1000 close (incl. a genuine 1008/1006)
-        // as a toast AT CLOSE TIME (toasts auto-dismiss after ~7s, so the
-        // close-time snapshot is the source of truth, not the live DOM).
-        // Code 1006 (abnormal) has a split surface: the boot-probe path shows
-        // the token hint; an accurate "connection closed (code 1006)" is the
-        // mid-session surface. Both are accepted; the misleading-token-only
-        // case is recorded as a finding.
-        const needles =
-          c.code === 1006
-            ? ['connection closed (code 1006', 'connection failed (wrong or missing token']
-            : [`connection closed (code ${c.code}`];
-        // Allow the 120ms close-toast snapshot to land.
+      const CONTROLLED_REASON = 'slowclient controlled close';
+      const upstream = new URL(url);
+      const proxy = await startCloseProxy(upstream.hostname, Number(upstream.port));
+      metrics.run.controlledClose = { proxy: proxy.url, reason: CONTROLLED_REASON };
+      let bodyError = null;
+      try {
+        await page.goto(`${proxy.url}/web`, { waitUntil: 'domcontentloaded', timeout: 20000 });
+        await connOn(page, 'C6.0: WS not connected through close proxy');
+        const closesBefore = await page.evaluate(() => window.__slowclient.closes.length);
+        const captured = proxy.arm();
+        await clickFeature(page, '#sidechat-toggle-btn');
+        await waitFor(
+          page,
+          () => !!document.getElementById('side-chat-panel'),
+          'C6.0: side chat panel did not open',
+          10000
+        );
+        const pendingId = await captured;
+        await proxy.waitHeld(pendingId);
+        const stillPending = await page.evaluate((id) => {
+          const rows = window.__slowclient.settlements;
+          return rows.some((row) => row.id === id && row.kind === 'sent')
+            && !rows.some((row) => row.id === id && row.kind !== 'sent');
+        }, pendingId);
+        assertBound(stillPending, `C6: side_chat_list ${pendingId} response was delivered before close`);
+        await proxy.sendClose(1008, CONTROLLED_REASON);
+        await page.waitForFunction(
+          (before) => window.__slowclient.closes.length > before,
+          closesBefore,
+          { timeout: 5000 }
+        );
         await page.waitForTimeout(300);
-        const snapshot = await page.evaluate(
-          ({ code, reason, needles: nd }) => {
-            const match = window.__slowclient.closeToasts.find(
-              (ct) => ct.code === code && ct.reason === reason
-            );
-            if (!match) return { found: false, snapshot: null };
-            return {
-              found: true,
-              snapshot: match.toasts,
-              seen: match.toasts.some((t) => nd.some((n) => t.includes(n))),
-            };
-          },
-          { code: c.code, reason: c.reason, needles }
+        const closed = await page.evaluate((before) => {
+          const row = window.__slowclient.closes.slice(before).find((item) => item.code !== 1000);
+          return row ? { code: row.code, reason: row.reason } : null;
+        }, closesBefore);
+        assertBound(!!closed, 'C6.1: controlled server close was not observed');
+        assertBound(closed.code === 1008, `C6.1: controlled close code ${closed && closed.code}, expected 1008`);
+        assertBound(
+          closed.reason === CONTROLLED_REASON,
+          `C6.1: controlled close reason ${JSON.stringify(closed && closed.reason)}`
         );
-        assertBound(!!snapshot.found, `C6.1: close-time toast snapshot missing for ${c.code} "${c.reason}"`);
-        assertBound(snapshot.seen, `C6.1: non-1000 close toast missing for ${c.code} "${c.reason}"`);
-        if (c.code === 1006 && snapshot.seen) {
-          const tokenOnly = (snapshot.snapshot || []).some((t) => t.includes('connection failed (wrong or missing token'));
-          const codeSurface = (snapshot.snapshot || []).some((t) => t.includes('connection closed (code 1006'));
-          if (tokenOnly && !codeSurface) {
-            metrics.run.mislabeled1006Toast = true;
-            console.error('web-slowclient: METRIC: mid-session 1006 surfaced only the token hint (mislabeled close cause)');
-          }
-        }
+        const snapshot = await page.evaluate(({ code, reason }) => {
+          const match = window.__slowclient.closeToasts.find((ct) => ct.code === code && ct.reason === reason);
+          if (!match) return { found: false, snapshot: [] };
+          const needle = `connection closed (code ${code}`;
+          return { found: true, snapshot: match.toasts, seen: match.toasts.some((text) => text.includes(needle)) };
+        }, closed);
+        assertBound(snapshot.found, `C6.1: close-time toast snapshot missing for ${closed.code}`);
+        assertBound(snapshot.seen, `C6.1: connection closed toast missing for ${closed.code}`);
         record('C6.1');
-      }
-      if (unexpected.length === 0) {
-        // No non-1000 close occurred: the guard is vacuous but the toast
-        // plumbing is still exercised (the app's toast list is live).
-        record('C6.1');
-      }
-    }
-
-    /* ---------------- C7: accurate close cause + no mislabeled rejection --- */
-    {
-      const closes = await page.evaluate(() => window.__slowclient.closes);
-      const non1000 = closes.find((c) => c.code !== 1000);
-      if (non1000) {
-        // The accurate close toast (code + server reason where present) must
-        // surface in the close-time snapshot: 1008 -> the server's reason
-        // "client is not reading messages"; 1006 (browser abnormal abort) ->
-        // "connection closed (code 1006" via the mid-session accurate-cause
-        // path.
-        const needle = non1000.code === 1008 ? 'client is not reading messages' : 'connection closed (code 1006';
-        const seen = await page.evaluate(
-          ({ code, reason, nd }) =>
-            (window.__slowclient.closeToasts.find((ct) => ct.code === code && ct.reason === reason)?.toasts || [])
-              .some((t) => t.includes(nd)),
-          { code: non1000.code, reason: non1000.reason, nd: needle }
+        const accurate = await page.evaluate(({ code, reason }) =>
+          (window.__slowclient.closeToasts.find((ct) => ct.code === code && ct.reason === reason)?.toasts || [])
+            .some((text) => text.includes(`connection closed (code ${code}`) && text.includes(reason)),
+          closed
         );
-        assertBound(seen, `C7.1: accurate close toast missing in close-time snapshot for ${non1000.code}`);
+        assertBound(accurate, 'C7.1: close toast missing the controlled 1008 reason');
         record('C7.1');
-        // No mislabeled pending rejection: after a close the pending is
-        // drained in onclose with the close cause (rpc=true, off the toast
-        // surface), so neither the reconnect-era "send failed: connection
-        // replaced" nor the 30s "command timed out" toast may appear. Watch
-        // the full window in which the old 30s timer would have fired.
-        let mislabeled = await page.evaluate(() =>
+        const settlement = await page.evaluate((id) => {
+          const rows = window.__slowclient.settlements.filter((row) => row.id === id);
+          const handler = window.__slowclient.settlements.find((row) => row.kind === 'close-handler');
+          return {
+            sent: rows.filter((row) => row.kind === 'sent').length,
+            response: rows.filter((row) => row.kind === 'response' || row.kind === 'response-failure').length,
+            handler: handler || null,
+          };
+        }, pendingId);
+        assertBound(settlement.sent === 1, `C7.2: side_chat_list ${pendingId} was not sent once`);
+        assertBound(settlement.response === 0, `C7.2: held side_chat_list ${pendingId} response was delivered`);
+        assertBound(
+          !!settlement.handler && settlement.handler.code === 1008 && settlement.handler.reason === CONTROLLED_REASON,
+          `C7.2: close handler did not observe controlled 1008 (${JSON.stringify(settlement.handler)})`
+        );
+        assertBound(
+          settlement.handler.responsesDuringClose === 0,
+          `C7.2: ${settlement.handler.responsesDuringClose} response(s) arrived during close handling`
+        );
+        const mislabeled = await page.evaluate(() =>
           [...document.querySelectorAll('#toasts .toast')].some((el) => {
-            const t = el.textContent || '';
-            return t.includes('command timed out') || t.includes('send failed: connection replaced');
+            const text = el.textContent || '';
+            return text.includes('timed out after')
+              || text.includes('send failed: connection replaced')
+              || text.includes('connection replaced');
           })
         );
-        if (!mislabeled) {
-          const started = Date.now();
-          while (Date.now() - started < 32000) {
-            await page.waitForTimeout(500);
-            mislabeled = await page.evaluate(() =>
-              [...document.querySelectorAll('#toasts .toast')].some((el) => {
-                const t = el.textContent || '';
-                return t.includes('command timed out') || t.includes('send failed: connection replaced');
-              })
-            );
-            if (mislabeled) break;
-          }
+        assertBound(!mislabeled, 'C7.2: timeout or connection-replaced toast appeared after controlled close');
+        record('C7.2');
+      } catch (error) {
+        bodyError = error;
+      } finally {
+        let cleanupError = null;
+        try {
+          await proxy.close();
+        } catch (error) {
+          cleanupError = error;
         }
-        assertBound(!mislabeled, 'C7: mislabeled pending-rejection toast appeared after close (command timed out / connection replaced)');
-        record('C7.2');
-      } else {
-        record('C7.1');
-        record('C7.2');
+        if (bodyError && cleanupError) {
+          const aggregate = new Error(`${bodyError.message}; ${cleanupError.message}`);
+          aggregate.errors = [bodyError, cleanupError];
+          throw aggregate;
+        }
+        if (bodyError) throw bodyError;
+        if (cleanupError) throw cleanupError;
       }
     }
 
     console.log(
-      'web-slowclient: PASSED (calibration, heavy finalize, amplification bound, transient-stall no false 1008, sustained no-read accurate close + cause, close-toast guard)'
+      'web-slowclient: PASSED (calibration, heavy finalize, amplification bound, renderer-stall no false 1008, exact 7s content, controlled 1008 close + cause)'
     );
   } finally {
     writeEvidence();
@@ -995,3 +1032,177 @@ main().catch((err) => {
   writeEvidence();
   process.exit(2);
 });
+
+function startCloseProxy(upstreamHost, upstreamPort) {
+  const httpServer = http.createServer((req, res) => {
+    const target = http.request({
+      host: upstreamHost,
+      port: upstreamPort,
+      method: req.method,
+      path: req.url,
+      headers: { ...req.headers, host: `${upstreamHost}:${upstreamPort}` },
+    }, (upstream) => {
+      res.writeHead(upstream.statusCode || 502, upstream.headers);
+      upstream.pipe(res);
+    });
+    target.on('error', (error) => {
+      proxy.fail(error);
+      if (!res.headersSent) res.writeHead(502);
+      res.end();
+    });
+    req.pipe(target);
+  });
+  const wss = new WebSocketServer({ noServer: true });
+  const sockets = new Set();
+  let holdId = '';
+  let held = null;
+  const proxy = {
+    errors: [],
+    armed: false,
+    capture: null,
+    fail(error) { proxy.errors.push(error); },
+    url: '',
+    arm() {
+      proxy.armed = true;
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('side_chat_list request was not captured before forwarding')), 5000);
+        proxy.capture = (id) => {
+          clearTimeout(timer);
+          resolve(id);
+        };
+      });
+    },
+    async waitHeld(id) {
+      const deadline = Date.now() + 5000;
+      while (!held || held.id !== id) {
+        if (proxy.errors.length) throw proxy.errors[0];
+        if (Date.now() >= deadline) throw new Error(`matching side_chat_list response ${id} was not held`);
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+    },
+    async sendClose(code, reason) {
+      if (!held || held.released) throw new Error('cannot close before the captured side_chat_list response is held');
+      const ack = new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('close handshake timed out before opcode 8 ack')), 1000);
+        held.browser.once('close', (ackCode, ackReason) => {
+          clearTimeout(timer);
+          if (ackCode !== code || String(ackReason) !== reason) {
+            reject(new Error(`close ack ${ackCode} ${JSON.stringify(String(ackReason))} != ${code} ${JSON.stringify(reason)}`));
+            return;
+          }
+          resolve();
+        });
+      });
+      held.browser.close(code, reason);
+      await ack;
+    },
+    async close() {
+      const closed = await Promise.allSettled([...sockets].map((socket) => new Promise((resolve) => {
+        if (socket.readyState === WebSocket.CLOSED) {
+          resolve();
+          return;
+        }
+        const timer = setTimeout(() => {
+          proxy.fail(new Error('websocket cleanup close timed out'));
+          resolve();
+        }, 1000);
+        socket.once('close', () => {
+          clearTimeout(timer);
+          resolve();
+        });
+        if (socket.readyState !== WebSocket.CLOSING) socket.close(1001, 'proxy cleanup');
+      })));
+      for (const result of closed) if (result.status === 'rejected') proxy.fail(result.reason);
+      const wssResult = await new Promise((resolve) => wss.close((error) => resolve(error || null)));
+      const httpResult = await new Promise((resolve) => httpServer.close((error) => resolve(error || null)));
+      if (wssResult) proxy.fail(wssResult);
+      if (httpResult) proxy.fail(httpResult);
+      if (proxy.errors.length === 1) throw proxy.errors[0];
+      if (proxy.errors.length > 1) {
+        const error = new Error(proxy.errors.map((failure) => failure.message || String(failure)).join('; '));
+        error.errors = [...proxy.errors];
+        throw error;
+      }
+    },
+  };
+  httpServer.on('error', (error) => proxy.fail(error));
+  httpServer.on('clientError', (error) => proxy.fail(error));
+  wss.on('error', (error) => proxy.fail(error));
+  httpServer.on('upgrade', (req, socket, head) => {
+    socket.on('error', (error) => proxy.fail(error));
+    if (req.url !== '/ws') {
+      socket.destroy();
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, (browser) => {
+      sockets.add(browser);
+      const upstream = new WebSocket(`ws://${upstreamHost}:${upstreamPort}/ws`, {
+        headers: { host: req.headers.host, origin: req.headers.origin || '' },
+        protocols: req.headers['sec-websocket-protocol'],
+      });
+      sockets.add(upstream);
+      const toUpstream = [];
+      const toBrowser = [];
+      let opened = false;
+      const release = (error) => {
+        if (held) held.released = true;
+        proxy.fail(error);
+        for (const item of toBrowser.splice(0)) {
+          if (browser.readyState === WebSocket.OPEN) browser.send(item.data, { binary: item.binary });
+        }
+      };
+      upstream.on('open', () => {
+        opened = true;
+        for (const item of toUpstream.splice(0)) upstream.send(item.data, { binary: item.binary });
+      });
+      upstream.on('message', (data, isBinary) => {
+        const text = isBinary ? '' : String(data);
+        let matched = false;
+        if (holdId && (!held || held.released)) {
+          try {
+            const frame = JSON.parse(text);
+            matched = frame.type === 'response' && frame.command === 'side_chat_list' && frame.id === holdId && frame.success === true;
+            if (matched) held = { id: frame.id, browser, released: false };
+          } catch (error) {
+            release(error);
+            return;
+          }
+        }
+        if (matched) return;
+        if (browser.readyState === WebSocket.OPEN) browser.send(data, { binary: isBinary });
+        else toBrowser.push({ data, binary: isBinary });
+      });
+      browser.on('message', (data, isBinary) => {
+        let commandId = '';
+        if (proxy.armed && !holdId && !isBinary) {
+          try {
+            const frame = JSON.parse(String(data));
+            if (frame.type === 'side_chat_list' && typeof frame.id === 'string') commandId = frame.id;
+          } catch (error) {
+            proxy.fail(error);
+            return;
+          }
+        }
+        if (commandId) holdId = commandId;
+        if (upstream.readyState === WebSocket.OPEN) upstream.send(data, { binary: isBinary });
+        else if (!opened) toUpstream.push({ data, binary: isBinary });
+        else {
+          proxy.fail(new Error('browser frame arrived before upstream websocket opened'));
+          return;
+        }
+        if (commandId && proxy.capture) proxy.capture(commandId);
+      });
+      upstream.on('error', release);
+      browser.on('error', release);
+      upstream.on('close', () => { if (!held || held.released) browser.close(); });
+      browser.on('close', () => upstream.close());
+    });
+  });
+  return new Promise((resolve, reject) => {
+    httpServer.once('error', reject);
+    httpServer.listen(0, '127.0.0.1', () => {
+      proxy.url = `http://127.0.0.1:${httpServer.address().port}`;
+      resolve(proxy);
+    });
+  });
+}

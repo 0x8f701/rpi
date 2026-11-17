@@ -62,7 +62,7 @@ async fn session(
 
     let session = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model,
+            model: Some(model),
             cwd: cwd.to_path_buf(),
             system_prompt: String::new(),
             thinking_level: pi_agent::ThinkingLevel::Off,
@@ -565,7 +565,7 @@ async fn task_abort_keeps_supervised_process_then_explicit_stop_cleans_up() {
     let pid = process.pid.expect("managed pid") as i32;
 
     // The exact task-interrupt entry point the TUI Esc/Ctrl-C path calls.
-    application.abort().await;
+    application.abort().await.expect("abort running turn");
 
     let listed = application.process_list();
     assert_eq!(
@@ -664,7 +664,7 @@ async fn task_abort_cancels_in_flight_turn_but_keeps_supervised_process_alive() 
 
     // Task interrupt mid-turn: the foreground bash child is cancelled, the
     // turn settles, and the supervised process must survive untouched.
-    application.abort().await;
+    application.abort().await.expect("abort running turn");
     tokio::time::timeout(Duration::from_secs(3), run)
         .await
         .expect("aborted turn must settle");

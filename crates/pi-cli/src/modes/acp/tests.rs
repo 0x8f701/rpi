@@ -1744,6 +1744,109 @@ async fn session_close_releases_the_session() {
     server.await.expect("server join").expect("server ok");
 }
 
+/// Cancel-on-close contract: closing a session aborts its in-flight turn, so
+/// that turn's `session/prompt` response must report `stopReason: "cancelled"`
+/// (as `session/cancel` does), never `end_turn` or an internal error.
+#[tokio::test]
+async fn session_close_cancels_the_active_turn_as_cancelled() {
+    let (registration, model_id) = register_faux("close-active");
+    registration.set_responses(vec![FauxResponse::text("not reached: close aborts")]);
+    let agent = tempfile::tempdir().expect("agent dir");
+    let sessions = tempfile::tempdir().expect("sessions dir");
+    let cli = test_cli(sessions.path(), &model_id);
+
+    // Provider stream that settles only when the session aborts it.
+    let stream_started = Arc::new(tokio::sync::Notify::new());
+    let started = stream_started.clone();
+    let stream_fn: pi_agent::StreamFn = Arc::new(move |model, _context, options| {
+        let started = started.clone();
+        Box::pin(async move {
+            let stream = pi_ai::new_assistant_message_event_stream();
+            let producer = stream.clone();
+            tokio::spawn(async move {
+                started.notify_one();
+                options.stream.abort_signal.unwrap().cancelled().await;
+                let mut message = pi_ai::AssistantMessage::pending(&model);
+                message.stop_reason = pi_ai::StopReason::Aborted;
+                message.error_message = Some("aborted".into());
+                producer
+                    .push(pi_ai::AssistantMessageEvent::Error {
+                        reason: pi_ai::StopReason::Aborted,
+                        error: message.clone(),
+                    })
+                    .await;
+                producer.end(Some(message)).await;
+            });
+            stream
+        })
+    });
+    let (mut client, server) = spawn_server_with_stream(&cli, agent.path(), stream_fn).await;
+    let session_id = connect(&mut client, agent.path()).await;
+
+    client
+        .tx
+        .send(json!({
+            "jsonrpc": "2.0",
+            "id": 310,
+            "method": "session/prompt",
+            "params": { "sessionId": session_id, "prompt": [{ "type": "text", "text": "go" }] },
+        }))
+        .await
+        .expect("send prompt");
+    tokio::time::timeout(Duration::from_secs(10), stream_started.notified())
+        .await
+        .expect("the prompt turn must reach the provider stream");
+
+    client
+        .tx
+        .send(json!({
+            "jsonrpc": "2.0",
+            "id": 311,
+            "method": "session/close",
+            "params": { "sessionId": session_id },
+        }))
+        .await
+        .expect("send close");
+
+    // Both responses race; collect them by id.
+    let (prompt_response, close_response) =
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let mut prompt_response = None;
+            let mut close_response = None;
+            while prompt_response.is_none() || close_response.is_none() {
+                let message = client.next().await;
+                match message.get("id") {
+                    Some(id) if id == &json!(310) => prompt_response = Some(message),
+                    Some(id) if id == &json!(311) => close_response = Some(message),
+                    _ => {}
+                }
+            }
+            (
+                prompt_response.expect("prompt response"),
+                close_response.expect("close response"),
+            )
+        })
+        .await
+        .expect("session/close and the aborted turn must both settle");
+
+    assert!(
+        close_response.get("result").is_some(),
+        "session/close must succeed while aborting a turn: {close_response}"
+    );
+    assert!(
+        prompt_response.get("result").is_some(),
+        "the closed turn must respond cancelled, not with an error: {prompt_response}"
+    );
+    assert_eq!(
+        TestClient::result(&prompt_response)["stopReason"],
+        "cancelled",
+        "closing a session must cancel its active turn: {prompt_response}"
+    );
+
+    drop(client);
+    server.await.expect("server join").expect("server ok");
+}
+
 #[tokio::test]
 async fn session_cancel_as_request_acknowledges_and_validates() {
     // The spec defines session/cancel as a notification, but the server also

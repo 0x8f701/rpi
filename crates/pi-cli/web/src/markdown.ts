@@ -19,8 +19,9 @@ import {
   fileExplorerListCommand,
   fileExplorerResolvedRequestPath,
   normalizeRead,
+  parseFileExplorerAmbiguity,
 } from './fileExplorer';
-
+import { reviewRepositoryUnavailable, type ReviewRepository } from './codeReview';
 // highlight.js core build + a focused language subset (tree-shakeable
 // per-language imports; auto-detection uses only the registered set).
 import hljs from 'highlight.js/lib/core';
@@ -276,6 +277,79 @@ function highlightLineRun(language: string, texts: string[]): string[] {
 // the always-visible viewer toolbar row (mermaidViewer.ts: View / Download
 // SVG; double-click opens the one global full-screen viewer).
 
+// Host summary text backslash-prefixes every ASCII punctuation character.
+// One scan lifts those escapes and genuine math. A dollar opens math only
+// when its preceding backslashes are even, so `\$` stays literal. Math
+// bodies and inline code spans are copied raw. The placeholder marker is
+// chosen from the whole original input, including fences, so a source token
+// can never share the generated namespace. Decoded characters are
+// HTML-escaped only after renderLines.
+const ASCII_PUNCT = /[!-/:-@[-`{-~]/;
+
+function escapedBefore(raw: string, index: number): boolean {
+  let slashes = 0;
+  for (let j = index - 1; j >= 0 && raw[j] === '\\'; j -= 1) slashes += 1;
+  return slashes % 2 === 1;
+}
+
+function literalMarker(raw: string): string {
+  let marker = '\u0001Z';
+  while (raw.includes(marker)) marker += 'Z';
+  return marker;
+}
+
+function protectLiteralEscapes(raw: string, marker: string): { text: string; literals: string[] } {
+  const literals: string[] = [];
+  let out = '';
+  let i = 0;
+  const takeCode = (): boolean => {
+    const span = raw.slice(i).match(/^(`+)([\s\S]*?)\1/);
+    if (!span || escapedBefore(raw, i)) return false;
+    out += span[0];
+    i += span[0].length;
+    return true;
+  };
+  const takeMath = (): boolean => {
+    if (raw[i] !== '$' || escapedBefore(raw, i)) return false;
+    const prev = i > 0 ? raw[i - 1] : '';
+    if (/\d/.test(prev)) return false;
+    const rest = raw.slice(i);
+    const display = rest.match(/^\$\$([\s\S]*?)\$\$/);
+    if (display && display[1].trim() !== '') {
+      out += display[0];
+      i += display[0].length;
+      return true;
+    }
+    const inline = rest.match(/^\$(\S(?:[^$\n]*?\S)?)\$/);
+    if (!inline) return false;
+    out += inline[0];
+    i += inline[0].length;
+    return true;
+  };
+  while (i < raw.length) {
+    if (raw[i] === '`' && takeCode()) continue;
+    if (raw[i] === '$' && takeMath()) continue;
+    if (raw[i] === '\\' && i + 1 < raw.length && ASCII_PUNCT.test(raw[i + 1]) && !escapedBefore(raw, i)) {
+      literals.push(raw[i + 1]);
+      out += `${marker}${literals.length - 1}\u0002`;
+      i += 2;
+      continue;
+    }
+    out += raw[i];
+    i += 1;
+  }
+  return { text: out, literals };
+}
+
+function restoreLiteralEscapes(html: string, literals: string[], marker: string): string {
+  if (literals.length === 0) return html;
+  const pattern = new RegExp(`${marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(\\d+)\u0002`, 'g');
+  return html.replace(pattern, (_m, index: string) => {
+    const literal = literals[Number(index)];
+    return literal === undefined ? '' : escapeHtmlRaw(literal);
+  });
+}
+
 /* ------------------------------------------------------------------ *
  * Math extraction ($...$ inline, $$...$$ display)
  * ------------------------------------------------------------------ */
@@ -286,8 +360,8 @@ interface MathPart {
 }
 
 // Scanner that lifts math out of raw text while leaving inline code spans
-// (backtick runs) alone. Output text uses \u0001M<n>\u0002 placeholders,
-// which escapeHtml cannot alter.
+// (backtick runs) alone. A backslash-escaped dollar is not a delimiter.
+// Output text uses \u0001M<n>\u0002 placeholders, which escapeHtml cannot alter.
 function extractMath(raw: string): { text: string; parts: MathPart[] } {
   let out = '';
   const parts: MathPart[] = [];
@@ -296,7 +370,7 @@ function extractMath(raw: string): { text: string; parts: MathPart[] } {
     const ch = raw[i];
     if (ch === '`') {
       const span = raw.slice(i).match(/^(`+)([\s\S]*?)\1/);
-      if (span) {
+      if (span && !escapedBefore(raw, i)) {
         out += span[0];
         i += span[0].length;
         continue;
@@ -305,7 +379,7 @@ function extractMath(raw: string): { text: string; parts: MathPart[] } {
       i += 1;
       continue;
     }
-    if (ch === '$') {
+    if (ch === '$' && !escapedBefore(raw, i)) {
       const prev = i > 0 ? raw[i - 1] : '';
       if (/\d/.test(prev)) {
         // currency amount, not math
@@ -365,11 +439,23 @@ type Segment =
   | { kind: 'text'; text: string }
   | { kind: 'fence'; lang: string; source: string };
 
+/** CommonMark fence OPENER: 0-3 spaces, a run of >= 3 backticks, then the info
+ *  string (`(.*)` allows spaces, so the caller takes the first token). A
+ *  backtick fence whose info string contains a backtick is not a fence
+ *  (CommonMark); `~~~` fences stay out of scope — the Web renderer has never
+ *  recognized them, and this parser does not widen the surface. */
+const FENCE_OPEN = /^ {0,3}(`{3,})(.*)$/;
+/** A CLOSING run: same marker, whitespace only after it. The caller requires
+ *  its length to be >= the opening run's, so a ``` line inside a `````` block
+ *  is content, never a premature close. */
+const FENCE_CLOSE = /^ {0,3}(`{3,})\s*$/;
+
 function extractFences(raw: string): Segment[] {
   const segments: Segment[] = [];
   const lines = raw.split('\n');
   let buf: string[] = [];
-  let inFence = false;
+  /** Length of the opening backtick run; 0 = not inside a fence. */
+  let openingMarkerLen = 0;
   let lang = '';
   const flushText = () => {
     if (buf.length > 0) {
@@ -378,25 +464,35 @@ function extractFences(raw: string): Segment[] {
     }
   };
   for (const line of lines) {
+    // Marker decisions ignore a trailing CR (CRLF input) while the source
+    // keeps the original line byte-for-byte.
+    const markerLine = line.endsWith('\r') ? line.slice(0, -1) : line;
     // CommonMark: a fence opener/closer may be indented 0-3 spaces. Model
     // output regularly indents fences (observed: " ```mermaid" inside a
     // briefing) — without tolerance the whole diagram renders as prose.
-    const fence = line.match(/^ {0,3}```(\S*)\s*$/);
-    if (fence) {
-      if (inFence) {
+    if (openingMarkerLen > 0) {
+      const close = markerLine.match(FENCE_CLOSE);
+      if (close && close[1].length >= openingMarkerLen) {
         segments.push({ kind: 'fence', lang, source: buf.join('\n') });
         buf = [];
-        inFence = false;
-      } else {
-        flushText();
-        inFence = true;
-        lang = fence[1] || '';
+        openingMarkerLen = 0;
+        continue;
       }
+      buf.push(line);
+      continue;
+    }
+    const open = markerLine.match(FENCE_OPEN);
+    if (open && !open[2].includes('`')) {
+      flushText();
+      openingMarkerLen = open[1].length;
+      // The info string's FIRST token names the language (CommonMark; the
+      // Rust neutral renderer resolves it the same way).
+      lang = open[2].trim().split(/\s+/)[0] ?? '';
       continue;
     }
     buf.push(line);
   }
-  if (inFence) {
+  if (openingMarkerLen > 0) {
     // Unclosed fence: still render as a fence block.
     segments.push({ kind: 'fence', lang, source: buf.join('\n') });
   } else {
@@ -692,17 +788,20 @@ function isBareHttpUrl(url: string): boolean {
   return safeUrl(url) === url;
 }
 
-function httpDownloadButton(target: string): string {
-  return /^https?:/i.test(target)
-    ? `<button type="button" class="md-link-download" data-href="${target}">Download</button>`
-    : '';
+function anchorHtml(href: string, label: string, hrefEscaped = false): string {
+  const safeHref = hrefEscaped ? href : escapeHtmlRaw(href);
+  const target = /^https?:/i.test(href) ? ' target="_blank"' : '';
+  return `<a href="${safeHref}"${target} rel="noopener noreferrer">${label}</a>`;
 }
 
 function linkifyBareHttp(escaped: string): string {
-  return escaped.replace(/(?<![A-Za-z0-9])(https?:\/\/[^\s<]+)/gi, (full, raw: string) => {
+  // CJK sentence punctuation ends a bare token, so following prose stays
+  // outside the anchor; CJK ideographs stay allowed so real Chinese
+  // paths/queries/fragments still linkify whole.
+  return escaped.replace(/(?<![A-Za-z0-9])(https?:\/\/[^\s<\u3001\u3002\u3008-\u3011\uFF01\uFF08\uFF09\uFF0C\uFF1A\uFF1B\uFF1F]+)/gi, (full, raw: string) => {
     const { core, trailing } = peelHttpTrailing(raw);
     if (!isBareHttpUrl(core)) return full;
-    return `<a href="${core}" rel="noopener noreferrer">${core}</a>${httpDownloadButton(core)}${trailing}`;
+    return `${anchorHtml(core, core, true)}${trailing}`;
   });
 }
 
@@ -750,19 +849,20 @@ function inlineMd(escaped: string, completePath: CompleteMarkdownPath): string {
   });
   s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_m, label: string, url: string) => {
     const gitCandidate = markdownGitWebPath(url);
-    let target = gitCandidate
+    const gitTarget = gitCandidate
       ? (gitCandidate.line === undefined ? gitCandidate.path : `${gitCandidate.path}:${gitCandidate.line}`)
-      : safeUrl(url);
+      : '';
+    let target = gitTarget ? escapeHtmlRaw(gitTarget) : safeUrl(url);
+    let hrefEscaped = true;
     if (!target) {
       const hrefCandidate = parseWorkspacePathCandidate(url, 'href');
       if (hrefCandidate && (hrefCandidate.path.includes('/') || hrefCandidate.path.includes('\\'))) {
         target = hrefCandidate.line === undefined ? hrefCandidate.path : `${hrefCandidate.path}:${hrefCandidate.line}`;
+        hrefEscaped = true;
       }
     }
     if (!target) return label;
-    // http(s) links keep safe navigation AND gain an explicit Download
-    // affordance (fetch+blob only on click — never auto-download).
-    return `<a href="${escapeHtmlRaw(target)}" rel="noopener noreferrer">${label}</a>${httpDownloadButton(target)}`;
+    return anchorHtml(target, label, hrefEscaped);
   });
   const slots: string[] = [];
   s = protectGeneratedMarkup(s, slots);
@@ -924,9 +1024,11 @@ export function renderMarkdown(raw: string, pathContext: string = raw, workspace
       html += renderFence(segment.lang, segment.source);
       continue;
     }
-    const { text, parts } = extractMath(segment.text);
+    const marker = literalMarker(raw);
+    const { text: protectedText, literals } = protectLiteralEscapes(segment.text, marker);
+    const { text, parts } = extractMath(protectedText);
     const escaped = escapeHtml(text);
-    html += substituteMath(renderLines(escaped, completePath), parts);
+    html += restoreLiteralEscapes(substituteMath(renderLines(escaped, completePath), parts), literals, marker);
   }
   return html;
 }
@@ -1860,10 +1962,11 @@ if (typeof document !== 'undefined') {
 }
 
 /* ------------------------------------------------------------------ *
- * Workspace-path interception (file-explorer drawer) + explicit
- * http(s) link download. Like the fence-copy handler above, both are
- * delegated document-level listeners, so every rendered markdown surface
- * is covered: host App, StreamingAssistant, and the collab guest view.
+ * Workspace-path interception (file-explorer drawer). Like the fence-copy
+ * handler above, this is a delegated document-level listener, so every
+ * rendered markdown surface is covered: host App, StreamingAssistant, and
+ * the collab guest view. Ordinary http(s) anchors are the only control for
+ * that URL.
  * ------------------------------------------------------------------ */
 
 /** A parsed workspace-path candidate: workspace-RELATIVE path plus the
@@ -1880,10 +1983,10 @@ export interface MarkdownPathOwner {
   runnerId?: string;
   mappingId?: string;
   workspaceCwd?: string;
-  /** The repository a REVIEW is scoped to (its workspace-relative root).
-   *  Citations inside that review are repo-relative, so a missing click
-   *  falls back to `${reviewRepo}/${path}` before it is declared dead. */
-  reviewRepo?: string;
+  /** Review citation authority. Absent means an ordinary transcript owner.
+   *  `null` is the review's session directory, a string is its child root,
+   *  and `{ unavailable: true }` rejects navigation before any file RPC. */
+  reviewRepo?: ReviewRepository;
 }
 
 export interface MarkdownOpenedPath {
@@ -1904,14 +2007,11 @@ interface PathClickNodeLike {
   textContent: string | null;
   getAttribute(name: string): string | null;
   closest(selectors: string): unknown;
-  dataset?: { mdDownloadBusy?: string };
 }
 
 const MAX_WORKSPACE_PATH_CHARS = 512;
 const MAX_WORKSPACE_PATH_LINE = 10_000_000;
 const MAX_WORKSPACE_PATH_COLUMN = 1_000_000;
-const MAX_MARKDOWN_DOWNLOAD_BYTES = 16 * 1024 * 1024;
-const MAX_DOWNLOAD_FILENAME_LENGTH = 128;
 const WORKSPACE_FILE_LINE = /^\d+(:\d+)?$/;
 const WORKSPACE_FILE_RANGE = /^\d+-\d+$/;
 const BLOCKED_WORKSPACE_SCHEMES = /^(javascript|data|file|https?|mailto|vbscript|blob):/i;
@@ -2190,19 +2290,35 @@ export function markdownPathReadValid(path: string, response: unknown): boolean 
   return markdownPathReadResolvedPath(path, response) !== null;
 }
 
-/** The client-side copy of the host's own missing-file verdict
- *  (`FileExplorerError::FileUnavailable`: `rpcCode: 'file_unavailable'`,
- *  message `file is unavailable`). A probe that was ANSWERED but resolved no
- *  file for the requested workspace path is exactly that verdict — the same
- *  shape `onResponse` stamps on the host's rejection — so every caller
- *  routes it through its existing file_unavailable channel (App's
- *  refresh+retry, then the named `文件已不存在：…` toast) instead of dropping
- *  a dead click. */
-function markdownOpenFileUnavailableError(): Error & { rpc: true; rpcCode: 'file_unavailable' } {
-  const error = new Error('file is unavailable') as Error & { rpc: true; rpcCode: 'file_unavailable' };
+/** An answered read that resolved no file. This is not the host's typed
+ *  `file_unavailable`: basename search may follow only that host code. */
+function markdownOpenUnresolvedReadError(): Error & { rpc: true; rpcCode: 'file_unresolved' } {
+  const error = new Error('file read did not resolve') as Error & { rpc: true; rpcCode: 'file_unresolved' };
   error.rpc = true;
-  error.rpcCode = 'file_unavailable';
+  error.rpcCode = 'file_unresolved';
   return error;
+}
+
+/**
+ * Prefix a repo-relative citation with the review's authoritative root. A
+ * citation that already names that root (or a path inside it) is returned
+ * unchanged, so the existing path-scoped lookup can never double-prefix.
+ */
+function markdownReviewScopedPath(path: string, reviewRepo: string): string {
+  return path === reviewRepo || path.startsWith(`${reviewRepo}/`) ? path : `${reviewRepo}/${path}`;
+}
+
+/**
+ * Confine a successful probe echo to the authoritative review root. The
+ * shared resolver also accepts a sibling-prefixed homonym (`other/<repo>/…`)
+ * for a deeper echo, so the review boundary must re-check the resolved path.
+ */
+function markdownReviewRootedResolvedPath(resolved: string | null, reviewRepo: string): string | null {
+  if (resolved === null) return null;
+  const canonical = fileExplorerCanonicalPath(resolved);
+  const root = fileExplorerCanonicalPath(reviewRepo);
+  if (!canonical || !root) return null;
+  return canonical === root || canonical.startsWith(`${root}/`) ? resolved : null;
 }
 
 /**
@@ -2220,6 +2336,11 @@ function markdownOpenFileUnavailableError(): Error & { rpc: true; rpcCode: 'file
  * The absolute→relative workspace bound (markdownWorkspaceRelativePath)
  * still applies first: an invalid candidate errors nothing and opens
  * nothing.
+ *
+ * Inside a review, the snapshot's authoritative `repo` scopes every
+ * citation: the repo-rooted path is probed FIRST and remains the only
+ * candidate spelling. A same-named parent file never wins, and a missing
+ * child never falls back to the parent or another repository.
  */
 export async function markdownOpenValidatedPath(
   path: string,
@@ -2233,60 +2354,54 @@ export async function markdownOpenValidatedPath(
   const sessionId = owner.sessionId.trim();
   const relative = markdownWorkspaceRelativePath(path, owner.workspaceCwd);
   if (!sessionId || !relative || relative.trim() !== relative) return;
-  const command = fileExplorerCommandForSession(sessionId, fileExplorerReadCommand(relative, undefined, 1));
+  if (reviewRepositoryUnavailable(owner.reviewRepo)) {
+    onError(Object.assign(new Error('review repository is unavailable'), { rpc: true, rpcCode: 'review_unavailable' }));
+    return;
+  }
+  const reviewRoot = owner.reviewRepo === undefined ? null : owner.reviewRepo;
+  const scopedPrimary = reviewRoot === null ? relative : markdownReviewScopedPath(relative, reviewRoot);
+  const completionRelative = markdownWorkspaceRelativePath(completion ?? '', owner.workspaceCwd);
+  const scopedCompletion = completionRelative === null || completionRelative === relative
+    ? null
+    : reviewRoot === null
+      ? completionRelative
+      : markdownReviewScopedPath(completionRelative, reviewRoot);
+  // A valid same-owner completion is the only first probe. The cited
+  // shorter path is not read first: that short walk is exactly what a
+  // unique context path exists to avoid.
+  const firstTarget = scopedCompletion !== null && scopedCompletion !== scopedPrimary
+    ? scopedCompletion
+    : scopedPrimary;
+  const command = fileExplorerCommandForSession(sessionId, fileExplorerReadCommand(firstTarget, undefined, 1));
   let response: unknown;
   try {
     response = await send(command);
   } catch (error) {
+    // A typed ambiguity names real files. It is never a missing-file
+    // verdict and never a reason to probe a completion or another path.
+    if (parseFileExplorerAmbiguity(error) !== null) {
+      onError(error);
+      return;
+    }
     if ((error as { rpcCode?: unknown } | null)?.rpcCode === 'directory_unavailable') {
       try {
-        await send(fileExplorerCommandForSession(sessionId, fileExplorerListCommand(relative)));
-        open(relative, undefined, owner, { kind: 'directory' });
+        await send(fileExplorerCommandForSession(sessionId, fileExplorerListCommand(firstTarget)));
+        open(firstTarget, undefined, owner, { kind: 'directory' });
         return;
       } catch (directoryError) {
         onError(directoryError);
         return;
       }
     }
-    const typedMissing = (error as { rpcCode?: unknown } | null)?.rpcCode === 'file_unavailable';
-    const repoFallback = typedMissing && owner.reviewRepo && !relative.startsWith(`${owner.reviewRepo}/`)
-      ? `${owner.reviewRepo}/${relative}`
-      : null;
-    if (repoFallback) {
-      try {
-        response = await send(fileExplorerCommandForSession(sessionId, fileExplorerReadCommand(repoFallback, undefined, 1)));
-      } catch (repoError) {
-        onError(repoError);
-        return;
-      }
-      const resolvedRepo = markdownPathReadResolvedPath(repoFallback, response);
-      if (resolvedRepo) {
-        open(resolvedRepo, line, owner);
-        return;
-      }
-    }
-    const fallback = typedMissing ? markdownWorkspaceRelativePath(completion ?? '', owner.workspaceCwd) : null;
-    if (!typedMissing || !fallback || fallback === relative) {
-      onError(error);
-      return;
-    }
-    try {
-      response = await send(fileExplorerCommandForSession(sessionId, fileExplorerReadCommand(fallback, undefined, 1)));
-    } catch (retryError) {
-      onError(retryError);
-      return;
-    }
-    const resolvedFallback = markdownPathReadResolvedPath(fallback, response);
-    if (!resolvedFallback) {
-      onError(markdownOpenFileUnavailableError());
-      return;
-    }
-    open(resolvedFallback, line, owner);
+    onError(error);
     return;
   }
-  const resolved = markdownPathReadResolvedPath(relative, response);
+  const resolvedPath = markdownPathReadResolvedPath(firstTarget, response);
+  const resolved = reviewRoot === null
+    ? resolvedPath
+    : markdownReviewRootedResolvedPath(resolvedPath, reviewRoot);
   if (!resolved) {
-    onError(markdownOpenFileUnavailableError());
+    onError(markdownOpenUnresolvedReadError());
     return;
   }
   open(resolved, line, owner);
@@ -2303,6 +2418,27 @@ export function markdownOpenBoundedPathText(path: string): string {
 export function markdownOpenMissingFileVerdict(retried: boolean, error: unknown): boolean {
   if (!retried || error === null || typeof error !== 'object') return false;
   return (error as { rpcCode?: unknown }).rpcCode === 'file_unavailable';
+}
+
+/** Basename search follows only the host's typed missing-file RPC code.
+ *  Message text and a locally synthesized unresolved read never qualify. */
+export function markdownOpenHostFileUnavailable(error: unknown): boolean {
+  if (error === null || typeof error !== 'object' || !('rpcCode' in error)) return false;
+  return error.rpcCode === 'file_unavailable';
+}
+
+/** A retried host miss for a bare basename updates that owner slot.
+ *  Displayed chrome opens only when the owner is the displayed runtime. */
+export function markdownOwnerBasenameSearch(input: {
+  path: string;
+  completion?: string;
+  ownerSessionId: string;
+  displayedSessionId?: string | null;
+  hostMissing: boolean;
+}): { query: string; revealDisplayed: boolean } | null {
+  const bare = input.path !== '' && !input.path.includes('/') && !input.path.includes('\\') && !input.completion;
+  if (!bare || !input.hostMissing || input.ownerSessionId === '') return null;
+  return { query: input.path, revealDisplayed: input.displayedSessionId === input.ownerSessionId };
 }
 
 export function markdownOpenMissingFileToast(path: string): string {
@@ -2369,98 +2505,54 @@ function notifyMarkdownOpenPath(
   return called;
 }
 
-function flashDownloadFeedback(button: PathClickNodeLike, message: string): void {
-  const original = button.textContent;
-  button.textContent = message.slice(0, 48);
-  if (typeof window === 'undefined') return;
-  window.setTimeout(() => {
-    button.textContent = original;
-  }, 1600);
-}
-
-/** Basename + control-char scrub for an explicit markdown-link download.
- *  Mirrors sessionExportFileName bounds without the `.html` requirement. */
-export function markdownDownloadFileName(href: string, contentDisposition?: string | null): string {
-  let name = '';
-  if (contentDisposition) {
-    const encoded = contentDisposition.match(/filename\*\s*=\s*UTF-8''([^;]+)/i);
-    const quoted = contentDisposition.match(/filename\s*=\s*"([^"]+)"/i);
-    const bare = contentDisposition.match(/filename\s*=\s*([^;]+)/i);
-    const raw = encoded?.[1] ?? quoted?.[1] ?? bare?.[1] ?? '';
-    try {
-      name = decodeURIComponent(raw).trim();
-    } catch {
-      name = raw.trim();
-    }
+/**
+ * Path-shaped clicks inside a `data-path-navigation="disabled"` boundary are
+ * inert. The boundary exists for surfaces that have NO authoritative file
+ * owner (the subagent details transcript): a relative `<a href>` would
+ * otherwise fall through to browser default navigation because the dispatcher
+ * bails out when no owner session id is rendered. Ordinary external links and
+ * fragment anchors keep their default behaviour; Copy/fold controls never
+ * reach this path because they are not anchors, code paths, or md-path nodes.
+ */
+function blockPathNavigationWithoutOwner(
+  target: PathClickNodeLike,
+  event: { preventDefault(): void },
+): boolean {
+  const toolPath = target.closest('[data-md-path]');
+  if (toolPath) {
+    event.preventDefault();
+    return true;
   }
-  if (!name) {
-    try {
-      const url = new URL(href);
-      const base = url.pathname.split('/').filter(Boolean).pop() ?? '';
-      name = decodeURIComponent(base);
-    } catch {
-      name = '';
-    }
+  const code = asPathClickNode(target.closest('code.md-code')) ?? asPathClickNode(target.closest('.md-code'));
+  if (code && !code.closest('.md-fence')) {
+    if (!parseWorkspacePathCandidate(code.textContent ?? '')) return false;
+    event.preventDefault();
+    return true;
   }
-  const bounded = name
-    .replace(/[\u0000-\u001f\u007f\\/]+/g, '-')
-    .trim()
-    .slice(0, MAX_DOWNLOAD_FILENAME_LENGTH);
-  return bounded || 'download';
-}
-
-async function downloadMarkdownHref(href: string, button: PathClickNodeLike): Promise<void> {
-  if (!/^https?:\/\//i.test(href)) {
-    flashDownloadFeedback(button, 'blocked');
-    return;
-  }
-  if (button.dataset?.mdDownloadBusy === '1') {
-    flashDownloadFeedback(button, 'busy');
-    return;
-  }
-  if (!button.dataset) button.dataset = {};
-  button.dataset.mdDownloadBusy = '1';
-  try {
-    const response = await fetch(href, { credentials: 'omit', referrerPolicy: 'no-referrer' });
-    if (!response.ok) {
-      flashDownloadFeedback(button, `failed — HTTP ${response.status}`);
-      return;
-    }
-    const blob = await response.blob();
-    if (blob.size > MAX_MARKDOWN_DOWNLOAD_BYTES) {
-      flashDownloadFeedback(button, 'failed — too large');
-      return;
-    }
-    const objectUrl = URL.createObjectURL(blob);
-    try {
-      const anchor = document.createElement('a');
-      anchor.href = objectUrl;
-      anchor.download = markdownDownloadFileName(href, response.headers.get('content-disposition'));
-      anchor.hidden = true;
-      document.body.appendChild(anchor);
-      anchor.click();
-      anchor.remove();
-    } finally {
-      URL.revokeObjectURL(objectUrl);
-    }
-  } catch {
-    flashDownloadFeedback(button, 'failed — retry');
-  } finally {
-    if (button.dataset) delete button.dataset.mdDownloadBusy;
-  }
+  const anchor = asPathClickNode(target.closest('a'));
+  if (!anchor) return false;
+  const href = (anchor.getAttribute('href') ?? '').trim();
+  // External URLs (any RFC scheme) and same-document fragments are not
+  // filesystem candidates; everything else — relative, root-absolute, or a
+  // git-web file link — must not navigate out of an ownerless pane.
+  if (href === '' || href.startsWith('#') || hasRfcScheme(href)) return false;
+  event.preventDefault();
+  return true;
 }
 
 /**
- * Dispatch a markdown click: `.md-link-download` → fetch+blob download;
- * `.md-code` (not inside a fence) → code path parse; a relative
- * `<a href>` → href path parse. Ordinary prose — including bare absolute
- * paths — is never interactive, so no auto-linked anchor exists to click.
- * Path handlers receive only a workspace-relative path plus the exact
- * rendered owner. Missing owners, absolute paths without an authoritative
- * cwd, and absolute paths outside that cwd stay inert. A bare-basename
- * candidate is completed from the SAME rendered owner's text when that text
- * names exactly one longer path ending in it (`gatherer.rs:178-260` cited
- * next to a `src/queue/gatherer.rs` grep hit probes the cited file).
+ * Dispatch a markdown click: `.md-code` (not inside a fence) → code path
+ * parse; a relative `<a href>` → href path parse. Ordinary http(s) anchors,
+ * including scoped artifact URLs, are the only control for that URL and open
+ * in a new tab — no sibling button. Ordinary prose —
+ * including bare absolute paths — is never interactive, so no auto-linked
+ * anchor exists to click. Path handlers receive only a workspace-relative
+ * path plus the exact rendered owner. Missing owners, absolute paths without
+ * an authoritative cwd, and absolute paths outside that cwd stay inert. A
+ * bare-basename candidate is completed from the SAME rendered owner's text
+ * when that text names exactly one longer path ending in it
+ * (`gatherer.rs:178-260` cited next to a `src/queue/gatherer.rs` grep hit
+ * probes the cited file).
  */
 export function dispatchMarkdownPathClick(
   event: { target: unknown; preventDefault(): void; defaultPrevented?: boolean },
@@ -2469,27 +2561,45 @@ export function dispatchMarkdownPathClick(
   if (event.defaultPrevented) return false;
   const target = asPathClickNode(event.target);
   if (!target) return false;
-  const download = asPathClickNode(target.closest('.md-link-download'));
-  if (download) {
-    event.preventDefault();
-    const href = (download.getAttribute('data-href') ?? '').trim();
-    void downloadMarkdownHref(href, download);
-    return true;
+
+  if (target.closest('[data-path-navigation="disabled"]')) {
+    return blockPathNavigationWithoutOwner(target, event);
   }
 
   const ownerNode = asPathClickNode(target.closest('[data-session-id]'));
   const sessionId = ownerNode?.getAttribute('data-session-id')?.trim();
   if (!ownerNode || !sessionId) return false;
+  const reviewScope = ownerNode.getAttribute('data-review-scope');
+  const reviewRepo = ownerNode.getAttribute('data-review-repo')?.trim() || '';
+  let reviewOwner: ReviewRepository | undefined;
+  switch (reviewScope) {
+    case null:
+      break;
+    case 'null':
+      reviewOwner = null;
+      break;
+    case 'child':
+      if (reviewRepo === '') {
+        event.preventDefault();
+        return true;
+      }
+      reviewOwner = reviewRepo;
+      break;
+    case 'unavailable':
+      event.preventDefault();
+      return true;
+    default:
+      event.preventDefault();
+      return true;
+  }
   const runnerId = ownerNode.getAttribute('data-runner-id')?.trim() || undefined;
   const mappingId = ownerNode.getAttribute('data-mapping-id')?.trim() || undefined;
   const workspaceCwd = ownerNode.getAttribute('data-workspace-cwd')?.trim() || undefined;
-  const reviewRepo = ownerNode.getAttribute('data-review-repo')?.trim() || undefined;
   const owner: MarkdownPathOwner = { sessionId };
   if (runnerId) owner.runnerId = runnerId;
   if (mappingId) owner.mappingId = mappingId;
   if (workspaceCwd) owner.workspaceCwd = workspaceCwd;
-  if (reviewRepo) owner.reviewRepo = reviewRepo;
-
+  if (reviewScope !== null) owner.reviewRepo = reviewOwner;
   const toolPath = asPathClickNode(target.closest('[data-md-path]'));
   if (toolPath) {
     const rawPath = (toolPath.getAttribute('data-md-path') ?? '').trim();
@@ -2511,12 +2621,13 @@ export function dispatchMarkdownPathClick(
 
   const code = asPathClickNode(target.closest('code.md-code') ?? target.closest('.md-code'));
   if (code && !code.closest('.md-fence')) {
-    if ((code.getAttribute('data-md-resolved') ?? '') === 'none') return false;
+    const unresolved = (code.getAttribute('data-md-resolved') ?? '') === 'none';
     const candidate = parseWorkspacePathCandidate(code.textContent ?? '');
     if (!candidate) return false;
     const bare = !candidate.path.includes('/') && !candidate.path.includes('\\');
-    if (bare && !code.getAttribute('data-md-path')) return false;
-    if (!notifyMarkdownOpenPath(candidate, owner, onOpenPath, null, code.getAttribute('data-md-completion'))) return false;
+    if (unresolved && !bare) return false;
+    if (bare && !unresolved && !code.getAttribute('data-md-path')) return false;
+    if (!notifyMarkdownOpenPath(candidate, owner, onOpenPath, unresolved ? null : null, unresolved ? null : code.getAttribute('data-md-completion'))) return false;
     event.preventDefault();
     return true;
   }

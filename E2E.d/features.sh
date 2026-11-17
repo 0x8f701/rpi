@@ -104,7 +104,8 @@ Installer
 
 Platforms
   Linux --release         this runner
-  macOS/Windows native    .github/workflows/release.yml (not executed here)
+  macOS artifacts         temporarily unavailable (release not published)
+  Windows hosted proofs   .github/workflows/test.yml (not executed here)
 
 Usage: bash E2E.d/features.sh
 EOF

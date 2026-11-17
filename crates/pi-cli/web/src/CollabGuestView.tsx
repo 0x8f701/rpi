@@ -24,11 +24,13 @@ import type { ContentBlock } from './types';
 import {
   boundOutput,
   customToItem,
+  applyToolStartToItems,
   applyToolSnapshot,
   toolCardCompletionStatus,
   applyToolResultToItems,
   toolMedia,
   finalizeStreamingAssistant,
+  assistantTimestampMs,
   transcriptPathContext,
   BASH_OUTPUT_LINE_LIMIT,
   TOOL_OUTPUT_LINE_LIMIT,
@@ -42,19 +44,44 @@ import {
   type CollabResponse,
   type CollabConnState,
 } from './collab';
+import { loadReplyStars, saveReplyStars, type ReplyStarScope } from './replyStars';
+import type { StorageLike } from './hostToken';
 
-/** Unwrap a collab snapshot's recorder entries into the raw `pi_ai::Message`
- *  records `messagesToItems` expects. `SessionEntry` carries
+/** Unwrap a collab snapshot's recorder entries into the `pi_ai::Message`
+ *  rows `messagesToItems` expects. `SessionEntry` carries
  *  `message: Option<Message>`; metadata entries (e.g. a thinking-level change)
  *  carry no message and are filtered out — one bad record never breaks the
- *  transcript restore. */
+ *  transcript restore. The recorder entry's `id` travels WITH the message:
+ *  `messagesToItems` hydrates it as the authoritative `entryId` (the row-star
+ *  key) and projects `message.timestamp` through the shared typed boundary,
+ *  so restored guest replies keep both time and entry identity. */
 function snapshotToItems(snapshot: CollabSnapshot): Item[] {
   const entries = Array.isArray(snapshot.entries) ? snapshot.entries : [];
-  const messages = entries
-    .map((e) => (e as { message?: unknown } | null | undefined)?.message)
-    .filter((m): m is NonNullable<typeof m> => m != null);
-  return messagesToItems(messages);
+  const rows = entries
+    .map((e) => {
+      const entry = (e ?? {}) as { id?: unknown; message?: unknown };
+      if (entry.message == null) return null;
+      return typeof entry.id === 'string' && entry.id !== ''
+        ? { id: entry.id, message: entry.message }
+        : { message: entry.message };
+    })
+    .filter((row): row is NonNullable<typeof row> => row !== null);
+  return messagesToItems(rows);
 }
+
+/** The guest's browser-local star storage; null when storage is unavailable
+ *  (private mode / blocked cookies) so the shared replyStars store fails
+ *  closed instead of crashing the view. */
+function guestStarStorage(): StorageLike | null {
+  try {
+    return window.localStorage;
+  } catch {
+    return null;
+  }
+}
+
+/** Starred entry-id set used before any snapshot names a star scope. */
+const EMPTY_STARRED_IDS: ReadonlySet<string> = new Set<string>();
 
 /** A toast surfaced to the guest. */
 type GuestToast = { id: string; message: string; error: boolean };
@@ -98,6 +125,36 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink | null }) {
       setToasts((prev) => prev.filter((t) => t.id !== id));
     }, 7000);
   }, []);
+  /** Guest reply-star scope: the collab room id stands in as the authority
+   *  (a guest never learns the host's listener authority) alongside the
+   *  snapshot's recorder session id — the SAME replyStars store and key
+   *  format the host view uses, never a second store. Null until a snapshot
+   *  names a session; the favorite stays hidden without it while copy/save
+   *  keep working. */
+  const [starScope, setStarScope] = useState<ReplyStarScope | null>(null);
+  const [starredIds, setStarredIds] = useState<ReadonlySet<string>>(EMPTY_STARRED_IDS);
+  /** Central sink for the shared reply action strip — the guest's own toast
+   *  layer (same stacking/timeout as every other guest toast); never silenced. */
+  const reportReplyActionError = useCallback((message: string) => {
+    toast(message, true);
+  }, [toast]);
+  /** Persist-before-commit toggle (the host toggleReplyStar contract): a
+   *  failed save leaves the visible star untouched and toasts the store
+   *  error instead of silently dropping the toggle. */
+  const toggleReplyStar = useCallback((entryId: string, starred: boolean) => {
+    if (starScope === null || entryId === '') return;
+    if (starredIds.has(entryId) === starred) return;
+    const next = new Set(starredIds);
+    if (starred) next.add(entryId);
+    else next.delete(entryId);
+    try {
+      saveReplyStars(guestStarStorage(), starScope, next);
+    } catch (err) {
+      toast(`reply stars could not be saved: ${(err as Error).message}`, true);
+      return;
+    }
+    setStarredIds(next);
+  }, [starScope, starredIds, toast]);
 
   /* ---------------- single-session transcript dispatch ---------------- */
   //
@@ -198,7 +255,12 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink | null }) {
         setStreaming(true);
         const id = nextId('a');
         assistantIdRef.current = id;
-        pushItem({ kind: 'assistant', id, status: 'streaming', blocks: [] });
+        // Stable wire clock captured at message_start (pi-ai
+        // `AssistantMessage.timestamp`); message_end and the snapshot
+        // replace overwrite it, the no-message_end finalize keeps it via the
+        // item spread. Never a browser/click time.
+        const startTimestamp = assistantTimestampMs(message);
+        pushItem({ kind: 'assistant', id, status: 'streaming', blocks: [], ...(startTimestamp !== undefined ? { timestamp: startTimestamp } : {}) });
         return;
       }
       case 'toolResult': {
@@ -302,23 +364,32 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink | null }) {
         ];
     streamBuf.delete(key);
     normalizedThinkingKeys.delete(key);
-    patchItem(targetId, (item) =>
-      item.kind === 'assistant' ? { ...item, status: 'final' as const, blocks } : item,
-    );
+    const endTimestamp = assistantTimestampMs(message);
+    patchItem(targetId, (item) => {
+      if (item.kind !== 'assistant') return item;
+      // message_end's own wire clock is canonical; when this frame omits a
+      // usable timestamp the message_start value survives the spread.
+      return {
+        ...item,
+        status: 'final' as const,
+        blocks,
+        ...(endTimestamp !== undefined ? { timestamp: endTimestamp } : {}),
+      };
+    });
   }, [patchItem]);
 
   const onToolStart = useCallback((frame: CollabEventFrame) => {
     setStreaming(true);
-    pushItem({
+    const toolCallId = (frame.toolCallId as string) || '';
+    updateItems((prev) => applyToolStartToItems(prev, {
       kind: 'toolCard',
-      id: nextId('tc'),
-      toolCallId: (frame.toolCallId as string) || '',
+      toolCallId,
       toolName: safeText(frame.toolName || 'tool'),
       args: frame.args,
       status: 'running',
       result: '',
-    });
-  }, [pushItem]);
+    }, frame.itemId));
+  }, [updateItems]);
 
   const onToolUpdate = useCallback((frame: CollabEventFrame) => {
     const toolCallId = (frame.toolCallId as string) || '';
@@ -470,7 +541,20 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink | null }) {
     optimisticQueueRef.current = [];
     setStreaming(false);
     setItems(snapshotToItems(snapshot));
-  }, []);
+    // Star scope binds to THIS room + recorder session. Reload the guest's
+    // browser-local starred ids for it from the SAME store/key format the
+    // host view uses; a read failure toasts and keeps no stale stars.
+    if (sid !== '' && link !== null) {
+      const scope: ReplyStarScope = { authority: link.roomId, sessionId: sid };
+      setStarScope(scope);
+      try {
+        setStarredIds(loadReplyStars(guestStarStorage(), scope));
+      } catch (err) {
+        setStarredIds(EMPTY_STARRED_IDS);
+        toast(`saved reply stars are unreadable: ${(err as Error).message}`, true);
+      }
+    }
+  }, [link, toast]);
 
   const onStatus = useCallback((state: CollabConnState) => {
     setStatus(state);
@@ -656,7 +740,26 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink | null }) {
               return item.status === 'streaming' ? (
                 <StreamingAssistant key={item.id} sid={sidRef.current ?? ''} id={item.id} pathContext={pathContext} />
               ) : (
-                <FinalAssistant key={item.id} blocks={item.blocks} errorMessage={item.errorMessage} onLayoutChange={pinIfPinned} pathContext={pathContext} />
+                <FinalAssistant
+                  key={item.id}
+                  blocks={item.blocks}
+                  errorMessage={item.errorMessage}
+                  onLayoutChange={pinIfPinned}
+                  pathContext={pathContext}
+                  reply={{
+                    timestampMs: item.timestamp,
+                    // Favorite reuses the shared replyStars store scoped to
+                    // this room + session; restored replies carry the
+                    // recorder entry id, live synthetic ids show no star
+                    // (same host contract) while copy/save always render.
+                    star: starScope === null ? undefined : {
+                      entryId: item.entryId ?? null,
+                      starred: item.entryId !== undefined && starredIds.has(item.entryId),
+                      onToggle: toggleReplyStar,
+                    },
+                    onError: reportReplyActionError,
+                  }}
+                />
               );
             case 'toolCard':
               return <ToolCard key={item.id} item={item} onLayoutChange={pinIfPinned} />;

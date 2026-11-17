@@ -1,5 +1,6 @@
 import { safeText } from '../redact';
 import { boundText } from '../transcript';
+import type { JobStatus } from '../jobCard';
 import type { EventFrame } from '../types';
 import { projectTodoPhases, type TodoPhase } from './todoPanelState';
 
@@ -81,7 +82,7 @@ export interface WorkflowJobSnapshot {
   displayName: string;
   jobId: string;
   role?: string;
-  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+  status: JobStatus;
   taskSummary?: string | null;
   todoTaskId?: string | null;
   createdAtMs: number;
@@ -152,7 +153,7 @@ const WORKFLOW_STATUSES: ReadonlySet<string> = new Set([
   'cancelled',
   'conflicted',
 ]);
-const JOB_STATUSES: ReadonlySet<string> = new Set(['queued', 'running', 'completed', 'failed', 'cancelled']);
+const JOB_STATUSES: ReadonlySet<string> = new Set(['queued', 'running', 'cancelling', 'completed', 'failed', 'cancelled']);
 const ACTOR_LIMIT = 64;
 const JOB_LIMIT = 128;
 const ACTIVE_TASK_LIMIT = 128;

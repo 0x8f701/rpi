@@ -82,9 +82,20 @@ export type Item =
       id: string;
       status: 'streaming' | 'final';
       blocks: ContentBlock[];
+      /** Authoritative session-log entry id (`{ id, message }` row id from
+       *  `public_transcript_rows`), set ONLY by `messagesToItems`. Live
+       *  synthetic ids are never persisted, so this is the only id the
+       *  session-scoped reply-star store may key on. */
+      entryId?: string;
       /** Persisted failure reason (pi-ai AssistantMessage.errorMessage);
        *  aborted turns stay hidden here (TUI status-row contract). */
       errorMessage?: string;
+      /** Stable wire timestamp in epoch milliseconds (pi-ai
+       *  `AssistantMessage.timestamp`), projected ONLY by `messagesToItems`
+       *  / the typed `assistantTimestampMs` boundary. Never the browser
+       *  clock or a click time; absent when the wire record omits a usable
+       *  value (the reply itself stays visible). */
+      timestamp?: number;
     }
   | {
       kind: 'toolCard';
@@ -167,6 +178,24 @@ export function transcriptPathContext(items: readonly Item[]): string {
 
 export function nextId(prefix: string): string {
   return `${prefix}${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/** The one frozen UI identity of a logical tool call.
+ *
+ *  Every creation point — the live `tool_execution_start` frame handlers and
+ *  the authoritative `messagesToItems` restore — derives a tool card's row id
+ *  from `toolCallId` through this function. The transcript merge replaces a
+ *  live card with its authoritative twin; when the two ids agree that is an
+ *  in-place patch, when they differ React unmounts and remounts the row, which
+ *  destroys the subtree's local interaction state (a copy that already wrote
+ *  to the clipboard loses its confirmation because the button unmounted).
+ *  The frame's wire entry id (`itemId`) is NOT an identity source for a card
+ *  that carries a `toolCallId`: it is a different id for the same call than
+ *  the restore side derives. A card without a `toolCallId` is never correlated
+ *  or merged, so the `frameItemId` its caller supplies is the frozen id. */
+export function toolCardId(toolCallId: string, frameItemId?: unknown): string {
+  if (toolCallId !== '') return `tc:${toolCallId}`;
+  return typeof frameItemId === 'string' && frameItemId !== '' ? frameItemId : nextId('tc');
 }
 
 export function contentText(content: unknown): string {
@@ -469,23 +498,34 @@ export function toolCardCompletionStatus(
   return cancelled ? 'cancelled' : isError ? 'error' : 'done';
 }
 
+/** A tool card as it arrives on a live `tool_execution_start` frame: every
+ *  field except the frozen row identity, which `applyToolStartToItems` derives
+ *  from `toolCallId` so a caller can never introduce a second identity. */
+export type ToolCardStart = Omit<Extract<Item, { kind: 'toolCard' }>, 'id'>;
+
 export function applyToolStartToItems(
   items: Item[],
-  card: Extract<Item, { kind: 'toolCard' }>,
+  card: ToolCardStart,
+  frameItemId?: unknown,
 ): Item[] {
-  if (card.toolCallId === '') return [...items, card];
+  const started: Extract<Item, { kind: 'toolCard' }> = {
+    ...card,
+    id: toolCardId(card.toolCallId, frameItemId),
+  };
+  if (started.toolCallId === '') return [...items, started];
   const index = items.findIndex(
-    (item) => item.kind === 'toolCard' && item.toolCallId === card.toolCallId,
+    (item) => item.kind === 'toolCard' && item.toolCallId === started.toolCallId,
   );
-  if (index < 0) return [...items, card];
+  if (index < 0) return [...items, started];
   const existing = items[index];
   if (existing.kind !== 'toolCard') return items;
   const next = items.slice();
+  // A duplicate start frame only fills the gaps; the row keeps the frozen
+  // identity it was created with.
   next[index] = {
     ...existing,
-    id: existing.id || card.id,
-    toolName: existing.toolName || card.toolName,
-    args: existing.args ?? card.args,
+    toolName: existing.toolName || started.toolName,
+    args: existing.args ?? started.args,
   };
   return next;
 }
@@ -633,42 +673,43 @@ export function mergeAuthoritativeItems(history: Item[], live: Item[], preserveI
   // authoritative generation already omission-settled, so a history
   // replacement must never regress a settled child to queued/running.
   // Authoritative job frames stay free to advance a status later.
-  const terminalProjections = new Map<string, Map<string, string>>();
+  const liveProjections = new Map<string, Map<string, TaskCardChild>>();
   for (const item of live) {
-    if (item.kind !== 'toolCard' || item.toolCallId === '') continue;
+    if (item.kind !== 'toolCard' || item.toolName.toLowerCase() !== 'task' || item.toolCallId === '') continue;
     const view = resolveTaskCardView(item.args, item.details);
     if (!view) continue;
     for (const child of view.children) {
       if (!child.jobId) continue;
-      const status = child.status.toLowerCase();
-      if (status === 'queued' || status === 'running') continue;
-      let byJobId = terminalProjections.get(item.toolCallId);
+      let byJobId = liveProjections.get(item.toolCallId);
       if (!byJobId) {
         byJobId = new Map();
-        terminalProjections.set(item.toolCallId, byJobId);
+        liveProjections.set(item.toolCallId, byJobId);
       }
-      byJobId.set(child.jobId, child.status);
+      byJobId.set(child.jobId, child);
     }
   }
-  if (terminalProjections.size === 0) {
-    return transient.length === 0 ? authoritative : [...authoritative, ...transient];
-  }
   const merged = transient.length === 0 ? authoritative : [...authoritative, ...transient];
+  if (liveProjections.size === 0) return merged;
   return merged.map((item) => {
-    if (item.kind !== 'toolCard' || item.toolCallId === '') return item;
-    const byJobId = terminalProjections.get(item.toolCallId);
-    if (!byJobId) return item;
-    const view = resolveTaskCardView(item.args, item.details);
-    if (!view) return item;
+    if (item.kind !== 'toolCard' || item.toolName.toLowerCase() !== 'task' || item.toolCallId === '') return item;
+    const byJobId = liveProjections.get(item.toolCallId);
+    const view = byJobId ? resolveTaskCardView(item.args, item.details) : null;
+    if (!byJobId || !view) return item;
     let changed = false;
     const children = view.children.map((child) => {
       if (!child.jobId) return child;
-      const terminal = byJobId.get(child.jobId);
-      if (!terminal) return child;
-      const status = projectedJobStatus(child.status, terminal);
-      if (status === child.status) return child;
+      const liveChild = byJobId.get(child.jobId);
+      if (!liveChild) return child;
+      const status = projectedJobStatus(liveChild.status, child.status);
+      const parentId = child.parentId || liveChild.parentId;
+      const todoTaskId = child.todoTaskId || liveChild.todoTaskId;
+      const activity = child.activity || liveChild.activity;
+      const result = child.result || liveChild.result;
+      const error = child.error || liveChild.error;
+      if (status === child.status && parentId === child.parentId && todoTaskId === child.todoTaskId
+        && activity === child.activity && result === child.result && error === child.error) return child;
       changed = true;
-      return { ...child, status };
+      return { ...child, status, parentId, todoTaskId, activity, result, error };
     });
     if (!changed) return item;
     return withProjectedChildren(item, children);
@@ -1155,7 +1196,7 @@ function projectedChildren(details: unknown): TaskCardChild[] | null {
 function taskStatusFromChildren(children: TaskCardChild[]): ToolCardStatus | null {
   if (children.length === 0) return null;
   const statuses = children.map((child) => child.status.toLowerCase());
-  if (statuses.some((status) => status === 'queued' || status === 'running')) return 'running';
+  if (statuses.some((status) => status === 'queued' || status === 'running' || status === 'cancelling')) return 'running';
   if (statuses.some((status) => status === 'failed' || status === 'error')) return 'error';
   if (statuses.some((status) => status === 'cancelled' || status === 'canceled' || status === 'aborted')) {
     return 'cancelled';
@@ -1244,13 +1285,76 @@ export function compactToolArgs(args: unknown): string {
   return '';
 }
 
+/** Bash failure stage. Only these three wire values are a diagnostic. */
+export type BashDiagnosticStage = 'launch' | 'timed_out' | 'non_zero_exit';
+
+/** Frozen bash failure diagnostic. `null` means the details are absent,
+ *  legacy, or invalid — callers keep the original error text. */
+export interface BashDiagnostic {
+  requestedCwd: string;
+  stage: BashDiagnosticStage;
+  exitCode: number | null;
+}
+
+function bashDiagnosticStage(value: unknown): BashDiagnosticStage | null {
+  switch (value) {
+    case 'launch':
+    case 'timed_out':
+    case 'non_zero_exit':
+      return value;
+    default:
+      return null;
+  }
+}
+
+function bashDiagnosticExitCode(value: unknown): number | null | undefined {
+  if (value === null) return null;
+  if (typeof value === 'number' && Number.isInteger(value) && value >= -2147483648 && value <= 2147483647) {
+    return value;
+  }
+  return undefined;
+}
+
+/** Strict `details` parse for the frozen bash diagnostic schema. Any missing,
+ *  mistyped, or extra-shape failure returns null and must not replace the
+ *  original command error. `exitCode` must be present as null or an integer. */
+export function parseBashDiagnostic(details: unknown): BashDiagnostic | null {
+  const record = asRecord(details);
+  if (!record || !Object.hasOwn(record, 'requestedCwd') || !Object.hasOwn(record, 'stage') || !Object.hasOwn(record, 'exitCode')) {
+    return null;
+  }
+  if (typeof record.requestedCwd !== 'string' || record.requestedCwd === '') return null;
+  const stage = bashDiagnosticStage(record.stage);
+  if (!stage) return null;
+  const exitCode = bashDiagnosticExitCode(record.exitCode);
+  if (exitCode === undefined) return null;
+  return { requestedCwd: record.requestedCwd, stage, exitCode };
+}
+
+/** Producer trailer from `bash_failure_error`: one exact trailing line. */
+export function stripBashDiagnosticTrailer(result: string, diagnostic: BashDiagnostic): string {
+  const expected = `[bash diagnostic] stage=${diagnostic.stage} requested_cwd=${diagnostic.requestedCwd}`;
+  const lines = result.split('\n');
+  let end = lines.length;
+  while (end > 0 && lines[end - 1].trim() === '') end -= 1;
+  if (end === 0 || lines[end - 1] !== expected) return result;
+  const kept = lines.slice(0, end - 1);
+  while (kept.length > 0 && kept[kept.length - 1].trim() === '') kept.pop();
+  return kept.join('\n');
+}
+
 /** Bash / command tool card view: extracts the `command` string from args.
- *  Returns null when no command is present (the card falls back to generic). */
-export function parseCommandCardArgs(args: unknown): { command: string } | null {
+ *  Returns null when no command is present (the card falls back to generic).
+ *  A present `diagnostic` is the typed bash failure; invalid details leave it
+ *  absent so the original error still renders. */
+export function parseCommandCardArgs(
+  args: unknown,
+  details?: unknown,
+): { command: string; diagnostic: BashDiagnostic | null } | null {
   const record = asRecord(args);
   if (!record) return null;
   const command = typeof record.command === 'string' ? record.command : '';
-  return command === '' ? null : { command };
+  return command === '' ? null : { command, diagnostic: parseBashDiagnostic(details) };
 }
 
 /** Process tool card view: extracts a human-readable label from the `op` +
@@ -2038,8 +2142,9 @@ function projectedJobStatus(current: string, incoming: string): string {
   const rank = (status: string) => {
     if (status === 'queued') return 0;
     if (status === 'running') return 1;
+    if (status === 'cancelling') return 2;
     if (status === 'completed' || status === 'failed' || status === 'error'
-      || status === 'cancelled' || status === 'canceled' || status === 'aborted') return 2;
+      || status === 'cancelled' || status === 'canceled' || status === 'aborted') return 3;
     return -1;
   };
   return rank(normalizedIncoming) < rank(normalizedCurrent) ? current : incoming;
@@ -2139,7 +2244,7 @@ export function applyJobSnapshot(items: Item[], jobs: unknown, omissionEligible?
     const children = view.children.map((child) => {
       if (!child.jobId) return child;
       const status = child.status.toLowerCase();
-      if (status !== 'queued' && status !== 'running') return child;
+      if (status !== 'queued' && status !== 'running' && status !== 'cancelling') return child;
       if (authoritativeIds.has(child.jobId)) return child;
       if (omissionEligible && !omissionEligible.has(child.jobId)) return child;
       changed = true;
@@ -2349,6 +2454,28 @@ export function customToItem(m: CustomWire): Item | null {
  *  Unknown/malformed records are skipped defensively; one bad record never
  *  breaks the transcript restore.
  */
+/** Stable epoch-millisecond wire timestamp of an assistant message. The one
+ *  typed boundary App / chat / collab reuse so a reply's copy/save/star
+ *  surfaces always key on the backend clock, never the click time or
+ *  `Date.now()`.
+ *
+ *  `raw` may be the message itself or an authoritative hydrated wrapper
+ *  (`{ id, message }` from `public_transcript_rows`). Inside a wrapper the
+ *  inner `message.timestamp` is the authority; an outer wrapper timestamp is
+ *  never a fallback. Missing, non-numeric, non-finite, or non-positive values
+ *  (Rust's `unwrap_or_default()` sentinel is 0) yield `undefined`: callers
+ *  keep the reply visible and must not synthesize a replacement clock. */
+export function assistantTimestampMs(raw: unknown): number | undefined {
+  const record = asRecord(raw);
+  if (record === null) return undefined;
+  const message = asRecord('message' in record ? record.message : record);
+  if (message === null) return undefined;
+  const timestamp = message.timestamp;
+  return typeof timestamp === 'number' && Number.isFinite(timestamp) && timestamp > 0
+    ? timestamp
+    : undefined;
+}
+
 /** Failure reason of a settled assistant message with no renderable content
  *  (wire `stopReason:"error"` + `errorMessage`); aborted turns keep the TUI
  *  reserved-status-row contract and stay off the transcript. */
@@ -2362,6 +2489,11 @@ export function messagesToItems(messages: unknown): Item[] {
   const list = Array.isArray(messages) ? messages : [];
   const out: Item[] = [];
   const pendingToolCards = new Map<string, number>();
+  // Repeats of the same authoritative row set (2s detail polls, session
+  // restores) must keep every row's identity: an entry id when the wire has
+  // one, otherwise a position-derived id. `row:*` ids are item identities
+  // only — they are never promoted to the authoritative `entryId`.
+  const rowId = (index: number, suffix: string): string => `row:${index}:${suffix}`;
   const entryMessage = (raw: unknown): { id?: string; message: unknown } => {
     if (raw && typeof raw === 'object' && 'message' in raw) {
       const entry = raw as { id?: unknown; message?: unknown };
@@ -2372,7 +2504,7 @@ export function messagesToItems(messages: unknown): Item[] {
     }
     return { message: raw };
   };
-  for (const raw of list) {
+  list.forEach((raw, index) => {
     try {
       const entry = entryMessage(raw);
       const stableId = entry.id;
@@ -2392,13 +2524,14 @@ export function messagesToItems(messages: unknown): Item[] {
         cancelled?: boolean;
         stopReason?: unknown;
         errorMessage?: unknown;
+        timestamp?: unknown;
       };
       switch (m.role) {
         case 'user': {
           const projected = userMessageProjection(m.content);
           out.push({
             kind: 'user',
-            id: stableId ?? nextId('u'),
+            id: stableId ?? rowId(index, 'user'),
             text: projected.text,
             optimistic: false,
             ...(projected.images.length > 0 ? { images: projected.images } : {}),
@@ -2423,21 +2556,29 @@ export function messagesToItems(messages: unknown): Item[] {
             }
           }
           const failureMessage = assistantFailureMessage(m.stopReason, m.errorMessage);
+          // Only an authoritative row id may become `entryId`; live synthetic
+          // ids and body-derived identities never do.
+          const entryFields = stableId === undefined ? {} : { entryId: stableId };
+          // Stable wire clock only: the row's real message.timestamp. No
+          // field/invalid value stays absent so the reply still renders and
+          // no synthetic clock is invented.
+          const timestamp = assistantTimestampMs(m);
+          const timestampFields = timestamp === undefined ? {} : { timestamp };
           const hasRenderableBlocks = visibleBlocks.some(
             (block) => (block.type === 'text' && block.text) || (block.type === 'thinking' && block.thinking)
           );
           if (hasRenderableBlocks) {
-            out.push({ kind: 'assistant', id: stableId ?? nextId('a'), status: 'final', blocks: visibleBlocks });
+            out.push({ kind: 'assistant', id: stableId ?? rowId(index, 'assistant'), status: 'final', blocks: visibleBlocks, ...entryFields, ...timestampFields });
           } else if (failureMessage) {
-            out.push({ kind: 'assistant', id: stableId ?? nextId('a'), status: 'final', blocks: [], errorMessage: failureMessage });
+            out.push({ kind: 'assistant', id: stableId ?? rowId(index, 'assistant'), status: 'final', blocks: [], errorMessage: failureMessage, ...entryFields, ...timestampFields });
           } else if (visibleBlocks.length > 0) {
-            out.push({ kind: 'assistant', id: stableId ?? nextId('a'), status: 'final', blocks: visibleBlocks });
+            out.push({ kind: 'assistant', id: stableId ?? rowId(index, 'assistant'), status: 'final', blocks: visibleBlocks, ...entryFields, ...timestampFields });
           }
-          for (const toolCall of toolCalls) {
+          for (const [callIndex, toolCall] of toolCalls.entries()) {
             const cardIndex = out.length;
             out.push({
               kind: 'toolCard',
-              id: nextId('tc'),
+              id: toolCardId(toolCall.id, rowId(index, `tool:${callIndex}`)),
               toolCallId: toolCall.id,
               toolName: toolCall.name,
               args: toolCall.arguments,
@@ -2466,7 +2607,7 @@ export function messagesToItems(messages: unknown): Item[] {
           } else {
             out.push({
               kind: 'toolResult',
-              id: stableId ?? nextId('r'),
+              id: stableId ?? rowId(index, 'result'),
               toolCallId,
               text: boundOutput(result, TOOL_OUTPUT_LINE_LIMIT).text,
             });
@@ -2489,7 +2630,7 @@ export function messagesToItems(messages: unknown): Item[] {
                   : undefined;
           out.push({
             kind: 'bash',
-            id: stableId ?? nextId('b'),
+            id: stableId ?? rowId(index, 'bash'),
             command: m.command || '',
             output: boundOutput(m.output || '', BASH_OUTPUT_LINE_LIMIT).text,
             ...(bashStatus ? { status: bashStatus } : {}),
@@ -2498,13 +2639,13 @@ export function messagesToItems(messages: unknown): Item[] {
         }
         case 'custom': {
           const item = customToItem(m);
-          if (item) out.push(item);
+          if (item) out.push({ ...item, id: stableId ?? rowId(index, item.kind) });
           break;
         }
         case 'branchSummary':
           out.push({
             kind: 'summary',
-            id: nextId('s'),
+            id: rowId(index, 'summary'),
             label: 'Branch summary',
             text: typeof m.summary === 'string' ? m.summary : '',
           });
@@ -2512,7 +2653,7 @@ export function messagesToItems(messages: unknown): Item[] {
         case 'compactionSummary':
           out.push({
             kind: 'summary',
-            id: nextId('s'),
+            id: rowId(index, 'summary'),
             label: 'Compaction summary',
             text: typeof m.summary === 'string' ? m.summary : '',
           });
@@ -2523,6 +2664,6 @@ export function messagesToItems(messages: unknown): Item[] {
     } catch {
       /* one malformed record never breaks the whole transcript restore */
     }
-  }
+  });
   return out;
 }

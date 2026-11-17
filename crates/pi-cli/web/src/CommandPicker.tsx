@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type RefObject } from 'react';
 import {
   composeCommandText,
   composeSkillCommandText,
@@ -20,6 +20,112 @@ export interface CommandPickerProps {
   onError: (message: string) => void;
   getComposerValue: () => string;
   onCatalog: (commands: CommandEntry[]) => void;
+}
+
+/** Shared `get_commands` fetch: the ONE catalog source for the popover picker
+ *  and the composer's inline slash autocomplete. Callers narrow with
+ *  `filterSupportedCommands` (the popover keeps the full catalog for
+ *  `onCatalog`). */
+function fetchCommandCatalog(sendCommand: (command: Record<string, unknown>) => Promise<unknown>): Promise<CommandEntry[]> {
+  return sendCommand({ type: 'get_commands' }).then(normalizeCommands);
+}
+
+export interface SlashIntent {
+  mode: 'commands' | 'skills';
+  query: string;
+}
+
+/** The composer's inline autocomplete is keyed to the WHOLE trimmed draft
+ *  being one slash token (never a mid-text caret probe): `/foo` searches
+ *  commands (+ skills, mirroring the picker's query behavior), `/skill
+ *  [query]` searches skill candidates. Anything else — multiline drafts, a
+ *  command's args being typed — closes the popup. */
+export function slashIntentFromDraft(draft: string): SlashIntent | null {
+  const trimmed = draft.trim();
+  if (!trimmed.startsWith('/') || trimmed.includes('\n')) return null;
+  const skill = trimmed.match(/^\/skill(?:\s+(.*))?$/i);
+  if (skill) return { mode: 'skills', query: (skill[1] ?? '').trim() };
+  if (!/\s/.test(trimmed)) return { mode: 'commands', query: trimmed.slice(1) };
+  return null;
+}
+
+/** Candidate list for a slash intent — the exact list rule the popover uses,
+ *  shared here so the inline popup can never drift from the picker. */
+function slashCandidates(catalog: CommandEntry[] | null, intent: SlashIntent): CommandEntry[] {
+  if (!catalog) return [];
+  const primary = primaryCommands(catalog);
+  const skills = skillCandidates(catalog);
+  if (intent.mode === 'skills') return filterCommands(skills, intent.query);
+  return intent.query.trim() === '' ? primary : filterCommands([...primary, ...skills], intent.query);
+}
+
+/** Stable identity for an intent: dismissal and active-index resets key on
+ *  this, so the popup stays closed for a settled token but re-opens as soon
+ *  as the token changes again. */
+function slashIntentKey(intent: SlashIntent): string {
+  return `${intent.mode}:${intent.query}`;
+}
+
+/** Identity-preserving intent update for the uncontrolled main composer: a
+ *  keystroke that does not change the slash token keeps the same object so
+ *  React bails out instead of re-rendering on every keypress. */
+export function mergeSlashIntent(current: SlashIntent | null, next: SlashIntent | null): SlashIntent | null {
+  if (current && next && slashIntentKey(current) === slashIntentKey(next)) return current;
+  if (current === null && next === null) return current;
+  return next;
+}
+
+/** Shared presentational row content for the popover list and the composer's
+ *  inline autocomplete — one markup, two surfaces. */
+function CommandOptionContent({ command }: { command: CommandEntry }) {
+  if (isSkillCandidate(command)) {
+    return (
+      <>
+        <span className="command-picker__name">{command.skillName}</span>
+        <span className="command-picker__desc">{command.description}</span>
+      </>
+    );
+  }
+  return (
+    <>
+      <span className="command-picker__name">/{command.name}</span>
+      {command.argumentHint && (
+        <span className="command-picker__arg">{command.argumentHint}</span>
+      )}
+      <span className="command-picker__desc">{command.description}</span>
+    </>
+  );
+}
+
+/** Inline slash autocomplete popup painted INSIDE the picker container (the
+ *  positioned `.command-picker` anchor), reusing the popover/list/option
+ *  styles. A dumb renderer: the picker owns the list/active state and this
+ *  never takes focus (mousedown is prevented so the composer keeps its
+ *  caret); keyboard interaction happens in the picker's capture listener. */
+function SlashAutocomplete({ list, activeIndex, onPick }: {
+  list: CommandEntry[];
+  activeIndex: number;
+  onPick: (index: number) => void;
+}) {
+  if (list.length === 0) return null;
+  return (
+    <div className="command-picker__popover" role="listbox" aria-label="Slash command suggestions">
+      <ul className="command-picker__list">
+        {list.map((command, i) => (
+          <li
+            key={command.name}
+            role="option"
+            aria-selected={i === activeIndex}
+            className={`command-picker__option${i === activeIndex ? ' is-active' : ''}`}
+            onMouseDown={(e) => { e.preventDefault(); }}
+            onClick={() => onPick(i)}
+          >
+            <CommandOptionContent command={command} />
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
 }
 
 /** A slash-menu button left of the composer textarea that opens a searchable
@@ -54,6 +160,10 @@ export function CommandPicker({
   onError,
   getComposerValue,
   onCatalog,
+  onInlineAccept,
+  inlineIntent,
+  composerInputRef,
+  inlineCanAccept,
 }: {
   connected: boolean;
   sendCommand: (command: Record<string, unknown>) => Promise<unknown>;
@@ -62,6 +172,19 @@ export function CommandPicker({
   onError: (message: string) => void;
   getComposerValue: () => string;
   onCatalog: (commands: CommandEntry[]) => void;
+  /** Inline autocomplete: the composer passes ONLY the DOM-derived slash
+   *  intent (never a draft copy) plus the composer textarea ref; the catalog,
+   *  candidate list, highlight, and Enter/Arrow/Escape handling stay inside
+   *  this single picker instance — no second fetch, list, or active state. */
+  inlineIntent?: SlashIntent | null;
+  composerInputRef?: RefObject<HTMLTextAreaElement | null>;
+  onInlineAccept?: (text: string) => void;
+  /** Composer-provided live gate for the inline Enter pick — reuses the
+   *  composer's EXACT submit gates (composition window, paste-enter guard)
+   *  instead of a copied clock/IME reimplementation: a guarded Enter is
+   *  neither a pick nor a submit, it falls through unprevented to the
+   *  composer's own handler. */
+  inlineCanAccept?: () => boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [mode, setMode] = useState<'commands' | 'skills'>('commands');
@@ -82,15 +205,117 @@ export function CommandPicker({
   // drill (which does NOT close), so the follow-up candidate pick proceeds.
   const openRef = useRef(false);
 
+  // Inline slash autocomplete (composer textarea popup). The composer owns
+  // only the DOM-derived `inlineIntent` (never a draft copy); THIS picker
+  // keeps the single catalog/list/active: the popup list derives from this
+  // component's `commands` catalog with the same rule the popover uses, the
+  // highlight reuses `activeIndex`, and Enter/Arrow/Escape are handled by a
+  // CAPTURE-phase keydown listener on the composer textarea (element-level,
+  // never a document-global) that runs before React's delegated handlers and
+  // stopPropagation()s consumed keys so the composer's Enter-submit and
+  // Esc-abort never see them.
+  const [inlineDismissed, setInlineDismissed] = useState<string | null>(null);
+  const inlineList = useMemo(() => {
+    if (!inlineIntent) return [];
+    return slashCandidates(commands, inlineIntent);
+  }, [commands, inlineIntent]);
+  const inlineVisible =
+    inlineIntent != null
+    && !open
+    && onInlineAccept !== undefined
+    && composerInputRef !== undefined
+    && inlineList.length > 0
+    && slashIntentKey(inlineIntent) !== inlineDismissed;
+  const inlineActive = inlineList.length === 0 ? -1 : Math.min(activeIndex, inlineList.length - 1);
+  // Every (re)open of the popup starts on the first (default) candidate.
+  const inlineVisibleKey = inlineVisible && inlineIntent ? slashIntentKey(inlineIntent) : '';
+  useEffect(() => {
+    if (inlineVisibleKey) setActiveIndex(0);
+  }, [inlineVisibleKey]);
+  // A dismissal suppresses only the CONTINUOUS token it was issued for: once
+  // the intent key moves away (a different token, or the draft cleared), the
+  // dismissal expires — Esc → clear → retyping the SAME token reopens, while
+  // a settled pick (dismissal + settled intent in one commit) stays closed.
+  const inlineIntentKeyNow = inlineIntent ? slashIntentKey(inlineIntent) : '';
+  useEffect(() => {
+    if (inlineDismissed !== null && inlineIntentKeyNow !== inlineDismissed) setInlineDismissed(null);
+  }, [inlineIntentKeyNow, inlineDismissed]);
+
+  const acceptInline = useCallback((entry: CommandEntry) => {
+    if (!onInlineAccept) return;
+    const text = isSkillCandidate(entry) && entry.skillName
+      ? composeSkillCommandText(entry.skillName)
+      : composeCommandText(entry.name, entry.requiresArguments);
+    onInlineAccept(text);
+    // The settled draft IS the completed token; dismiss on ITS intent key so
+    // the popup stays closed for the completed token yet re-opens as soon as
+    // the user keeps typing a different token.
+    const settled = slashIntentFromDraft(text);
+    setInlineDismissed(settled ? slashIntentKey(settled) : null);
+    setActiveIndex(0);
+  }, [onInlineAccept]);
+
+  const closeInline = useCallback(() => {
+    const input = composerInputRef?.current;
+    const intent = input ? slashIntentFromDraft(input.value) : null;
+    setInlineDismissed(intent ? slashIntentKey(intent) : null);
+  }, [composerInputRef]);
+
+  // Event-time snapshot for the capture listener (render-phase assignment,
+  // the repo's standard ref-mirror pattern) so one mount-time listener always
+  // sees the current visibility/list/active without re-attaching per render.
+  const inlineStateRef = useRef({
+    visible: false,
+    list: [] as CommandEntry[],
+    active: -1,
+    canAccept: null as (() => boolean) | null,
+  });
+  inlineStateRef.current = { visible: inlineVisible, list: inlineList, active: inlineActive, canAccept: inlineCanAccept ?? null };
+
+  useEffect(() => {
+    const input = composerInputRef?.current;
+    if (!input) return;
+    function onComposerKeyDown(event: globalThis.KeyboardEvent) {
+      const state = inlineStateRef.current;
+      // IME composition (isComposing / keyCode 229) never triggers select.
+      if (!state.visible || event.isComposing || event.keyCode === 229) return;
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault();
+        event.stopPropagation();
+        setActiveIndex((i) => (event.key === 'ArrowDown'
+          ? Math.min(i + 1, state.list.length - 1)
+          : Math.max(i - 1, 0)));
+      } else if (
+        (event.key === 'Enter' || event.key === 'NumpadEnter')
+        && !event.shiftKey && !event.altKey && !event.metaKey && !event.ctrlKey
+      ) {
+        // Enter with candidates CONSUMES the pick and never submits — but only
+        // through the composer's live gates: a guarded Enter (composition
+        // window, paste-enter guard) falls through unprevented so the
+        // composer's own handler applies the same gates (no pick, no submit).
+        if (state.canAccept && !state.canAccept()) return;
+        event.preventDefault();
+        event.stopPropagation();
+        const entry = state.list[Math.max(state.active, 0)];
+        if (entry) acceptInline(entry);
+      } else if (event.key === 'Escape') {
+        event.preventDefault();
+        event.stopPropagation();
+        closeInline();
+      }
+    }
+    input.addEventListener('keydown', onComposerKeyDown, true);
+    return () => input.removeEventListener('keydown', onComposerKeyDown, true);
+  }, [composerInputRef, acceptInline, closeInline]);
+
   // The backend get_commands is the catalog authority; fetch on each open so
   // the menu reflects freshly loaded skills (reload/reconnect picks up new
   // candidates without a stale client cache). Cheap local RPC.
   const load = useCallback(() => {
     if (!connected) return;
     setLoading(true);
-    sendCommand({ type: 'get_commands' })
-      .then((data) => {
-        const catalog = normalizeCommands(data);
+    fetchCommandCatalog(sendCommand)
+      .then((catalog) => {
         onCatalog(catalog);
         setCommands(filterSupportedCommands(catalog));
         setActiveIndex(0);
@@ -103,6 +328,19 @@ export function CommandPicker({
         onError(`commands failed: ${err instanceof Error ? err.message : String(err)}`);
       });
   }, [connected, sendCommand, onError, onCatalog]);
+  // A fresh composer that starts typing a slash token triggers the SAME
+  // single `load` the popover uses (never a second catalog request path).
+  // Requested at most ONCE: a legitimately empty catalog or a failed fetch
+  // must never spin into repeated get_commands (or repeated error toasts) —
+  // the inline popup simply shows nothing and Enter keeps the original
+  // submit; the explicit popover open remains the refresh path.
+  const inlineLoadRequestedRef = useRef(false);
+  useEffect(() => {
+    if (!inlineIntent || inlineLoadRequestedRef.current || !connected) return;
+    if (commands.length > 0 || loading) return;
+    inlineLoadRequestedRef.current = true;
+    load();
+  }, [inlineIntent, commands.length, loading, connected, load]);
 
   // Opening while the composer holds `/skill [query]` drills straight into
   // skill candidates AND carries the typed tail into the picker search. This
@@ -272,6 +510,16 @@ export function CommandPicker({
         <span aria-hidden="true">/</span>
         <span className="command-btn__label">Command</span>
       </button>
+      {!open && inlineVisible && (
+        <SlashAutocomplete
+          list={inlineList}
+          activeIndex={inlineActive}
+          onPick={(index) => {
+            const entry = inlineList[index];
+            if (entry) acceptInline(entry);
+          }}
+        />
+      )}
       {open && (
         <div className="command-picker__popover" role="dialog" aria-label="Slash commands">
           {mode === 'skills' && (
@@ -348,21 +596,8 @@ export function CommandPicker({
                 onClick={() => choose(command)}
                 onMouseEnter={() => setActiveIndex(i)}
               >
-                {isSkillCandidate(command) ? (
-                  <>
-                    <span className="command-picker__name">{command.skillName}</span>
-                    <span className="command-picker__desc">{command.description}</span>
-                  </>
-                ) : (
-                  <>
-                    <span className="command-picker__name">/{command.name}</span>
-                    {command.argumentHint && (
-                      <span className="command-picker__arg">{command.argumentHint}</span>
-                    )}
-                    <span className="command-picker__desc">{command.description}</span>
-                  </>
-                )}
-              </li>
+                <CommandOptionContent command={command} />
+          </li>
             ))}
           </ul>
         </div>

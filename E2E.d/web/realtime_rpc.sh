@@ -9,9 +9,10 @@
 # asserts the USER-VISIBLE realtime lifecycle against the REAL Rust proxy
 # path (realtime_create_call -> mock) in two phases:
 #   ok phase (MOCK_REALTIME_ERROR unset):
-#     R1  the mic button enters realtime mode (backend advertises
+#     R1  the Live button enters realtime mode (backend advertises
 #         runtimeSettings.live = {enabled, mode: "realtime"}); clicking
-#         #mic-btn dispatches realtime_create_call on the WS
+#         #live-btn dispatches realtime_create_call on the WS while
+#         #mic-btn stays hold-to-talk (disabled during the call)
 #     R2  the Rust realtime proxy reaches the mock with the real JSON
 #         create-call request (`sdp` + complete `session`; OpenAI-Alpha:
 #         quicksilver=v2 + Bearer + sessionPresent/sessionValid=true persisted
@@ -20,7 +21,7 @@
 #     R3  a successful call renders the live overlay (#realtime-transcript
 #         with the "realtime voice" label) and exposes the connection-state
 #         bucket (#realtime-conn-state)
-#     R5  clicking #mic-btn again while active dispatches realtime_stop and
+#     R5  clicking #live-btn again while active dispatches realtime_stop and
 #         the overlay disappears
 #   error phase (MOCK_REALTIME_ERROR=1):
 #     R4  the mock rejects /v1/realtime/calls with 500; the page surfaces the
@@ -71,8 +72,9 @@ run_phase() {
 
     # Live realtime settings in the isolated agent dir so the Web listener
     # advertises runtimeSettings.live = {enabled: true, mode: "realtime"} and
-    # the composer mic enters realtime mode. realtimeApiKey is a fixture
-    # secret written directly to the fixture settings file (never logged).
+    # the composer Live button (#live-btn) enters realtime mode. realtimeApiKey
+    # is a fixture secret written directly to the fixture settings file (never
+    # logged).
     cat >"$root/home/.rpi/settings.json" <<EOF
 {
   "live": {
@@ -117,7 +119,7 @@ main() {
     case "${1:-run}" in
         list|--list|--dry-run)
             printf '%s\n' \
-                'web-realtime-rpc - user-visible realtime start/error/stop against the real Rust proxy: #mic-btn dispatches realtime_create_call + the mock validates SDP and the AVAS-compatible session shape without audio.input, live overlay renders, mock-500 surfaces the failure toast, second click dispatches realtime_stop (PLAYWRIGHT-ONLY, hard-fail)'
+                'web-realtime-rpc - user-visible realtime start/error/stop against the real Rust proxy: #live-btn dispatches realtime_create_call + the mock validates SDP and the AVAS-compatible session shape without audio.input, live overlay renders, mock-500 surfaces the failure toast, second click dispatches realtime_stop (PLAYWRIGHT-ONLY, hard-fail)'
             return 0
             ;;
         run|all) ;;

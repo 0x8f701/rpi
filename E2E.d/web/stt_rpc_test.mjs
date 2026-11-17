@@ -14,12 +14,17 @@
 //   RPI_EVIDENCE       evidence dir for screenshots
 //
 // ok phase:
-//   S1  #mic-btn is in hold-to-talk (STT) mode; a pointer hold records via
-//       the synthetic mic and release dispatches stt_transcribe on the WS
-//       with ONLY {audioBase64, mimeType: "audio/wav"}
+//   S1  #mic-btn is Hold to talk. While its getUserMedia is pending,
+//       #live-btn stays Start live voice and disabled; a click sends no
+//       realtime_create_call. Pointer release BEFORE that acquisition
+//       resolves must stop every track of the old stream and must not start
+//       MediaRecorder or dispatch stt_transcribe. The second hold records;
+//       pointerup then immediate pointerleave, while the proxy still holds
+//       stt_transcribe, submits that transcript exactly once and re-enables
+//       mic and live. The composer is cleared by that existing auto-submit.
 //   S2  the Rust proxy reached the mock /v1/audio/transcriptions with the
 //       server-held Bearer + multipart WAV + model (evidence metadata only)
-//   S3  the returned transcript lands in the composer (#prompt-input)
+//   S3  switching A→B while transcription is held keeps the late result off B
 //   S4  the fixture key appears nowhere in the page DOM or the evidence
 // error phase (MOCK_STT_ERROR=1):
 //   S5  the mock 500 surfaces the bounded "transcription failed" toast and
@@ -176,15 +181,273 @@ async function main() {
       fail(`S0: the fixture STT endpoint (with path) reached the browser`);
     }
 
-    // Hold-to-talk: press and hold the mic (synthetic device records), then
-    // release; the recorder stops, the capture is converted to WAV, and
-    // stt_transcribe is dispatched on the WS.
+    const idleVoice = await page.evaluate(() => {
+      const describe = (node) => node ? {
+        label: node.getAttribute('aria-label'),
+        pressed: node.getAttribute('aria-pressed'),
+        disabled: node.disabled === true,
+      } : null;
+      return {
+        mic: describe(document.getElementById('mic-btn')),
+        live: describe(document.getElementById('live-btn')),
+      };
+    });
+    if (!idleVoice.mic) fail('S1: #mic-btn missing');
+    if (!idleVoice.live) fail('S1: #live-btn missing');
+    if (idleVoice.mic.label !== 'Hold to talk' || idleVoice.mic.pressed !== 'false') {
+      fail(`S1: #mic-btn is not idle Hold to talk (${JSON.stringify(idleVoice.mic)})`);
+    }
+    if (idleVoice.live.label !== 'Start live voice' || idleVoice.live.pressed !== 'false') {
+      fail(`S1: #live-btn is not idle Start live voice (${JSON.stringify(idleVoice.live)})`);
+    }
+    if (idleVoice.live.disabled) {
+      fail('S1: #live-btn was already disabled before STT getUserMedia (cannot prove the pending-setup block)');
+    }
+    const gumInstalled = await page.evaluate(() => {
+      const devices = navigator.mediaDevices;
+      if (!devices || typeof devices.getUserMedia !== 'function') return 'missing';
+      const native = devices.getUserMedia.bind(devices);
+      const state = {
+        calls: 0,
+        held: false,
+        released: false,
+        recordersStarted: 0,
+        recordersStopped: 0,
+        recorderOnStops: 0,
+        recorderErrors: 0,
+        dataSizes: [],
+        recorderStateAtStop: null,
+        tracksStopped: 0,
+        tracksLive: 0,
+        acquisitions: [],
+      };
+      const NativeMediaRecorder = window.MediaRecorder;
+      if (typeof NativeMediaRecorder === 'function' && !NativeMediaRecorder.__sttObserved) {
+        const ObservedMediaRecorder = function ObservedMediaRecorder(stream, options) {
+          const recorder = new NativeMediaRecorder(stream, options);
+          const nativeStart = recorder.start.bind(recorder);
+          const nativeStop = recorder.stop.bind(recorder);
+          recorder.addEventListener('dataavailable', (event) => {
+            state.dataSizes.push(event.data?.size ?? 0);
+          });
+          recorder.addEventListener('stop', () => {
+            state.recorderOnStops += 1;
+            state.recorderStateAtStop = recorder.state;
+          });
+          recorder.addEventListener('error', () => {
+            state.recorderErrors += 1;
+          });
+          recorder.start = (...args) => {
+            state.recordersStarted += 1;
+            state.recorderStartedAt = performance.now();
+            return nativeStart(...args);
+          };
+          recorder.stop = (...args) => {
+            state.recordersStopped += 1;
+            return nativeStop(...args);
+          };
+          return recorder;
+        };
+        ObservedMediaRecorder.prototype = NativeMediaRecorder.prototype;
+        ObservedMediaRecorder.isTypeSupported = NativeMediaRecorder.isTypeSupported.bind(NativeMediaRecorder);
+        ObservedMediaRecorder.__sttObserved = true;
+        window.MediaRecorder = ObservedMediaRecorder;
+      }
+      const wrapped = (constraints) => {
+        const call = ++state.calls;
+        const acquisition = {
+          call,
+          settled: false,
+          trackCount: 0,
+          stopped: 0,
+          run: null,
+          stream: null,
+          releaseStream: null,
+        };
+        state.acquisitions.push(acquisition);
+        state.held = true;
+        return new Promise((resolve, reject) => {
+          acquisition.run = () => native(constraints).then((stream) => {
+            acquisition.stream = stream;
+            for (const track of stream.getTracks()) {
+              state.tracksLive += 1;
+              acquisition.trackCount += 1;
+              const nativeStop = track.stop.bind(track);
+              track.stop = () => {
+                if (track.readyState !== 'ended') {
+                  acquisition.stopped += 1;
+                  state.tracksStopped += 1;
+                  state.tracksLive -= 1;
+                }
+                nativeStop();
+              };
+            }
+            return new Promise((releaseStream) => {
+              acquisition.releaseStream = () => {
+                acquisition.settled = true;
+                acquisition.releaseStream = null;
+                releaseStream();
+                resolve(stream);
+              };
+            });
+          }, reject);
+        });
+      };
+      try {
+        devices.getUserMedia = wrapped;
+      } catch {
+        try {
+          Object.defineProperty(devices, 'getUserMedia', { configurable: true, writable: true, value: wrapped });
+        } catch {
+          return 'unpatchable';
+        }
+      }
+      window.__sttGumState = state;
+      window.__sttGumRelease = (call) => {
+        const queued = state.acquisitions.filter((entry) => (
+          typeof entry.run === 'function' && entry.stream === null && (call == null || entry.call === call)
+        ));
+        if (queued.length === 0) return false;
+        for (const entry of queued) entry.run();
+        return true;
+      };
+      window.__sttGumDeliver = (call) => {
+        const entry = state.acquisitions.find((candidate) => candidate.call === call && typeof candidate.releaseStream === 'function');
+        if (!entry) return false;
+        entry.releaseStream();
+        const stillPending = state.acquisitions.some((candidate) => candidate.settled !== true);
+        state.held = stillPending;
+        state.released = !stillPending;
+        return true;
+      };
+      return 'ok';
+    });
+    if (gumInstalled !== 'ok') fail(`S1: could not hold getUserMedia (${gumInstalled})`);
+    const framesBeforeHold = sentFrames.length;
     const box = await page.locator('#mic-btn').boundingBox();
-    if (!box) fail('mic button has no bounding box');
+    if (!box) fail('S1: #mic-btn has no bounding box');
     await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
     await page.mouse.down();
-    await page.waitForTimeout(900);
+    await waitFor(
+      page,
+      () => window.__sttGumState?.held === true && window.__sttGumState?.calls >= 1,
+      'S1: Hold to talk never called getUserMedia',
+    );
+    await waitFor(
+      page,
+      () => {
+        const live = document.getElementById('live-btn');
+        return live?.disabled === true && live.getAttribute('aria-label') === 'Start live voice';
+      },
+      'S1: Live stayed enabled while STT getUserMedia was pending',
+    );
+    const callsBeforeLive = await page.evaluate(() => window.__sttGumState?.calls ?? 0);
+    await page.evaluate(() => document.getElementById('live-btn')?.click());
+    const callsAfterLive = await page.evaluate(() => window.__sttGumState?.calls ?? 0);
+    if (callsAfterLive !== callsBeforeLive) {
+      fail(`S1: Live click started another getUserMedia while STT setup was pending (${callsBeforeLive} -> ${callsAfterLive})`);
+    }
+    const voiceDuringHold = sentFrames.slice(framesBeforeHold).some((frame) => {
+      try {
+        const type = JSON.parse(frame).type;
+        return type === 'realtime_create_call' || type === 'stt_transcribe';
+      } catch { return false; }
+    });
+    if (voiceDuringHold) fail('S1: voice RPC dispatched while STT getUserMedia was pending');
+    const framesAtPointerRelease = sentFrames.length;
     await page.mouse.up();
+    const pointerReleased = await page.evaluate(() => {
+      const mic = document.getElementById('mic-btn');
+      const live = document.getElementById('live-btn');
+      return mic?.getAttribute('aria-pressed') !== 'true'
+        && live?.disabled !== true
+        && live?.getAttribute('aria-label') === 'Start live voice';
+    });
+    if (!pointerReleased) fail('S1: pointer release did not clear STT busy before getUserMedia resolved');
+    if (await page.evaluate(() => window.__sttGumRelease?.(1)) !== true) {
+      fail('S1: the deferred first getUserMedia acquisition could not be continued');
+    }
+    await waitFor(
+      page,
+      () => {
+        const first = window.__sttGumState?.acquisitions?.find((entry) => entry.call === 1);
+        return first?.stream !== null && first.trackCount > 0 && first.settled !== true && typeof first.releaseStream === 'function';
+      },
+      'S1: deferred getUserMedia never produced the old stream',
+    );
+    const callsBeforeSecond = await page.evaluate(() => window.__sttGumState?.calls ?? 0);
+    const secondBox = await page.locator('#mic-btn').boundingBox();
+    if (!secondBox) fail('S1: #mic-btn has no bounding box for the second hold');
+    await page.mouse.move(secondBox.x + secondBox.width / 2, secondBox.y + secondBox.height / 2);
+    await page.mouse.down();
+    await waitFor(
+      page,
+      () => window.__sttGumState?.calls === 2
+        && window.__sttGumState?.acquisitions?.some((entry) => entry.call === 2 && entry.stream === null),
+      'S1: second hold never started its own pending getUserMedia',
+    );
+    if (callsBeforeSecond !== 1) {
+      fail(`S1: first hold did not account for exactly one getUserMedia before the second hold (${callsBeforeSecond})`);
+    }
+    if (await page.evaluate(() => window.__sttGumDeliver?.(1)) !== true) {
+      fail('S1: old getUserMedia stream could not be delivered during the second hold');
+    }
+    await waitFor(
+      page,
+      () => {
+        const first = window.__sttGumState?.acquisitions?.find((entry) => entry.call === 1);
+        const second = window.__sttGumState?.acquisitions?.find((entry) => entry.call === 2);
+        const live = document.getElementById('live-btn');
+        return first?.settled === true
+          && first.trackCount > 0
+          && first.stopped === first.trackCount
+          && second?.settled !== true
+          && second?.stream === null
+          && live?.disabled === true
+          && (window.__sttGumState?.recordersStarted ?? -1) === 0
+          && (window.__sttGumState?.tracksLive ?? -1) === 0;
+      },
+      'S1: old acquisition completion cleared the second hold, left tracks live, or started a recorder',
+    );
+    if (sentFrames.slice(framesAtPointerRelease).some((frame) => {
+      try { return JSON.parse(frame).type === 'stt_transcribe'; } catch { return false; }
+    })) {
+      fail('S1: old stream delivery dispatched stt_transcribe');
+    }
+    if (await page.evaluate(() => window.__sttGumRelease?.(2)) !== true) {
+      fail('S1: the second getUserMedia acquisition could not be continued');
+    }
+    await waitFor(
+      page,
+      () => {
+        const second = window.__sttGumState?.acquisitions?.find((entry) => entry.call === 2);
+        return second?.stream !== null && second.trackCount > 0 && typeof second.releaseStream === 'function';
+      },
+      'S1: second getUserMedia never produced its stream',
+    );
+    if (await page.evaluate(() => window.__sttGumDeliver?.(2)) !== true) {
+      fail('S1: second getUserMedia stream could not be delivered');
+    }
+    await waitFor(
+      page,
+      () => {
+        const second = window.__sttGumState?.acquisitions?.find((entry) => entry.call === 2);
+        return second?.settled === true
+          && (window.__sttGumState?.recordersStarted ?? 0) >= 1
+          && document.getElementById('mic-btn')?.getAttribute('aria-pressed') === 'true';
+      },
+      'S1: second hold never started recording',
+    );
+    await page.waitForTimeout(900);
+    const captureMs = await page.evaluate(() => performance.now() - (window.__sttGumState?.recorderStartedAt ?? performance.now()));
+    if (!(captureMs >= 300)) fail(`S1: second recording was released before a real capture (${captureMs}ms)`);
+    await page.mouse.up();
+    await page.locator('#mic-btn').dispatchEvent('pointerleave');
+    await waitFor(
+      page,
+      () => document.getElementById('mic-btn')?.getAttribute('aria-pressed') !== 'true',
+      'S1: pointerup did not release the second recording',
+    );
 
     // ---- S1: stt_transcribe RPC with ONLY {audioBase64, mimeType} ----
     let sawTranscribe = false;
@@ -204,7 +467,40 @@ async function main() {
       if (!sawTranscribe) await page.waitForTimeout(200);
     }
     if (!sawTranscribe) {
-      fail(`S1: stt_transcribe RPC never dispatched (sent frames: ${sentFrames.slice(-5).join(' | ')})`);
+      const micTrace = await page.evaluate(() => {
+        const mic = document.getElementById('mic-btn');
+        const live = document.getElementById('live-btn');
+        const gum = window.__sttGumState;
+        return {
+          recordersStarted: gum?.recordersStarted ?? null,
+          recordersStopped: gum?.recordersStopped ?? null,
+          recorderOnStops: gum?.recorderOnStops ?? null,
+          recorderErrors: gum?.recorderErrors ?? null,
+          recorderStateAtStop: gum?.recorderStateAtStop ?? null,
+          dataSizes: gum?.dataSizes ?? null,
+          tracksStopped: gum?.tracksStopped ?? null,
+          tracksLive: gum?.tracksLive ?? null,
+          acquisitions: (gum?.acquisitions ?? []).map((entry) => ({
+            call: entry.call,
+            settled: entry.settled,
+            trackCount: entry.trackCount,
+            stopped: entry.stopped,
+            hasStream: entry.stream !== null,
+          })),
+          mic: mic ? {
+            pressed: mic.getAttribute('aria-pressed'),
+            disabled: mic.disabled === true,
+            className: mic.className,
+            title: mic.getAttribute('title'),
+          } : null,
+          live: live ? {
+            label: live.getAttribute('aria-label'),
+            disabled: live.disabled === true,
+          } : null,
+          toasts: Array.from(document.querySelectorAll('.toast')).map((node) => node.textContent || ''),
+        };
+      });
+      fail(`S1: stt_transcribe RPC never dispatched (sent frames: ${sentFrames.slice(-5).join(' | ')}; mic=${JSON.stringify(micTrace)})`);
     }
     if (transcribePayload.mimeType !== 'audio/wav') {
       fail(`S1: stt_transcribe mimeType not audio/wav (${JSON.stringify(transcribePayload)})`);
@@ -217,7 +513,50 @@ async function main() {
     if (payloadKeys.some((key) => /url|key|token/i.test(key))) {
       fail(`S1: stt_transcribe payload carries a URL/key-shaped field (${JSON.stringify(transcribePayload)})`);
     }
+    if (sentFrames.some((frame) => {
+      try { return JSON.parse(frame).type === 'realtime_create_call'; } catch { return false; }
+    })) {
+      fail('S1: hold-to-talk dispatched realtime_create_call');
+    }
 
+    if (phase === 'ok') {
+      await waitForNode(
+        () => fs.existsSync(sttEvidence),
+        'S1: held STT request never reached the proxy before pointerleave recovery',
+      );
+      await releaseStt();
+      const framesBeforeTranscript = sentFrames.length;
+      await waitForNode(
+        () => sentFrames.slice(framesBeforeTranscript).filter((raw) => {
+          try {
+            const frame = JSON.parse(raw);
+            return (frame.type === 'prompt' || frame.type === 'steer') && frame.message === 'web stt transcript';
+          } catch { return false; }
+        }).length === 1,
+        'S1: held STT transcript was not submitted exactly once after pointerleave',
+      );
+      const submitted = sentFrames.slice(framesBeforeTranscript).filter((raw) => {
+        try {
+          const frame = JSON.parse(raw);
+          return (frame.type === 'prompt' || frame.type === 'steer') && frame.message === 'web stt transcript';
+        } catch { return false; }
+      });
+      if (submitted.length !== 1) fail(`S1: held STT transcript submissions=${submitted.length}`);
+      const composer = await page.inputValue('#prompt-input');
+      if (composer !== '') fail(`S1: auto-submitted STT transcript remained in the composer (${JSON.stringify(composer)})`);
+      await waitFor(
+        page,
+        () => {
+          const mic = document.getElementById('mic-btn');
+          const live = document.getElementById('live-btn');
+          return mic?.disabled !== true
+            && mic?.getAttribute('aria-pressed') !== 'true'
+            && live?.disabled !== true
+            && live?.getAttribute('aria-label') === 'Start live voice';
+        },
+        'S1: mic or live stayed disabled after pointerleave during the held STT response',
+      );
+    }
 
     if (phase === 'owner-error') {
       const evidenceDeadline = Date.now() + 15000;
@@ -325,13 +664,60 @@ async function main() {
     if (meta.wavPresent !== true) fail(`S2: the WAV bytes are missing from the forwarded form (${JSON.stringify(meta)})`);
     if (meta.modelPresent !== true) fail(`S2: the model field is missing (${JSON.stringify(meta)})`);
 
-    // ---- S3: switch A→B while the backend transcription is still held.
-    // The stt_transcribe command must stay targeted at A, and its late result
-    // must not mutate B's composer. ----
-    const transcribeSession = transcribePayload.sessionId;
-    if (typeof transcribeSession !== 'string' || transcribeSession === '') {
-      fail(`S3: stt_transcribe missing its captured session owner (${JSON.stringify(transcribePayload)})`);
+    // ---- S3: a new hold after S1 is still owned by A. Its late result
+    // must not mutate B. ----
+    const s1Evidence = fs.statSync(sttEvidence);
+    const framesBeforeThird = sentFrames.length;
+    const thirdBox = await page.locator('#mic-btn').boundingBox();
+    if (!thirdBox) fail('S3: #mic-btn has no bounding box for the third hold');
+    await page.mouse.move(thirdBox.x + thirdBox.width / 2, thirdBox.y + thirdBox.height / 2);
+    await page.mouse.down();
+    await waitFor(
+      page,
+      () => window.__sttGumState?.calls === 3
+        && window.__sttGumState?.acquisitions?.some((entry) => entry.call === 3 && entry.stream === null),
+      'S3: third hold never started its own pending getUserMedia',
+    );
+    if (await page.evaluate(() => window.__sttGumRelease?.(3)) !== true) {
+      fail('S3: the third getUserMedia acquisition could not be continued');
     }
+    await waitFor(
+      page,
+      () => {
+        const third = window.__sttGumState?.acquisitions?.find((entry) => entry.call === 3);
+        return third?.stream !== null && third.trackCount > 0 && typeof third.releaseStream === 'function';
+      },
+      'S3: third getUserMedia never produced its stream',
+    );
+    if (await page.evaluate(() => window.__sttGumDeliver?.(3)) !== true) {
+      fail('S3: third getUserMedia stream could not be delivered');
+    }
+    await waitFor(
+      page,
+      () => (window.__sttGumState?.recordersStarted ?? 0) >= 2
+        && document.getElementById('mic-btn')?.getAttribute('aria-pressed') === 'true',
+      'S3: third hold never started recording',
+    );
+    await page.waitForTimeout(900);
+    const thirdCaptureMs = await page.evaluate(() => performance.now() - (window.__sttGumState?.recorderStartedAt ?? performance.now()));
+    if (!(thirdCaptureMs >= 300)) fail(`S3: third recording was released before a real capture (${thirdCaptureMs}ms)`);
+    await page.mouse.up();
+    let thirdPayload = null;
+    await waitForNode(
+      () => {
+        thirdPayload = sentFrames.slice(framesBeforeThird).map((raw) => {
+          try { return JSON.parse(raw); } catch { return null; }
+        }).find((frame) => frame?.type === 'stt_transcribe') ?? null;
+        return thirdPayload?.id && thirdPayload.id !== transcribePayload.id;
+      },
+      'S3: third hold never dispatched its own stt_transcribe',
+    );
+    await waitForNode(
+      () => {
+        try { return fs.statSync(sttEvidence).mtimeMs > s1Evidence.mtimeMs; } catch { return false; }
+      },
+      'S3: third STT request never registered a new proxy hold',
+    );
     const framesBeforeSessionPanel = sentFrames.length;
     let created;
     try {
@@ -347,18 +733,29 @@ async function main() {
       });
       fail(`S3: Session panel lifecycle failed: ${error instanceof Error ? error.message : String(error)}; frames=${JSON.stringify(frames)}`);
     }
-    if (created.beforeSessionId !== transcribeSession) {
-      fail(`S3: STT command owner ${transcribeSession} did not match session A ${created.beforeSessionId}`);
+    if (created.beforeSessionId !== thirdPayload.sessionId) {
+      fail(`S3: third STT owner ${thirdPayload.sessionId} did not match session A ${created.beforeSessionId}`);
     }
     await page.fill('#prompt-input', 'session B draft');
+    const framesBeforeLateRelease = sentFrames.length;
     await releaseStt();
-    await page.waitForTimeout(800);
+    await waitForNode(
+      () => receivedFrames.some((raw) => {
+        try { return JSON.parse(raw).id === thirdPayload.id; } catch { return false; }
+      }),
+      'S3: third STT command never settled after release',
+    );
+    const lateSubmits = sentFrames.slice(framesBeforeLateRelease).filter((raw) => {
+      try {
+        const frame = JSON.parse(raw);
+        return (frame.type === 'prompt' || frame.type === 'steer') && frame.message === 'web stt transcript';
+      } catch { return false; }
+    });
+    if (lateSubmits.length !== 0) fail(`S3: late A transcript submitted on B (${lateSubmits.length})`);
     const bComposer = await page.inputValue('#prompt-input');
     if (bComposer !== 'session B draft') {
       fail(`S3: late A transcript polluted B composer (${JSON.stringify(bComposer)})`);
     }
-    if (bComposer.includes('web stt transcript')) fail('S3: session A transcript landed in session B composer');
-    await page.screenshot({ path: `${evidence}/stt-session-switch-isolated.png`, fullPage: true });
 
     // ---- S4: the fixture key never appears in the DOM or the evidence ----
     const domText = await page.evaluate(() => document.body.innerText || '');

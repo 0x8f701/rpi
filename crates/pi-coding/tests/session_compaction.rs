@@ -3,19 +3,32 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use pi_agent::{StreamFn, ThinkingLevel};
 use pi_ai::providers::{FauxProviderOptions, FauxResponse, register_faux_provider};
 use pi_ai::{
-    AssistantMessage, AssistantMessageEvent, ContentBlock, Message, Model, StopReason, Usage,
-    new_assistant_message_event_stream,
+    AssistantMessage, AssistantMessageEvent, ContentBlock, Context, Message, Model, StopReason,
+    Usage, new_assistant_message_event_stream,
 };
 use pi_coding::{
     BeforeCompactionResult, CompactionDetails, CompactionReason, CompactionResult,
-    CompactionSettings, RetrySettings, Session, SessionEvent, SessionOptions,
+    CompactionSettings, ResourceDiscovery, RetrySettings, Session, SessionEvent, SessionOptions,
+    ToolSelection, estimate_context_tokens, estimate_context_tokens_usage_aware,
+    estimate_live_context_tokens, estimate_message_tokens, should_compact,
 };
+
 
 static REGISTRY_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 fn registry_guard() -> MutexGuard<'static, ()> {
     REGISTRY_LOCK.lock().expect("provider registry test lock")
 }
+fn hermetic_session(options: SessionOptions) -> Session {
+    Session::new_with_additional_tools_filtered_and_discovery(
+        options,
+        Vec::new(),
+        ToolSelection::default(),
+        ResourceDiscovery::Disabled,
+    )
+    .expect("build hermetic session")
+}
+
 
 #[tokio::test]
 async fn enabled_compaction_summarizes_after_completed_prompt() {
@@ -35,12 +48,12 @@ async fn enabled_compaction_summarizes_after_completed_prompt() {
         chunk_size: 8,
     });
     registration.set_responses(vec![
-        FauxResponse::text("final answer"),
         FauxResponse::text("checkpoint summary"),
+        FauxResponse::text("final answer"),
     ]);
     let cwd = tempfile::tempdir().expect("temporary working directory");
-    let session = Session::new(SessionOptions {
-        model,
+    let session = hermetic_session(SessionOptions {
+        model: Some(model),
         cwd: cwd.path().to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,
@@ -58,8 +71,7 @@ async fn enabled_compaction_summarizes_after_completed_prompt() {
         stream_fn: None,
         auth_resolver: None,
         auth_manager: None,
-    })
-    .expect("build compacting session");
+    });
     session
         .load_history(vec![
             Message::user_text("older request ".repeat(20), 1),
@@ -97,8 +109,8 @@ async fn disabled_compaction_does_not_consume_summary_response() {
     });
     registration.set_responses(vec![FauxResponse::text("direct answer")]);
     let cwd = tempfile::tempdir().expect("temporary working directory");
-    let session = Session::new(SessionOptions {
-        model,
+    let session = hermetic_session(SessionOptions {
+        model: Some(model),
         cwd: cwd.path().to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,
@@ -111,8 +123,7 @@ async fn disabled_compaction_does_not_consume_summary_response() {
         stream_fn: None,
         auth_resolver: None,
         auth_manager: None,
-    })
-    .expect("build non-compacting session");
+    });
     session
         .load_history(vec![Message::user_text("large history ".repeat(20), 1)])
         .await
@@ -130,8 +141,8 @@ fn auto_compaction_toggle_is_truthful_without_initial_settings() {
     let mut model = Model::default();
     model.id = "compaction-toggle".into();
     let cwd = tempfile::tempdir().expect("temporary working directory");
-    let session = Session::new(SessionOptions {
-        model,
+    let session = hermetic_session(SessionOptions {
+        model: Some(model),
         cwd: cwd.path().to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,
@@ -144,8 +155,7 @@ fn auto_compaction_toggle_is_truthful_without_initial_settings() {
         stream_fn: None,
         auth_resolver: None,
         auth_manager: None,
-    })
-    .expect("build session");
+    });
 
     assert!(!session.auto_compaction_enabled());
     session.set_auto_compaction_enabled(true);
@@ -169,15 +179,15 @@ async fn compaction_activity_is_set_only_while_summary_runs() {
             let release_summary = release_summary.clone();
             let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Box::pin(async move {
-                if call == 1 {
+                if call == 0 {
                     summary_started.notify_one();
                     release_summary.notified().await;
                 }
                 let mut message = AssistantMessage::pending(&model);
                 message.content = vec![ContentBlock::text(if call == 0 {
-                    "final answer"
-                } else {
                     "checkpoint summary"
+                } else {
+                    "final answer"
                 })];
                 message.stop_reason = StopReason::Stop;
                 let stream = new_assistant_message_event_stream();
@@ -200,8 +210,8 @@ async fn compaction_activity_is_set_only_while_summary_runs() {
         ..Model::default()
     };
     let cwd = tempfile::tempdir().expect("temporary working directory");
-    let session = Session::new(SessionOptions {
-        model,
+    let session = hermetic_session(SessionOptions {
+        model: Some(model),
         cwd: cwd.path().to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,
@@ -219,8 +229,7 @@ async fn compaction_activity_is_set_only_while_summary_runs() {
         stream_fn: Some(stream_fn),
         auth_resolver: None,
         auth_manager: None,
-    })
-    .expect("build compacting session");
+    });
     session
         .load_history(vec![
             Message::user_text("older request ".repeat(20), 1),
@@ -256,8 +265,8 @@ async fn manual_compaction_emits_paired_success_events() {
     });
     registration.set_responses(vec![FauxResponse::text("manual checkpoint")]);
     let cwd = tempfile::tempdir().expect("temporary working directory");
-    let session = Session::new(SessionOptions {
-        model,
+    let session = hermetic_session(SessionOptions {
+        model: Some(model),
         cwd: cwd.path().to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,
@@ -275,8 +284,7 @@ async fn manual_compaction_emits_paired_success_events() {
         stream_fn: None,
         auth_resolver: None,
         auth_manager: None,
-    })
-    .expect("build session");
+    });
     let history = vec![
         Message::user_text("older request ".repeat(20), 1),
         Message::Assistant({
@@ -338,8 +346,8 @@ async fn manual_compaction_emits_paired_success_events() {
 #[tokio::test]
 async fn hook_compaction_persists_details_usage_and_source() {
     let cwd = tempfile::tempdir().expect("temporary working directory");
-    let session = Session::new(SessionOptions {
-        model: Model::default(),
+    let session = hermetic_session(SessionOptions {
+        model: Some(Model::default()),
         cwd: cwd.path().to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,
@@ -357,8 +365,7 @@ async fn hook_compaction_persists_details_usage_and_source() {
         stream_fn: None,
         auth_resolver: None,
         auth_manager: None,
-    })
-    .expect("build session");
+    });
     let recorder = pi_coding::start_session_in(
         cwd.path(),
         None,
@@ -450,8 +457,8 @@ async fn overflow_compacts_once_then_retries_without_duplicate_user_turn() {
         FauxResponse::text("recovered answer"),
     ]);
     let cwd = tempfile::tempdir().expect("temporary working directory");
-    let session = Session::new(SessionOptions {
-        model,
+    let session = hermetic_session(SessionOptions {
+        model: Some(model),
         cwd: cwd.path().to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,
@@ -469,8 +476,7 @@ async fn overflow_compacts_once_then_retries_without_duplicate_user_turn() {
         stream_fn: None,
         auth_resolver: None,
         auth_manager: None,
-    })
-    .expect("build session");
+    });
     session
         .load_history(vec![Message::user_text("older context ".repeat(30), 1)])
         .await
@@ -528,8 +534,8 @@ async fn second_overflow_stops_with_actionable_error() {
         FauxResponse::error("input exceeds the context window"),
     ]);
     let cwd = tempfile::tempdir().expect("temporary working directory");
-    let session = Session::new(SessionOptions {
-        model,
+    let session = hermetic_session(SessionOptions {
+        model: Some(model),
         cwd: cwd.path().to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,
@@ -547,8 +553,7 @@ async fn second_overflow_stops_with_actionable_error() {
         stream_fn: None,
         auth_resolver: None,
         auth_manager: None,
-    })
-    .expect("build session");
+    });
     session
         .load_history(vec![Message::user_text("older context ".repeat(30), 1)])
         .await
@@ -611,8 +616,8 @@ async fn compaction_resolves_auth_into_request_options_without_mutating_model() 
         ..Model::default()
     };
     let cwd = tempfile::tempdir().expect("temporary working directory");
-    let session = Session::new(SessionOptions {
-        model: model.clone(),
+    let session = hermetic_session(SessionOptions {
+        model: Some(model.clone()),
         cwd: cwd.path().to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,
@@ -630,8 +635,7 @@ async fn compaction_resolves_auth_into_request_options_without_mutating_model() 
         stream_fn: Some(stream_fn),
         auth_resolver: Some(resolver),
         auth_manager: None,
-    })
-    .expect("build session");
+    });
     session
         .load_history(vec![
             Message::user_text("older request ".repeat(20), 1),
@@ -703,8 +707,8 @@ async fn manual_compaction_retries_transient_summary_and_emits_ordered_events() 
         FauxResponse::text("retried checkpoint"),
     ]);
     let cwd = tempfile::tempdir().expect("temporary working directory");
-    let session = Session::new(SessionOptions {
-        model,
+    let session = hermetic_session(SessionOptions {
+        model: Some(model),
         cwd: cwd.path().to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,
@@ -722,8 +726,7 @@ async fn manual_compaction_retries_transient_summary_and_emits_ordered_events() 
         stream_fn: None,
         auth_resolver: None,
         auth_manager: None,
-    })
-    .expect("build session");
+    });
     session.set_retry_settings(RetrySettings {
         enabled: true,
         max_retries: 1,
@@ -769,6 +772,536 @@ async fn manual_compaction_retries_transient_summary_and_emits_ordered_events() 
     assert_eq!(
         lifecycle,
         ["start", "scheduled", "attempt", "finished", "end"]
+    );
+    registration.unregister();
+}
+
+fn context_text(context: &Context) -> String {
+    context
+        .messages
+        .iter()
+        .flat_map(|message| match message {
+            Message::User(message) => message.content.iter(),
+            Message::Assistant(message) => message.content.iter(),
+            Message::ToolResult(message) => message.content.iter(),
+            other => panic!("provider context contains an unprojected session message: {other:?}"),
+        })
+        .filter_map(|block| match block {
+            ContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Regression: a turn that starts with its live context already above
+/// `should_compact` must summarize BEFORE the turn's first provider request.
+/// A threshold check that only runs in `finish_run` lets the oversized context
+/// reach the provider and defers compaction to the next successful turn, which
+/// is the "auto-run errors once, user has to send another message" lag.
+#[tokio::test]
+async fn threshold_compaction_preflights_before_the_first_provider_request() {
+    let contexts: Arc<Mutex<Vec<Context>>> = Arc::new(Mutex::new(Vec::new()));
+    let stream_fn: StreamFn = {
+        let contexts = contexts.clone();
+        Arc::new(move |model, context, _options| {
+            let contexts = contexts.clone();
+            Box::pin(async move {
+                let call = {
+                    let mut captured = contexts.lock().expect("captured contexts");
+                    captured.push(context.clone());
+                    captured.len() - 1
+                };
+                let mut message = AssistantMessage::pending(&model);
+                message.content = vec![ContentBlock::text(if call == 0 {
+                    "checkpoint summary"
+                } else {
+                    "final answer"
+                })];
+                message.stop_reason = StopReason::Stop;
+                let stream = new_assistant_message_event_stream();
+                stream
+                    .push(AssistantMessageEvent::Done {
+                        reason: StopReason::Stop,
+                        message: message.clone(),
+                    })
+                    .await;
+                stream.end(Some(message)).await;
+                stream
+            })
+        })
+    };
+    let model = Model {
+        id: "compaction-preflight".into(),
+        name: "Compaction Preflight".into(),
+        context_window: 60,
+        max_tokens: 32,
+        ..Model::default()
+    };
+    let settings = CompactionSettings {
+        enabled: true,
+        reserve_tokens: 10,
+        keep_recent_tokens: 4,
+        snap_keep_turns: 10,
+    };
+    let cwd = tempfile::tempdir().expect("temporary working directory");
+    let session = hermetic_session(SessionOptions {
+        model: Some(model),
+        cwd: cwd.path().to_path_buf(),
+        system_prompt: String::new(),
+        thinking_level: ThinkingLevel::Off,
+        api_key: String::new(),
+        compaction: Some(settings.clone()),
+        stream_options: Default::default(),
+        tools: Some(Vec::new()),
+        before_tool_call: None,
+        after_tool_call: None,
+        stream_fn: Some(stream_fn),
+        auth_resolver: None,
+        auth_manager: None,
+    });
+    session
+        .load_history(vec![
+            Message::user_text("older request ".repeat(20), 1),
+            Message::user_text("recent request", 2),
+        ])
+        .await
+        .expect("load history");
+    let preloaded = session.history();
+    assert!(
+        should_compact(estimate_live_context_tokens(&preloaded), 60, &settings),
+        "preloaded context must already exceed the threshold: {preloaded:?}"
+    );
+    let mut events = session.subscribe_session_events();
+    let answer = session
+        .run_print(&mut Vec::new(), "first normal request")
+        .await
+        .expect("run prompt");
+    assert_eq!(
+        answer, "final answer",
+        "the normal request must be served by the post-summary response"
+    );
+
+    let captured = contexts.lock().expect("captured contexts").clone();
+    assert!(
+        captured.len() >= 2,
+        "expected a compaction summary call before the normal turn request, saw {} provider call(s)",
+        captured.len(),
+    );
+    assert_eq!(
+        captured[0].messages.len(),
+        1,
+        "the first provider call must be the summarization request, not the oversized turn"
+    );
+    let normal = context_text(&captured[1]);
+    assert!(
+        normal.contains("checkpoint summary"),
+        "the first normal request must carry the compaction summary"
+    );
+    assert!(
+        normal.contains("first normal request"),
+        "the second provider call must be the user's turn"
+    );
+
+    let mut reasons = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let SessionEvent::CompactionStart { reason } = event {
+            reasons.push(reason);
+        }
+    }
+    assert_eq!(
+        reasons,
+        vec![CompactionReason::Threshold],
+        "preflight compaction must publish exactly one threshold start"
+    );
+    assert!(
+        matches!(
+            session.history().first(),
+            Some(Message::CompactionSummary(_))
+        ),
+        "history must start with the compaction summary"
+    );
+}
+
+
+#[tokio::test]
+async fn preflight_hook_decline_continues_on_last_good_history() {
+    let _guard = registry_guard();
+    let mut model = Model::default();
+    model.id = "decline-faux".into();
+    model.api = "decline-faux-api".into();
+    model.provider = "faux".into();
+    model.base_url = "http://localhost:0".into();
+    model.context_window = 60;
+    model.max_tokens = 32;
+    let registration = register_faux_provider(FauxProviderOptions {
+        api: model.api.clone(),
+        provider: model.provider.clone(),
+        models: vec![model.clone()],
+        chunk_size: 8,
+    });
+    registration.set_responses(vec![FauxResponse::text("decline answer")]);
+    let cwd = tempfile::tempdir().expect("temporary working directory");
+    let session = hermetic_session(SessionOptions {
+        model: Some(model),
+        cwd: cwd.path().to_path_buf(),
+        system_prompt: String::new(),
+        thinking_level: ThinkingLevel::Off,
+        api_key: "faux".into(),
+        compaction: Some(CompactionSettings {
+            enabled: true,
+            reserve_tokens: 10,
+            keep_recent_tokens: 4,
+            snap_keep_turns: 10,
+        }),
+        stream_options: Default::default(),
+        tools: Some(Vec::new()),
+        before_tool_call: None,
+        after_tool_call: None,
+        stream_fn: None,
+        auth_resolver: None,
+        auth_manager: None,
+    });
+    session
+        .load_history(vec![
+            Message::user_text("older request ".repeat(20), 1),
+            Message::user_text("recent request", 2),
+        ])
+        .await
+        .expect("load history");
+    session.set_before_compaction(Some(Arc::new(|_| {
+        Box::pin(async move {
+            Ok(BeforeCompactionResult {
+                cancel: true,
+                compaction: None,
+            })
+        })
+    })));
+    let mut events = session.subscribe_session_events();
+    let answer = session
+        .run_print(&mut Vec::new(), "first normal request")
+        .await
+        .expect("decline must continue on last-good history");
+    assert_eq!(answer, "decline answer");
+    while let Ok(event) = events.try_recv() {
+        assert!(
+            !matches!(event, SessionEvent::CompactionStart { .. }),
+            "a declined preflight must not publish a compaction start: {event:?}"
+        );
+    }
+    let history = session.history();
+    assert!(
+        !matches!(history.first(), Some(Message::CompactionSummary(_))),
+        "last-good history must be preserved: {history:?}"
+    );
+    assert_eq!(
+        history.len(),
+        4,
+        "history must keep both preloaded turns plus this prompt and answer: {history:?}"
+    );
+    registration.unregister();
+}
+
+#[tokio::test]
+async fn preflight_abort_returns_typed_abort_without_provider_or_queue_restart() {
+    let _guard = registry_guard();
+    let mut model = Model::default();
+    model.id = "abort-faux".into();
+    model.api = "abort-faux-api".into();
+    model.provider = "faux".into();
+    model.base_url = "http://localhost:0".into();
+    model.context_window = 60;
+    model.max_tokens = 32;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let stream_fn: StreamFn = {
+        let calls = calls.clone();
+        Arc::new(move |model, _context, _options| {
+            let calls = calls.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut message = AssistantMessage::pending(&model);
+                message.content = vec![ContentBlock::text("aborted turn answer")];
+                message.stop_reason = StopReason::Stop;
+                let stream = new_assistant_message_event_stream();
+                stream
+                    .push(AssistantMessageEvent::Done {
+                        reason: StopReason::Stop,
+                        message: message.clone(),
+                    })
+                    .await;
+                stream.end(Some(message)).await;
+                stream
+            })
+        })
+    };
+    let cwd = tempfile::tempdir().expect("temporary working directory");
+    let session = hermetic_session(SessionOptions {
+        model: Some(model),
+        cwd: cwd.path().to_path_buf(),
+        system_prompt: String::new(),
+        thinking_level: ThinkingLevel::Off,
+        api_key: String::new(),
+        compaction: Some(CompactionSettings {
+            enabled: true,
+            reserve_tokens: 10,
+            keep_recent_tokens: 4,
+            snap_keep_turns: 10,
+        }),
+        stream_options: Default::default(),
+        tools: Some(Vec::new()),
+        before_tool_call: None,
+        after_tool_call: None,
+        stream_fn: Some(stream_fn),
+        auth_resolver: None,
+        auth_manager: None,
+    });
+    session
+        .load_history(vec![
+            Message::user_text("older request ".repeat(20), 1),
+            Message::user_text("recent request", 2),
+        ])
+        .await
+        .expect("load history");
+    session
+        .steer(Message::user_text("queued mid-abort", 3))
+        .await
+        .expect("steer queued before the run");
+    let hook_session = session.clone();
+    session.set_before_compaction(Some(Arc::new(move |_| {
+        let hook_session = hook_session.clone();
+        Box::pin(async move {
+            hook_session.abort().await;
+            Ok(BeforeCompactionResult::default())
+        })
+    })));
+    let result = session.run("first normal request", Vec::new()).await;
+    let error = result.expect_err("aborted preflight must surface the abort");
+    assert!(
+        error.downcast_ref::<pi_agent::AbortError>().is_some(),
+        "preflight abort must be the typed AbortError: {error:#}"
+    );
+    assert!(
+        calls.load(std::sync::atomic::Ordering::SeqCst) <= 1,
+        "the turn request must not start after the abort"
+    );
+    assert_eq!(
+        session.pending_message_count().await,
+        1,
+        "the queued steering must stay queued, never restart a provider turn"
+    );
+}
+
+#[tokio::test]
+async fn queued_next_turn_messages_count_toward_preflight_threshold() {
+    let contexts: Arc<Mutex<Vec<Context>>> = Arc::new(Mutex::new(Vec::new()));
+    let stream_fn: StreamFn = {
+        let contexts = contexts.clone();
+        Arc::new(move |model, context, _options| {
+            let contexts = contexts.clone();
+            Box::pin(async move {
+                let call = {
+                    let mut captured = contexts.lock().expect("captured contexts");
+                    captured.push(context);
+                    captured.len() - 1
+                };
+                let mut message = AssistantMessage::pending(&model);
+                message.content = vec![ContentBlock::text(if call == 0 {
+                    "checkpoint summary"
+                } else {
+                    "final answer"
+                })];
+                message.stop_reason = StopReason::Stop;
+                let stream = new_assistant_message_event_stream();
+                stream
+                    .push(AssistantMessageEvent::Done {
+                        reason: StopReason::Stop,
+                        message: message.clone(),
+                    })
+                    .await;
+                stream.end(Some(message)).await;
+                stream
+            })
+        })
+    };
+    let model = Model {
+        id: "queued-preflight".into(),
+        name: "Queued Preflight".into(),
+        context_window: 60,
+        max_tokens: 32,
+        ..Model::default()
+    };
+    let settings = CompactionSettings {
+        enabled: true,
+        reserve_tokens: 10,
+        keep_recent_tokens: 4,
+        snap_keep_turns: 10,
+    };
+    let cwd = tempfile::tempdir().expect("temporary working directory");
+    let session = hermetic_session(SessionOptions {
+        model: Some(model),
+        cwd: cwd.path().to_path_buf(),
+        system_prompt: String::new(),
+        thinking_level: ThinkingLevel::Off,
+        api_key: String::new(),
+        compaction: Some(settings.clone()),
+        stream_options: Default::default(),
+        tools: Some(Vec::new()),
+        before_tool_call: None,
+        after_tool_call: None,
+        stream_fn: Some(stream_fn),
+        auth_resolver: None,
+        auth_manager: None,
+    });
+    session
+        .load_history(vec![
+            Message::user_text("older request ".repeat(3), 1),
+            Message::user_text("recent request", 2),
+        ])
+        .await
+        .expect("load history");
+    let preloaded = session.history();
+    assert!(
+        !should_compact(estimate_live_context_tokens(&preloaded), 60, &settings),
+        "history alone must sit under the threshold: {preloaded:?}"
+    );
+    session
+        .send_custom_message(
+            pi_ai::CustomMessage {
+                custom_type: "pi.test.queued".to_owned(),
+                content: "queued payload ".repeat(40).into(),
+                display: false,
+                details: None,
+                timestamp: 2,
+            },
+            pi_coding::MessageDelivery::NextTurn,
+            false,
+        )
+        .await
+        .expect("queue next-turn message");
+    let mut events = session.subscribe_session_events();
+    let answer = session
+        .run_print(&mut Vec::new(), "first normal request")
+        .await
+        .expect("run prompt");
+    assert_eq!(answer, "final answer");
+    let captured = contexts.lock().expect("captured contexts").clone();
+    assert!(
+        captured.len() >= 2,
+        "the queued message must push preflight over the threshold: {} call(s)",
+        captured.len()
+    );
+    assert_eq!(
+        captured[0].messages.len(),
+        1,
+        "the first provider call must be the summarization request"
+    );
+    let mut saw_threshold = false;
+    while let Ok(event) = events.try_recv() {
+        saw_threshold |= matches!(
+            event,
+            SessionEvent::CompactionStart {
+                reason: CompactionReason::Threshold
+            }
+        );
+    }
+    assert!(saw_threshold, "preflight must publish a threshold start");
+}
+
+#[tokio::test]
+async fn tool_result_overflow_compacts_and_retries_in_one_run() {
+    let _guard = registry_guard();
+    let mut model = Model::default();
+    model.id = "tool-overflow-faux".into();
+    model.api = "tool-overflow-faux-api".into();
+    model.provider = "faux".into();
+    model.base_url = "http://localhost:0".into();
+    model.context_window = 100;
+    model.max_tokens = 32;
+    let registration = register_faux_provider(FauxProviderOptions {
+        api: model.api.clone(),
+        provider: model.provider.clone(),
+        models: vec![model.clone()],
+        chunk_size: 32,
+    });
+    registration.set_responses(vec![
+        FauxResponse {
+            content: vec![ContentBlock::ToolCall(pi_ai::ToolCall {
+                id: "call-1".into(),
+                name: "echo".into(),
+                arguments: serde_json::json!({}),
+                thought_signature: None,
+            })],
+            stop_reason: StopReason::ToolUse,
+            error_message: None,
+        },
+        FauxResponse::error("input exceeds the context window"),
+        FauxResponse::text("overflow checkpoint"),
+        FauxResponse::text("turn prefix checkpoint"),
+        FauxResponse::text("recovered answer"),
+    ]);
+    let cwd = tempfile::tempdir().expect("temporary working directory");
+    let echo = pi_agent::AgentTool::new(
+        "echo",
+        "echo",
+        pi_ai::Schema::default(),
+        |_context| async {
+            Ok(pi_agent::AgentToolResult {
+                content: vec![ContentBlock::text("tool output")],
+                ..Default::default()
+            })
+        },
+    );
+    let session = hermetic_session(SessionOptions {
+        model: Some(model),
+        cwd: cwd.path().to_path_buf(),
+        system_prompt: String::new(),
+        thinking_level: ThinkingLevel::Off,
+        api_key: "faux".into(),
+        compaction: Some(CompactionSettings {
+            enabled: true,
+            reserve_tokens: 20,
+            keep_recent_tokens: 4,
+            snap_keep_turns: 10,
+        }),
+        stream_options: Default::default(),
+        tools: Some(vec![echo]),
+        before_tool_call: None,
+        after_tool_call: None,
+        stream_fn: None,
+        auth_resolver: None,
+        auth_manager: None,
+    });
+    session
+        .load_history(vec![Message::user_text("older context ".repeat(30), 1)])
+        .await
+        .expect("load history");
+    let mut events = session.subscribe_session_events();
+    let result = session
+        .run("one user turn", Vec::new())
+        .await
+        .expect("same-run overflow recovery");
+    assert_eq!(result.text, "recovered answer");
+    let history = session.history();
+    assert!(
+        history
+            .iter()
+            .any(|message| matches!(message, Message::ToolResult(result) if result.tool_name == "echo")),
+        "the tool result must stay in the transcript: {history:?}"
+    );
+    assert!(
+        matches!(history.first(), Some(Message::CompactionSummary(_))),
+        "overflow compaction must run before the retry"
+    );
+    let mut reasons = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let SessionEvent::CompactionStart { reason } = event {
+            reasons.push(reason);
+        }
+    }
+    assert_eq!(
+        reasons,
+        vec![CompactionReason::Overflow],
+        "mid-loop overflow must compact exactly once for the overflow reason"
     );
     registration.unregister();
 }

@@ -3,6 +3,10 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+#[cfg(test)]
+use std::cell::RefCell;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(target_os = "windows")]
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
@@ -220,7 +224,7 @@ impl SessionFileIdentity {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct FsMetadata {
+pub struct FsMetadata {
     pub(crate) identity: FileIdentity,
     pub(crate) len: u64,
     pub(crate) modified_ns: i128,
@@ -953,6 +957,7 @@ fn open_managed_components_within_root(
     mut resolved_relative: PathBuf,
     components: &[OsString],
     hops: &mut usize,
+    on_traversal: &mut dyn FnMut(&Path) -> Result<(), FsError>,
 ) -> Result<ManagedOpenedEntry, FsError> {
     let Some((name, remaining)) = components.split_first() else {
         let entry = if resolved_relative.as_os_str().is_empty() {
@@ -980,7 +985,8 @@ fn open_managed_components_within_root(
         *hops += 1;
         let link_identity = platform_managed_link_identity(&parent.root.directory, name_path)?;
         let target = platform_read_link(&parent.root.directory, name_path)?;
-        let target_relative = managed_target_within_root(root, &resolved_relative, &target)?;
+        let target_relative =
+            managed_target_within_root(root, &resolved_relative, &target, on_traversal)?;
         let target_components = target_relative
             .components()
             .filter_map(|component| match component {
@@ -993,6 +999,7 @@ fn open_managed_components_within_root(
             PathBuf::new(),
             &target_components,
             hops,
+            on_traversal,
         ) {
             Ok(opened) => opened,
             Err(error) if is_missing(&error) => return Err(FsError::UnsupportedEntryType),
@@ -1021,6 +1028,7 @@ fn open_managed_components_within_root(
             target_relative.to_path_buf(),
             remaining,
             hops,
+            on_traversal,
         )
         .map(|mut opened| {
             opened.followed_link = true;
@@ -1028,26 +1036,45 @@ fn open_managed_components_within_root(
         });
     }
     resolved_relative.push(name);
-    open_managed_components_within_root(root, resolved_relative, remaining, hops)
+    on_traversal(&resolved_relative)?;
+    open_managed_components_within_root(root, resolved_relative, remaining, hops, on_traversal)
 }
 
 fn managed_target_within_root(
     root: &CapabilityRootLease,
     parent_relative: &Path,
     target: &Path,
+    on_traversal: &mut dyn FnMut(&Path) -> Result<(), FsError>,
 ) -> Result<PathBuf, FsError> {
     if target.is_absolute() {
-        let normalized = lexically_normalize_absolute(target);
-        return normalized
+        // Strip the root prefix from the RAW target: normalizing first would
+        // erase pre-pop components (`denied/../final`) that the traversal
+        // callback must still see. A raw `..` climbing above the root fails
+        // closed with `OutsideCapability`.
+        let suffix = target
             .strip_prefix(root.authority_root.as_path())
-            .map(Path::to_path_buf)
-            .map_err(|_| FsError::OutsideCapability);
+            .map_err(|_| FsError::OutsideCapability)?;
+        return walk_target_components_within_root(suffix, on_traversal);
     }
+    walk_target_components_within_root(parent_relative.join(target).as_path(), on_traversal)
+}
+
+/// Lexically normalizes `path` within the root while reporting every entered
+/// prefix to `on_traversal` BEFORE a later `..` can pop it back out, so a
+/// denied directory traversed by a link target is never masked by
+/// normalization.
+fn walk_target_components_within_root(
+    path: &Path,
+    on_traversal: &mut dyn FnMut(&Path) -> Result<(), FsError>,
+) -> Result<PathBuf, FsError> {
     let mut normalized = PathBuf::new();
-    for component in parent_relative.join(target).components() {
+    for component in path.components() {
         match component {
             Component::CurDir => {}
-            Component::Normal(name) => normalized.push(name),
+            Component::Normal(name) => {
+                normalized.push(name);
+                on_traversal(&normalized)?;
+            }
             Component::ParentDir => {
                 if !normalized.pop() {
                     return Err(FsError::OutsideCapability);
@@ -1350,7 +1377,22 @@ impl CapabilityRootLease {
         &self,
         relative: &Path,
     ) -> Result<ManagedOpenedEntry, FsError> {
+        self.open_managed_entry_within_root_checked(relative, &mut|_| Ok(()))
+    }
+
+    /// Same within-root walk, but every real directory entered — including
+    /// symlink target prefixes before `..` normalization pops them — is
+    /// reported to `on_traversal` (root-relative) so the caller can authorize
+    /// the traversal itself and not just the resolved endpoint. The root
+    /// itself is reported once as the empty path. Any callback error aborts
+    /// the walk fail-closed.
+    pub(crate) fn open_managed_entry_within_root_checked(
+        &self,
+        relative: &Path,
+        on_traversal: &mut dyn FnMut(&Path) -> Result<(), FsError>,
+    ) -> Result<ManagedOpenedEntry, FsError> {
         validate_relative(relative)?;
+        on_traversal(Path::new(""))?;
         let components = relative
             .components()
             .filter_map(|component| match component {
@@ -1358,7 +1400,13 @@ impl CapabilityRootLease {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        open_managed_components_within_root(self, PathBuf::new(), &components, &mut 0)
+        open_managed_components_within_root(
+            self,
+            PathBuf::new(),
+            &components,
+            &mut 0,
+            on_traversal,
+        )
     }
 
     fn open_agent_store_top_level_link(
@@ -2453,6 +2501,83 @@ impl CapabilityEntry {
     }
 }
 
+#[cfg(test)]
+struct EnumeratedChildOpenFault {
+    relative: PathBuf,
+    error: FsError,
+    fired: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static ENUMERATED_CHILD_OPEN_FAULT: RefCell<Option<EnumeratedChildOpenFault>> =
+        RefCell::new(None);
+}
+
+/// One-shot fault for the open that follows directory enumeration.
+///
+/// Armed only on the calling thread, and only the next `ProjectResources`
+/// child whose lease-relative path is `relative`. The enumerated identity is
+/// left untouched; the fault replaces that child's `OpenEntry`.
+#[cfg(test)]
+pub(crate) struct EnumeratedChildOpenFaultGuard {
+    fired: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+impl Drop for EnumeratedChildOpenFaultGuard {
+    fn drop(&mut self) {
+        ENUMERATED_CHILD_OPEN_FAULT.with(|slot| {
+            slot.borrow_mut().take();
+        });
+    }
+}
+
+#[cfg(test)]
+impl EnumeratedChildOpenFaultGuard {
+    pub(crate) fn fired(&self) -> bool {
+        self.fired.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn arm_enumerated_child_open_fault(
+    relative: &Path,
+    error: FsError,
+) -> EnumeratedChildOpenFaultGuard {
+    let fired = Arc::new(AtomicBool::new(false));
+    ENUMERATED_CHILD_OPEN_FAULT.with(|slot| {
+        *slot.borrow_mut() = Some(EnumeratedChildOpenFault {
+            relative: relative.to_path_buf(),
+            error,
+            fired: Arc::clone(&fired),
+        });
+    });
+    EnumeratedChildOpenFaultGuard { fired }
+}
+
+#[cfg(test)]
+fn take_enumerated_child_open_fault(
+    lease: &CapabilityRootLease,
+    relative: &Path,
+) -> Option<FsError> {
+    if lease.purpose() != CapabilityRootPurpose::ProjectResources {
+        return None;
+    }
+    ENUMERATED_CHILD_OPEN_FAULT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let matches = slot
+            .as_ref()
+            .is_some_and(|fault| fault.relative == relative);
+        if !matches {
+            return None;
+        }
+        let fault = slot.take()?;
+        fault.fired.store(true, Ordering::SeqCst);
+        Some(fault.error)
+    })
+}
+
 impl CapabilityReadDir {
     pub(crate) fn next(&mut self) -> Result<Option<CapabilityDirEntry>, FsError> {
         let Some((name, enumerated)) = self.cursor.entries.get(self.cursor.next).cloned() else {
@@ -2460,6 +2585,10 @@ impl CapabilityReadDir {
         };
         self.cursor.next += 1;
         let relative = self.parent.relative.join(&name);
+        #[cfg(test)]
+        if let Some(error) = take_enumerated_child_open_fault(&self.parent.lease, &relative) {
+            return Err(error);
+        }
         let entry = match enumerated.kind() {
             EntryKind::RegularFile => {
                 CapabilityEntry::File(self.parent.lease.open_file(&relative)?)

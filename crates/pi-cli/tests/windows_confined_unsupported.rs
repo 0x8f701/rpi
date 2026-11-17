@@ -53,7 +53,7 @@ mod windows_proof {
         options.disable_context_files = true;
         let resources = ResourceManager::new(options).expect("create deterministic resources");
         let session = Session::new(SessionOptions {
-            model: pi_ai::Model::default(),
+            model: Some(pi_ai::Model::default()),
             cwd: roots.workspace.clone(),
             system_prompt: String::new(),
             thinking_level: pi_agent::ThinkingLevel::Off,

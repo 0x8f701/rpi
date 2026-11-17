@@ -2,9 +2,9 @@
 // Kept React-free so the running-details first-render contract is directly
 // testable: callers pass a real clock instead of waiting for the panel ticker.
 
-export type JobStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+export type JobStatus = 'queued' | 'running' | 'cancelling' | 'completed' | 'failed' | 'cancelled';
 
-/** Subagents panel list filter: live work (queued/running) vs settled history. */
+/** Subagents panel list filter: live work vs settled history. */
 export type SubagentJobFilter = 'running' | 'completed';
 
 export const SUBAGENT_FILTER_LABEL: Record<SubagentJobFilter, string> = {
@@ -13,12 +13,21 @@ export const SUBAGENT_FILTER_LABEL: Record<SubagentJobFilter, string> = {
 };
 
 /**
- * Bucket a job status into the panel filter it belongs to. queued+running are
- * "in flight" (a just-spawned job must be visible under Running), everything
- * else is settled history under Completed.
+ * Live execution phases. `cancelling` has committed cancellation intent but
+ * the runner still owns abort/drain/cleanup, so it stays active: elapsed,
+ * progress, and the Running filter. Terminal statuses are history.
+ */
+export function isLiveJobStatus(status: JobStatus): boolean {
+  return status === 'queued' || status === 'running' || status === 'cancelling';
+}
+
+/**
+ * Bucket a job status into the panel filter it belongs to. queued, running,
+ * and cancelling are in flight (a just-spawned or draining job must stay
+ * visible under Running); everything else is settled history under Completed.
  */
 export function subagentJobBucket(status: JobStatus): SubagentJobFilter {
-  return status === 'queued' || status === 'running' ? 'running' : 'completed';
+  return isLiveJobStatus(status) ? 'running' : 'completed';
 }
 
 
@@ -64,7 +73,7 @@ export function formatDuration(milliseconds: number): string {
 
 /** Mirror of job_card_adapter::elapsed_ms: live wall-clock while active. */
 export function elapsedMs(job: JobWire, now: number): number | null {
-  if (job.status === 'queued' || job.status === 'running') {
+  if (isLiveJobStatus(job.status)) {
     if (now === 0) return null;
     const start = job.startedAt ?? job.createdAt;
     return Math.max(0, now - start);

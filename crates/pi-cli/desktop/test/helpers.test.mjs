@@ -437,6 +437,7 @@ const errorPage = errorPageHtml({
 check('error page escapes the failing URL', !errorPage.includes('<script>'));
 check('error page reports the failure description', errorPage.includes('ERR_CERT_AUTHORITY_INVALID'));
 check('error page reports the error code', errorPage.includes('-202'));
+check('error page names the app rpi', errorPage.includes('<h1>rpi could not load the runner</h1>') && !errorPage.includes('rpi desktop'));
 check('error page names the retry URL', errorPage.includes(`${RUNNER_ORIGIN}/web`));
 check('error page names the certificate action', errorPage.includes('Trust current certificate'));
 check('error page names the runner URL action', errorPage.includes('Set runner URL'));

@@ -44,7 +44,7 @@ export interface ActivityEventFrame {
 }
 
 export const ACTIVITY_LIMIT = 200;
-const JOB_STATUSES: ReadonlySet<string> = new Set(['queued', 'running', 'completed', 'failed', 'cancelled']);
+const JOB_STATUSES: ReadonlySet<string> = new Set(['queued', 'running', 'cancelling', 'completed', 'failed', 'cancelled']);
 
 function record(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value)

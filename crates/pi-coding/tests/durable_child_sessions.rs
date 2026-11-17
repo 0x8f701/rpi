@@ -95,7 +95,7 @@ async fn recorded_parent(
     .expect("parent recorder");
     let parent = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model: test_model(),
+            model: Some(test_model()),
             cwd: project,
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -124,7 +124,7 @@ async fn resumed_parent(parent: &Session, resource_root: &std::path::Path) -> Se
     let (_, parent_path) = parent.recorder_info().expect("parent recording");
     let resumed = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model: test_model(),
+            model: Some(test_model()),
             cwd: parent.cwd().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -154,7 +154,7 @@ async fn resumed_parent(parent: &Session, resource_root: &std::path::Path) -> Se
 fn unused_runtime(artifacts: &std::path::Path) -> OrchestrationRuntime {
     let mut config =
         OrchestrationConfig::new(AgentCatalog::from_agents(vec![definition()]), artifacts);
-    config.parent_model = test_model();
+    config.parent_model = Some(test_model());
     config.idle_ttl = None;
     OrchestrationRuntime::new(
         config,
@@ -502,7 +502,7 @@ async fn non_bound_runtime_works_without_persistence() {
             });
             Session::new_with_additional_tools_filtered_and_discovery(
                 SessionOptions {
-                    model: request.model,
+                    model: Some(request.model),
                     cwd: std::env::current_dir().expect("cwd"),
                     system_prompt: request.system_prompt,
                     thinking_level: ThinkingLevel::Off,
@@ -526,7 +526,7 @@ async fn non_bound_runtime_works_without_persistence() {
         AgentCatalog::from_agents(vec![definition()]),
         artifacts.path(),
     );
-    config.parent_model = test_model();
+    config.parent_model = Some(test_model());
     config.idle_ttl = None;
     let runtime = OrchestrationRuntime::new(config, factory).expect("runtime");
     assert!(
@@ -589,7 +589,7 @@ async fn parked_send_returns_revived() {
             });
             Session::new_with_additional_tools_filtered_and_discovery(
                 SessionOptions {
-                    model: request.model,
+                    model: Some(request.model),
                     cwd: std::env::current_dir().expect("cwd"),
                     system_prompt: request.system_prompt,
                     thinking_level: ThinkingLevel::Off,
@@ -613,7 +613,7 @@ async fn parked_send_returns_revived() {
         AgentCatalog::from_agents(vec![definition()]),
         artifacts.path(),
     );
-    config.parent_model = test_model();
+    config.parent_model = Some(test_model());
     config.idle_ttl = None;
     let runtime = OrchestrationRuntime::new(config, factory).expect("runtime");
     let application = Application::new_with_orchestration(parent, runtime.clone()).await;
@@ -711,7 +711,7 @@ async fn idle_send_revives_durable_child_with_message_in_context() {
             });
             Session::new_with_additional_tools_filtered_and_discovery(
                 SessionOptions {
-                    model: request.model,
+                    model: Some(request.model),
                     cwd: std::env::current_dir().expect("cwd"),
                     system_prompt: request.system_prompt,
                     thinking_level: ThinkingLevel::Off,
@@ -735,7 +735,7 @@ async fn idle_send_revives_durable_child_with_message_in_context() {
         AgentCatalog::from_agents(vec![definition()]),
         artifacts.path(),
     );
-    config.parent_model = test_model();
+    config.parent_model = Some(test_model());
     config.idle_ttl = None;
     let runtime = OrchestrationRuntime::new(config, factory).expect("runtime");
     let application = Application::new_with_orchestration(parent, runtime.clone()).await;
@@ -858,6 +858,7 @@ fn interrupted_job_preserved_on_recovery() {
         created_at: 1,
         started_at: Some(2),
         finished_at: None,
+        cancellation_cause: None,
         result: None,
         soft_budget_exhausted: false,
     };
@@ -936,7 +937,7 @@ async fn aborted_waiter_handoff_restores_and_survives_restart() {
             });
             Session::new_with_additional_tools_filtered_and_discovery(
                 SessionOptions {
-                    model: test_model(),
+                    model: Some(test_model()),
                     cwd: std::env::current_dir().expect("cwd"),
                     system_prompt: request.system_prompt,
                     thinking_level: ThinkingLevel::Off,
@@ -960,7 +961,7 @@ async fn aborted_waiter_handoff_restores_and_survives_restart() {
         AgentCatalog::from_agents(vec![definition()]),
         artifacts.path(),
     );
-    config.parent_model = test_model();
+    config.parent_model = Some(test_model());
     config.idle_ttl = None;
     let runtime = OrchestrationRuntime::new(config.clone(), factory.clone()).expect("runtime");
     let group_id = runtime.group_id().to_owned();

@@ -38,6 +38,7 @@ import { chromium } from 'playwright';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createFreshSessionViaManage } from './lib/session-lifecycle.mjs';
+import { openFeatureMenu, clickFeature, openSessionsDrawer } from './lib/feature-menu.mjs';
 
 const url = process.env.RPI_URL;
 const token = process.env.RPI_TOKEN || '';
@@ -68,10 +69,60 @@ const backgroundHead = 'steer-1-';
 const postRestartTail = process.env.RPI_POST_RESTART_REPLY || 'reconnect-post-restart-reply';
 const backgroundReply = `steer-1-ing stream ${firstTail}`;
 
+function writeTaskRouteTrace(socketFrames, selectedSessionId, sessionBId) {
+  const routeFrames = parsedFrames(socketFrames?.timeline || []);
+  const selectedReady = [...routeFrames].reverse().find((frame) => frame.direction === 'received'
+    && frame.type === 'response'
+    && frame.success === true
+    && frame.data?.sessionId === selectedSessionId
+    && typeof frame.data?.runtimeIncarnation === 'string');
+  const selectedSubscribe = [...routeFrames].reverse().find((frame) => frame.direction === 'sent'
+    && frame.type === 'subscribe'
+    && frame.sessionId === selectedSessionId);
+  const taskFrames = routeFrames
+    .filter((frame) => frame.direction === 'received' && (frame.type === 'job_updated' || frame.type === 'tool_execution_start' || frame.type === 'tool_execution_end' || frame.type === 'tool_execution_update'))
+    .map((frame) => ({
+      order: frame.order,
+      type: frame.type,
+      sessionId: frame.sessionId || '',
+      runtimeIncarnation: frame.runtimeIncarnation || '',
+      sequence: typeof frame.sequence === 'number' ? frame.sequence : null,
+      matchesSelectedSession: frame.sessionId === selectedSessionId,
+      matchesSelectedRuntime: frame.runtimeIncarnation === selectedReady?.data?.runtimeIncarnation,
+      toolName: frame.toolName || '',
+      toolCallId: frame.toolCallId || '',
+      jobId: frame.job?.id || frame.job?.jobId || '',
+      parentId: frame.job?.parentId || frame.job?.parent_id || '',
+      status: frame.job?.status || '',
+      isError: frame.isError === true,
+    }));
+  const hydration = routeFrames
+    .filter((frame) => frame.direction === 'received' && frame.type === 'response' && frame.command === 'get_messages')
+    .map((frame) => ({
+      order: frame.order,
+      sessionId: frame.sessionId || '',
+      success: frame.success === true,
+      messageCount: Array.isArray(frame.data?.messages) ? frame.data.messages.length : null,
+      taskChildCount: Array.isArray(frame.data?.messages)
+        ? frame.data.messages.filter((message) => message?.message?.role === 'toolResult' && message?.message?.toolName === 'task').length
+        : null,
+    }));
+  fs.writeFileSync(path.join(evidence, 'reconnect-task-route.json'), JSON.stringify({
+    selectedSessionId: selectedSessionId || '',
+    sessionB: sessionBId || '',
+    selectedRuntimeIncarnation: selectedReady?.data?.runtimeIncarnation || '',
+    selectedReadyOrder: selectedReady?.order ?? null,
+    selectedSubscribeCursor: typeof selectedSubscribe?.cursor === 'number' ? selectedSubscribe.cursor : null,
+    selectedSubscribeOrder: selectedSubscribe?.order ?? null,
+    taskFrames,
+    hydration,
+  }, null, 2));
+}
 function fail(message) {
   // Exit 2 (not 1): 1 means "playwright setup failure (node/chromium/npm)",
   // which must NOT be confused with an assertion failure (the mock's request
   // counter is stateful and a rerun would see shifted replies).
+  try { writeTaskRouteTrace(globalThis.__rpiReconnectSocketFrames, globalThis.__rpiReconnectSelectedSessionId, globalThis.__rpiReconnectSessionB); } catch {}
   console.error(`web-reconnect: FAIL: ${message}`);
   process.exit(2);
 }
@@ -143,6 +194,30 @@ function rectanglesOverlap(a, b) {
     && a.y < b.y + b.height
     && a.y + a.height > b.y;
 }
+function chromeSettledInPage() {
+  const header = document.querySelector('header')?.getBoundingClientRect();
+  const footerNode = document.querySelector('footer:has(#composer-row), footer:has(#prompt-input)');
+  const footer = footerNode?.getBoundingClientRect();
+  const root = getComputedStyle(document.documentElement);
+  const headerVar = Number.parseFloat(root.getPropertyValue('--app-header-height'));
+  const footerVar = Number.parseFloat(root.getPropertyValue('--app-footer-height'));
+  const near = (rect, value) => !!rect && rect.height > 0 && Number.isFinite(value) && Math.abs(rect.height - value) <= 1;
+  // Files-open fullscreen is the ONE state that hides the entire main
+  // composer footer (footer.app-composer-hidden, display:none) and pins
+  // --app-footer-height to 0px. It is identified only by the three live
+  // signals together — section.file-explorer + .app-layout--files-open +
+  // footer.app-composer-hidden — and must measure zero on the rect AND the
+  // variable. Every other state keeps the original measured footer (> 0).
+  const fullFiles = document.querySelector('section.file-explorer') != null
+    && document.querySelector('.app-layout')?.classList.contains('app-layout--files-open') === true
+    && footerNode?.classList.contains('app-composer-hidden') === true;
+  const footerSettled = fullFiles
+    ? !!footer && footer.width === 0 && footer.height === 0 && footerVar === 0
+      && getComputedStyle(footerNode).display === 'none'
+    : near(footer, footerVar);
+  return near(header, headerVar) && footerSettled;
+}
+
 
 async function captureReconnectState(page, state, options) {
   const panelWasOpen = (await page.locator('#session-panel').count()) === 1;
@@ -156,9 +231,90 @@ async function captureReconnectState(page, state, options) {
     { name: 'mobile', width: 390, height: 844 },
   ]) {
     await page.setViewportSize({ width: viewport.width, height: viewport.height });
-    if (viewport.name === 'desktop') {
-      await waitFor(page, () => document.querySelector('.app-layout')?.classList.contains('app-layout--files-overlay') !== true,
-        `${state}: desktop Files overlay class stayed on at ${viewport.width}`);
+    await waitFor(page, (width) => innerWidth === width, `${state}: ${viewport.name} viewport did not settle`, 10000, viewport.width);
+    await waitFor(page, chromeSettledInPage, `${state}: ${viewport.name} header and footer variables did not match the live chrome`, 1000);
+    const filesBody = await page.evaluate(() => {
+      const explorer = document.querySelector('section.file-explorer');
+      const box = explorer?.getBoundingClientRect() || null;
+      const header = document.querySelector('header')?.getBoundingClientRect();
+      const footerNode = document.querySelector('footer:has(#composer-row), footer:has(#prompt-input)');
+      const footer = footerNode?.getBoundingClientRect();
+      const body = document.querySelector('[data-testid="file-explorer-layout"]')?.getBoundingClientRect();
+      const root = getComputedStyle(document.documentElement);
+      const headerVar = Number.parseFloat(root.getPropertyValue('--app-header-height'));
+      const footerVar = Number.parseFloat(root.getPropertyValue('--app-footer-height'));
+      const visible = (rect) => !!rect && rect.width > 0 && rect.height > 0;
+      // Files-open fullscreen: section.file-explorer + .app-layout--files-open
+      // + footer.app-composer-hidden. The hidden footer measures 0/0 and the
+      // drawer body then ends on the ACTUAL layout viewport bottom, not on
+      // footer.top (which is 0 for a display:none footer).
+      const fullFiles = explorer != null
+        && document.querySelector('.app-layout')?.classList.contains('app-layout--files-open') === true
+        && footerNode?.classList.contains('app-composer-hidden') === true;
+      return {
+        open: explorer != null,
+        filesOpen: document.querySelector('.app-layout')?.classList.contains('app-layout--files-open') === true,
+        fullFiles,
+        expand: document.querySelector('#file-explorer-expand-btn, button.file-explorer__expand-btn') != null,
+        headerVisible: visible(header) && header.top >= -1,
+        footerHidden: fullFiles && getComputedStyle(footerNode).display === 'none'
+          && !!footer && footer.width === 0 && footer.height === 0,
+        footerVisible: !fullFiles && visible(footer) && footer.bottom <= innerHeight + 1,
+        headerMatchesVar: !!header && Number.isFinite(headerVar) && Math.abs(header.height - headerVar) <= 1,
+        footerMatchesVar: fullFiles
+          ? footerVar === 0
+          : !!footer && Number.isFinite(footerVar) && Math.abs(footer.height - footerVar) <= 1,
+        left: box ? Math.round(box.left) : null,
+        right: box ? Math.round(innerWidth - box.right) : null,
+        topGap: box && header ? Math.round(box.top - header.bottom) : null,
+        bodyBottomGap: body && (fullFiles || footer)
+          ? Math.round((fullFiles ? innerHeight : footer.top) - body.bottom)
+          : null,
+        width: box ? Math.round(box.width) : 0,
+        viewportWidth: innerWidth,
+        viewportHeight: innerHeight,
+        coversViewport: !!box && Math.round(box.top) === 0 && Math.round(box.height) === innerHeight,
+      };
+    });
+    if (filesBody.expand || filesBody.coversViewport || (filesBody.open && filesBody.left !== 0)) {
+      fail(`${state}: ${viewport.name} Files is not the current header-to-footer body (${JSON.stringify(filesBody)})`);
+    }
+    if (filesBody.open && (
+      !filesBody.filesOpen || !filesBody.fullFiles || !filesBody.footerHidden
+      || !filesBody.headerVisible || !filesBody.headerMatchesVar || !filesBody.footerMatchesVar
+      || filesBody.right !== 0 || Math.abs(filesBody.topGap) > 1
+      || !Number.isFinite(filesBody.bodyBottomGap) || Math.abs(filesBody.bodyBottomGap) > 1
+      || Math.abs(filesBody.width - filesBody.viewportWidth) > 2
+    )) {
+      fail(`${state}: ${viewport.name} open Files missed the header-to-footer body (${JSON.stringify(filesBody)})`);
+    }
+    if (state === 'outage') {
+      // Offline: the overlay owns the pointer — do not touch ANY sidebar
+      // state (no reopen click, no menu journey). Assert the overlay
+      // INTERCEPTS the drawer controls' hit points (pointer ownership, not
+      // mere overlay existence) and the retained session identity survives
+      // in the DOM. The on-screen retained-row proof for this stage is
+      // carried by the desktop leg's still-open rail and re-proven fully on
+      // the recovered leg's real menu journey.
+      await waitFor(page, () => {
+        const overlay = document.getElementById('reconnect-overlay');
+        if (!overlay) return false;
+        const triggerBox = document.getElementById('feature-menu-btn')?.getBoundingClientRect();
+        if (!triggerBox || triggerBox.width <= 0 || triggerBox.height <= 0) return false;
+        const triggerHit = document.elementFromPoint(triggerBox.left + triggerBox.width / 2, triggerBox.top + triggerBox.height / 2);
+        if (!triggerHit || triggerHit.closest('#reconnect-overlay') !== overlay) return false;
+        const reopenBox = document.getElementById('rail-reopen-btn')?.getBoundingClientRect();
+        if (reopenBox && reopenBox.width > 0 && reopenBox.height > 0) {
+          const reopenHit = document.elementFromPoint(reopenBox.left + reopenBox.width / 2, reopenBox.top + reopenBox.height / 2);
+          if (!reopenHit || reopenHit.closest('#reconnect-overlay') !== overlay) return false;
+        }
+        return true;
+      }, `${state}: ${viewport.name} outage overlay does not own the drawer controls' hit points`);
+      await waitFor(page, () => {
+        const rowId = document.querySelector('.session-sidebar__row--active .session-sidebar__switch')?.dataset.sessionId || '';
+        return rowId !== '' && rowId === (document.getElementById('session-lifecycle')?.dataset.displayedSessionId || '');
+      }, `${state}: ${viewport.name} outage lost the retained session DOM identity`);
+    } else if (viewport.name === 'desktop') {
       const railOpen = await page.locator('.app-layout').evaluate((layout) =>
         layout.classList.contains('app-layout--drawer-open'));
       if (!railOpen) {
@@ -167,22 +323,23 @@ async function captureReconnectState(page, state, options) {
           `${state}: desktop rail did not reopen for composer proof`);
       }
     } else {
-      await waitFor(page, () => {
-        const layout = document.querySelector('.app-layout');
-        const filesOpen = document.querySelector('.file-explorer') !== null;
-        return !filesOpen || layout?.classList.contains('app-layout--files-overlay') === true;
-      }, `${state}: mobile Files overlay class did not track innerWidth`);
-      const sidebarOpen = await page.locator('#sidebar-toggle-btn').getAttribute('aria-pressed');
-      if (sidebarOpen !== 'true') {
-        await page.evaluate(() => document.getElementById('sidebar-toggle-btn')?.click());
-      }
-      await waitFor(page, () => document.getElementById('sidebar-toggle-btn')?.getAttribute('aria-pressed') === 'true',
+      const sidebarOpen = await page.evaluate(() => document.querySelector('.app-layout')?.classList.contains('app-layout--drawer-open') === true);
+      if (!sidebarOpen) await openSessionsDrawer(page);
+      await waitFor(page, () => document.querySelector('.app-layout')?.classList.contains('app-layout--drawer-open') === true,
         `${state}: mobile session surface did not open`);
     }
     await waitFor(page, () => {
+      const footerNode = document.querySelector('footer:has(#composer-row), footer:has(#prompt-input)');
+      const fullFiles = document.querySelector('section.file-explorer') != null
+        && document.querySelector('.app-layout')?.classList.contains('app-layout--files-open') === true
+        && footerNode?.classList.contains('app-composer-hidden') === true;
+      if (fullFiles) {
+        return footerNode.getBoundingClientRect().height === 0
+          && getComputedStyle(footerNode).display === 'none';
+      }
       const send = document.getElementById('send-btn');
       return send !== null && send.getBoundingClientRect().width > 0;
-    }, `${state}: Send was not visible at ${viewport.name}`);
+    }, `${state}: composer chrome did not settle at ${viewport.name}`);
     const proof = await page.evaluate(({ reply, sendDisabled, toastCount }) => {
       const rectangle = (element) => {
         if (!element) return null;
@@ -194,10 +351,15 @@ async function captureReconnectState(page, state, options) {
       const activeSession = document.querySelector('.session-sidebar__row--active');
       const composerInput = document.getElementById('prompt-input');
       const send = document.getElementById('send-btn');
+      const footerNode = document.querySelector('footer:has(#composer-row), footer:has(#prompt-input)');
+      const fullFiles = document.querySelector('section.file-explorer') != null
+        && document.querySelector('.app-layout')?.classList.contains('app-layout--files-open') === true
+        && footerNode?.classList.contains('app-composer-hidden') === true;
       const toast = document.querySelector('#toasts .toast[data-toast-kind="transport"]');
       const sidebar = document.querySelector('.session-sidebar');
       const overlay = document.getElementById('reconnect-overlay');
       return {
+        composerHidden: fullFiles,
         transportToasts: document.querySelectorAll('#toasts .toast[data-toast-kind="transport"]').length,
         overlay: overlay !== null,
         activeSessionId: document.querySelector('.session-sidebar__row--active .session-sidebar__switch')?.dataset.sessionId || '',
@@ -226,14 +388,21 @@ async function captureReconnectState(page, state, options) {
       !proof.retainedReplyVisible
       || proof.sendDisabled !== options.sendDisabled
       || proof.transportToasts !== options.toastCount
-      || !isVisible(proof.activeSessionBox)
+      || (!proof.overlay && !isVisible(proof.activeSessionBox))
       || !isVisible(proof.replyBox)
-      || !isVisible(proof.inputBox)
-      || !isVisible(proof.sendBox)
+      || (!proof.composerHidden && (!isVisible(proof.inputBox) || !isVisible(proof.sendBox)))
     ) {
       fail(`${state}: incomplete ${viewport.name} visual proof: ${JSON.stringify(proof)}`);
     }
-    if (options.sendDisabled && Number(proof.sendOpacity) > 0.75) {
+    // fullFiles hides the whole composer footer, so the prompt and Send must
+    // stay unmeasurable (display:none) — never visible and never hittable.
+    if (proof.composerHidden && (
+      !proof.inputBox || proof.inputBox.width > 0 || proof.inputBox.height > 0
+      || !proof.sendBox || proof.sendBox.width > 0 || proof.sendBox.height > 0
+    )) {
+      fail(`${state}: fullscreen Files composer stayed measurable at ${viewport.name}: ${JSON.stringify(proof)}`);
+    }
+    if (!proof.composerHidden && options.sendDisabled && Number(proof.sendOpacity) > 0.75) {
       fail(`${state}: disabled Send was not visibly muted at ${viewport.name}: ${JSON.stringify(proof)}`);
     }
     if (
@@ -251,20 +420,31 @@ async function captureReconnectState(page, state, options) {
     captures.push({ viewport: viewport.name, file, proof });
   }
   await page.setViewportSize({ width: 1280, height: 720 });
-  await waitFor(page, () => document.querySelector('.app-layout')?.classList.contains('app-layout--files-overlay') !== true,
-    `${state}: desktop Files overlay class stayed on after 1280 restore`);
-  // Desktop-to-mobile collapse leaves sidebarOpen=false; returning to 1280
-  // keeps the 44px rail, which hides #session-toggle-btn. Reopen the rail
-  // so Files can stay mounted while Session is clicked.
-  const railOpen = await page.locator('.app-layout').evaluate((layout) =>
-    layout.classList.contains('app-layout--drawer-open'));
-  if (!railOpen) {
-    await page.evaluate(() => document.getElementById('rail-reopen-btn')?.click());
-    await waitFor(page, () => document.querySelector('.app-layout')?.classList.contains('app-layout--drawer-open') === true,
-      `${state}: desktop rail did not reopen after composer proof`);
-  }
+  await waitFor(page, () => innerWidth === 1280 && innerHeight === 720, `${state}: restored desktop viewport did not settle`, 10000);
+  await waitFor(page, chromeSettledInPage, `${state}: restored desktop header and footer variables did not match the live chrome`, 1000);
+  await waitFor(page, () => {
+    const explorer = document.querySelector('section.file-explorer')?.getBoundingClientRect();
+    const header = document.querySelector('header')?.getBoundingClientRect();
+    const footerNode = document.querySelector('footer:has(#composer-row), footer:has(#prompt-input)');
+    const footer = footerNode?.getBoundingClientRect();
+    const body = document.querySelector('[data-testid="file-explorer-layout"]')?.getBoundingClientRect();
+    if (!explorer) return header != null && header.height > 0 && footer != null && footer.height > 0;
+    // Mounted Files is always fullFiles: explorer + files-open + hidden
+    // composer footer. Its body ends on the actual layout viewport bottom.
+    const fullFiles = document.querySelector('.app-layout')?.classList.contains('app-layout--files-open') === true
+      && footerNode?.classList.contains('app-composer-hidden') === true;
+    if (!fullFiles) return false;
+    return header != null && footer != null && body != null
+      && getComputedStyle(footerNode).display === 'none'
+      && footer.width === 0 && footer.height === 0
+      && Math.abs(Math.round(explorer.top - header.bottom)) <= 1
+      && Math.abs(Math.round(innerHeight - body.bottom)) <= 1
+      && Math.round(explorer.left) === 0
+      && Math.abs(Math.round(explorer.width) - innerWidth) <= 2
+      && Math.round(explorer.top) !== 0;
+  }, `${state}: restored desktop Files is not the fullscreen header-to-viewport body`);
   if (panelWasOpen) {
-    await page.evaluate(() => document.getElementById('session-toggle-btn')?.click());
+    if (!(await page.locator('#session-panel').count())) await clickFeature(page, '#session-toggle-btn');
     await waitFor(page, () => document.getElementById('session-panel') !== null, `${state}: panel did not reopen after composer proof`);
   }
   return captures;
@@ -518,6 +698,7 @@ async function main() {
       };
     });
     const socketFrames = { nextGen: 0, nextOrder: 0, sent: [], received: [], timeline: [] };
+    globalThis.__rpiReconnectSocketFrames = socketFrames;
     page.on('websocket', (socket) => {
       const gen = ++socketFrames.nextGen;
       const socketUrl = socket.url();
@@ -578,6 +759,8 @@ async function main() {
     const created = await createFreshSessionViaManage(page, waitFor, 'create session B before reconnect');
     const sessionB = created.sessionId;
     if (!sessionB || sessionB === sessionA) fail('fresh session B identity missing');
+    globalThis.__rpiReconnectSessionB = sessionB;
+    globalThis.__rpiReconnectSelectedSessionId = sessionB;
     await page.fill('#prompt-input', 'complete on active session B before reconnect');
     await page.press('#prompt-input', 'Enter');
     await waitFor(
@@ -667,11 +850,55 @@ async function main() {
     await page.press('#prompt-input', 'Enter');
     await waitFor(page, (count) => document.querySelectorAll('.tool-card--task').length > count,
       'restart Task card never rendered', 30000, taskCardBefore);
-    await waitFor(page, () => {
-      const child = document.querySelector('.tool-card--task .tool-card__child[data-job-id][data-agent-id][data-parent-id="Main"]');
-      const status = child?.getAttribute('data-status');
-      return status === 'queued' || status === 'running';
-    }, 'restart Task child never reached queued/running', 30000);
+    try {
+      await waitForError(page, () => {
+        const child = document.querySelector('.tool-card--task .tool-card__child[data-job-id][data-agent-id][data-parent-id="Main"]');
+        const status = child?.getAttribute('data-status');
+        return status === 'queued' || status === 'running';
+      }, 'restart Task child never reached queued/running', 30000);
+    } catch (error) {
+      const taskDom = await page.evaluate(() => [...document.querySelectorAll('.tool-card--task')].map((card) => ({
+        text: (card.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 500),
+        children: [...card.querySelectorAll('.tool-card__child')].map((child) => ({
+          jobId: child.getAttribute('data-job-id'),
+          agentId: child.getAttribute('data-agent-id'),
+          parentId: child.getAttribute('data-parent-id'),
+          status: child.getAttribute('data-status'),
+        })),
+      })));
+      const selectedSessionId = await activeSessionId(page);
+      const routeFrames = parsedFrames(socketFrames.timeline);
+      const selectedReady = [...routeFrames].reverse().find((frame) => frame.direction === 'received'
+        && frame.type === 'response'
+        && frame.success === true
+        && frame.data?.sessionId === selectedSessionId
+        && typeof frame.data?.runtimeIncarnation === 'string');
+      const selectedSubscribe = [...routeFrames].reverse().find((frame) => frame.direction === 'sent'
+        && frame.type === 'subscribe'
+        && frame.sessionId === selectedSessionId);
+      const taskEvents = routeFrames
+        .filter((frame) => frame.direction === 'received' && (frame.type === 'job_updated' || frame.type === 'tool_execution_start' || frame.type === 'tool_execution_end' || frame.type === 'tool_execution_update'))
+        .map((frame) => ({
+          order: frame.order,
+          type: frame.type,
+          sessionId: frame.sessionId || '',
+          runtimeIncarnation: frame.runtimeIncarnation || '',
+          sequence: typeof frame.sequence === 'number' ? frame.sequence : null,
+          selectedSessionId,
+          sessionB,
+          selectedRuntimeIncarnation: selectedReady?.data?.runtimeIncarnation || '',
+          selectedSubscribeCursor: typeof selectedSubscribe?.cursor === 'number' ? selectedSubscribe.cursor : null,
+          matchesSelectedSession: frame.sessionId === selectedSessionId,
+          matchesSelectedRuntime: frame.runtimeIncarnation === selectedReady?.data?.runtimeIncarnation,
+          toolName: frame.toolName || '',
+          toolCallId: frame.toolCallId || '',
+          jobId: frame.job?.id || frame.job?.jobId || '',
+          parentId: frame.job?.parentId || frame.job?.parent_id || '',
+          status: frame.job?.status || '',
+          isError: frame.isError === true,
+        }));
+      fail(`${error instanceof Error ? error.message : String(error)} taskDom=${JSON.stringify(taskDom)} taskEvents=${JSON.stringify(taskEvents)}`);
+    }
     const taskBeforeKill = await page.evaluate(() => {
       const cards = [...document.querySelectorAll('.tool-card--task')];
       const card = cards.find((candidate) => (candidate.textContent || '').includes('restart-held-subagent'));
@@ -702,7 +929,7 @@ async function main() {
     // Real listener kill while both A and B are durable, B is active, and the
     // Session panel remains visible. The restart must retain the active view
     // and permit frame-correlated A→B switching afterward.
-    await page.evaluate(() => document.getElementById('session-toggle-btn')?.click());
+    if (!(await page.locator('#session-panel').count())) await clickFeature(page, '#session-toggle-btn');
     await waitFor(page, () => document.getElementById('session-panel') !== null, 'session panel did not open before real outage');
     await waitFor(page, () => {
       const dts = [...document.querySelectorAll('#session-panel dl dt')];
@@ -710,9 +937,86 @@ async function main() {
       const value = index >= 0 ? (dts[index]?.nextElementSibling?.textContent || '').trim() : '';
       return value !== '' && value !== '—';
     }, 'session panel content did not load');
-    await page.click('#file-explorer-toggle-btn');
+    await clickFeature(page, '#file-explorer-toggle-btn');
     await waitFor(page, () => document.querySelector('.file-explorer') !== null,
       'File Explorer did not open before real outage');
+    await waitFor(page, chromeSettledInPage, 'header and footer variables did not match the live chrome before the outage', 1000);
+    const filesBody = await page.evaluate(() => {
+      const layout = document.querySelector('.app-layout');
+      const header = document.querySelector('header')?.getBoundingClientRect();
+      const footerNode = document.querySelector('footer:has(#composer-row), footer:has(#prompt-input)');
+      const footer = footerNode?.getBoundingClientRect();
+      const explorer = document.querySelector('section.file-explorer')?.getBoundingClientRect();
+      const root = getComputedStyle(document.documentElement);
+      const headerVar = Number.parseFloat(root.getPropertyValue('--app-header-height'));
+      const footerVar = Number.parseFloat(root.getPropertyValue('--app-footer-height'));
+      const visible = (rect) => !!rect && rect.width > 0 && rect.height > 0;
+      const expand = document.querySelector('#file-explorer-expand-btn, button.file-explorer__expand-btn');
+      const hitAt = (node) => {
+        const r = node?.getBoundingClientRect();
+        if (!r || r.width < 1 || r.height < 1) return null;
+        const hit = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+        return hit === node || node.contains(hit);
+      };
+      const body = document.querySelector('[data-testid="file-explorer-layout"]')?.getBoundingClientRect();
+      // Files-open fullscreen: section.file-explorer + .app-layout--files-open
+      // + the ONE hidden composer footer (footer.app-composer-hidden).
+      const fullFiles = explorer != null
+        && layout?.classList.contains('app-layout--files-open') === true
+        && footerNode?.classList.contains('app-composer-hidden') === true;
+      return {
+        mounted: explorer != null,
+        filesOpen: layout?.classList.contains('app-layout--files-open') === true,
+        fullFiles,
+        expandMounted: expand != null,
+        headerVisible: visible(header) && header.top >= -1 && header.bottom > 0,
+        footerHidden: fullFiles && getComputedStyle(footerNode).display === 'none'
+          && !!footer && footer.width === 0 && footer.height === 0,
+        footerVisible: visible(footer) && footer.bottom <= innerHeight + 1 && footer.top < innerHeight,
+        headerMatchesVar: !!header && Number.isFinite(headerVar) && Math.abs(header.height - headerVar) <= 1,
+        footerMatchesVar: fullFiles
+          ? footerVar === 0
+          : !!footer && Number.isFinite(footerVar) && Math.abs(footer.height - footerVar) <= 1,
+        left: explorer ? Math.round(explorer.left) : null,
+        right: explorer ? Math.round(innerWidth - explorer.right) : null,
+        top: explorer && header ? Math.round(explorer.top - header.bottom) : null,
+        bodyBottomToViewport: body ? Math.round(innerHeight - body.bottom) : null,
+        explorerBottomToViewport: explorer ? Math.round(innerHeight - explorer.bottom) : null,
+        composerHit: hitAt(document.getElementById('prompt-input')) === true,
+        newSessionCovered: hitAt(document.querySelector('button[aria-label="New Session"]')) !== true,
+        width: explorer ? Math.round(explorer.width) : 0,
+        viewportWidth: innerWidth,
+      };
+    });
+    if (!filesBody.mounted || !filesBody.filesOpen) {
+      fail(`Files did not open over the app body before the outage (${JSON.stringify(filesBody)})`);
+    }
+    if (filesBody.expandMounted) {
+      fail('Files expand/shrink control is still mounted');
+    }
+    // Opened Files must be the precise fullscreen state, never a mounted
+    // drawer beside a visible composer.
+    if (!filesBody.fullFiles || !filesBody.footerHidden) {
+      fail(`Files is not the fullscreen hidden-composer body (${JSON.stringify(filesBody)})`);
+    }
+    if (!filesBody.headerVisible
+      || !filesBody.headerMatchesVar || !filesBody.footerMatchesVar
+      || filesBody.left !== 0 || filesBody.right !== 0
+      || Math.abs(filesBody.top) > 1
+      || Math.abs(filesBody.width - filesBody.viewportWidth) > 2) {
+      fail(`Files is not the header-to-viewport app body (${JSON.stringify(filesBody)})`);
+    }
+    // Fullscreen bottom authority: footer.app-composer-hidden is display:none
+    // (--app-footer-height 0px), so the drawer AND its flex body end flush on
+    // the ACTUAL layout viewport bottom (±1px). footer.top is 0 for a hidden
+    // footer and is NOT a boundary.
+    if (!Number.isFinite(filesBody.explorerBottomToViewport) || Math.abs(filesBody.explorerBottomToViewport) > 1
+      || !Number.isFinite(filesBody.bodyBottomToViewport) || Math.abs(filesBody.bodyBottomToViewport) > 1) {
+      fail(`Files fullscreen body does not end on the layout viewport bottom ±1px (${JSON.stringify(filesBody)})`);
+    }
+    if (filesBody.composerHit || !filesBody.newSessionCovered) {
+      fail(`fullscreen Files left the composer hittable or New Session uncovered (${JSON.stringify(filesBody)})`);
+    }
     const beforeKill = await page.evaluate(() => ({
       attempts: window.__rpiReconnectObservation?.attempts || 0,
       nativeAttempts: window.__rpiReconnectObservation?.nativeAttempts || 0,
@@ -891,7 +1195,123 @@ async function main() {
       fail(`File recovery surface mismatch: ${JSON.stringify(fileRecovery)}`);
     }
     await page.screenshot({ path: `${evidence}/reconnect-file-recovered.png`, fullPage: true });
-    await page.click('#session-toggle-btn');
+    const filesToggleTrace = async (label) => page.evaluate((name) => {
+      const boxOf = (node) => {
+        if (!node) return null;
+        const box = node.getBoundingClientRect();
+        const style = getComputedStyle(node);
+        return {
+          x: Math.round(box.x), y: Math.round(box.y), w: Math.round(box.width), h: Math.round(box.height),
+          display: style.display, visibility: style.visibility, opacity: style.opacity,
+        };
+      };
+      const toggle = document.getElementById('file-explorer-toggle-btn');
+      const toggleBox = boxOf(toggle);
+      const point = toggleBox && toggleBox.w > 0 && toggleBox.h > 0
+        ? { x: toggleBox.x + toggleBox.w / 2, y: toggleBox.y + Math.min(12, toggleBox.h / 2) }
+        : null;
+      const hit = point ? document.elementFromPoint(point.x, point.y) : null;
+      return {
+        label: name,
+        viewport: { w: innerWidth, h: innerHeight },
+        layout: document.querySelector('.app-layout')?.className || '',
+        sidebarPressed: document.getElementById('sidebar-menu-item')?.getAttribute('aria-pressed') || '',
+        header: boxOf(document.querySelector('header')),
+        featureMenuBtn: boxOf(document.getElementById('feature-menu-btn')),
+        filesToggle: toggleBox,
+        filesMounted: document.querySelector('.file-explorer') !== null,
+        hit: hit ? `${hit.id || hit.tagName}.${hit.className || ''}` : null,
+        hitsFiles: hit?.closest('#file-explorer-toggle-btn') != null,
+      };
+    }, label);
+    const openFilesToggle = async (label) => {
+      await openFeatureMenu(page);
+      const before = await filesToggleTrace(`${label}-before`);
+      await page.screenshot({ path: `${evidence}/reconnect-files-toggle-${label.replace(/\s+/g, '-')}-before.png` });
+      console.log(`reconnect files toggle ${label}: ${JSON.stringify(before)}`);
+      if (!before.filesToggle || before.filesToggle.w < 1 || before.filesToggle.h < 1 || !before.hitsFiles) {
+        fail(`${label}: feature menu did not reveal a hittable Files toggle ${JSON.stringify(before)}`);
+      }
+      await clickFeature(page, '#file-explorer-toggle-btn');
+    };
+    for (const viewport of [
+      { name: 'desktop', width: 1280, height: 720 },
+      { name: 'mobile', width: 390, height: 844 },
+    ]) {
+      await page.setViewportSize({ width: viewport.width, height: viewport.height });
+      await waitFor(page, (size) => innerWidth === size.width && innerHeight === size.height,
+        `${viewport.name} viewport did not settle`, 10000, viewport);
+      if (viewport.width <= 720) {
+        await waitFor(page, () => document.querySelector('.app-layout')?.classList.contains('app-layout--drawer-open') !== true,
+          `${viewport.name}: responsive sidebar collapse did not commit after the viewport change`);
+      }
+      if (await page.locator('.file-explorer').count()) {
+        await page.locator('#file-explorer-drawer-close-btn').click();
+        await waitFor(page, () => document.querySelector('.file-explorer') === null,
+          `${viewport.name}: Files did not close before the body open`);
+      }
+      await openFilesToggle(`${viewport.name} open`);
+      await waitFor(page, chromeSettledInPage, `${viewport.name}: header and footer variables did not match the live chrome`, 1000);
+      await waitFor(page, () => {
+        const layout = document.querySelector('.app-layout');
+        const header = document.querySelector('header')?.getBoundingClientRect();
+        const footerNode = document.querySelector('footer:has(#composer-row), footer:has(#prompt-input)');
+        const footer = footerNode?.getBoundingClientRect();
+        const explorer = document.querySelector('section.file-explorer')?.getBoundingClientRect();
+        const root = getComputedStyle(document.documentElement);
+        const headerVar = Number.parseFloat(root.getPropertyValue('--app-header-height'));
+        const footerVar = Number.parseFloat(root.getPropertyValue('--app-footer-height'));
+        const visible = (rect) => !!rect && rect.width > 0 && rect.height > 0;
+        const expand = document.querySelector('#file-explorer-expand-btn, button.file-explorer__expand-btn');
+        const body = document.querySelector('[data-testid="file-explorer-layout"]')?.getBoundingClientRect();
+        const fullFiles = explorer != null
+          && layout?.classList.contains('app-layout--files-open') === true
+          && footerNode?.classList.contains('app-composer-hidden') === true;
+        return fullFiles
+          && expand == null
+          && visible(header) && header.top >= -1 && header.bottom > 0
+          && Number.isFinite(headerVar) && Math.abs(header.height - headerVar) <= 1
+          && Number.isFinite(footerVar) && footerVar === 0
+          && footer != null && footer.width === 0 && footer.height === 0
+          && getComputedStyle(footerNode).display === 'none'
+          && Math.round(explorer.left) === 0
+          && Math.abs(Math.round(innerWidth - explorer.right)) <= 1
+          && Math.abs(Math.round(explorer.top - header.bottom)) <= 1
+          && body != null && Math.abs(Math.round(innerHeight - body.bottom)) <= 1
+          && Math.abs(Math.round(explorer.width) - innerWidth) <= 2;
+      }, `${viewport.name}: Files open was not the fullscreen header-to-viewport app body`);
+      await page.locator('#file-explorer-drawer-close-btn').click();
+      await waitFor(page, () => document.querySelector('.file-explorer') === null
+        && document.querySelector('header')?.getBoundingClientRect().height > 0
+        && document.querySelector('footer:has(#composer-row), footer:has(#prompt-input)')?.getBoundingClientRect().height > 0,
+        `${viewport.name}: close did not restore the header and footer`);
+      await openFilesToggle(`${viewport.name} reopen`);
+      await waitFor(page, chromeSettledInPage, `${viewport.name}: reopen header and footer variables did not match the live chrome`, 1000);
+      await waitFor(page, () => {
+        const header = document.querySelector('header')?.getBoundingClientRect();
+        const footerNode = document.querySelector('footer:has(#composer-row), footer:has(#prompt-input)');
+        const footer = footerNode?.getBoundingClientRect();
+        const explorer = document.querySelector('section.file-explorer')?.getBoundingClientRect();
+        const expand = document.querySelector('#file-explorer-expand-btn, button.file-explorer__expand-btn');
+        const body = document.querySelector('[data-testid="file-explorer-layout"]')?.getBoundingClientRect();
+        const fullFiles = explorer != null
+          && document.querySelector('.app-layout')?.classList.contains('app-layout--files-open') === true
+          && footerNode?.classList.contains('app-composer-hidden') === true;
+        return fullFiles && header != null && header.height > 0 && expand == null
+          && footer != null && footer.width === 0 && footer.height === 0
+          && getComputedStyle(footerNode).display === 'none'
+          && Math.abs(Math.round(explorer.top - header.bottom)) <= 1
+          && body != null && Math.abs(Math.round(innerHeight - body.bottom)) <= 1
+          && Math.abs(Math.round(explorer.width) - innerWidth) <= 2
+          && Math.round(explorer.left) === 0;
+      }, `${viewport.name}: reopen was not the fullscreen header-to-viewport app body`);
+      await page.locator('#file-explorer-drawer-close-btn').click();
+      await waitFor(page, () => document.querySelector('.file-explorer') === null,
+        `${viewport.name}: final close left Files mounted`);
+    }
+    await page.setViewportSize({ width: 1280, height: 720 });
+
+    if (!(await page.locator('#session-panel').count())) await clickFeature(page, '#session-toggle-btn');
     await waitFor(page, (sessionId) => {
       const panel = document.getElementById('session-panel');
       return panel !== null
@@ -941,6 +1361,19 @@ async function main() {
     await page.waitForTimeout(400);
     await page.screenshot({ path: `${evidence}/reconnect-sessionlist-rpclimit-mobile.png`, fullPage: false });
     await page.setViewportSize({ width: 1280, height: 720 });
+    await waitFor(page, (expected) => {
+      const card = [...document.querySelectorAll('.tool-card--task')]
+        .find((candidate) => candidate.getAttribute('data-tool-call-id') === expected.toolCallId);
+      const child = card?.querySelector('.tool-card__child');
+      const status = child?.getAttribute('data-status');
+      return child?.getAttribute('data-job-id') === expected.jobId
+        && child?.getAttribute('data-agent-id') === expected.agentId
+        && child?.getAttribute('data-parent-id') === expected.parentId
+        && (status === 'queued' || status === 'running');
+    }, 'recovered Task child lost its nonterminal identity before release', 30000, taskBeforeKill);
+    if (!mockPort) fail('RPI_MOCK_PORT is required to release the restart-held task');
+    const restartTaskRelease = await fetch(`http://127.0.0.1:${mockPort}/__release-restart-task`, { method: 'POST' });
+    if (!restartTaskRelease.ok) fail(`restart task release POST failed: ${restartTaskRelease.status}`);
     await waitFor(page, (expected) => {
       const card = [...document.querySelectorAll('.tool-card--task')]
         .find((candidate) => candidate.getAttribute('data-tool-call-id') === expected.toolCallId);
@@ -1141,6 +1574,41 @@ async function main() {
       'precondition: turn never entered the streaming Stop state',
       30000,
     );
+    // Refresh-during-gated-turn regression: a real page refresh MID-TURN must
+    // restore the streamed partial from the authoritative cold snapshot's
+    // retained active-turn events (the in-flight assistant is not persisted
+    // yet, so messages alone cannot show it), keep exactly ONE user message,
+    // and re-track the turn so the later terminal settles the transcript
+    // WITHOUT any second reload. The disconnect/reconnect legs below then run
+    // on the SAME held turn — the socket-drop authority scenario is preserved,
+    // not replaced.
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await waitFor(page, () => document.title === 'rpi web', 'post-refresh page title missing');
+    await waitFor(
+      page,
+      (sid) => document.querySelector('.session-sidebar__row--active .session-sidebar__switch')?.dataset.sessionId === sid,
+      'post-refresh active session did not rebind to the gated session',
+      30000,
+      sessionB,
+    );
+    const refreshUserCount = await page.evaluate(() => {
+      const text = document.getElementById('transcript')?.textContent || '';
+      return text.split('mid-stream gate').length - 1;
+    });
+    if (refreshUserCount !== 1) fail(`refresh must keep exactly one user message, found ${refreshUserCount}`);
+    await waitFor(
+      page,
+      () => (document.getElementById('transcript')?.textContent || '').includes('mid-stream-head-'),
+      'refresh dropped the streamed partial: the cold snapshot never restored the active-turn head',
+      30000,
+    );
+    await waitFor(
+      page,
+      () => document.getElementById('send-btn')?.getAttribute('aria-label') === 'Stop generating',
+      'post-refresh gated turn never re-entered the streaming Stop state',
+      30000,
+    );
+    await page.screenshot({ path: `${evidence}/reconnect-refresh-restored-head.png`, fullPage: true });
     await page.evaluate(() => window.__rpiReconnectTest.disconnect());
     await waitFor(
       page,
@@ -1216,6 +1684,7 @@ async function main() {
         appliedSessionId: sessionB,
       },
     }, null, 2));
+    writeTaskRouteTrace(socketFrames, await activeSessionId(page), sessionB);
     console.log('web-reconnect: MOBILE 390x844 active/outage/recovered: PASSED');
     console.log(`web-reconnect: RAW browser errors pageErrors=${JSON.stringify(pageErrors)} consoleErrors=${JSON.stringify(consoleErrors)}: PASSED`);
     console.log('web-reconnect: PASSED (real 1006 + three failed product reconnect generations + retained surfaces + same-port recovery)');

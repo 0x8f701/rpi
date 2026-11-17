@@ -25,14 +25,14 @@ use crate::settings::{
     HostHttpDestinationWire, HostHttpHostWire, HostHttpPolicySettings, McpServerConfig,
     SandboxSettingsWire, WritableRootWire, resolved_sandbox_mode,
 };
-use crate::{RequestAuth, ResourceCandidate, WorkspaceRoots};
+use crate::{ResourceCandidate, WorkspaceRoots};
 
 use super::grant_registry::{
     CredentialConfigError, CredentialGrantRegistry, CredentialGrantRegistrySnapshot,
 };
 use super::http::{
-    BuiltinHttpEndpoints, RawSessionHttpTransport, SessionHttpAuthority, SessionHttpError,
-    SessionHttpRequirements, SessionHttpTransport, SystemDnsResolver,
+    BuiltinHttpEndpoints, ProviderAuthority, RawSessionHttpTransport, SessionHttpAuthority,
+    SessionHttpError, SessionHttpRequirements, SessionHttpTransport, SystemDnsResolver,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -491,8 +491,7 @@ struct SandboxGenerationBuilder<'a> {
     provenance: Arc<GenerationProvenance>,
     resource_capabilities: &'a Arc<CapabilityFs>,
     session: SessionPolicyInputs,
-    selected_model: &'a pi_ai::Model,
-    request_auth: &'a RequestAuth,
+    provider_authority: Option<ProviderAuthority<'a>>,
     stream: &'a pi_ai::StreamOptions,
     image_generation: Option<(
         &'a pi_ai::Model,
@@ -501,6 +500,15 @@ struct SandboxGenerationBuilder<'a> {
     )>,
     builtins: &'a BuiltinHttpEndpoints,
 }
+/// Builds a generation's sandbox policy, filesystem, credential, and HTTP
+/// authority.
+///
+/// `provider_authority` is absent when no provider is configured yet (a
+/// listener starts before the operator picks a model). Absence removes only the
+/// provider API and stored-OAuth refresh destinations; the credential registry
+/// build/validation, trust derivation, built-in product destinations, and the
+/// independent image-generation destination are still staged, and no error is
+/// suppressed in either case.
 pub(crate) fn build_sandbox_generation(
     settings: Option<&SandboxSettingsWire>,
     mcp_servers: &[McpServerConfig],
@@ -508,8 +516,7 @@ pub(crate) fn build_sandbox_generation(
     provenance: Arc<GenerationProvenance>,
     resource_capabilities: &Arc<CapabilityFs>,
     session: SessionPolicyInputs,
-    selected_model: &pi_ai::Model,
-    request_auth: &RequestAuth,
+    provider_authority: Option<ProviderAuthority<'_>>,
     stream: &pi_ai::StreamOptions,
     image_generation: Option<(
         &pi_ai::Model,
@@ -525,8 +532,7 @@ pub(crate) fn build_sandbox_generation(
         provenance,
         resource_capabilities,
         session,
-        selected_model,
-        request_auth,
+        provider_authority,
         stream,
         image_generation,
         builtins,
@@ -576,8 +582,7 @@ impl SandboxGenerationBuilder<'_> {
             .validate_policy(&credentials)
             .map_err(SandboxConfigError::from)?;
         let requirements = SessionHttpRequirements::derive_with_builtins(
-            self.selected_model,
-            self.request_auth,
+            self.provider_authority,
             self.stream,
             self.image_generation,
             self.builtins,

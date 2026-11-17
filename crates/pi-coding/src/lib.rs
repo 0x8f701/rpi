@@ -8,7 +8,7 @@ pub mod encrypt;
 pub mod export;
 mod fs;
 pub mod share;
-pub use fs::{FsError, FsOperation, SessionFileIdentity};
+pub use fs::{FsError, FsMetadata, FsOperation, SessionFileIdentity};
 pub mod compaction;
 pub mod extensions;
 pub mod goal;

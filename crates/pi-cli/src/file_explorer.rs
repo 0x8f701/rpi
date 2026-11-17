@@ -27,7 +27,7 @@ use serde_json::json;
 use ignore::Match;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
-use crate::code_review::{IsolatedGitSandbox, run_git_bounded_timeout};
+use crate::code_review::{IsolatedGitSandbox, RepositoryDiscoveryError, run_git_bounded_timeout};
 
 pub(crate) const DEFAULT_PAGE_LINES: usize = 400;
 pub(crate) const MAX_PAGE_LINES: usize = 2_000;
@@ -36,7 +36,7 @@ pub(crate) const MAX_LIST_ENTRIES: usize = 5_000;
 pub(crate) const MAX_CHANGED_FILES: usize = 5_000;
 const MAX_GIT_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const GIT_TIMEOUT: Duration = Duration::from_secs(15);
-const MAX_PAGE_CONTENT_BYTES: usize = MAX_PAGE_BYTES - 1024;
+pub(crate) const MAX_PAGE_CONTENT_BYTES: usize = MAX_PAGE_BYTES - 1024;
 const FILE_VALIDATION_BYTES: u64 = 1;
 const MAX_TEXT_LINE_BYTES: usize = MAX_PAGE_BYTES;
 const MAX_GITIGNORE_BYTES: usize = MAX_PAGE_BYTES;
@@ -66,6 +66,34 @@ impl std::fmt::Display for FileExplorerError {
 }
 
 impl std::error::Error for FileExplorerError {}
+
+/// Two or more authorized files share one citation. Kept off
+/// [`FileExplorerError`] so that enum stays `Copy` for callers that copy a
+/// code without a candidate list. `candidates` are workspace-relative and
+/// sorted; the wire form is `{"code":"file_ambiguous","candidates":[...]}`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FileAmbiguous {
+    pub(crate) candidates: Vec<String>,
+}
+
+impl std::fmt::Display for FileAmbiguous {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("file is ambiguous")
+    }
+}
+
+impl std::error::Error for FileAmbiguous {}
+
+impl Serialize for FileAmbiguous {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("code", "file_ambiguous")?;
+        map.serialize_entry("candidates", &self.candidates)?;
+        map.end()
+    }
+}
+
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct ListEntry {
@@ -743,20 +771,24 @@ pub(crate) fn read(
     let workspace_root = app.session().cwd().to_path_buf();
     match read_page(app, &workspace_root, path, cursor, max_lines) {
         Ok(response) => Ok(response),
-        // A basename-only reference from transcript prose (`init.rs:495`)
-        // misses at the workspace root yet names a real file deeper in the
-        // tree. Resolve a UNIQUE exact-basename match and read that instead;
-        // zero or several matches keep the stable missing-file error — the
-        // request never guesses between homonyms.
+        // A literal workspace path that exists wins before any suffix walk.
+        // A miss may still be a basename (`init.rs:495`) or a shortened
+        // relative suffix (`psy_node_redis/src/store/rewards.rs`). One
+        // complete-walk match reads that file; two or more are a typed
+        // ambiguity and never a guess; an incomplete walk keeps this miss.
         Err(error)
-            if !path.contains('/')
-                && !path.contains('\\')
+            if citation_fallback_eligible(path)
                 && error.downcast_ref::<FileExplorerError>()
                     == Some(&FileExplorerError::FileUnavailable) =>
         {
-            match unique_basename_file(&workspace_root, Path::new(path)) {
-                Some(found) => read_page(app, &workspace_root, &found, cursor, max_lines),
-                None => Err(error),
+            match resolve_citation(app, &workspace_root, path)? {
+                CitationHit::Unique(found) => {
+                    read_page(app, &workspace_root, &found, cursor, max_lines)
+                }
+                CitationHit::Ambiguous(candidates) => {
+                    bail!(FileAmbiguous { candidates })
+                }
+                CitationHit::Unresolved => Err(error),
             }
         }
         Err(error) => Err(error),
@@ -802,83 +834,152 @@ pub(crate) fn read_page(
 /// `node_modules` are the heavy subtrees that never legitimately host a cited
 /// source file; they are exclusions, not bounds.
 const BASENAME_SEARCH_MAX_DEPTH: usize = 32;
-const BASENAME_SEARCH_MAX_VISITED: usize = 50_000;
+const BASENAME_SEARCH_MAX_VISITED: usize = 500_000;
 const BASENAME_SEARCH_SKIP_DIRS: &[&str] = &[".git", "target", "node_modules"];
 
-/// The single workspace file whose exact file name equals `leaf`, found by a
-/// bounded no-follow walk from the workspace root. `Some` requires BOTH a
-/// COMPLETE traversal of the eligible tree AND exactly one match; either half
-/// alone is no proof. Counting one observed match says nothing about
-/// homonyms the walk never reached, so the verdict is withheld whenever the
-/// walk stopped early — a visited-entry budget stop, a depth-ceiling stop, or
-/// any enumeration/open failure. Zero matches return `None` and keep the
-/// caller's original error, exactly one match on a complete walk returns its
-/// path, and a second match is homonym ambiguity and returns `None`, so the
-/// fallback can only ever narrow, never widen, what a direct read would have
-/// answered. Skipped heavy subtrees and symlinks are intentional exclusions,
-/// not candidates (symlinks never match or recurse — the same no-follow
-/// authority as every other read here).
-fn unique_basename_file(root: &Path, leaf: &Path) -> Option<String> {
-    let leaf = leaf.file_name()?;
+/// The single workspace file whose exact file name equals `leaf`, found by
+/// [`resolve_citation`]. `Ok(Some)` requires a complete eligible walk and
+/// exactly one match. Zero matches and a depth or visit bound are
+/// `Ok(None)`. Two matches are also `Ok(None)` here — the basename helper
+/// never picks one — while [`read`] reports that same complete set as
+/// [`FileAmbiguous`]. An unlistable directory or unreadable entry is `Err`
+/// with the IO error as context. Symlinks and heavy skip dirs stay excluded.
+
+struct CitationQuery<'a> {
+    /// Empty for a basename citation. Otherwise the citation's parent
+    /// components, matched only on `/` boundaries.
+    parents: Vec<&'a str>,
+    leaf: &'a OsStr,
+}
+
+enum CitationHit {
+    Unique(String),
+    Ambiguous(Vec<String>),
+    Unresolved,
+}
+
+fn citation_fallback_eligible(path: &str) -> bool {
+    !path.is_empty()
+        && !path.contains('\\')
+        && !path.contains('\0')
+        && !Path::new(path).is_absolute()
+        && path != "."
+        && path != ".."
+        && !path.split('/').any(|component| component.is_empty() || component == "." || component == "..")
+}
+
+fn citation_query(path: &str) -> Option<CitationQuery<'_>> {
+    if !citation_fallback_eligible(path) {
+        return None;
+    }
+    let mut parts = path.split('/').collect::<Vec<_>>();
+    let leaf = OsStr::new(parts.pop()?);
     if leaf.is_empty() {
         return None;
     }
-    let mut matches: Vec<String> = Vec::new();
-    let mut visited = 0usize;
-    let root_dir = open_workspace_root(root).ok()?;
-    let complete = walk_basename(&root_dir, "", 0, leaf, &mut visited, &mut matches);
-    if complete && matches.len() == 1 {
-        matches.pop()
-    } else {
-        None
-    }
+    Some(CitationQuery { parents: parts, leaf })
 }
 
-/// Depth-first, no-follow enumeration collecting every workspace-relative
-/// path whose file name equals `leaf`. Returns `true` only when the whole
-/// eligible subtree was examined. Every other exit is `false` and MUST be
-/// read as "unexamined entries may still hide a homonym": a
-/// [`BASENAME_SEARCH_MAX_VISITED`] stop, a subtree refused at the
-/// [`BASENAME_SEARCH_MAX_DEPTH`] ceiling, a directory that cannot be listed,
-/// an entry whose kind cannot be read, and a child directory that cannot be
-/// opened. A second match also ends the walk early with `false` (the caller
-/// rejects the ambiguity regardless, so no further proof is needed).
+/// Basename or relative-suffix citation resolved by the same bounded
+/// no-follow walk as [`walk_basename`]. A directory the captured policy
+/// rejects is not entered, and a matching file is published only after
+/// [`validate_regular_file`] accepts it, so a denied or secret path never
+/// appears in a unique hit or an ambiguity list. `Ok(Unique)` requires a
+/// complete eligible walk and exactly one authorized match.
+/// `Ok(Ambiguous)` requires that same complete walk and at least two,
+/// returned sorted. A depth ceiling or visit budget is `Ok(Unresolved)` and
+/// keeps the caller's original miss. Policy denial is an exclusion. Every
+/// other inspect, list, or open failure is `Err` with that error as context.
+fn resolve_citation(app: &Application, root: &Path, citation: &str) -> Result<CitationHit> {
+    let Some(query) = citation_query(citation) else {
+        return Ok(CitationHit::Unresolved);
+    };
+    let mut matches = Vec::new();
+    let mut visited = 0usize;
+    let root_dir = open_workspace_root(root)?;
+    let complete = walk_basename(
+        app,
+        root,
+        &root_dir,
+        "",
+        0,
+        &query,
+        &mut visited,
+        &mut matches,
+    )?;
+    if !complete {
+        return Ok(CitationHit::Unresolved);
+    }
+    Ok(match matches.len() {
+        0 => CitationHit::Unresolved,
+        1 => CitationHit::Unique(matches.pop().expect("one match")),
+        _ => {
+            matches.sort();
+            CitationHit::Ambiguous(matches)
+        }
+    })
+}
+
+fn unique_basename_file(app: &Application, root: &Path, leaf: &Path) -> Result<Option<String>> {
+    let Some(leaf) = leaf.to_str() else {
+        return Ok(None);
+    };
+    Ok(match resolve_citation(app, root, leaf)? {
+        CitationHit::Unique(found) => Some(found),
+        CitationHit::Ambiguous(_) | CitationHit::Unresolved => None,
+    })
+}
+
+/// Depth-first, no-follow enumeration. A file matches when its name equals
+/// `query.leaf` and its parent path equals `query.parents`, or ends with
+/// those parents on a `/` boundary. The path is appended only after policy
+/// accepts it as a regular file. A directory is entered only after policy
+/// accepts it. `Ok(true)` means the eligible subtree was examined.
+/// `Ok(false)` is only a visit-budget or depth-ceiling stop. Policy denial
+/// prunes that entry. Every other failure is `Err` with its context.
 fn walk_basename(
+    app: &Application,
+    root: &Path,
     directory: &Dir,
     prefix: &str,
     depth: usize,
-    leaf: &OsStr,
+    query: &CitationQuery<'_>,
     visited: &mut usize,
     matches: &mut Vec<String>,
-) -> bool {
-    if matches.len() > 1 {
-        return false;
-    }
+) -> Result<bool> {
     if *visited >= BASENAME_SEARCH_MAX_VISITED {
-        return false;
+        return Ok(false);
     }
-    let Ok(entries) = directory.entries() else { return false };
+    let entries = directory
+        .entries()
+        .map_err(|error| anyhow!("file could not be read right now").context(error))?;
     for entry in entries {
         *visited += 1;
         if *visited >= BASENAME_SEARCH_MAX_VISITED {
-            return false;
+            return Ok(false);
         }
-        let Ok(entry) = entry else { return false };
-        let Ok(file_type) = entry.file_type() else { return false };
+        let entry = entry
+            .map_err(|error| anyhow!("file could not be read right now").context(error))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| anyhow!("file could not be read right now").context(error))?;
         if file_type.is_symlink() {
             continue;
         }
         let name = entry.file_name();
-        if file_type.is_file() && name == leaf {
-            matches.push(format!("{prefix}{}", name.to_string_lossy()));
-            if matches.len() > 1 {
-                return false;
+        let relative = format!("{prefix}{}", name.to_string_lossy());
+        if file_type.is_file() && name == query.leaf && suffix_parents_match(prefix, &query.parents)
+        {
+            match validate_regular_file(app, &root.join(&relative)) {
+                Ok(()) => matches.push(relative),
+                Err(error) if citation_policy_excluded(&error) => {}
+                Err(error) => return Err(error),
             }
             continue;
         }
         if file_type.is_dir() {
             if depth + 1 >= BASENAME_SEARCH_MAX_DEPTH {
-                return false;
+                return Ok(false);
             }
             let skipped = BASENAME_SEARCH_SKIP_DIRS
                 .iter()
@@ -886,21 +987,60 @@ fn walk_basename(
             if skipped {
                 continue;
             }
-            let Ok(child) = directory.open_dir_nofollow(&name) else { return false };
+            match app.inspect_generation_directory(&root.join(&relative)) {
+                Ok(_) => {}
+                Err(error) if citation_policy_excluded(&error) => continue,
+                Err(error) => return Err(error.context("file could not be read right now")),
+            }
+            let child = directory.open_dir_nofollow(&name).map_err(|error| {
+                anyhow!("file could not be read right now").context(error)
+            })?;
             if !walk_basename(
+                app,
+                root,
                 &child,
-                &format!("{prefix}{}/", name.to_string_lossy()),
+                &format!("{relative}/"),
                 depth + 1,
-                leaf,
+                query,
                 visited,
                 matches,
-            ) {
-                return false;
+            )? {
+                return Ok(false);
             }
         }
     }
-    true
+    Ok(true)
 }
+
+
+fn citation_policy_excluded(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<FsError>(),
+            Some(
+                FsError::Denied
+                    | FsError::OutsideCapability
+                    | FsError::InvalidPath
+            )
+        )
+    })
+}
+
+
+/// `prefix` is the walk's parent path plus a trailing `/`, or empty at the
+/// workspace root. The citation's parent components must be that whole parent
+/// (`candidate == citation`) or its ending components (`.../citation`).
+fn suffix_parents_match(prefix: &str, parents: &[&str]) -> bool {
+    if parents.is_empty() {
+        return true;
+    }
+    let Some(parent) = prefix.strip_suffix('/') else {
+        return false;
+    };
+    let components = parent.split('/').collect::<Vec<_>>();
+    components.len() >= parents.len() && components[components.len() - parents.len()..] == *parents
+}
+
 
 
 pub(crate) fn changes(app: &Application) -> Result<ChangesResponse> {
@@ -967,9 +1107,10 @@ pub(crate) fn diff(
     let change = changes.files.iter().find(|file| file.path == relative);
     validate_diff_target(app, &absolute, change)?;
 
-    let (sandbox, repository_path) = covering_repository(&workspace_root, &relative)?;
+    let (sandbox, repository_path) =
+        covering_repository(&workspace_root, &relative, historical_diff_path(change))?;
     let old_repository_path = match change.and_then(|file| file.old_path.as_deref()) {
-        Some(old_path) => Some(covering_repository(&workspace_root, old_path)?.1),
+        Some(old_path) => Some(covering_repository(&workspace_root, old_path, true)?.1),
         None => None,
     };
     let untracked = change.is_some_and(|file| file.status == "added")
@@ -1070,7 +1211,7 @@ pub(crate) fn blame(
         }
         bail!("blame selection exceeds the response limit");
     }
-    let (sandbox, repository_path) = covering_repository(&workspace_root, &page.path)?;
+    let (sandbox, repository_path) = covering_repository(&workspace_root, &page.path, false)?;
     let untracked = is_untracked_path(&sandbox, &repository_path).map_err(|error| {
         if error.downcast_ref::<FileExplorerError>().is_some() {
             error
@@ -1329,9 +1470,14 @@ fn validate_regular_file(app: &Application, absolute: &Path) -> Result<()> {
         Ok(_) => Ok(()),
         Err(error) => match error.downcast_ref::<FsError>() {
             Some(FsError::ReadLimitExceeded { .. }) => Ok(()),
-            Some(FsError::UnsupportedEntryType) => bail!("not a file"),
+            Some(FsError::UnsupportedEntryType) => {
+                match app.inspect_generation_directory(absolute) {
+                    Ok(_) => bail!(FileExplorerError::DirectoryUnavailable),
+                    Err(probe) => return Err(error.context(probe)),
+                }
+            }
             Some(FsError::OutsideCapability | FsError::Denied | FsError::InvalidPath) => {
-                bail!("path is outside the workspace")
+                Err(error.context("path is outside the workspace"))
             }
             Some(fs_error @ FsError::System { .. }) => {
                 return Err(unavailable_file_error(fs_error));
@@ -1622,13 +1768,13 @@ fn read_gitignore_matcher(root: &Dir, directory: &Path) -> Result<Option<Gitigno
 }
 
 #[derive(Debug)]
-struct TextPage {
-    lines: Vec<String>,
-    next_cursor: Option<usize>,
-    total_lines: usize,
+pub(crate) struct TextPage {
+    pub(crate) lines: Vec<String>,
+    pub(crate) next_cursor: Option<usize>,
+    pub(crate) total_lines: usize,
 }
 
-fn text_page<R: BufRead>(
+pub(crate) fn text_page<R: BufRead>(
     mut reader: R,
     path: &str,
     cursor: usize,
@@ -2059,10 +2205,58 @@ fn expand_gitlink_changes(
     Ok((out, truncated))
 }
 
-fn covering_repository(workspace_root: &Path, relative: &str) -> Result<(IsolatedGitSandbox, String)> {
-    let (sandbox, prefix) = repository_for_workspace(workspace_root)
-        .ok_or_else(|| anyhow!("not a repository"))?;
-    covering_from(sandbox, prefix.as_deref(), workspace_root, relative.to_owned(), 0)
+fn historical_diff_path(change: Option<&ChangedFile>) -> bool {
+    change.is_some_and(|file| matches!(file.status, "deleted" | "renamed"))
+}
+
+fn covering_repository(
+    workspace_root: &Path,
+    relative: &str,
+    historical: bool,
+) -> Result<(IsolatedGitSandbox, String)> {
+    let relative_path = Path::new(relative);
+    let parent = relative_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new(""));
+    let mut directory = workspace_root.join(parent);
+    let start = loop {
+        match fs::symlink_metadata(&directory) {
+            Ok(_) => {
+                break fs::canonicalize(&directory)
+                    .map_err(|_| anyhow!("repository discovery failed"))?;
+            }
+            Err(error) if historical && error.kind() == ErrorKind::NotFound => {
+                directory = directory
+                    .parent()
+                    .filter(|parent| parent.starts_with(workspace_root))
+                    .ok_or_else(|| anyhow!("not a repository"))?
+                    .to_path_buf();
+            }
+            Err(_) => bail!("repository discovery failed"),
+        }
+    };
+    let sandbox = match IsolatedGitSandbox::discover_typed(&start) {
+        Ok(sandbox) => sandbox,
+        Err(RepositoryDiscoveryError::NotRepository) => bail!("not a repository"),
+        Err(RepositoryDiscoveryError::Failed(_)) => bail!("repository discovery failed"),
+    };
+    let root = sandbox.work_tree();
+    let file = fs::canonicalize(workspace_root)
+        .map_err(|_| anyhow!("repository discovery failed"))?
+        .join(relative_path);
+    let repository_path = file
+        .strip_prefix(root)
+        .map_err(|_| anyhow!("not a repository"))?
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    if repository_path.is_empty() {
+        bail!("not a repository");
+    }
+    let root = root.to_path_buf();
+    covering_from(sandbox, None, &root, repository_path, 0)
 }
 
 fn covering_from(
@@ -2179,16 +2373,17 @@ mod tests {
     /// at the depth ceiling, so the lone match is no longer a verdict: an
     /// unexamined subtree may still hide a homonym, and the request stays
     /// fail-closed.
-    #[test]
-    fn unique_basename_file_refuses_a_lone_match_when_the_walk_does_not_complete() {
+    #[tokio::test]
+    async fn unique_basename_file_refuses_a_lone_match_when_the_walk_does_not_complete() {
         let workspace = tempfile::tempdir().expect("workspace");
         std::fs::create_dir_all(workspace.path().join("src/queue")).expect("queue dir");
         std::fs::write(workspace.path().join("src/queue/gatherer.rs"), "fn handle() {}\n")
             .expect("cited file");
 
+        let app = completion_application(workspace.path(), &[]).await;
         let leaf = Path::new("gatherer.rs");
         assert_eq!(
-            unique_basename_file(workspace.path(), leaf).as_deref(),
+            unique_basename_file(&app, workspace.path(), leaf).expect("walk").as_deref(),
             Some("src/queue/gatherer.rs"),
             "no bound met: the complete walk proves the match unique"
         );
@@ -2199,7 +2394,7 @@ mod tests {
         }
         std::fs::create_dir_all(&deep).expect("deep chain");
         assert_eq!(
-            unique_basename_file(workspace.path(), leaf),
+            unique_basename_file(&app, workspace.path(), leaf).expect("walk"),
             None,
             "the depth ceiling leaves a subtree unexamined: incomplete, no verdict"
         );
@@ -2208,40 +2403,41 @@ mod tests {
     /// In-bounds trees walk to the end, so exactly one match IS the proof: the
     /// shallow eligible match resolves, while a second eligible homonym, a
     /// directory of that name, and an absent name all stay `None`.
-    #[test]
-    fn unique_basename_file_answers_an_in_bounds_lone_match() {
+    #[tokio::test]
+    async fn unique_basename_file_answers_an_in_bounds_lone_match() {
         let workspace = tempfile::tempdir().expect("workspace");
         std::fs::create_dir_all(workspace.path().join("src/queue")).expect("queue dir");
         std::fs::write(workspace.path().join("src/queue/gatherer.rs"), "fn handle() {}\n")
             .expect("cited file");
 
+        let app = completion_application(workspace.path(), &[]).await;
         let leaf = Path::new("gatherer.rs");
         assert_eq!(
-            unique_basename_file(workspace.path(), leaf).as_deref(),
+            unique_basename_file(&app, workspace.path(), leaf).expect("walk").as_deref(),
             Some("src/queue/gatherer.rs")
         );
         assert_eq!(
-            unique_basename_file(workspace.path(), Path::new("queue")),
+            unique_basename_file(&app, workspace.path(), Path::new("queue")).expect("walk"),
             None,
             "a directory of that name is not a match"
         );
         assert_eq!(
-            unique_basename_file(workspace.path(), Path::new("absent.rs")),
+            unique_basename_file(&app, workspace.path(), Path::new("absent.rs")).expect("walk"),
             None
         );
 
         std::fs::create_dir_all(workspace.path().join("tests")).expect("tests dir");
         std::fs::write(workspace.path().join("tests/gatherer.rs"), "fn other() {}\n")
             .expect("homonym");
-        assert_eq!(unique_basename_file(workspace.path(), leaf), None);
+        assert_eq!(unique_basename_file(&app, workspace.path(), leaf).expect("walk"), None);
     }
 
     /// The counterexample the completeness rule exists for: a SECOND
     /// `gatherer.rs` below a depth-exceeding chain is never enumerated, so a
     /// lone shallow match must NOT be reported as unique while that homonym
     /// sits past the ceiling.
-    #[test]
-    fn unique_basename_file_refuses_a_homonym_below_the_depth_ceiling() {
+    #[tokio::test]
+    async fn unique_basename_file_refuses_a_homonym_below_the_depth_ceiling() {
         let workspace = tempfile::tempdir().expect("workspace");
         std::fs::create_dir_all(workspace.path().join("src/queue")).expect("queue dir");
         std::fs::write(workspace.path().join("src/queue/gatherer.rs"), "fn handle() {}\n")
@@ -2252,9 +2448,9 @@ mod tests {
         }
         std::fs::create_dir_all(&deep).expect("deep chain");
         std::fs::write(deep.join("gatherer.rs"), "fn hidden() {}\n").expect("hidden homonym");
-
+        let app = completion_application(workspace.path(), &[]).await;
         assert_eq!(
-            unique_basename_file(workspace.path(), Path::new("gatherer.rs")),
+            unique_basename_file(&app, workspace.path(), Path::new("gatherer.rs")).expect("walk"),
             None,
             "a homonym below the depth ceiling is never seen, so nothing is unique"
         );
@@ -2262,21 +2458,57 @@ mod tests {
 
     /// The heavy subtrees skipped by the walk are excluded subtrees, never
     /// homonyms: their copies of the name cannot veto the one eligible match.
-    #[test]
-    fn unique_basename_file_skips_heavy_subtrees() {
+    #[tokio::test]
+    async fn unique_basename_file_skips_heavy_subtrees() {
         let workspace = tempfile::tempdir().expect("workspace");
         std::fs::create_dir_all(workspace.path().join("src")).expect("src dir");
         std::fs::write(workspace.path().join("src/gatherer.rs"), "fn handle() {}\n")
             .expect("cited file");
+        git_fixture(workspace.path(), &["init", "-q"]);
         for skipped in ["target/debug", ".git/objects", "node_modules/pkg"] {
             let directory = workspace.path().join(skipped);
             std::fs::create_dir_all(&directory).expect("skipped dir");
             std::fs::write(directory.join("gatherer.rs"), "fn built() {}\n").expect("built copy");
         }
-
+        let app = completion_application(workspace.path(), &[]).await;
         assert_eq!(
-            unique_basename_file(workspace.path(), Path::new("gatherer.rs")).as_deref(),
+            unique_basename_file(&app, workspace.path(), Path::new("gatherer.rs")).expect("walk").as_deref(),
             Some("src/gatherer.rs")
+        );
+    }
+
+    #[tokio::test]
+    async fn walk_basename_finds_a_unique_suffix_after_fifty_thousand_entries() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(workspace.path().join("crates/pi-cli/src")).expect("src dir");
+        std::fs::write(
+            workspace.path().join("crates/pi-cli/src/file_explorer.rs"),
+            "fn read() {}\n",
+        )
+        .expect("cited file");
+        let app = completion_application(workspace.path(), &[]).await;
+        let root_dir = open_workspace_root(workspace.path()).expect("root dir");
+        let query = citation_query("src/file_explorer.rs").expect("query");
+        let mut visited = 50_000;
+        let mut matches = Vec::new();
+        let complete = walk_basename(
+            &app,
+            workspace.path(),
+            &root_dir,
+            "",
+            0,
+            &query,
+            &mut visited,
+            &mut matches,
+        )
+        .expect("walk");
+        assert!(
+            complete,
+            "an already-visited prefix of 50_000 entries must not exhaust the visit budget"
+        );
+        assert_eq!(
+            matches,
+            vec!["crates/pi-cli/src/file_explorer.rs".to_owned()]
         );
     }
 
@@ -2318,7 +2550,219 @@ mod tests {
         std::fs::write(deep.join("gatherer.rs"), "fn hidden() {}\n").expect("hidden homonym");
         let error = read(&app, "gatherer.rs", 0, Some(1)).expect_err("homonym below the ceiling");
         assert_eq!(error.to_string(), "file is unavailable");
+
+        std::fs::create_dir_all(cwd.path().join("tests")).expect("tests dir");
+        std::fs::write(cwd.path().join("tests/gatherer.rs"), "fn other() {}\n").expect("homonym");
+        let shallow = cwd.path().join("src/queue/gatherer.rs");
+        std::fs::remove_dir_all(cwd.path().join("d")).expect("drop the unexamined chain");
+        let ambiguous = read(&app, "gatherer.rs", 0, Some(1)).expect_err("complete homonyms");
+        assert_eq!(
+            ambiguous_candidates(&ambiguous),
+            vec!["src/queue/gatherer.rs".to_owned(), "tests/gatherer.rs".to_owned()]
+        );
+        assert!(shallow.is_file());
     }
+
+    fn ambiguous_candidates(error: &anyhow::Error) -> Vec<String> {
+        error
+            .downcast_ref::<FileAmbiguous>()
+            .map(|ambiguous| ambiguous.candidates.clone())
+            .unwrap_or_default()
+    }
+
+    /// Two real files share the shortened citation. The read must not pick
+    /// one and must not call the file missing: the typed payload lists both
+    /// workspace-relative paths, sorted.
+    #[tokio::test]
+    async fn read_reports_suffix_ambiguity_instead_of_missing_when_two_files_share_it() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let citation = "psy_node_redis/src/store/rewards.rs";
+        for tree in ["psy-node", "psy-node-fix"] {
+            let file = cwd.path().join(tree).join(citation);
+            std::fs::create_dir_all(file.parent().expect("store dir")).expect("store dir");
+            std::fs::write(&file, format!("fn rewards() {{ /* {tree} */ }}\n")).expect("rewards");
+        }
+        let app = completion_application(cwd.path(), &[]).await;
+
+        let error = read(&app, citation, 0, Some(1)).expect_err("two suffix matches");
+        assert!(error.downcast_ref::<FileExplorerError>().is_none());
+        assert_eq!(error.to_string(), "file is ambiguous");
+        let candidates = ambiguous_candidates(&error);
+        assert_eq!(
+            candidates,
+            vec![
+                "psy-node-fix/psy_node_redis/src/store/rewards.rs".to_owned(),
+                "psy-node/psy_node_redis/src/store/rewards.rs".to_owned(),
+            ]
+        );
+        assert_eq!(
+            serde_json::to_value(error.downcast_ref::<FileAmbiguous>().expect("typed"))
+                .expect("wire"),
+            json!({
+                "code": "file_ambiguous",
+                "candidates": candidates,
+            })
+        );
+    }
+
+    /// One suffix match reads that file and echoes its full workspace-relative
+    /// path. The shortened citation itself is not the response identity.
+    #[tokio::test]
+    async fn read_resolves_a_unique_slash_suffix_to_its_workspace_path() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let citation = "psy_node_redis/src/store/rewards.rs";
+        let only = cwd.path().join("psy-node").join(citation);
+        std::fs::create_dir_all(only.parent().expect("store dir")).expect("store dir");
+        std::fs::write(&only, "fn only() {}\n").expect("single rewards");
+        let app = completion_application(cwd.path(), &[]).await;
+
+        let response = read(&app, citation, 0, Some(1)).expect("unique suffix");
+        assert_eq!(response.path, "psy-node/psy_node_redis/src/store/rewards.rs");
+        assert_eq!(response.lines, ["fn only() {}"]);
+        assert_eq!(response.total_lines, 1);
+    }
+
+    /// A file that exists at the requested workspace-relative path is that
+    /// file. A deeper namesake does not replace it or turn the read into an
+    /// ambiguity.
+    #[tokio::test]
+    async fn read_keeps_a_root_literal_ahead_of_a_deeper_namesake() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        std::fs::write(cwd.path().join("rewards.rs"), "fn root() {}\n").expect("root literal");
+        std::fs::create_dir_all(cwd.path().join("psy-node")).expect("nested");
+        std::fs::write(cwd.path().join("psy-node/rewards.rs"), "fn nested() {}\n").expect("nested");
+        let app = completion_application(cwd.path(), &[]).await;
+
+        let literal = read(&app, "rewards.rs", 0, Some(1)).expect("root literal wins");
+        assert_eq!(literal.path, "rewards.rs");
+        assert_eq!(literal.lines, ["fn root() {}"]);
+    }
+
+    /// A symlink to a file outside the workspace is not a suffix candidate and
+    /// its target is not disclosed. The one real file still resolves.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_suffix_candidates_exclude_external_symlinks() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let outside = tempfile::tempdir().expect("outside");
+        let citation = "store/rewards.rs";
+        let real = cwd.path().join("psy-node").join(citation);
+        std::fs::create_dir_all(real.parent().expect("store dir")).expect("store dir");
+        std::fs::write(&real, "fn real() {}\n").expect("real rewards");
+        std::fs::create_dir_all(cwd.path().join("linked/store")).expect("link parent");
+        std::fs::write(outside.path().join("rewards.rs"), "secret\n").expect("outside secret");
+        std::os::unix::fs::symlink(
+            outside.path().join("rewards.rs"),
+            cwd.path().join("linked").join(citation),
+        )
+        .expect("external symlink");
+        let app = completion_application(cwd.path(), &[]).await;
+
+        let response = read(&app, citation, 0, Some(1)).expect("symlink excluded");
+        assert_eq!(response.path, "psy-node/store/rewards.rs");
+        assert_eq!(response.lines, ["fn real() {}"]);
+        assert!(!response.path.contains(outside.path().to_str().expect("utf-8")));
+    }
+
+    /// A second suffix match past the depth ceiling means the walk cannot
+    /// prove the candidate set, so the original missing error stays. A
+    /// component that merely contains the citation text is not a suffix match,
+    /// so one real segmented suffix still resolves beside it.
+    #[tokio::test]
+    async fn read_suffix_requires_a_complete_walk_and_segment_boundary() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let citation = "src/store/rewards.rs";
+        let visible = cwd.path().join("psy-node").join(citation);
+        std::fs::create_dir_all(visible.parent().expect("store dir")).expect("store dir");
+        std::fs::write(&visible, "fn visible() {}\n").expect("visible");
+        std::fs::create_dir_all(cwd.path().join("notsrc/store")).expect("embedded");
+        std::fs::write(cwd.path().join("notsrc/store/rewards.rs"), "fn embedded() {}\n")
+            .expect("embedded name");
+        let app = completion_application(cwd.path(), &[]).await;
+
+        let response = read(&app, citation, 0, Some(1)).expect("segment boundary");
+        assert_eq!(response.path, "psy-node/src/store/rewards.rs");
+        assert_eq!(response.lines, ["fn visible() {}"]);
+
+        let mut deep = cwd.path().to_path_buf();
+        for _ in 0..(BASENAME_SEARCH_MAX_DEPTH + 8) {
+            deep.push("d");
+        }
+        std::fs::create_dir_all(deep.join("src/store")).expect("deep store");
+        std::fs::write(deep.join(citation), "fn hidden() {}\n").expect("hidden suffix");
+        let error = read(&app, citation, 0, Some(1)).expect_err("incomplete suffix walk");
+        assert_eq!(
+            error.downcast_ref::<FileExplorerError>(),
+            Some(&FileExplorerError::FileUnavailable)
+        );
+        assert!(error.downcast_ref::<FileAmbiguous>().is_none());
+    }
+
+    async fn denied_citation_app(cwd: &Path, denied: &[PathBuf]) -> anyhow::Result<Application> {
+        let settings = serde_json::json!({
+            "sandbox": { "mode": "workspace-write", "deniedPaths": denied }
+        })
+        .to_string();
+        match completion_application_with_settings(cwd, &[], &settings).await {
+            Ok(app) => Ok(app),
+            Err(error) if format!("{error:#}").contains("launcher") => {
+                anyhow::bail!("trusted sandbox launcher unavailable")
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_suffix_omits_a_policy_denied_directory_and_file() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let citation = "store/rewards.rs";
+        for tree in ["open", "secret-dir"] {
+            let file = cwd.path().join(tree).join(citation);
+            std::fs::create_dir_all(file.parent().expect("parent")).expect("parent");
+            std::fs::write(&file, format!("fn {tree}() {{}}\n")).expect("file");
+        }
+        std::fs::create_dir_all(cwd.path().join("secret-file/store")).expect("file parent");
+        let denied_file = cwd.path().join("secret-file").join(citation);
+        std::fs::write(&denied_file, "fn secret_file() {}\n").expect("denied file");
+        let hidden = |error: &anyhow::Error, needle: &str| {
+            let rendered = format!("{error:#}");
+            assert!(!rendered.contains(needle), "{rendered}");
+            assert!(error.downcast_ref::<FileAmbiguous>().is_none() || ambiguous_candidates(error).iter().all(|path| !path.contains(needle)));
+        };
+
+        let both = match denied_citation_app(cwd.path(), &[cwd.path().join("secret-dir"), denied_file.clone()]).await {
+            Ok(app) => app,
+            Err(error) if format!("{error:#}").contains("launcher") => return,
+            Err(error) => panic!("confined citation fixture failed: {error:#}"),
+        };
+        let open = read(&both, citation, 0, Some(1)).expect("only the open suffix");
+        assert_eq!(open.path, "open/store/rewards.rs");
+        assert_eq!(open.lines, ["fn open() {}"]);
+
+        let dir_only = match denied_citation_app(cwd.path(), &[cwd.path().join("secret-dir")]).await {
+            Ok(app) => app,
+            Err(error) if format!("{error:#}").contains("launcher") => return,
+            Err(error) => panic!("{error:#}"),
+        };
+        let directory = read(&dir_only, citation, 0, Some(1)).expect_err("dir pruned");
+        assert_eq!(ambiguous_candidates(&directory), vec!["open/store/rewards.rs".to_owned(), "secret-file/store/rewards.rs".to_owned()]);
+        hidden(&directory, "secret-dir");
+
+        let file_only = match denied_citation_app(cwd.path(), &[denied_file]).await {
+            Ok(app) => app,
+            Err(error) if format!("{error:#}").contains("launcher") => return,
+            Err(error) => panic!("{error:#}"),
+        };
+        let file = read(&file_only, citation, 0, Some(1)).expect_err("file pruned");
+        assert_eq!(ambiguous_candidates(&file), vec!["open/store/rewards.rs".to_owned(), "secret-dir/store/rewards.rs".to_owned()]);
+        hidden(&file, "secret-file");
+    }
+
+
+
+
+
+
 
     #[cfg(unix)]
     #[test]
@@ -2938,6 +3382,224 @@ mod tests {
         assert_eq!(outside.to_string(), "line range is outside the file");
     }
 
+    const BLAME_FIXTURE_AUTHOR: &str = "Blame Fixture";
+    const BLAME_FIXTURE_EMAIL: &str = "blame-fixture@example.test";
+
+    fn git_fixture(cwd: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args([
+                "-c",
+                "color.ui=false",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "init.defaultBranch=main",
+                "-c",
+                "core.hooksPath=.git-test-no-hooks",
+            ])
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", cwd.join("absent-global-git-config"))
+            .env("LC_ALL", "C")
+            .env("GIT_AUTHOR_NAME", BLAME_FIXTURE_AUTHOR)
+            .env("GIT_AUTHOR_EMAIL", BLAME_FIXTURE_EMAIL)
+            .env("GIT_COMMITTER_NAME", BLAME_FIXTURE_AUTHOR)
+            .env("GIT_COMMITTER_EMAIL", BLAME_FIXTURE_EMAIL)
+            .output()
+            .expect("git");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn commit_tracked_line(repo: &Path, relative: &str, line: &str) -> String {
+        if let Some(parent) = Path::new(relative).parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(repo.join(parent)).expect("tracked parent");
+            }
+        }
+        std::fs::write(repo.join(relative), format!("{line}\n")).expect("tracked file");
+        git_fixture(repo, &["add", "--", relative]);
+        git_fixture(repo, &["commit", "-q", "-m", "baseline"]);
+        let head = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", repo.join("absent-global-git-config"))
+            .env("LC_ALL", "C")
+            .output()
+            .expect("rev-parse");
+        assert!(head.status.success(), "rev-parse failed");
+        let oid = String::from_utf8(head.stdout)
+            .expect("oid utf-8")
+            .trim()
+            .to_owned();
+        assert_eq!(oid.len(), 40);
+        oid
+    }
+
+    /// Parent cwd is not a repository; the tracked file lives in a child
+    /// repository. `blame` must resolve that child, not stop at the
+    /// ancestor-only workspace discovery (`not a repository`).
+    #[tokio::test]
+    async fn blame_child_repo_from_nonrepo_cwd_uses_workspace_relative_path() {
+        const LINE: &str = "tracked child line";
+        let cwd = tempfile::tempdir().expect("non-repo cwd");
+        let child = cwd.path().join("child");
+        std::fs::create_dir(&child).expect("child dir");
+        git_fixture(&child, &["init", "-q"]);
+        let oid = commit_tracked_line(&child, "tracked.txt", LINE);
+
+        let app = completion_application(cwd.path(), &[]).await;
+        let response = blame(&app, "child/tracked.txt", 1, 1).expect("child repo blame");
+        assert_eq!(response.path, "child/tracked.txt");
+        assert_eq!(response.lines.len(), 1);
+        assert_eq!(response.lines[0].current_line, 1);
+        assert_eq!(response.lines[0].original_line, 1);
+        assert_eq!(response.lines[0].text, LINE);
+        assert_eq!(response.lines[0].commit.as_deref(), Some(oid.as_str()));
+        assert_eq!(response.lines[0].author, BLAME_FIXTURE_AUTHOR);
+    }
+
+    /// A nested repository inside an ancestor repository is its own covering
+    /// repository: blame uses the nested commit, not the ancestor's.
+    #[tokio::test]
+    async fn blame_nested_repo_inside_parent_repo_uses_inner_commit() {
+        const LINE: &str = "nested tracked line";
+        let cwd = tempfile::tempdir().expect("parent repo cwd");
+        git_fixture(cwd.path(), &["init", "-q"]);
+        commit_tracked_line(cwd.path(), "outer.txt", "outer line");
+        let child = cwd.path().join("child");
+        std::fs::create_dir(&child).expect("child dir");
+        git_fixture(&child, &["init", "-q"]);
+        let oid = commit_tracked_line(&child, "tracked.txt", LINE);
+
+        let app = completion_application(cwd.path(), &[]).await;
+        let response = blame(&app, "child/tracked.txt", 1, 1).expect("nested repo blame");
+        assert_eq!(response.path, "child/tracked.txt");
+        assert_eq!(response.lines.len(), 1);
+        assert_eq!(response.lines[0].current_line, 1);
+        assert_eq!(response.lines[0].text, LINE);
+        assert_eq!(response.lines[0].commit.as_deref(), Some(oid.as_str()));
+        assert_eq!(response.lines[0].author, BLAME_FIXTURE_AUTHOR);
+    }
+
+    #[tokio::test]
+    async fn blame_nonrepo_file_is_not_a_repository() {
+        let cwd = tempfile::tempdir().expect("non-repo cwd");
+        std::fs::write(cwd.path().join("plain.txt"), "plain\n").expect("plain file");
+        let app = completion_application(cwd.path(), &[]).await;
+        let error = blame(&app, "plain.txt", 1, 1).expect_err("non-repo blame");
+        assert_eq!(error.to_string(), "not a repository");
+    }
+
+    #[tokio::test]
+    async fn blame_symlink_escape_stays_rejected() {
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(outside.path().join("secret.txt"), "outside line\n").expect("secret");
+        let cwd = tempfile::tempdir().expect("workspace");
+        git_fixture(cwd.path(), &["init", "-q"]);
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.txt"),
+            cwd.path().join("escape.txt"),
+        )
+        .expect("file symlink");
+        let app = completion_application(cwd.path(), &[]).await;
+        let error = blame(&app, "escape.txt", 1, 1).expect_err("symlink escape");
+        assert_eq!(error.to_string(), "file is a symlink");
+        assert_eq!(
+            error.downcast_ref::<FileExplorerError>(),
+            Some(&FileExplorerError::FileSymlink)
+        );
+    }
+
+    /// Workspace cwd sits inside an enclosing repository. Discovery must use
+    /// that outer root; the file path stays workspace-relative.
+    #[tokio::test]
+    async fn blame_workspace_inside_enclosing_repo_uses_outer_commit() {
+        const LINE: &str = "nested workspace line";
+        let repo = tempfile::tempdir().expect("enclosing repo");
+        git_fixture(repo.path(), &["init", "-q"]);
+        let workspace = repo.path().join("src");
+        std::fs::create_dir(&workspace).expect("workspace dir");
+        let oid = commit_tracked_line(repo.path(), "src/file.txt", LINE);
+        let app = completion_application(&workspace, &[]).await;
+        let response = blame(&app, "file.txt", 1, 1).expect("enclosing blame");
+        assert_eq!(response.path, "file.txt");
+        assert_eq!(response.lines.len(), 1);
+        assert_eq!(response.lines[0].current_line, 1);
+        assert_eq!(response.lines[0].text, LINE);
+        assert_eq!(response.lines[0].commit.as_deref(), Some(oid.as_str()));
+        assert_eq!(response.lines[0].author, BLAME_FIXTURE_AUTHOR);
+    }
+
+    /// A deleted file whose parent directory is gone still diffs. The
+    /// historical repository path is the full deleted path, not a truncated
+    /// ancestor.
+    #[tokio::test]
+    async fn diff_deleted_file_with_missing_parent_keeps_historical_path() {
+        let cwd = tempfile::tempdir().expect("repo");
+        git_fixture(cwd.path(), &["init", "-q"]);
+        commit_tracked_line(cwd.path(), "gone/file.txt", "deleted line");
+        std::fs::remove_dir_all(cwd.path().join("gone")).expect("remove parent");
+        let app = completion_application(cwd.path(), &[]).await;
+        let response = diff(&app, "gone/file.txt", 0, None).expect("deleted diff");
+        assert_eq!(response.path, "gone/file.txt");
+        assert!(
+            response.lines.iter().any(|line| line.contains("gone/file.txt")),
+            "historical path missing from diff"
+        );
+        assert!(
+            response.lines.iter().any(|line| line.contains("deleted line")),
+            "deleted line missing from diff"
+        );
+    }
+
+    /// A rename out of a removed directory still diffs. The old path stays
+    /// the full historical repository path.
+    #[tokio::test]
+    async fn diff_renamed_file_with_missing_old_parent_keeps_historical_path() {
+        let cwd = tempfile::tempdir().expect("repo");
+        git_fixture(cwd.path(), &["init", "-q"]);
+        commit_tracked_line(cwd.path(), "old/file.txt", "renamed line");
+        std::fs::create_dir(cwd.path().join("new")).expect("new dir");
+        git_fixture(cwd.path(), &["mv", "old/file.txt", "new/file.txt"]);
+        git_fixture(cwd.path(), &["add", "-A"]);
+        std::fs::remove_dir(cwd.path().join("old")).expect("remove old parent");
+        let app = completion_application(cwd.path(), &[]).await;
+        let response = diff(&app, "new/file.txt", 0, None).expect("renamed diff");
+        assert_eq!(response.path, "new/file.txt");
+        assert!(
+            response.lines.iter().any(|line| line.contains("rename from old/file.txt")),
+            "rename-from metadata missing"
+        );
+        assert!(
+            response.lines.iter().any(|line| line.contains("rename to new/file.txt")),
+            "rename-to metadata missing"
+        );
+    }
+
+
+    #[tokio::test]
+    async fn blame_malformed_git_metadata_is_not_repository_absence() {
+        let cwd = tempfile::tempdir().expect("broken repo");
+        git_fixture(cwd.path(), &["init", "-q"]);
+        commit_tracked_line(cwd.path(), "tracked.txt", "tracked line");
+        std::fs::write(cwd.path().join(".git/HEAD"), "ref: refs/heads/../main\n").expect("bad head");
+        let app = completion_application(cwd.path(), &[]).await;
+        let error = blame(&app, "tracked.txt", 1, 1).expect_err("malformed metadata");
+        assert_eq!(error.to_string(), "repository discovery failed");
+        assert_ne!(error.to_string(), "not a repository");
+    }
+
+
+
+
+
     async fn completion_application(cwd: &Path, additional_roots: &[PathBuf]) -> Application {
         completion_application_with_settings(
             cwd,
@@ -2965,7 +3627,7 @@ mod tests {
             WorkspaceRoots::new(cwd, additional_roots.iter().map(PathBuf::as_path)).expect("roots");
         let session = pi_coding::Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
             SessionOptions {
-                model,
+                model: Some(model),
                 cwd: cwd.to_path_buf(),
                 system_prompt: String::new(),
                 thinking_level: ThinkingLevel::Off,

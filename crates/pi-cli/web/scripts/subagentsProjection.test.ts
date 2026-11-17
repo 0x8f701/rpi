@@ -1,7 +1,4 @@
 #!/usr/bin/env node
-import { readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server.browser';
 import {
@@ -13,9 +10,11 @@ import {
   MAX_ORCHESTRATION_EVENT_BUFFER,
   normalizedEventGroup,
 } from '../src/orchestrationProjection.ts';
-import { historyTranscriptRows, historyRowTag, SubagentHistoryList } from '../src/subagentHistory.tsx';
-import { act, create, type ReactTestRenderer } from 'react-test-renderer';
-import { cssBlock, phoneSheetRects, rectsIntersect, subagentSheetTaskShrinks } from '../src/subagentSheetLayout.ts';
+import { deriveProjectAggregate, runnerActivityJobs, type TeamSessionState } from '../src/chat/team.ts';
+import { projectAgentHistory } from '../src/panels/SubagentsPanel.tsx';
+import { renderSubagentHistory } from '../src/App.tsx';
+import { dispatchMarkdownPathClick } from '../src/markdown.ts';
+
 
 const failures: string[] = [];
 let ran = 0;
@@ -192,6 +191,82 @@ check(
 }
 
 {
+  let state = beginOrchestrationRefresh(initialOrchestrationProjection(), 1);
+  state = applyAuthoritativeOrchestrationSnapshot(state, 1, {
+    groupId: 'current-group',
+    enabled: true,
+    jobs: [
+      job('running-job', 'gpt'),
+      { ...job('draining-job', 'gpt'), id: 'draining-job', status: 'cancelling' as const },
+    ],
+    agents: [agent('gpt-agent', 'running')],
+    messages: [],
+    catalog: [],
+  });
+  state = applyOrchestrationEvent(state, {
+    type: 'message_delivered',
+    groupId: 'current-group',
+    message: message('drain-progress', 'gpt-agent', 'still draining'),
+  });
+  check(
+    'cancelling outranks running for the same agent activity',
+    state.jobs['draining-job']?.activity === 'still draining'
+      && state.jobs['running-job']?.activity == null,
+    JSON.stringify(state.jobs),
+  );
+}
+
+{
+  const jobView = (id: string, status: 'running' | 'cancelling' | 'cancelled') => ({
+    job: { ...job(id, 'gpt'), id, status, createdAt: status === 'cancelling' ? 9 : 1 },
+    activity: null,
+    activityAt: null,
+  });
+  const session: TeamSessionState = {
+    key: 'runner/session',
+    mappingId: 'map-1',
+    projectId: 'project-1',
+    runnerId: 'runner',
+    sessionId: 'session',
+    sessionPath: '/session',
+    codename: null,
+    connection: 'connected',
+    lastSequence: 0,
+    activeTurnId: null,
+    isStreaming: false,
+    orchestrationEnabled: true,
+    bootstrapped: true,
+    refreshError: '',
+    goalError: '',
+    goal: null,
+    orchestration: {
+      ...initialOrchestrationProjection(),
+      groupId: 'current-group',
+      jobs: {
+        'running-job': jobView('running-job', 'running'),
+        'draining-job': jobView('draining-job', 'cancelling'),
+        'done-job': jobView('done-job', 'cancelled'),
+      },
+    },
+  };
+  const aggregate = deriveProjectAggregate('project-1', { 'runner/session': session });
+  check(
+    'cancelling counts active and is not aliased to running or cancelled',
+    aggregate.activeJobCount === 2
+      && aggregate.jobCounts.cancelling === 1
+      && aggregate.jobCounts.running === 1
+      && aggregate.jobCounts.cancelled === 1,
+    JSON.stringify(aggregate.jobCounts),
+  );
+  const activity = runnerActivityJobs(session);
+  check(
+    'cancelling stays in the live activity prefix',
+    activity[0]?.status === 'cancelling' && activity[2]?.status === 'cancelled',
+    JSON.stringify(activity.map((entry) => entry.status)),
+  );
+}
+
+{
   let state = initialize();
   state = beginOrchestrationRefresh(state, 2);
   state = applyOrchestrationEvent(state, {
@@ -286,334 +361,337 @@ check(
   );
 }
 
-{
-  const parsed = historyTranscriptRows([
-    'user: steer the child',
-    'assistant: working on it',
-    'assistant · bash rg -n "verify_state_updates"',
-    '[tool: bash] · ok',
-    'assistant · read seed.txt',
-    'assistant · hub message=go, op=send',
-    '[tool: read] · ok',
-    '[tool: hub] · error',
-    '[bash] ls',
-  ].join('\n'));
-  check('role rows keep muted tags and text', parsed[0]?.kind === 'text' && parsed[0].kind === 'text' && parsed[0].role === 'user' && parsed[0].text === 'steer the child');
-  check('assistant prose is a text row', parsed[1]?.kind === 'text' && parsed[1].kind === 'text' && parsed[1].role === 'assistant' && parsed[1].text === 'working on it');
-  check('call and result merge into one bash row',
-    parsed[2]?.kind === 'call'
-    && parsed[2].kind === 'call'
-    && parsed[2].name === 'bash'
-    && parsed[2].summary === 'rg -n "verify_state_updates"'
-    && parsed[2].status.kind === 'ok');
-  check('tool rows are labeled with the humanized action, not the wire tag',
-    historyRowTag(parsed[2]) === 'Command'
-    && historyRowTag(parsed[3]) === 'Read'
-    && historyRowTag(parsed[4]) === 'Hub'
-    && historyRowTag(parsed[5]) === 'Command');
-  check('later results match pending calls by name, not adjacency',
-    parsed[3]?.kind === 'call' && parsed[3].kind === 'call' && parsed[3].name === 'read' && parsed[3].status.kind === 'ok'
-    && parsed[4]?.kind === 'call' && parsed[4].kind === 'call' && parsed[4].name === 'hub' && parsed[4].status.kind === 'error');
-  check('named command line is a call row', parsed[5]?.kind === 'call' && parsed[5].kind === 'call' && parsed[5].name === 'bash' && parsed[5].summary === 'ls');
-  check('merged history is six rows', parsed.length === 6, String(parsed.length));
-  check('unknown role tokens are not role rows', (() => {
-    const unknownRole = historyTranscriptRows('vendor: notice');
-    const first = unknownRole[0];
-    return unknownRole.length === 1 && first?.kind === 'line' && first.text === 'vendor: notice';
-  })());
-
-  // Two-space-indented continuation lines carry extra evidence (multi-line
-  // assistant prose, bounded tool output preview). They extend the row they
-  // belong to — a call row the result line MERGED into, which is not always
-  // the last row — and a leading orphan (a stream slice that starts
-  // mid-block) degrades to a plain row.
-  const continued = historyTranscriptRows([
-    '  orphan continuation from a partial stream head',
-    'assistant: first prose line',
-    '  second prose line',
-    'assistant · read a.txt',
-    'assistant · read b.txt',
-    '[tool: read] · ok',
-    '  a.txt:1:hello',
-    '[tool: read] · ok',
-    '  b.txt:2:world',
-  ].join('\n'));
-  check('continuation lines extend the row they belong to',
-    continued.length === 4
-    && continued[0]?.kind === 'line'
-    && continued[0].kind === 'line'
-    && continued[0].text === 'orphan continuation from a partial stream head'
-    && continued[1]?.kind === 'text'
-    && continued[1].kind === 'text'
-    && continued[1].text === 'first prose line\nsecond prose line'
-    && continued[2]?.kind === 'call'
-    && continued[2].kind === 'call'
-    && continued[2].summary === 'a.txt'
-    && continued[2].output === 'a.txt:1:hello'
-    && continued[3]?.kind === 'call'
-    && continued[3].kind === 'call'
-    && continued[3].summary === 'b.txt'
-    && continued[3].output === 'b.txt:2:world',
-    JSON.stringify(continued));
-
-  const continuedHtml = renderToStaticMarkup(createElement(SubagentHistoryList, {
-    text: [
-      'assistant: first prose line',
-      '  second prose line',
-      'assistant · read a.txt',
-      '[tool: read] · ok',
-      '  a.txt:1:hello',
-      '  a.txt:2:world',
-    ].join('\n'),
-    error: '',
-  }));
-  check('multi-line prose stays multi-line through the markdown pipeline',
-    continuedHtml.includes('<p class="md-p">first prose line</p>')
-    && continuedHtml.includes('<p class="md-p">second prose line</p>'));
-  check('tool output preview stays out of the collapsed row',
-    !/<pre[^>]*data-history-output(?:=|\s|>)/.test(continuedHtml)
-    && !continuedHtml.includes('a.txt:1:hello'));
-
-  // Bug 1 repro fixtures: targets longer than the old 64-char preview cut, so
-  // the pre-fix renderer produced `real_data/…`-style ellipsis stubs.
-  const longPath = 'real_data/psy_node_common/src/realm/processor/proposal_store_impl.rs';
-  const longCommand = `nl -ba ${longPath}`;
-  const grepCommand = 'grep -n verify_state_updates crates/pi-coding/src/orchestration/runtime.rs';
-  const rows = renderToStaticMarkup(createElement(SubagentHistoryList, {
-    text: [
-      'user: steer the child',
-      `assistant · bash ${longCommand}`,
-      '[tool: bash] · ok',
-      `assistant · read ${longPath}`,
-      '[tool: read] · ok',
-      `assistant · grep ${grepCommand}`,
-      '[tool: grep] · ok',
-      'Reply from Main: go',
-    ].join('\n'),
-    error: '',
-  }));
-  check('tool rows carry the full command and path — no basename stub, no ellipsis',
-    rows.includes(longCommand)
-    && rows.includes(longPath)
-    && rows.includes(grepCommand)
-    && !rows.includes('\u2026')
-    && !rows.includes('nl · proposal_store_impl.rs'),
-    rows.slice(0, 900));
-  check('the tool outcome is its own labeled chip, never folded into the target body',
-    rows.includes('data-history-status="ok"')
-    && !rows.includes(' · ok</span>'),
-    rows.slice(0, 500));
-
-  const prose = renderToStaticMarkup(createElement(SubagentHistoryList, {
-    text: 'user: steer the child\nassistant: shipped **bold** with `code`',
-    error: '',
-  }));
-  check('prose renders through the shared Markdown pipeline, not flat role text',
-    prose.includes('class="subagent-details__history-md"')
-    && prose.includes('<p class="md-p">shipped <strong>bold</strong> with <code class="md-code">code</code></p>')
-    && !prose.includes('**bold**'),
-    prose.slice(0, 600));
-  check('user prose keeps its scanning tag; assistant prose carries none',
-    prose.includes('>user</span>') && !prose.includes('>assistant</span>'));
-
-  check('successful output stays collapsed behind one labeled Output control',
-    (continuedHtml.match(/<button[^>]*data-history-output-toggle/g) ?? []).length === 1
-    && continuedHtml.includes('aria-expanded="false"')
-    && !/<pre[^>]*data-history-output(?:=|\s|>)/.test(continuedHtml)
-    && !continuedHtml.includes('a.txt:1:hello'));
-  const failedHtml = renderToStaticMarkup(createElement(SubagentHistoryList, {
-    text: 'assistant · bash cargo test\n[tool: bash] · error\n  thread panicked at src/main.rs:2',
-    error: '',
-  }));
-  check('failed output is open and visible without interaction',
-    failedHtml.includes('data-history-output')
-    && failedHtml.includes('thread panicked')
-    && failedHtml.includes('aria-expanded="true"'));
-  check('rows are containers, not buttons — markdown links must not nest in a control',
-    !rows.includes('class="subagent-details__history-row" aria-expanded')
-    && /<div[^>]*class="subagent-details__history-row"[^>]*data-history-kind="call"/.test(rows),
-    rows.slice(0, 400));
-  check('unparsed wire lines stay plain rows without a control',
-    rows.includes('Reply from Main: go')
-    && !rows.slice(rows.indexOf('data-history-kind="line"')).includes('data-history-output-toggle'),
-    rows.slice(-400));
-
-  const html = renderToStaticMarkup(createElement(SubagentHistoryList, {
-    text: 'user: hello there\nassistant · bash rg -n "verify_state_updates"\n[tool: bash] · ok',
-    error: '',
-  }));
-  check('transcript is compact labeled rows, not a wrapped pre', !html.includes('<pre') && html.includes('subagent-details__transcript') && html.includes('subagent-details__history-tag') && html.includes('subagent-details__history-text'));
-  check('role tag and body are separate elements', html.includes('>user</span>') && html.includes('<p class="md-p">hello there</p>') && !html.includes('user: hello there<'));
-  check('merged tool row is one command row',
-    html.includes('>Command</span>')
-    && html.includes('verify_state_updates')
-    && (html.match(/data-history-kind="call"/g) || []).length === 1
-    && !html.includes('[tool: bash]')
-    && !html.includes('>assistant</span>'),
-    html.slice(0, 800));
-
-  const invocationHtml = renderToStaticMarkup(createElement(SubagentHistoryList, {
-    text: 'assistant: working on it\nassistant · Read FEATURES.md\nassistant · bash cargo build\nassistant · hub message=go, op=send',
-    error: '',
-  }));
-  check('assistant prose renders unlabeled through the markdown pipeline',
-    !invocationHtml.includes('>assistant</span>') && invocationHtml.includes('<p class="md-p">working on it</p>'));
-  check('invocation rows use the humanized tool name as their tag',
-    invocationHtml.includes('>Read</span>')
-    && invocationHtml.includes('>FEATURES.md</span>')
-    && invocationHtml.includes('>Command</span>')
-    && invocationHtml.includes('>cargo build</span>')
-    && invocationHtml.includes('>Hub</span>'));
-
-  const empty = renderToStaticMarkup(createElement(SubagentHistoryList, { text: '', error: '' }));
-  check('empty transcript is a compact placeholder row', empty.includes('(no transcript yet — waiting for child activity)') && !empty.includes('<pre'));
-
-  const here = dirname(fileURLToPath(import.meta.url));
-  const styles = readFileSync(join(here, '../src/styles.css'), 'utf8');
-  const bodyStart = styles.indexOf('.subagent-details__body {\n  flex: 1 1 auto');
-  const bodyRule = bodyStart >= 0 ? styles.slice(bodyStart, styles.indexOf('}', bodyStart)) : '';
-  const headStart = styles.indexOf('.subagent-details__head {');
-  const headRule = headStart >= 0 ? styles.slice(headStart, styles.indexOf('}', headStart)) : '';
-  const sheetStart = styles.indexOf('.subagent-details {\n  display: flex');
-  const sheetRule = sheetStart >= 0 ? styles.slice(sheetStart, styles.indexOf('}', sheetStart)) : '';
-  const historyRowStart = styles.indexOf('.subagent-details__history-row {\n  display: flex');
-  const historyRow = historyRowStart >= 0 ? styles.slice(historyRowStart, styles.indexOf('}', historyRowStart)) : '';
-  const phoneMqStart = styles.indexOf('@media (max-width: 768px) {');
-  const phoneMq = phoneMqStart >= 0 ? styles.slice(phoneMqStart, styles.indexOf('\n}\n\n@media (max-width: 480px)', phoneMqStart)) : '';
-  const phoneBody = cssBlock(styles, '.subagent-details__body {\n    -webkit-overflow-scrolling: touch;');
-  const phoneSheet = cssBlock(styles, '.subagent-details {\n    max-height: 94dvh;');
-  const phoneBackdrop = cssBlock(styles, '.subagent-details-backdrop { padding: 8px; align-items: stretch; }');
-  check('sheet is a flex column with overflow hidden and min-height 0', sheetRule.includes('flex-direction: column') && sheetRule.includes('overflow: hidden') && sheetRule.includes('min-height: 0'));
-  check('sheet header is not the scroller', headRule.includes('flex: none'));
-  check('sheet body is the only overflow-y auto region', bodyRule.includes('flex: 1 1 auto') && bodyRule.includes('min-height: 0') && bodyRule.includes('overflow-y: auto'));
-  check('static CSS: row is a column container whose first line holds label, body, outcome and control',
-    historyRow.includes('flex-direction: column')
-    && historyRow.includes('min-height: 0')
-    && historyRow.includes('padding: 4px 0')
-    && cssBlock(styles, '.subagent-details__history-line {').includes('display: flex'));
-  check('phone history rows stay 44px after the compact base rule',
-    styles.lastIndexOf('@media (max-width: 768px) {\n  .subagent-details__history-row {\n    min-height: 44px;')
-      > styles.indexOf('.subagent-details__history-row {\n  display: flex'));
-  check('static CSS: output preview stays bounded and scrolls',
-    cssBlock(styles, '.subagent-details__history-output {').includes('max-height: 12em')
-    && cssBlock(styles, '.subagent-details__history-output {').includes('overflow-y: auto')
-    && cssBlock(styles, '.subagent-details__history-output {').includes('white-space: pre-wrap'));
-  check('static CSS: phone sheet overrides sit after the base sheet rules, so they are not defeated',
-    !phoneMq.includes('.subagent-details {\n    max-height: 94dvh')
-    && styles.indexOf('.subagent-details {\n    max-height: 94dvh') > sheetStart
-    && phoneSheet.includes('max-height: 94dvh')
-    && phoneSheet.includes('min-height: 0')
-    && phoneBackdrop.includes('align-items: stretch')
-    && phoneBody.includes('-webkit-overflow-scrolling: touch'),
-    JSON.stringify({ phoneSheet, phoneBackdrop, phoneBody }));
-  const sectionStart = styles.indexOf('.subagent-details__section {\n  display: flex');
-  const section = sectionStart >= 0 ? styles.slice(sectionStart, styles.indexOf('}', sectionStart)) : '';
-  const descriptionStart = styles.indexOf('.subagent-details__description {');
-  const description = descriptionStart >= 0 ? styles.slice(descriptionStart, styles.indexOf('}', descriptionStart)) : '';
-  const shipped = phoneSheetRects(styles);
-  check('TASK/activity sections are content-sized in normal flow',
-    section.includes('flex: none')
-    && !section.includes('min-height: 0')
-    && !styles.includes('.subagent-details__section--transcript { flex: 1; }')
-    && !description.includes('position: absolute')
-    && !subagentSheetTaskShrinks(styles)
-    && styles.includes('.subagent-details__body > * {'));
-  check('CJK TASK bounding box does not intersect LATEST ACTIVITY',
-    !rectsIntersect(shipped.task, shipped.activity)
-    && shipped.task.bottom <= shipped.activity.top);
-  check('Subagents hides the standing height-resizer line',
-    styles.includes('body:has(#subagents-panel) .panel-drawer-resizer')
-    && styles.includes('body:has(#subagents-panel) .file-explorer-resizer'));
-  check('Subagents counts stay one ellipsized line',
-    styles.includes('.subagents-panel__counts { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }')
-    && styles.includes('.subagents-panel { width: 460px; overflow-y: hidden; border-top: none; }'));
-
-  // Bug 2 (390x844): the backdrop is a descendant of the fixed panel, so the
-  // panel's own z-index decides the modal's layer against the root-level
-  // composer footer — whatever the backdrop declares. These are static
-  // rule/source contracts, not a rendered journey: they pin the numbers the
-  // browser resolves, and the marker class that only exists while details is
-  // open.
-  const zIndexOf = (css: string): number => {
-    const match = /z-index:\s*(\d+)/.exec(css);
-    return match ? Number(match[1]) : Number.NaN;
-  };
-  const footerZ = zIndexOf(cssBlock(styles, 'footer {\n  display: flex'));
-  const backdropStart = styles.indexOf('.subagent-details-backdrop {\n  position: fixed;');
-  const backdropRule = backdropStart >= 0 ? styles.slice(backdropStart, styles.indexOf('}', backdropStart)) : '';
-  const backdropZ = zIndexOf(backdropRule);
-  const drawerZ = zIndexOf(cssBlock(styles, '.subagents-panel,\n.code-review-panel {'));
-  const raisedStart = styles.indexOf('.subagents-panel--details {');
-  const raisedZ = zIndexOf(cssBlock(styles, '.subagents-panel--details {'));
-  check('static CSS: the modal backdrop is trapped in the panel stacking context, under the root composer footer',
-    backdropZ === 60 && drawerZ === 46 && footerZ === 51 && drawerZ < footerZ,
-    JSON.stringify({ backdropZ, drawerZ, footerZ }));
-  check('static CSS: opening details lifts the panel above the footer, every backdrop cap and toasts, below the mermaid viewer',
-    raisedStart >= 0
-    && !styles.slice(Math.max(0, raisedStart - 400), raisedStart).includes('@media')
-    && raisedZ > footerZ
-    && raisedZ > drawerZ
-    && raisedZ > backdropZ
-    && raisedZ < 70,
-    JSON.stringify({ raisedStart, raisedZ, footerZ, drawerZ, backdropZ }));
-  const panelSource = readFileSync(join(here, '../src/panels/SubagentsPanel.tsx'), 'utf8');
-  check('static source: the panel asks for the core history line cap (200)',
-    /const HISTORY_LINES = (\d+);/.exec(panelSource)?.[1] === '200');
-  const panelModifier = /className=\{detailsJob \? '([^']*)' : '([^']*)'\}/.exec(panelSource);
-  check('static source: the panel carries the details-open modifier only while the modal is open',
-    panelModifier !== null
-    && (panelModifier[1] ?? '').includes('subagents-panel--details')
-    && !(panelModifier[2] ?? '').includes('subagents-panel--details'),
-    String(panelModifier));
-}
-
-// Mounted behavior (react-test-renderer, same harness as chatSessionView.test.ts):
-// exact poll sequence — closed ok→error opens; collapsed error→error stays
-// closed; opened ok→ok stays open.
-{
-  const previousActEnv = Object.getOwnPropertyDescriptor(globalThis, 'IS_REACT_ACT_ENVIRONMENT');
-  Object.defineProperty(globalThis, 'IS_REACT_ACT_ENVIRONMENT', { configurable: true, writable: true, value: true });
-  const longOutput = Array.from({ length: 12 }, (_, i) => `line-${i}: ${'x'.repeat(60)}`).join('\n  ');
-  const target = 'nl -ba real_data/psy_node_common/src/realm/processor/proposal_store_impl.rs';
-  const callText = (status: 'ok' | 'error') => `assistant · bash ${target}\n[tool: bash] · ${status}\n  ${longOutput}`;
-  let mounted: ReactTestRenderer | undefined;
-  const outputPres = () => mounted!.root.findAllByProps({ 'data-history-output': true });
-  const outputToggles = () => mounted!.root.findAllByProps({ 'data-history-output-toggle': true });
+// ---- agent_history wire → projectAgentHistory validation ------------------
+const trunc = (reason = 'none', omittedRows = 0) => ({ reason, omittedRows });
+const wire = (messages: unknown, agentId = 'child-agent', truncation: unknown = trunc()) => ({
+  agentId,
+  messages,
+  truncation,
+});
+const rejection = (data: unknown, agentId = 'child-agent'): string => {
   try {
-    await act(async () => {
-      mounted = create(createElement(SubagentHistoryList, { text: callText('ok'), error: '' }), { createNodeMock: () => null });
-    });
-    check('mounted: successful output starts collapsed',
-      outputPres().length === 0 && outputToggles().length === 1 && outputToggles()[0].props['aria-expanded'] === false);
-    await act(async () => {
-      mounted!.update(createElement(SubagentHistoryList, { text: callText('error'), error: '' }));
-    });
-    check('mounted: ok→error transition auto-opens the failed output',
-      outputPres().length === 1 && outputToggles()[0].props['aria-expanded'] === true);
-    await act(async () => { outputToggles()[0].props.onClick(); });
-    check('mounted: user collapse closes the failed output', outputPres().length === 0);
-    await act(async () => {
-      mounted!.update(createElement(SubagentHistoryList, { text: callText('error'), error: '' }));
-    });
-    check('mounted: error→error refresh stays collapsed', outputPres().length === 0);
-    await act(async () => {
-      mounted!.update(createElement(SubagentHistoryList, { text: callText('ok'), error: '' }));
-    });
-    check('mounted: error→ok keeps the user collapse', outputPres().length === 0);
-    await act(async () => { outputToggles()[0].props.onClick(); });
-    check('mounted: Output reveals the full bounded body',
-      outputPres().length === 1 && String(outputPres()[0].props.children).includes('line-11:'));
-    await act(async () => {
-      mounted!.update(createElement(SubagentHistoryList, { text: callText('ok'), error: '' }));
-    });
-    check('mounted: ok→ok refresh keeps the opened output',
-      outputPres().length === 1 && outputToggles()[0].props['aria-expanded'] === true);
-  } finally {
-    if (mounted) await act(async () => { mounted!.unmount(); });
-    if (previousActEnv) Object.defineProperty(globalThis, 'IS_REACT_ACT_ENVIRONMENT', previousActEnv);
-    else delete (globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT;
+    projectAgentHistory(data, agentId);
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
   }
+  return '';
+};
+
+check('null payload is rejected', rejection(null).includes('returned history for nothing'));
+check('array payload is rejected', rejection([]).includes('returned history for nothing'));
+check(
+  'history for a different agent is never rendered for this child',
+  rejection(wire([], 'other-agent')).includes('returned history for other-agent'),
+);
+check('missing messages array is rejected', rejection({ agentId: 'child-agent', truncation: trunc() }).includes('no messages array'));
+check('missing truncation is rejected', rejection({ agentId: 'child-agent', messages: [] }).includes('no truncation'));
+check(
+  'non-integer omittedRows is rejected',
+  rejection(wire([], 'child-agent', trunc('limit', 1.5))).includes('invalid omittedRows'),
+);
+check(
+  'negative omittedRows is rejected',
+  rejection(wire([], 'child-agent', trunc('bytes', -1))).includes('invalid omittedRows'),
+);
+check(
+  'unknown truncation reason is rejected',
+  rejection(wire([], 'child-agent', trunc('mystery', 3))).includes('invalid truncation reason'),
+);
+check(
+  'untruncated payload that still reports omitted rows is rejected',
+  rejection(wire([], 'child-agent', trunc('none', 2))).includes('untruncated but omitted rows'),
+);
+
+{
+  const history = projectAgentHistory(
+    wire(
+      [
+        { id: 'u-1', message: { role: 'user', content: [{ type: 'text', text: 'steer the child' }] } },
+        {
+          id: 'a-1',
+          message: {
+            role: 'assistant',
+            content: [
+              { type: 'thinking', thinking: 'plan first' },
+              { type: 'text', text: 'see docs/report.md for context' },
+              { type: 'toolCall', id: 'call-1', name: 'bash', arguments: { command: 'rg -n needle src/' } },
+              { type: 'toolCall', id: 'call-2', name: 'read', arguments: { path: 'src/lib.rs' } },
+            ],
+          },
+        },
+        { message: { role: 'toolResult', toolCallId: 'call-2', content: [{ type: 'text', text: 'fn lib() {}' }], isError: false } },
+        { message: { role: 'toolResult', toolCallId: 'call-1', content: [{ type: 'text', text: 'src/x.rs:1:needle' }], isError: false } },
+        { message: { role: 'bashExecution', command: 'make verify', output: 'ok', exitCode: 0 } },
+        { message: { role: 'toolResult', toolCallId: 'orphan', content: [{ type: 'text', text: '' }], isError: true } },
+      ],
+      'child-agent',
+      trunc('limit_and_bytes', 4),
+    ),
+    'child-agent',
+  );
+  check('truncation is carried through verbatim',
+    history.truncation.reason === 'limit_and_bytes' && history.truncation.omittedRows === 4,
+    JSON.stringify(history.truncation));
+  const kinds = history.items.map((item) => item.kind).join(',');
+  check('user/assistant/toolCard/bash/toolResult project as items',
+    kinds === 'user,assistant,toolCard,toolCard,bash,toolResult', kinds);
+  const assistant = history.items.find((item) => item.kind === 'assistant');
+  check('assistant keeps stable entry id and thinking block',
+    assistant?.kind === 'assistant'
+      && assistant.entryId === 'a-1'
+      && assistant.blocks.some((block) => block.type === 'thinking' && block.thinking === 'plan first'),
+    JSON.stringify(assistant));
+  const cards = history.items.filter((item) => item.kind === 'toolCard');
+  check('tool results pair back to their calls by toolCallId, not adjacency',
+    cards.length === 2
+      && cards[0].kind === 'toolCard' && cards[0].toolCallId === 'call-1' && cards[0].status === 'done' && cards[0].result.includes('src/x.rs:1:needle')
+      && cards[1].kind === 'toolCard' && cards[1].toolCallId === 'call-2' && cards[1].result.includes('fn lib() {}'),
+    JSON.stringify(cards));
+  const bashArgs = cards[0].kind === 'toolCard' && cards[0].args !== null && typeof cards[0].args === 'object' && 'command' in cards[0].args
+    ? cards[0].args.command
+    : undefined;
+  const readArgs = cards[1].kind === 'toolCard' && cards[1].args !== null && typeof cards[1].args === 'object' && 'path' in cards[1].args
+    ? cards[1].args.path
+    : undefined;
+  check('call args survive for the card detail views',
+    bashArgs === 'rg -n needle src/' && readArgs === 'src/lib.rs');
+  const bash = history.items.find((item) => item.kind === 'bash');
+  check('bash execution row keeps command, output, and done status',
+    bash?.kind === 'bash' && bash.command === 'make verify' && bash.output === 'ok' && bash.status === 'done',
+    JSON.stringify(bash));
+  const orphan = history.items.find((item) => item.kind === 'toolResult');
+  check('orphan tool result is kept as its own bounded row', orphan?.kind === 'toolResult' && orphan.text === '', JSON.stringify(orphan));
 }
+
+// Required row contract: every row is `{ id?, message: { role } }`. A
+// malformed row rejects the WHOLE payload (never a half-valid/empty success
+// that would overwrite last-good), and the role is a closed enum.
+check(
+  'a row without its message record rejects the payload',
+  rejection(wire([{ id: 'x' }])).includes('invalid message row'),
+  rejection(wire([{ id: 'x' }])),
+);
+check(
+  'a non-record message rejects the payload',
+  rejection(wire([{ id: 'x', message: null }])).includes('invalid message row'),
+  rejection(wire([{ id: 'x', message: null }])),
+);
+check(
+  'a non-string message role rejects the payload',
+  rejection(wire([{ id: 'x', message: { role: 7 } }])).includes('invalid message row'),
+  rejection(wire([{ id: 'x', message: { role: 7 } }])),
+);
+check(
+  'an unknown message role rejects the payload',
+  rejection(wire([{ message: { role: 'vendor' } }])).includes('invalid message row'),
+  rejection(wire([{ message: { role: 'vendor' } }])),
+);
+check(
+  'one malformed row rejects the whole payload (no half-valid list)',
+  rejection(wire([
+    { message: { role: 'user', content: [{ type: 'text', text: 'real row' }] } },
+    { id: 'bad' },
+  ])).includes('invalid message row'),
+  rejection(wire([
+    { message: { role: 'user', content: [{ type: 'text', text: 'real row' }] } },
+    { id: 'bad' },
+  ])),
+);
+check(
+  'a row without an id remains legal',
+  projectAgentHistory(
+    wire([{ message: { role: 'user', content: [{ type: 'text', text: 'only' }] } }]),
+    'child-agent',
+  ).items.length === 1,
+);
+check(
+  'an empty messages array remains a legal empty response',
+  projectAgentHistory(wire([]), 'child-agent').items.length === 0,
+);
+
+// Display contract: user/assistant/toolResult content is a block array; bash
+// command/output are strings; custom display is a boolean. These are the
+// fields `public_history_message` always emits and the renderer depends on.
+check(
+  'non-array message content rejects the payload',
+  rejection(wire([{ message: { role: 'assistant', content: 42 } }])).includes('invalid message row'),
+);
+check(
+  'a non-record content block rejects the payload',
+  rejection(wire([{ message: { role: 'assistant', content: [null] } }])).includes('invalid message row'),
+);
+check(
+  'a block without a type rejects the payload',
+  rejection(wire([{ message: { role: 'assistant', content: [{}] } }])).includes('invalid message row'),
+);
+check(
+  'a text block without text rejects the payload',
+  rejection(wire([{ message: { role: 'assistant', content: [{ type: 'text' }] } }])).includes('invalid message row'),
+);
+check(
+  'an image block without mimeType rejects the payload',
+  rejection(wire([{ message: { role: 'assistant', content: [{ type: 'image', data: 'aGk=' }] } }])).includes('invalid message row'),
+);
+check(
+  'a toolCall block without id/name rejects the payload',
+  rejection(wire([{ message: { role: 'assistant', content: [{ type: 'toolCall', arguments: {} }] } }])).includes('invalid message row'),
+);
+check(
+  'an unknown block type rejects the payload',
+  rejection(wire([{ message: { role: 'assistant', content: [{ type: 'vendor' }] } }])).includes('invalid message row'),
+);
+check(
+  'bash command/output must be strings',
+  rejection(wire([{ message: { role: 'bashExecution', command: 42, output: 'ok' } }])).includes('invalid message row')
+    && rejection(wire([{ message: { role: 'bashExecution', command: 'ls', output: null } }])).includes('invalid message row'),
+);
+check(
+  'custom display must be a boolean',
+  rejection(wire([{ message: { role: 'custom', customType: 'notice', display: 'yes', content: 'hi' } }])).includes('invalid message row'),
+);
+{
+  const user = projectAgentHistory(
+    wire([{ message: { role: 'user', content: [{ type: 'text', text: 'hi' }, { type: 'image', data: 'aGk=', mimeType: 'image/png' }] } }]),
+    'child-agent',
+  ).items[0];
+  check('valid text and image blocks project',
+    user?.kind === 'user' && user.text === 'hi' && user.images?.length === 1,
+    JSON.stringify(user));
+  const tool = projectAgentHistory(
+    wire([
+      { message: { role: 'assistant', content: [{ type: 'toolCall', id: 'call-1', name: 'bash', arguments: { command: 'ls' } }] } },
+      { message: { role: 'toolResult', toolCallId: 'call-1', content: [{ type: 'text', text: 'ok' }], isError: false } },
+    ]),
+    'child-agent',
+  ).items[0];
+  check('valid toolCall/toolResult controls still project',
+    tool?.kind === 'toolCard' && tool.toolCallId === 'call-1' && tool.status === 'done' && tool.result === 'ok',
+    JSON.stringify(tool));
+  const bash = projectAgentHistory(
+    wire([{ message: { role: 'bashExecution', command: 'ls', output: 'ok' } }]),
+    'child-agent',
+  ).items[0];
+  check('valid bash command/output projects', bash?.kind === 'bash' && bash.command === 'ls' && bash.output === 'ok');
+  const custom = projectAgentHistory(
+    wire([{ message: { role: 'custom', customType: 'notice', display: true, content: 'hi' } }]),
+    'child-agent',
+  ).items[0];
+  check('valid custom display projects', custom?.kind === 'custom' && custom.label === 'notice');
+}
+
+// ---- renderSubagentHistory → real SurfaceItems (SSR) ------------------------
+{
+  const history = projectAgentHistory(
+    wire([
+      { id: 'u-1', message: { role: 'user', content: [{ type: 'text', text: 'steer the child' }] } },
+      {
+        id: 'a-1',
+        message: {
+          role: 'assistant',
+          content: [
+            { type: 'thinking', thinking: 'plan first' },
+            { type: 'text', text: 'details live in [the tracker](https://example.com/tracker/1)' },
+            { type: 'toolCall', id: 'call-1', name: 'bash', arguments: { command: 'rg -n needle src/' } },
+          ],
+        },
+      },
+      { message: { role: 'toolResult', toolCallId: 'call-1', content: [{ type: 'text', text: 'src/x.rs:1:needle' }], isError: false } },
+      { message: { role: 'bashExecution', command: 'make verify', output: 'all green', exitCode: 0 } },
+      { message: { role: 'toolResult', toolCallId: 'orphan', content: [{ type: 'text', text: '' }], isError: true } },
+      { id: 'u-2', message: { role: 'user', content: [{ type: 'text', text: 'with image' }, { type: 'image', mimeType: 'image/png', data: 'aGk=' }] } },
+    ]),
+    'child-agent',
+  );
+  const html = renderToStaticMarkup(renderSubagentHistory(history.items));
+  check('thinking renders through the shared thinking fold',
+    html.includes('class="thinking"') && html.includes('plan first'), html.slice(0, 800));
+  check('assistant prose renders through the markdown pipeline',
+    html.includes('details live in'), html.slice(0, 800));
+  check('external URL survives ownerless rendering as a real anchor',
+    html.includes('href="https://example.com/tracker/1"'), html.slice(0, 1200));
+  check('tool call renders as the shared ToolCard with command and result',
+    html.includes('tool-card') && html.includes('rg -n needle src/') && html.includes('src/x.rs:1:needle'),
+    html.slice(0, 2000));
+  check('bash execution renders as the shared BashCard with done status',
+    html.includes('msg--bash') && html.includes('make verify') && html.includes('all green'));
+  check('empty tool result renders its explicit empty marker, not nothing',
+    html.includes('(empty tool result)'));
+  check('user image renders as an inline data image',
+    html.includes('msg--user__image') && html.includes('data:image/png;base64,aGk='));
+  check('rows carry the ownerless session stamp',
+    html.includes('data-session-id=""') && html.includes('data-workspace-cwd=""'));
+  check('no flat history-row markup leaks back in',
+    !html.includes('data-history-kind') && !html.includes('subagent-details__history'));
+}
+
+// ---- ownerless click boundary ----------------------------------------------
+interface MiniNode {
+  nodeType: number;
+  tag: string;
+  textContent: string | null;
+  attrs: Record<string, string>;
+  parent: MiniNode | null;
+  getAttribute(name: string): string | null;
+  closest(selector: string): MiniNode | null;
+}
+function miniNode(tag: string, attrs: Record<string, string>, textContent: string | null, parent: MiniNode | null): MiniNode {
+  const node: MiniNode = {
+    nodeType: 1,
+    tag,
+    textContent,
+    attrs,
+    parent,
+    getAttribute(name: string) { return attrs[name] ?? null; },
+    closest(selector: string) {
+      const attr = /^\[([a-zA-Z0-9_-]+)(?:="([^"]*)")?\]$/.exec(selector);
+      const cls = selector.includes('.') ? /^(?:(\w+)?\.)?([\w-]+)$/.exec(selector) : null;
+      let current: MiniNode | null = node;
+      while (current !== null) {
+        if (attr) {
+          const value = current.attrs[attr[1]];
+          if (value !== undefined && (attr[2] === undefined || value === attr[2])) return current;
+        } else if (cls && (cls[1] === undefined || current.tag === cls[1])
+            && (current.attrs.class ?? '').split(' ').includes(cls[2])) {
+          return current;
+        } else if (!attr && !cls && current.tag === selector) {
+          return current;
+        }
+        current = current.parent;
+      }
+      return null;
+    },
+  };
+  return node;
+}
+function click(target: MiniNode) {
+  const event = { target, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } };
+  return { event, handled: dispatchMarkdownPathClick(event, () => { throw new Error('ownerless pane must never open a path'); }) };
+}
+{
+  const pane = miniNode('div', { 'data-path-navigation': 'disabled', 'data-details-history': '' }, null, null);
+  const row = miniNode('div', { 'data-session-id': '', 'data-workspace-cwd': '' }, null, pane);
+  const relAnchor = miniNode('a', { href: 'docs/report.md' }, 'the report', row);
+  const rel = click(relAnchor);
+  check('relative markdown link inside the disabled pane is swallowed',
+    rel.handled === true && rel.event.defaultPrevented === true);
+  const extAnchor = miniNode('a', { href: 'https://example.com/tracker/1' }, 'tracker', row);
+  const ext = click(extAnchor);
+  check('external URL inside the disabled pane keeps default navigation',
+    ext.handled === false && ext.event.defaultPrevented === false);
+  const fragAnchor = miniNode('a', { href: '#section' }, 'section', row);
+  const frag = click(fragAnchor);
+  check('same-document fragment keeps default navigation',
+    frag.handled === false && frag.event.defaultPrevented === false);
+  const pathChip = miniNode('span', { 'data-md-path': 'src/lib.rs', 'data-md-line': '12' }, 'src/lib.rs:12', row);
+  const chip = click(pathChip);
+  check('structured tool path chip inside the disabled pane is swallowed',
+    chip.handled === true && chip.event.defaultPrevented === true);
+  const codePath = miniNode('code', { class: 'md-code' }, 'src/lib.rs:3', row);
+  const code = click(codePath);
+  check('code-span path inside the disabled pane is swallowed',
+    code.handled === true && code.event.defaultPrevented === true);
+}
+
 
 if (failures.length > 0) {
   console.error(`subagentsProjection.test: ${failures.length}/${ran} failure(s)`);

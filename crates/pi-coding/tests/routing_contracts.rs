@@ -151,7 +151,7 @@ fn recording_factory(contexts: Arc<Mutex<Vec<Context>>>) -> ChildSessionFactory 
                 .boxed()
             });
             Session::new(SessionOptions {
-                model: request.model,
+                model: Some(request.model),
                 cwd: std::env::current_dir().expect("current directory"),
                 system_prompt: request.system_prompt,
                 thinking_level: request.thinking_level.unwrap_or(ThinkingLevel::Off),
@@ -196,7 +196,7 @@ fn runtime(
     config.default_agent = "writer".to_owned();
     config.skills = skills;
     config.agent_settings = agent_settings;
-    config.parent_model = model();
+    config.parent_model = Some(model());
     OrchestrationRuntime::new(config, recording_factory(contexts)).expect("runtime")
 }
 
@@ -207,7 +207,7 @@ fn runtime_with_agents(
     let mut config = OrchestrationConfig::new(AgentCatalog::from_agents(agents), artifacts)
         .with_selector_settings(selector_settings());
     config.default_agent = config.catalog.agents()[0].name.clone();
-    config.parent_model = model();
+    config.parent_model = Some(model());
     OrchestrationRuntime::new(config, Arc::new(|_| Box::pin(async { unreachable!() })))
         .expect("runtime")
 }
@@ -422,7 +422,7 @@ async fn exact_agent_mentions_route_before_overlapping_skills_and_ambiguous_ment
     .with_selector_settings(selector_settings());
     config.default_agent = "writer".to_owned();
     config.skills = vec![research];
-    config.parent_model = model();
+    config.parent_model = Some(model());
     let runtime = OrchestrationRuntime::new(config, recording_factory(contexts.clone()))?;
     assert_eq!(
         runtime.select_agent("Have researcher study this", None),
@@ -606,7 +606,7 @@ async fn workflow_catalog_diagnostics_fail_for_missing_and_disabled_agents() -> 
     );
     config.default_agent = "writer".to_owned();
     config.skills = vec![research];
-    config.parent_model = model();
+    config.parent_model = Some(model());
     let runtime =
         OrchestrationRuntime::new(config, Arc::new(|_| Box::pin(async { unreachable!() })))?;
 
@@ -779,7 +779,7 @@ async fn workflow_catalog_diagnostics_fail_for_missing_and_disabled_agents() -> 
     )
     .with_agent_settings(disabled_settings);
     disabled_config.default_agent = "writer".to_owned();
-    disabled_config.parent_model = model();
+    disabled_config.parent_model = Some(model());
     let disabled_runtime = OrchestrationRuntime::new(
         disabled_config,
         Arc::new(|_| Box::pin(async { unreachable!() })),

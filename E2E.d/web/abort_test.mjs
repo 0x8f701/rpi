@@ -41,15 +41,33 @@ async function installSocketHarness(page) {
   await page.addInitScript(() => {
     const NativeWebSocket = window.WebSocket;
     const frames = { sent: [], received: [] };
+    const held = [];
     class TracedWebSocket extends NativeWebSocket {
       constructor(...args) {
         super(...args);
         this.addEventListener('message', (event) => {
-          if (typeof event.data === 'string') frames.received.push(event.data);
+          if (typeof event.data !== 'string') return;
+          let frame = null;
+          try { frame = JSON.parse(event.data); } catch { frame = null; }
+          const requestId = frame && typeof frame.id === 'string' ? frame.id : '';
+          const item = requestId === '' ? undefined : held.find((candidate) => candidate.id === requestId);
+          if (item && window.__rpiHoldSettledGetMessages === true && item.sessionId === window.__rpiHoldSessionId) {
+            item.data = event.data;
+            event.stopImmediatePropagation();
+            return;
+          }
+          frames.received.push(event.data);
         });
       }
       send(data) {
-        if (typeof data === 'string') frames.sent.push(data);
+        if (typeof data === 'string') {
+          frames.sent.push(data);
+          let frame = null;
+          try { frame = JSON.parse(data); } catch { frame = null; }
+          if (frame && frame.type === 'get_messages' && typeof frame.id === 'string' && frame.id !== '' && !held.some((item) => item.id === frame.id)) {
+            held.push({ id: frame.id, sessionId: frame.sessionId, duringHold: window.__rpiHoldSettledGetMessages === true, data: null, socket: this });
+          }
+        }
         return super.send(data);
       }
     }
@@ -58,6 +76,20 @@ async function installSocketHarness(page) {
     }
     window.WebSocket = TracedWebSocket;
     window.__rpiAbortFrames = frames;
+    window.__rpiAbortHeld = held;
+    window.__rpiReleaseHeldGetMessages = (sessionId) => {
+      const ready = held.filter((item) => item.sessionId === sessionId && typeof item.data === 'string' && item.data !== '');
+      if (ready.length === 0 || ready.some((item) => item.socket.readyState !== NativeWebSocket.OPEN)) return [];
+      window.__rpiHoldSettledGetMessages = false;
+      const ids = [];
+      for (const item of ready) {
+        frames.received.push(item.data);
+        item.socket.dispatchEvent(new MessageEvent('message', { data: item.data }));
+        ids.push(item.id);
+        item.data = null;
+      }
+      return ids;
+    };
   });
 }
 
@@ -146,6 +178,24 @@ async function main() {
     // EARLY abort: the unified composer action changes to Stop as soon as the
     // first delta is visible. The next chunks arrive 0.6s apart.
     await waitFor(page, () => document.getElementById('send-btn')?.getAttribute('aria-label') === 'Stop generating', 'unified action never switched to Stop');
+    const savingWhileStreaming = await page.evaluate((prefix) => {
+      const row = [...document.querySelectorAll('.msg--assistant')].find((node) => (node.textContent || '').includes(prefix));
+      if (!row) return true;
+      return (row.textContent || '').includes('Saving reply…') || row.querySelector('.assistant-star-pending') !== null;
+    }, slowPrefix);
+    if (savingWhileStreaming) fail('streaming reply showed "Saving reply…"');
+    const liveTurn = await page.evaluate((prefix) => {
+      const row = [...document.querySelectorAll('.msg--assistant')].find((node) => (node.querySelector('.assistant-text')?.textContent || '').includes(prefix));
+      const streamId = row?.querySelector('[data-stream-item-id]')?.getAttribute('data-stream-item-id') || '';
+      return { itemId: row?.getAttribute('data-item-id') || '', streamId, entryId: row?.getAttribute('data-entry-id') || '' };
+    }, slowPrefix);
+    if (!liveTurn.itemId || liveTurn.itemId !== liveTurn.streamId || liveTurn.entryId !== '') {
+      fail(`current turn is not an unhydrated live row before abort: ${JSON.stringify(liveTurn)}`);
+    }
+    await page.evaluate((sessionId) => {
+      window.__rpiHoldSessionId = sessionId;
+      window.__rpiHoldSettledGetMessages = true;
+    }, promptFrame.sessionId);
     await page.screenshot({ path: `${evidence}/abort-active.png`, fullPage: true });
     await page.click('#send-btn');
     const abortFrame = await waitForFrame(page, 'sent', { type: 'abort', sessionId: promptFrame.sessionId }, 'typed abort frame missing');
@@ -199,6 +249,57 @@ async function main() {
     if (toastState.anyError) fail('B2: an unexpected error toast appeared alongside the abort');
     await page.screenshot({ path: `${evidence}/abort-toast.png`, fullPage: true });
 
+    const prehydrate = await page.evaluate((itemId) => {
+      const rows = [...document.querySelectorAll('.msg--assistant')].map((node) => ({
+        itemId: node.getAttribute('data-item-id') || '',
+        entryId: node.getAttribute('data-entry-id') || '',
+        star: node.querySelector('.assistant-star-toggle') !== null,
+        stream: node.querySelector('[data-stream-item-id]')?.getAttribute('data-stream-item-id') || '',
+      }));
+      const row = document.querySelectorAll('.msg--assistant').length
+        ? [...document.querySelectorAll('.msg--assistant')].find((node) => node.getAttribute('data-item-id') === itemId)
+        : null;
+      const text = row?.querySelector('.assistant-text')?.textContent || '';
+      return {
+        itemId,
+        found: row !== null,
+        final: row !== null && row.querySelector('[data-stream-item-id]') === null,
+        visible: text.length > 0,
+        saving: (row?.textContent || '').includes('Saving reply…') || row?.querySelector('.assistant-star-pending') !== null,
+        star: row?.querySelector('.assistant-star-toggle') !== null,
+        entryId: row?.getAttribute('data-entry-id') || '',
+        rows,
+      };
+    }, liveTurn.itemId);
+    if (!prehydrate.found || !prehydrate.final || !prehydrate.visible || prehydrate.saving || prehydrate.star || prehydrate.entryId !== '') {
+      const wire = await page.evaluate((sessionId) => window.__rpiAbortHeld.filter((item) => item.sessionId === sessionId).map((item) => ({
+        id: item.id, duringHold: item.duringHold === true, data: typeof item.data,
+      })), promptFrame.sessionId);
+      const lines = [
+        `item=${prehydrate.itemId} found=${prehydrate.found} final=${prehydrate.final} visible=${prehydrate.visible} saving=${prehydrate.saving} star=${prehydrate.star} entryId=${prehydrate.entryId}`,
+        `rows=${JSON.stringify(prehydrate.rows)}`,
+        `held=${JSON.stringify(wire)}`,
+      ];
+      for (const line of lines.slice(0, 8)) console.error(`web-abort: prehydrate-meta: ${line}`);
+      fail('current turn final is not a visible null-id row before hydration');
+    }
+    await page.screenshot({ path: `${evidence}/abort-prehydrate-desktop.png`, fullPage: true });
+    const desktopViewport = page.viewportSize();
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.screenshot({ path: `${evidence}/abort-prehydrate-mobile.png`, fullPage: true });
+    if (desktopViewport) await page.setViewportSize(desktopViewport);
+    const released = await page.evaluate((sessionId) => window.__rpiReleaseHeldGetMessages(sessionId), promptFrame.sessionId);
+    if (!Array.isArray(released) || released.length === 0 || released.some((id) => typeof id !== 'string' || id === '')) {
+      fail('held get_messages responses were not released');
+    }
+    const savingReplyCount = await page.evaluate(() => document.querySelectorAll('.assistant-star-pending').length);
+    if (savingReplyCount !== 0) fail(`stop reply stuck on "Saving reply…": ${savingReplyCount} pending node(s) after settle`);
+    const abortedEntryId = await page.evaluate(() => {
+      const row = document.querySelector('.msg--assistant[data-entry-id]');
+      return row ? row.getAttribute('data-entry-id') : '';
+    });
+    if (typeof abortedEntryId !== 'string' || abortedEntryId === '') fail('aborted assistant reply has no canonical data-entry-id');
+
     // Recovery: request 2 in the mock is instant again.
     await page.fill('#prompt-input', 'recovery prompt');
     await page.press('#prompt-input', 'Enter');
@@ -209,6 +310,34 @@ async function main() {
       30000,
       fastReply
     );
+    // Stability + usability: the aborted reply keeps the SAME canonical id
+    // across the recovery turn's refills, ids stay distinct per reply, and
+    // the ORIGINAL (aborted) reply's star is usable.
+    const abortedEntryIdAfter = await page.evaluate(() => {
+      const row = document.querySelector('.msg--assistant[data-entry-id]');
+      return row ? row.getAttribute('data-entry-id') : '';
+    });
+    if (abortedEntryIdAfter !== abortedEntryId) {
+      fail(`stop reply entry id jumped across the recovery refill: "${abortedEntryId}" -> "${abortedEntryIdAfter}"`);
+    }
+    const allEntryIds = await page.evaluate(() =>
+      Array.from(document.querySelectorAll('.msg--assistant[data-entry-id]')).map((row) => row.getAttribute('data-entry-id')),
+    );
+    if (allEntryIds.length !== new Set(allEntryIds).size || allEntryIds.some((id) => !id)) {
+      fail(`assistant reply entry ids are not canonical per reply: ${JSON.stringify(allEntryIds)}`);
+    }
+    const savingReplyAfterRecovery = await page.evaluate(() => document.querySelectorAll('.assistant-star-pending').length);
+    if (savingReplyAfterRecovery !== 0) fail(`"Saving reply…" pending nodes remain after settle: ${savingReplyAfterRecovery}`);
+    await page.click('.msg--assistant .assistant-star-toggle');
+    await waitFor(
+      page,
+      () => document.querySelector('.msg--assistant .assistant-star-toggle')?.getAttribute('aria-pressed') === 'true',
+      'starring the original aborted reply never registered'
+    );
+    const starErrorToast = await page.evaluate(() =>
+      Array.from(document.querySelectorAll('#toasts .toast')).some((t) => t.classList.contains('toast--error')),
+    );
+    if (starErrorToast) fail('starring the aborted reply surfaced an error toast');
 
     if (pageErrors.length || consoleErrors.length) {
       fail(`browser errors: ${JSON.stringify({ pageErrors, consoleErrors })}`);

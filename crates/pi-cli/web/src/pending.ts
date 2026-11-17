@@ -224,6 +224,8 @@ export interface PendingCommandError extends Error {
   rpc?: boolean;
   toastOwned?: boolean;
   rpcCode?: RpcErrorCode;
+  /** Failure payload retained for file_ambiguous candidate parsing. */
+  rpcData?: unknown;
 }
 
 function pendingCommandError(message: string, rpc = false, toastOwned = false): PendingCommandError {

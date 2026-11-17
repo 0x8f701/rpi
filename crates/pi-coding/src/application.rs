@@ -1540,7 +1540,14 @@ struct ApplicationInner {
     /// deterministically interleaved against the retirement protocol.
     orchestration_commit_gate: Mutex<Option<ApplicationCutoverTestGate>>,
     restart_checkpointed: AtomicBool,
+    /// A model selected while a turn was active marks the live generation for
+    /// restaging; the next prompt admission rebuilds provider HTTP authority
+    /// before any side effect. Never a restart requirement.
+    generation_refresh_pending: AtomicBool,
     prompt_before_turn_start_gate: Mutex<Option<ApplicationCutoverTestGate>>,
+    /// Test-only pause after a goal round rekeys and before `run_messages`
+    /// claims the session. Production never arms it.
+    goal_before_claim_gate: Mutex<Option<ApplicationCutoverTestGate>>,
     prompt_after_settle_gate: Mutex<Option<ApplicationCutoverTestGate>>,
     cutover_after_loop_commit_gate: Mutex<Option<ApplicationCutoverTestGate>>,
     cutover_after_resident_take_gate: Mutex<Option<ApplicationCutoverTestGate>>,
@@ -1642,13 +1649,38 @@ impl Drop for OuterTurnLifecycle {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct GoalWorkKey {
+pub(crate) struct GoalWorkKey {
     goal_id: String,
     revision: u64,
     /// Goal-state lifecycle epoch the reservation was made against; a newer
     /// lifecycle-changing commit invalidates the key (see
     /// [`crate::GoalState::lifecycle_revision`]).
     lifecycle_revision: u64,
+    /// Spawn-unique owner token. Stop + an immediate resume of an Active
+    /// goal re-keys the same goal id + epoch with no lifecycle commit, so
+    /// only this token distinguishes the old owner from its successor.
+    owner_token: uuid::Uuid,
+}
+
+/// Borrows the activation slot for the synchronous claim inside `begin_run`.
+/// The guard stays held until `claim` returns, so Stop cannot take the slot
+/// between the token check and `claim_exclusive`.
+pub(crate) struct GoalRunAdmission<'a> {
+    slot: &'a parking_lot::Mutex<Option<GoalWorkKey>>,
+    owner: &'a GoalWorkKey,
+}
+
+impl<'a> GoalRunAdmission<'a> {
+    pub(crate) fn claim<T>(&self, claim: impl FnOnce() -> Result<T>) -> Result<T> {
+        let slot = self.slot.lock();
+        if !slot
+            .as_ref()
+            .is_some_and(|current| goal_owner_key_matches(current, self.owner))
+        {
+            return Err(pi_agent::AbortError.into());
+        }
+        claim()
+    }
 }
 
 struct ApplicationExtensionHost {
@@ -1657,7 +1689,7 @@ struct ApplicationExtensionHost {
 
 impl Application {
     pub async fn new(session: Session) -> Self {
-        Self::build(session, None, None, None, None)
+        Self::build(session, None, None, None, None, false)
             .await
             .expect("validated Application bootstrap")
     }
@@ -1667,7 +1699,7 @@ impl Application {
         runtime: ExtensionRuntime,
         permissions: ExtensionPermissionSet,
     ) -> Self {
-        Self::build(session, Some((runtime, permissions)), None, None, None)
+        Self::build(session, Some((runtime, permissions)), None, None, None, false)
             .await
             .expect("validated Application bootstrap")
     }
@@ -1830,6 +1862,7 @@ impl Application {
             session,
             extension_runtime,
             orchestration_runtime,
+            orchestration_explicit,
             goal_tool_binding,
             todo_child_tool_binding,
         } = candidate;
@@ -1839,6 +1872,7 @@ impl Application {
             orchestration_runtime,
             goal_tool_binding,
             todo_child_tool_binding,
+            orchestration_explicit,
         )
         .await
     }
@@ -1851,6 +1885,7 @@ impl Application {
             session,
             extension_runtime,
             orchestration_runtime,
+            orchestration_explicit,
             goal_tool_binding,
             todo_child_tool_binding,
         } = candidate;
@@ -1871,16 +1906,27 @@ impl Application {
             session.session_dir(),
             resource.capabilities(),
         )?;
-        let model = session
-            .model()
-            .ok_or_else(|| anyhow!("session has no model"))?;
-        let request_auth = session.request_auth_for_model(&model).await?;
+        let model = session.model();
+        let request_auth = match model.as_ref() {
+            Some(model) => Some(session.request_auth_for_model(model).await?),
+            None => None,
+        };
+        let provider_authority = model
+            .as_ref()
+            .zip(request_auth.as_ref())
+            .map(|(model, request_auth)| {
+                crate::sandbox::http::ProviderAuthority::new(model, request_auth)
+            });
         let stream = session.stream_options().stream;
-        let image_generation =
-            Self::staged_image_generation_http(&session, &settings, &model, &request_auth).await?;
+        let image_generation = Self::staged_image_generation_http(
+            &session,
+            &settings,
+            model.as_ref(),
+            request_auth.as_ref(),
+        )
+        .await?;
         let http_requirements = crate::sandbox::SessionHttpRequirements::derive_with_builtins(
-            &model,
-            &request_auth,
+            provider_authority,
             &stream,
             image_generation
                 .as_ref()
@@ -2027,6 +2073,7 @@ impl Application {
             orchestration_runtime,
             goal_tool_binding,
             todo_child_tool_binding,
+            orchestration_explicit,
         );
         initial_runtime.bind_publication(publication.clone())?;
         let inner = Arc::new(ApplicationInner {
@@ -2045,6 +2092,7 @@ impl Application {
             cutover_before_spawn_gate: Mutex::new(None),
             orchestration_commit_gate: Mutex::new(None),
             prompt_before_turn_start_gate: Mutex::new(None),
+            goal_before_claim_gate: Mutex::new(None),
             prompt_after_settle_gate: Mutex::new(None),
             cutover_after_loop_commit_gate: Mutex::new(None),
             cutover_after_resident_take_gate: Mutex::new(None),
@@ -2058,6 +2106,7 @@ impl Application {
             repository_test_executor: Mutex::new(None),
             cleaned: AtomicBool::new(false),
             restart_checkpointed: AtomicBool::new(false),
+            generation_refresh_pending: AtomicBool::new(false),
         });
         let application = Self { inner };
         let active = application.runtime();
@@ -2101,7 +2150,7 @@ impl Application {
         session: Session,
         orchestration: crate::OrchestrationRuntime,
     ) -> Self {
-        Self::build(session, None, Some(orchestration), None, None)
+        Self::build(session, None, Some(orchestration), None, None, false)
             .await
             .expect("validated Application bootstrap")
     }
@@ -2109,19 +2158,28 @@ impl Application {
     async fn staged_image_generation_http(
         session: &Session,
         settings: &crate::Settings,
-        selected_model: &Model,
-        selected_auth: &crate::RequestAuth,
+        selected_model: Option<&Model>,
+        selected_auth: Option<&crate::RequestAuth>,
     ) -> Result<Option<StagedImageGenerationHttp>> {
         let runtime = settings.image_gen_runtime();
+        // Without a configured `images.genModel` the active session model is
+        // the generation model; an absent session model means there is no
+        // image-generation provider authority at all (never a default model).
         let model = match runtime.gen_model.as_deref() {
             Some(spec) => crate::resolve_model(spec).map_err(|error| anyhow!(error))?,
-            None => selected_model.clone(),
+            None => match selected_model {
+                Some(model) => model.clone(),
+                None => return Ok(None),
+            },
         };
         if !model.image_generation {
             return Ok(None);
         }
-        let auth = if model == *selected_model {
-            selected_auth.clone()
+        let auth = if selected_model.is_some_and(|selected| model == *selected) {
+            match selected_auth {
+                Some(auth) => auth.clone(),
+                None => return Ok(None),
+            }
         } else {
             session.request_auth_for_model(&model).await?
         };
@@ -2238,10 +2296,17 @@ impl Application {
         lease: BootstrapGenerationLease,
     ) -> Result<(Arc<ApplicationPublication>, crate::SessionResourceUpdate)> {
         let provenance = lease.provenance().clone();
-        let model = session
-            .model()
-            .ok_or_else(|| anyhow!("session has no model"))?;
-        let request_auth = session.request_auth_for_model(&model).await?;
+        let model = session.model();
+        let request_auth = match model.as_ref() {
+            Some(model) => Some(session.request_auth_for_model(model).await?),
+            None => None,
+        };
+        let provider_authority = model
+            .as_ref()
+            .zip(request_auth.as_ref())
+            .map(|(model, request_auth)| {
+                crate::sandbox::http::ProviderAuthority::new(model, request_auth)
+            });
         let stream = session.stream_options().stream;
         let composed_trust = Self::compose_candidate_host_trust(
             session,
@@ -2253,8 +2318,13 @@ impl Application {
         let candidate =
             resources.stage_initial_candidate(provenance.clone(), composed_trust.as_ref())?;
         let settings = candidate.snapshot().settings.clone();
-        let image_generation =
-            Self::staged_image_generation_http(session, &settings, &model, &request_auth).await?;
+        let image_generation = Self::staged_image_generation_http(
+            session,
+            &settings,
+            model.as_ref(),
+            request_auth.as_ref(),
+        )
+        .await?;
         let policy_inputs = crate::sandbox::SessionPolicyInputs::validate_with_capabilities(
             session.session_policy_id(),
             session.workspace_roots().clone(),
@@ -2269,8 +2339,7 @@ impl Application {
             provenance.clone(),
             candidate.capabilities(),
             policy_inputs,
-            &model,
-            &request_auth,
+            provider_authority,
             &stream,
             image_generation
                 .as_ref()
@@ -2339,8 +2408,8 @@ impl Application {
             let restaged_image = Self::staged_image_generation_http(
                 session,
                 &restaged_settings,
-                &model,
-                &request_auth,
+                model.as_ref(),
+                request_auth.as_ref(),
             )
             .await?;
             let restaged_inputs = crate::sandbox::SessionPolicyInputs::validate_with_capabilities(
@@ -2350,6 +2419,12 @@ impl Application {
                 session.session_dir(),
                 restaged.capabilities(),
             )?;
+            let provider_authority = model
+                .as_ref()
+                .zip(request_auth.as_ref())
+                .map(|(model, request_auth)| {
+                    crate::sandbox::http::ProviderAuthority::new(model, request_auth)
+                });
             let restaged_sandbox = crate::sandbox::build_sandbox_generation(
                 restaged_settings.sandbox.as_ref(),
                 &restaged_settings.mcp_servers,
@@ -2357,8 +2432,7 @@ impl Application {
                 provenance.clone(),
                 restaged.capabilities(),
                 restaged_inputs,
-                &model,
-                &request_auth,
+                provider_authority,
                 &stream,
                 restaged_image
                     .as_ref()
@@ -2451,6 +2525,7 @@ impl Application {
         orchestration_runtime: Option<crate::OrchestrationRuntime>,
         goal_tool_binding: Option<GoalToolBinding>,
         todo_child_tool_binding: Option<TodoChildToolBinding>,
+        orchestration_explicit: bool,
     ) -> Result<Self> {
         let lease = BootstrapGenerationLease::new()?;
         let attached_resources = session.resource_manager();
@@ -2484,6 +2559,7 @@ impl Application {
             orchestration_runtime,
             goal_tool_binding,
             todo_child_tool_binding,
+            orchestration_explicit,
         );
         initial_runtime.bind_publication(publication.clone())?;
         if let Some(orchestration) = initial_runtime.orchestration_runtime() {
@@ -2505,6 +2581,7 @@ impl Application {
             cutover_before_spawn_gate: Mutex::new(None),
             orchestration_commit_gate: Mutex::new(None),
             prompt_before_turn_start_gate: Mutex::new(None),
+            goal_before_claim_gate: Mutex::new(None),
             prompt_after_settle_gate: Mutex::new(None),
             cutover_after_loop_commit_gate: Mutex::new(None),
             cutover_after_resident_take_gate: Mutex::new(None),
@@ -2518,6 +2595,7 @@ impl Application {
             repository_test_executor: Mutex::new(None),
             cleaned: AtomicBool::new(false),
             restart_checkpointed: AtomicBool::new(false),
+            generation_refresh_pending: AtomicBool::new(false),
         });
         let application = Self { inner };
         let generation = application.runtime();
@@ -3662,6 +3740,7 @@ impl Application {
             delta,
             state: self.goal_state(),
         });
+        self.runtime().goal_work_changed.notify_waiters();
         Ok(goal)
     }
 
@@ -3688,22 +3767,17 @@ impl Application {
             operation,
             state: self.goal_state(),
         });
+        self.runtime().goal_work_changed.notify_waiters();
         Ok(goal)
     }
 
-    /// Reserves the single activation slot for the given committed state
-    /// snapshot and spawns the continuation turn.
-    ///
-    /// The snapshot MUST be the result of the create/resume transition this
-    /// reservation belongs to, delivered through
-    /// [`crate::GoalRuntime::create_and_reserve`] /
-    /// [`crate::GoalRuntime::resume_and_reserve`] inside the same lock hold
-    /// as the commit, so the reservation is linearized with every lifecycle
-    /// transition: pause/complete/drop/budget exhaustion/fork can only
-    /// invalidate this reservation after its commit, and a newer create or
-    /// resume can only supersede it after its own commit — the ordering can
-    /// never invert. Repeating the reservation for the same goal revision
-    /// returns [`GoalActivationOutcome::AlreadyActive`].
+    /// Reserves the single activation slot for a committed create/resume
+    /// snapshot, delivered inside the same lock hold as the commit so the
+    /// reservation is linearized with every lifecycle transition. Owner
+    /// identity is goal id + lifecycle epoch + spawn-unique token: a repeat
+    /// reservation for the same owner returns
+    /// [`GoalActivationOutcome::AlreadyActive`] and leaves the slot — with
+    /// its existing token — unchanged.
     fn reserve_goal_work(
         &self,
         active: &Arc<runtime::ApplicationRuntime>,
@@ -3718,6 +3792,7 @@ impl Application {
             goal_id: goal.id.clone(),
             revision: state.revision,
             lifecycle_revision: state.lifecycle_revision,
+            owner_token: uuid::Uuid::now_v7(),
         };
         let turn_guard = active.turn_gate.clone().try_lock_owned().ok();
         let outcome = if turn_guard.is_some() {
@@ -3727,11 +3802,15 @@ impl Application {
         };
         {
             let mut activation = active.goal_work_activation.lock();
-            if activation.as_ref() == Some(&key) {
+            if activation
+                .as_ref()
+                .is_some_and(|current| goal_owner_identity_matches(current, &key))
+            {
                 return GoalActivationOutcome::AlreadyActive;
             }
             *activation = Some(key.clone());
         }
+        active.goal_work_changed.notify_waiters();
         active.goal_work_pending.fetch_add(1, Ordering::AcqRel);
         let inner = Arc::downgrade(&self.inner);
         tokio::spawn(run_goal_work(inner, active.clone(), key, turn_guard));
@@ -3752,6 +3831,7 @@ impl Application {
                 operation: "fork_clone",
                 state: goal_runtime.get(),
             });
+            active.goal_work_changed.notify_waiters();
         } else {
             self.inner.pause_goal_after_resume()?;
         }
@@ -3775,6 +3855,16 @@ impl Application {
     pub fn arm_prompt_before_turn_start_gate_for_test(&self) -> ApplicationCutoverTestGate {
         let gate = ApplicationCutoverTestGate::default();
         *self.inner.prompt_before_turn_start_gate.lock() = Some(gate.clone());
+        gate
+    }
+
+    /// Arms a one-shot pause after the next goal round rekeys its slot and
+    /// before that round claims the session. Stop during the pause is the
+    /// between-rounds window: the slot is gone and no run is active yet.
+    #[doc(hidden)]
+    pub fn arm_goal_before_claim_gate_for_test(&self) -> ApplicationCutoverTestGate {
+        let gate = ApplicationCutoverTestGate::default();
+        *self.inner.goal_before_claim_gate.lock() = Some(gate.clone());
         gate
     }
 
@@ -4091,37 +4181,81 @@ impl Application {
         Self::snapshot_for_runtime(self.runtime()).await
     }
     async fn state_for_runtime(active: Arc<runtime::ApplicationRuntime>) -> ApplicationState {
+        // Temporary get_state incident diagnostics: per-phase enter/done
+        // lines with elapsed ms since fn entry, gated by the presence of the
+        // RPI_STATE_TRACE flag (its contents are never read). The op id pairs
+        // interleaved concurrent calls.
+        static STATE_READ_OP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let op = STATE_READ_OP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tracing = std::env::var_os("RPI_STATE_TRACE").is_some();
+        let started = std::time::Instant::now();
+        let trace = |phase: &str, event: &str| {
+            if tracing {
+                eprintln!(
+                    "state_read op={op} phase={phase} {event} elapsed_ms={}",
+                    started.elapsed().as_millis()
+                );
+            }
+        };
         let session = &active.session;
+        trace("recorder_info", "enter");
         let (session_id, session_file) =
             session.recorder_info().map_or((None, None), |(id, path)| {
                 (Some(id), Some(path.to_string_lossy().into_owned()))
             });
+        trace("recorder_info", "done");
+        trace("todo_dag", "enter");
         let (todo_execution_status, todo_failure_reason) = {
             let coordinator = active.todo_dag.lock();
             (coordinator.status, coordinator.failure_reason.clone())
         };
+        trace("todo_dag", "done");
+        trace("live_queue", "enter");
         let (pending_message_count, queued_steering) = Self::live_queue_projection(session).await;
+        trace("live_queue", "done");
+        trace("model_history", "enter");
+        let model = session.model();
+        let thinking_level = session.thinking_level();
+        let is_streaming = Self::is_streaming_for_runtime(&active);
+        let is_compacting = session.is_compacting();
+        let steering_mode = session.steering_mode().await;
+        let follow_up_mode = session.follow_up_mode().await;
+        let session_name = session.session_name();
+        let auto_compaction_enabled = session.auto_compaction_enabled();
+        let message_count = session.history().len();
+        trace("model_history", "done");
+        trace("loader_drop_1", "enter");
+        let skipped_idless = session.loader_drop_counts().0;
+        trace("loader_drop_1", "done");
+        trace("loader_drop_2", "enter");
+        let undecodable_messages = session.loader_drop_counts().1;
+        trace("loader_drop_2", "done");
+        trace("goal_todo", "enter");
+        let last_selection = session.last_selection();
+        let todo_phases = session.todo_state().phases;
+        let goal = session.goal_runtime().get();
+        trace("goal_todo", "done");
         ApplicationState {
-            model: session.model(),
-            thinking_level: session.thinking_level(),
-            is_streaming: Self::is_streaming_for_runtime(&active),
-            is_compacting: session.is_compacting(),
-            steering_mode: session.steering_mode().await,
-            follow_up_mode: session.follow_up_mode().await,
+            model,
+            thinking_level,
+            is_streaming,
+            is_compacting,
+            steering_mode,
+            follow_up_mode,
             session_file,
             session_id,
-            session_name: session.session_name(),
-            auto_compaction_enabled: session.auto_compaction_enabled(),
-            message_count: session.history().len(),
+            session_name,
+            auto_compaction_enabled,
+            message_count,
             pending_message_count,
-            skipped_idless: session.loader_drop_counts().0,
-            undecodable_messages: session.loader_drop_counts().1,
+            skipped_idless,
+            undecodable_messages,
             queued_steering,
-            last_selection: session.last_selection(),
-            todo_phases: session.todo_state().phases,
+            last_selection,
+            todo_phases,
             todo_execution_status,
             todo_failure_reason,
-            goal: session.goal_runtime().get(),
+            goal,
         }
     }
 
@@ -4223,6 +4357,19 @@ impl Application {
         } else {
             (message, images)
         };
+        // No model is configured: reject the prompt with the typed error before
+        // auto-Todo routing, selection, turn publication, history writes, or
+        // durable child recorder creation. Extension `Handled` semantics above
+        // are untouched; a request that would actually execute needs a model.
+        if self.runtime().session.model().is_none() {
+            return Err(anyhow::Error::new(pi_agent::ModelNotConfigured));
+        }
+        // Refresh and admission share the existing operation gate: a pending
+        // model-selection rebuild is committed before auto-Todo routing and
+        // before any turn is published, and a concurrent prompt cannot admit
+        // between the check and the rebuild.
+        let operation = self.inner.operation_gate.clone().lock_owned().await;
+        self.refresh_generation_for_selected_model_locked().await?;
         let active = self.runtime();
         let session = active.session.clone();
         let inner = self.inner.clone();
@@ -4255,7 +4402,6 @@ impl Application {
             inner.publish(ApplicationEvent::TodoChildRouted { receipt });
             return Ok(None);
         }
-        let operation = self.inner.operation_gate.clone().lock_owned().await;
         let active = self.runtime();
         let admission = active.turn_admission.clone().lock_owned().await;
         if active.todo_continuation_suppressed.load(Ordering::Acquire) {
@@ -4369,40 +4515,56 @@ impl Application {
             };
             let (status, message) = match run {
                 Ok(result) => {
-                    inner.finish_goal_turn_for_runtime(
+                    match inner.finish_goal_turn_for_runtime(
                         &task_active,
                         result.usage,
                         started,
                         goal_was_active,
-                    );
-                    match result.stop_reason {
-                        pi_ai::StopReason::Aborted => {
-                            (TurnTerminalStatus::Aborted, result.error_message)
+                    ) {
+                        Ok(()) => match result.stop_reason {
+                            pi_ai::StopReason::Aborted => {
+                                (TurnTerminalStatus::Aborted, result.error_message)
+                            }
+                            pi_ai::StopReason::Error => {
+                                (TurnTerminalStatus::Failed, result.error_message)
+                            }
+                            _ => (TurnTerminalStatus::Succeeded, None),
+                        },
+                        Err(error) => {
+                            let message = format!("failed to charge goal usage: {error:#}");
+                            inner.publish(ApplicationEvent::RunFailed {
+                                message: message.clone(),
+                            });
+                            (TurnTerminalStatus::Failed, Some(message))
                         }
-                        pi_ai::StopReason::Error => {
-                            (TurnTerminalStatus::Failed, result.error_message)
-                        }
-                        _ => (TurnTerminalStatus::Succeeded, None),
                     }
                 }
                 Err(error) => {
-                    let message = error.to_string();
+                    let aborted = error.downcast_ref::<pi_agent::AbortError>().is_some();
+                    let round_usage = error
+                        .downcast_ref::<crate::session::RunFailureUsage>()
+                        .map_or(pi_ai::Usage::default(), |payload| payload.usage.clone());
+                    let mut message = format!("{error:#}");
                     inner.publish(ApplicationEvent::RunFailed {
                         message: message.clone(),
                     });
-                    inner.finish_goal_turn_for_runtime(
+                    let charge = inner.finish_goal_turn_for_runtime(
                         &task_active,
-                        pi_ai::Usage::default(),
+                        round_usage,
                         started,
                         goal_was_active,
                     );
-                    let status = session
-                        .history()
-                        .last()
-                        .and_then(pi_ai::Message::as_assistant)
-                        .map(|assistant| assistant.stop_reason)
-                        .filter(|reason| *reason == pi_ai::StopReason::Aborted)
-                        .map_or(TurnTerminalStatus::Failed, |_| TurnTerminalStatus::Aborted);
+                    if let Err(charge_error) = &charge {
+                        message =
+                            format!("{message}; goal usage charge failed: {charge_error:#}");
+                    }
+                    // A failed charge is never masked by the abort: the
+                    // terminal must carry both errors as Failed.
+                    let status = if aborted && charge.is_ok() {
+                        TurnTerminalStatus::Aborted
+                    } else {
+                        TurnTerminalStatus::Failed
+                    };
                     (status, Some(message))
                 }
             };
@@ -4472,16 +4634,33 @@ impl Application {
     ///   never replace. Only explicit `/ps` stop/signal, session switches
     ///   (`new_session`/`switch_session`/fork/goal), or application teardown
     ///   (`cleanup`/`shutdown`) stop supervised processes.
-    pub async fn abort(&self) {
+    pub async fn abort(&self) -> Result<()> {
         let active = self.runtime();
         active.todo_resume_requested.store(false, Ordering::Release);
         active
             .todo_continuation_suppressed
             .store(true, Ordering::Release);
-        if let Some(runtime) = active.orchestration_runtime() {
-            runtime.cancel_active();
+        let cancel_error = if let Some(runtime) = active.orchestration_runtime() {
+            let ids = runtime
+                .jobs(None)
+                .into_iter()
+                .filter(|job| !job.status.is_settled())
+                .map(|job| job.id)
+                .collect::<Vec<_>>();
+            // An abort with no unsettled jobs performs no durable mutation, so
+            // it must not request cancellation: a restart-checkpointed runtime
+            // freezes its sidecar and every `cancel_jobs_result` call — even a
+            // zero-job one — is rejected fail-closed.
+            let cancel_error = if ids.is_empty() {
+                None
+            } else {
+                runtime.cancel_jobs_result(&ids).err()
+            };
             self.inner.finish_todo_cycle_if_idle(Some(&runtime), false);
-        }
+            cancel_error
+        } else {
+            None
+        };
         // Ownership boundary: cancel the loop iteration token BEFORE the
         // session abort so the scheduler observes `runner_cancel.is_cancelled()`
         // and classifies the turn as `Cancelled` (silent; the loop remains
@@ -4497,7 +4676,17 @@ impl Application {
         if let Ok(handle) = self.loop_handle() {
             let _ = handle.cancel_active_iteration().await;
         }
+        // Stop must drop the owner before session abort. `session.abort` only
+        // marks an already-active run, and that flag is cleared when the run
+        // settles, so a queued owner or the window between rounds would
+        // otherwise keep the slot and start another turn.
+        active.goal_work_activation.lock().take();
+        active.goal_work_changed.notify_waiters();
         active.session.abort().await;
+        if let Some(error) = cancel_error {
+            return Err(error.context("orchestration abort failed to request cancellation"));
+        }
+        Ok(())
     }
 
     pub fn abort_compaction(&self) {
@@ -4619,11 +4808,27 @@ impl Application {
         self.runtime().session.remove_steering_at(index).await
     }
 
-    pub async fn send_queued_steering_now(&self) -> Result<crate::SteeringSendNow> {
+
+    pub async fn send_queued_steering_now(
+        &self,
+        diagnostic_op: Option<u64>,
+    ) -> Result<crate::SteeringSendNow> {
+        if let Some(op) = diagnostic_op {
+            eprintln!(
+                "rpc_phase command=queue_send_now phase=enter op={op} is_streaming={}",
+                self.is_streaming()
+            );
+        }
         let session = self.runtime().session.clone();
         let drained = session.drain_steering_messages().await;
         let sent = drained.len();
+        if let Some(op) = diagnostic_op {
+            eprintln!("rpc_phase command=queue_send_now phase=drained op={op} n={sent}");
+        }
         if sent == 0 {
+            if let Some(op) = diagnostic_op {
+                eprintln!("rpc_phase command=queue_send_now phase=complete op={op} outcome=empty");
+            }
             return Ok(crate::SteeringSendNow {
                 sent: 0,
                 combined: false,
@@ -4646,6 +4851,11 @@ impl Application {
             .partition(|message| matches!(message, Message::User(_)));
         for message in &passthrough {
             if let Err(error) = self.runtime().session.steer(message.clone()).await {
+                if let Some(op) = diagnostic_op {
+                    eprintln!(
+                        "rpc_phase command=queue_send_now phase=complete op={op} outcome=requeue_failed"
+                    );
+                }
                 return Err(anyhow!(
                     "re-queueing non-user queued steering: {error:#}"
                 ));
@@ -4663,6 +4873,11 @@ impl Application {
                     anyhow!("restore steering batch: {restore:#}")
                 })?;
             }
+            if let Some(op) = diagnostic_op {
+                eprintln!(
+                    "rpc_phase command=queue_send_now phase=complete op={op} outcome=no_user_content"
+                );
+            }
             bail!("queued steering contained no user content");
         };
         let (text, images) = pi_agent::split_queued_user_message(&combined);
@@ -4673,18 +4888,68 @@ impl Application {
         // Abort does not wait for run_slot; prompt() rejects while the turn
         // is held. Wait until idle, then prompt — never re-steer.
         if self.is_streaming() {
-            self.abort().await;
+            if let Some(op) = diagnostic_op {
+                eprintln!("rpc_phase command=queue_send_now phase=abort_begin op={op}");
+            }
+            if let Err(error) = self.abort().await {
+                if let Err(restore) = restore(combined.clone()).await {
+                    if let Some(op) = diagnostic_op {
+                        eprintln!(
+                            "rpc_phase command=queue_send_now phase=complete op={op} outcome=restore_failed"
+                        );
+                    }
+                    return Err(anyhow!(
+                        "{error:#}; restore steering: {restore:#}"
+                    ));
+                }
+                if let Some(op) = diagnostic_op {
+                    eprintln!(
+                        "rpc_phase command=queue_send_now phase=complete op={op} outcome=abort_failed"
+                    );
+                }
+                return Err(error);
+            }
+            if let Some(op) = diagnostic_op {
+                eprintln!("rpc_phase command=queue_send_now phase=abort_done op={op}");
+                eprintln!("rpc_phase command=queue_send_now phase=idle_wait op={op}");
+            }
             self.runtime().session.wait_for_idle().await;
+            if let Some(op) = diagnostic_op {
+                eprintln!("rpc_phase command=queue_send_now phase=idle op={op}");
+            }
             let handle = self.runtime().active_run.lock().take();
             if let Some(handle) = handle {
+                if let Some(op) = diagnostic_op {
+                    eprintln!("rpc_phase command=queue_send_now phase=join_begin op={op}");
+                }
                 let _ = handle.await;
+                if let Some(op) = diagnostic_op {
+                    eprintln!("rpc_phase command=queue_send_now phase=join_done op={op}");
+                }
             }
         }
         match self.prompt(text, images, None).await {
-            Ok(_) => Ok(result),
+            Ok(_) => {
+                if let Some(op) = diagnostic_op {
+                    eprintln!(
+                        "rpc_phase command=queue_send_now phase=complete op={op} outcome=accepted"
+                    );
+                }
+                Ok(result)
+            }
             Err(error) => {
                 if let Err(restore) = restore(combined).await {
+                    if let Some(op) = diagnostic_op {
+                        eprintln!(
+                            "rpc_phase command=queue_send_now phase=complete op={op} outcome=restore_failed"
+                        );
+                    }
                     return Err(anyhow!("{error:#}; restore steering: {restore:#}"));
+                }
+                if let Some(op) = diagnostic_op {
+                    eprintln!(
+                        "rpc_phase command=queue_send_now phase=complete op={op} outcome=prompt_failed"
+                    );
                 }
                 Err(error)
             }
@@ -5164,6 +5429,7 @@ impl Application {
             // invalidating queued goal admission or cancelling loop work.
             let session = session.commit_mcp_reset().await;
             active.goal_work_activation.lock().take();
+            active.goal_work_changed.notify_waiters();
             loop_handle
                 .commit_prepared_session_switch(loops, crate::LoopRemovalReason::SessionChanged)
                 .await;
@@ -5377,6 +5643,7 @@ impl Application {
             // Last fallible gate passed. Invalidate goal admission before loop
             // cancellation can release the old generation's shared turn guard.
             active.goal_work_activation.lock().take();
+            active.goal_work_changed.notify_waiters();
             loops
                 .commit_prepared_session_switch(
                     prepared_loops,
@@ -5682,10 +5949,10 @@ impl Application {
     /// Roll the session back to a rewind target.
     ///
     /// Safety rules enforced here, on top of the session-level guards:
-    /// rewinding is refused while orchestration jobs are queued/running, while
-    /// any workflow is active, or while bash is still executing — truncating
-    /// the journal under live work would orphan running jobs and corrupt the
-    /// state those jobs keep reading from. The active turn is drained first
+    /// rewinding is refused while orchestration jobs are queued, running, or
+    /// cancelling, while any workflow is active, or while bash is still
+    /// executing — truncating the journal under live work would orphan running
+    /// jobs and corrupt the state those jobs keep reading from. The active turn is drained first
     /// via [`Application::wait_for_idle`]; the session-level exclusive run
     /// slot additionally refuses a rewind issued while a prompt is running.
     pub async fn rewind(&self, target: crate::RewindTarget) -> Result<crate::RewindOutcome> {
@@ -5715,8 +5982,8 @@ impl Application {
 
     /// Pure refusal predicate for the rewind safety rules, factored out so it
     /// is unit-testable with snapshot vectors: refuses while any orchestration
-    /// job is queued/running or any workflow is active. Returns the actionable
-    /// message to surface, or `None` when rewinding is safe.
+    /// job is queued, running, or cancelling, or any workflow is active.
+    /// Returns the actionable message to surface, or `None` when rewinding is safe.
     fn rewind_refusal(
         jobs: &[crate::JobSnapshot],
         workflows: &[crate::WorkflowSnapshot],
@@ -5726,13 +5993,15 @@ impl Application {
             .filter(|job| {
                 matches!(
                     job.status,
-                    crate::JobStatus::Queued | crate::JobStatus::Running
+                    crate::JobStatus::Queued
+                        | crate::JobStatus::Running
+                        | crate::JobStatus::Cancelling
                 )
             })
             .count();
         if running_jobs > 0 {
             return Some(format!(
-                "rewind refused: {running_jobs} orchestration job(s) are still queued or running — wait for them to finish, or cancel them first (orchestration /queue cancel, workflow /workflow cancel)"
+                "rewind refused: {running_jobs} orchestration job(s) are still queued, running, or cancelling — wait for them to finish, or cancel them first (orchestration /queue cancel, workflow /workflow cancel)"
             ));
         }
         let active_workflows = workflows
@@ -6035,13 +6304,11 @@ impl Application {
         config =
             config.with_selector_settings(snapshot.settings.selector.clone().unwrap_or_default());
         config.agent_settings = snapshot.settings.agents.clone();
-        if let Some(model) = active.session.model() {
-            config.parent_model = model;
-        }
+        config.parent_model = active.session.model();
         // Live parent model so /model switches apply to child resolution without rebuild.
         let session_for_parent = active.session.clone();
         config = config.with_parent_model_provider(std::sync::Arc::new(move || {
-            session_for_parent.model().unwrap_or_default()
+            session_for_parent.model()
         }));
         let (resolver, resolver_binding) = crate::InternalUriResolver::deferred();
         let factory = crate::OrchestrationRuntime::child_factory_from_session_and_uri(
@@ -6224,7 +6491,7 @@ impl Application {
         // task yields. On a current-thread runtime it would still look active
         // at the retirement check and orchestration could never be disabled.
         // Yield only while a job has not started; a job that is already
-        // Running remains a reason to defer retirement.
+        // Running or Cancelling remains a reason to defer retirement.
         self.drive_queued_orchestration().await;
         Box::pin(self.reload_with_candidate_trust()).await
     }
@@ -6254,11 +6521,17 @@ impl Application {
             .session
             .resource_manager()
             .ok_or_else(|| anyhow!("session has no resource manager"))?;
-        let model = active
-            .session
-            .model()
-            .ok_or_else(|| anyhow!("session has no model"))?;
-        let request_auth = active.session.request_auth_for_model(&model).await?;
+        let model = active.session.model();
+        let request_auth = match model.as_ref() {
+            Some(model) => Some(active.session.request_auth_for_model(model).await?),
+            None => None,
+        };
+        let provider_authority = model
+            .as_ref()
+            .zip(request_auth.as_ref())
+            .map(|(model, request_auth)| {
+                crate::sandbox::http::ProviderAuthority::new(model, request_auth)
+            });
         let stream = active.session.stream_options().stream;
         let extension_runtime = active
             .extension_runtime
@@ -6275,9 +6548,13 @@ impl Application {
         let resource_candidate =
             resources.stage_candidate(provenance.clone(), composed_trust.as_ref())?;
         let settings = resource_candidate.snapshot().settings.clone();
-        let image_generation =
-            Self::staged_image_generation_http(&active.session, &settings, &model, &request_auth)
-                .await?;
+        let image_generation = Self::staged_image_generation_http(
+            &active.session,
+            &settings,
+            model.as_ref(),
+            request_auth.as_ref(),
+        )
+        .await?;
         let next_runtime_settings = settings.runtime_settings()?;
         let policy_inputs = crate::sandbox::SessionPolicyInputs::validate_with_capabilities(
             active.session.session_policy_id(),
@@ -6293,8 +6570,7 @@ impl Application {
             provenance.clone(),
             resource_candidate.capabilities(),
             policy_inputs,
-            &model,
-            &request_auth,
+            provider_authority,
             &stream,
             image_generation
                 .as_ref()
@@ -6498,10 +6774,118 @@ impl Application {
         &self,
         model: Model,
     ) -> Result<crate::ThinkingLevelChange> {
-        self.runtime()
+        // External selection is a single-writer operation on the application
+        // operation gate: the model/credential change and any idle generation
+        // refresh cannot be interleaved with prompt/spawn admission.
+        let operation = self.inner.operation_gate.clone().lock_owned().await;
+        let change = self
+            .runtime()
             .session
             .set_model_with_resolved_auth(model)
+            .await?;
+        self.inner
+            .generation_refresh_pending
+            .store(true, Ordering::Release);
+        // A turn admitted before the selection keeps the model and generation
+        // it was admitted with; the next admission applies the refresh.
+        if !self.is_streaming() {
+            self.refresh_generation_for_selected_model_locked().await?;
+        }
+        drop(operation);
+        Ok(change)
+    }
+
+    /// Extension-originated selection: pending only. Acquiring the operation
+    /// gate or reloading here would re-enter extension staging from inside an
+    /// extension action; the next admission applies the refresh.
+    pub(crate) async fn set_model_with_resolved_auth_deferred(
+        &self,
+        model: Model,
+    ) -> Result<crate::ThinkingLevelChange> {
+        let change = self
+            .runtime()
+            .session
+            .set_model_with_resolved_auth(model)
+            .await?;
+        self.inner
+            .generation_refresh_pending
+            .store(true, Ordering::Release);
+        Ok(change)
+    }
+
+    /// Applies a pending selection refresh. The caller MUST hold the
+    /// application operation gate: refresh and admission share that single
+    /// writer, and pending is cleared only after a successful reload whose
+    /// staged model/credential pair still matches the live selection.
+    async fn refresh_generation_for_selected_model_locked(&self) -> Result<()> {
+        if !self
+            .inner
+            .generation_refresh_pending
+            .load(Ordering::Acquire)
+        {
+            return Ok(());
+        }
+        // A live turn keeps the model and generation it was admitted with.
+        if self.is_streaming() {
+            return Ok(());
+        }
+        let selected = self.runtime().session.model();
+        let selected_api_key = self.runtime().session.current_api_key();
+        self.reload()
             .await
+            .context("refreshing the generation for the selected model")?;
+        let current = self.runtime().session.model();
+        let current_api_key = self.runtime().session.current_api_key();
+        let same_selection = (match (selected.as_ref(), current.as_ref()) {
+            (Some(selected), Some(current)) => {
+                selected.provider == current.provider && selected.id == current.id
+            }
+            (None, None) => true,
+            _ => false,
+        }) && selected_api_key == current_api_key;
+        if same_selection {
+            self.inner
+                .generation_refresh_pending
+                .store(false, Ordering::Release);
+            return Ok(());
+        }
+        // Extension-deferred selections do not hold the gate, so a selection
+        // that changed during staging is a real conflict: report it instead of
+        // retrying in a loop. Pending stays set for the next admission.
+        Err(anyhow!(
+            "model selection changed while refreshing the application generation; retry the command"
+        ))
+    }
+
+    /// Admission entry for commands whose launch inherits this application's
+    /// generation (orchestration `task_spawn`): the pending refresh, live
+    /// runtime re-read, item preparation, and spawn share one operation-gate
+    /// acquisition, never refresh-then-release.
+    pub async fn spawn_orchestration_tasks(
+        &self,
+        parameters: crate::TaskParameters,
+    ) -> Result<Vec<crate::TaskSpawn>> {
+        let _operation = self.inner.operation_gate.clone().lock_owned().await;
+        // A selection made while a turn is active is a next-turn selection.
+        // Spawning now would inherit the pre-selection generation, so reject
+        // before refresh, item preparation, or job registration; the caller
+        // retries once the turn settles.
+        if self
+            .inner
+            .generation_refresh_pending
+            .load(Ordering::Acquire)
+            && self.is_streaming()
+        {
+            return Err(SessionAlreadyProcessing.into());
+        }
+        self.refresh_generation_for_selected_model_locked().await?;
+        let runtime = self
+            .runtime()
+            .orchestration_runtime()
+            .ok_or_else(|| anyhow!("orchestration is not enabled in this session"))?;
+        let parent = runtime.main_agent_id().to_owned();
+        let items = parameters.into_items(&runtime)?;
+        runtime.spawn_tasks(&parent, 0, items)
     }
     pub fn set_thinking_level(&self, level: ThinkingLevel) -> crate::ThinkingLevelChange {
         self.runtime().session.set_thinking_level(level)
@@ -7066,7 +7450,9 @@ impl ExtensionActionHost for ApplicationExtensionHost {
                                 model.id
                             )
                         })?;
-                    let _ = application.set_model_with_resolved_auth(canonical).await?;
+                    let _ = application
+                        .set_model_with_resolved_auth_deferred(canonical)
+                        .await?;
                     Ok(Value::Bool(true))
                 }
                 ExtensionRuntimeAction::SetThinkingLevel { level } => {
@@ -7074,7 +7460,7 @@ impl ExtensionActionHost for ApplicationExtensionHost {
                     Ok(serde_json::to_value(change)?)
                 }
                 ExtensionRuntimeAction::Abort => {
-                    application.abort().await;
+                    application.abort().await?;
                     Ok(Value::Null)
                 }
                 ExtensionRuntimeAction::Shutdown => {
@@ -7140,7 +7526,9 @@ impl ApplicationInner {
                     job.todo_task_id.is_some()
                         && matches!(
                             job.status,
-                            crate::JobStatus::Queued | crate::JobStatus::Running
+                            crate::JobStatus::Queued
+                                | crate::JobStatus::Running
+                                | crate::JobStatus::Cancelling
                         )
                 })
                 .enumerate()
@@ -7294,7 +7682,9 @@ impl ApplicationInner {
         runtime.jobs(None).iter().any(|job| {
             matches!(
                 job.status,
-                crate::JobStatus::Queued | crate::JobStatus::Running
+                crate::JobStatus::Queued
+                    | crate::JobStatus::Running
+                    | crate::JobStatus::Cancelling
             )
         })
     }
@@ -7417,9 +7807,9 @@ impl ApplicationInner {
         parent_usage: pi_ai::Usage,
         started: Instant,
         goal_was_active: bool,
-    ) {
+    ) -> Result<()> {
         if active.session.goal_runtime().get().current.is_none() {
-            return;
+            return Ok(());
         }
         let mut tokens = usage_tokens(&parent_usage);
         let mut settled_jobs = Vec::new();
@@ -7444,24 +7834,24 @@ impl ApplicationInner {
         };
         if tokens != 0 || elapsed != 0 {
             let delta = GoalUsageDelta::new(tokens, elapsed);
-            match active.session.goal_runtime().update_usage(delta) {
-                Ok(_) => {
-                    active.charged_goal_jobs.lock().extend(settled_jobs);
-                    self.publish(ApplicationEvent::GoalUsageCharged {
-                        delta,
-                        state: active.session.goal_runtime().get(),
-                    });
-                }
-                Err(error) => self.publish(ApplicationEvent::RunFailed {
-                    message: format!("failed to charge goal usage: {error}"),
-                }),
-            }
+            active
+                .session
+                .goal_runtime()
+                .update_usage(delta)
+                .map_err(|error| anyhow!("failed to charge goal usage: {error}"))?;
+            active.charged_goal_jobs.lock().extend(settled_jobs);
+            self.publish(ApplicationEvent::GoalUsageCharged {
+                delta,
+                state: active.session.goal_runtime().get(),
+            });
         } else {
             active.charged_goal_jobs.lock().extend(settled_jobs);
         }
         self.publish(ApplicationEvent::GoalContinuation {
             decision: active.session.goal_runtime().continuation_decision(),
         });
+        active.goal_work_changed.notify_waiters();
+        Ok(())
     }
 
     fn pause_goal_after_resume(&self) -> Result<()> {
@@ -7479,6 +7869,7 @@ impl ApplicationInner {
             operation: "resume_safety_pause",
             state: runtime.get(),
         });
+        self.runtime().goal_work_changed.notify_waiters();
         Ok(())
     }
 }
@@ -7630,104 +8021,258 @@ impl Drop for GoalWorkPendingGuard {
 async fn run_goal_work(
     inner: Weak<ApplicationInner>,
     active: Arc<runtime::ApplicationRuntime>,
-    key: GoalWorkKey,
-    turn_guard: Option<OwnedMutexGuard<()>>,
+    mut key: GoalWorkKey,
+    mut turn_guard: Option<OwnedMutexGuard<()>>,
 ) {
     let _pending = GoalWorkPendingGuard {
         active: active.clone(),
     };
-    let turn_guard = match turn_guard {
-        Some(turn_guard) => turn_guard,
-        None => active.turn_gate.clone().lock_owned().await,
-    };
-    let Some(inner) = inner.upgrade() else {
-        return;
-    };
-    if inner.cleaned.load(Ordering::Acquire) {
-        clear_goal_work_activation(&active, &key);
-        return;
-    }
-    if !Arc::ptr_eq(&inner.runtime(), &active) {
-        clear_goal_work_activation(&active, &key);
-        return;
-    }
-    let state = active.session.goal_runtime().get();
-    // A usage charge from a completed prior turn may advance the revision
-    // without touching the goal's identity or lifecycle; that must not cancel
-    // this scheduled continuation. The activation slot is the authority: this
-    // turn runs only while it is still the scheduled work for the same active
-    // goal. A lifecycle/id change (pause, complete, drop, fork, new goal,
-    // budget exhaustion) advances `lifecycle_revision` and invalidates the
-    // key — even across a mutation-only resume that returns the goal to
-    // Active — while a usage-only revision bump keeps the key valid. A
-    // superseding schedule for a newer revision replaces the slot and
-    // cancels this turn.
-    let scheduled = {
-        let activation = active.goal_work_activation.lock();
-        activation.as_ref() == Some(&key)
-    };
-    if !scheduled
-        || !state.current.as_ref().is_some_and(|goal| {
-            goal.id == key.goal_id && goal.lifecycle == crate::GoalLifecycle::Active
-        })
-        || state.lifecycle_revision != key.lifecycle_revision
-    {
-        clear_goal_work_activation(&active, &key);
-        return;
-    }
-
-    inner.publish(ApplicationEvent::GoalContinuation {
-        decision: active.session.goal_runtime().continuation_decision(),
-    });
-    let turn_id = uuid::Uuid::now_v7().to_string();
-    let turn_model = active.session.model();
-    if !inner.publish_turn_started(&active, &turn_id, turn_model.as_ref()) {
-        clear_goal_work_activation(&active, &key);
-        return;
-    }
-    let mut lifecycle = OuterTurnLifecycle::new(inner.clone(), active.clone(), turn_id);
-    let message = Message::Custom(CustomMessage {
-        custom_type: GOAL_CONTINUATION_CUSTOM_TYPE.to_owned(),
-        content: "Start concrete work toward the active session goal now. Use the active goal reminder as the objective and continue through the normal Application workflow.".into(),
-        display: false,
-        details: Some(serde_json::json!({
-            "goalId": key.goal_id,
-            "revision": key.revision,
-        })),
-        timestamp: pi_ai::now_millis(),
-    });
-    let started = Instant::now();
-    let (status, terminal_message) = match active.session.run_messages(vec![message]).await {
-        Ok(result) => {
-            inner.finish_goal_turn_for_runtime(&active, result.usage, started, true);
-            match result.stop_reason {
-                pi_ai::StopReason::Aborted => (TurnTerminalStatus::Aborted, result.error_message),
-                pi_ai::StopReason::Error => (TurnTerminalStatus::Failed, result.error_message),
-                _ => (TurnTerminalStatus::Succeeded, None),
+    loop {
+        let guard = match turn_guard.take() {
+            Some(turn_guard) => turn_guard,
+            None => match admit_goal_turn(&active, &key).await {
+                Some(turn_guard) => turn_guard,
+                None => return,
+            },
+        };
+        let Some(inner) = inner.upgrade() else {
+            return;
+        };
+        if inner.cleaned.load(Ordering::Acquire) || !Arc::ptr_eq(&inner.runtime(), &active) {
+            clear_goal_work_activation(&active, &key);
+            return;
+        }
+        let state = active.session.goal_runtime().get();
+        // Usage advances `revision` only. Compare-and-replace the full key
+        // under one lock so a newer owner installed between the snapshot and
+        // the write is left in place.
+        let Some(key_now) = rekey_goal_owner(&active, &key, &state) else {
+            clear_goal_work_activation(&active, &key);
+            return;
+        };
+        key = key_now;
+        {
+            let gate = inner.goal_before_claim_gate.lock().take();
+            if let Some(gate) = gate {
+                gate.enter().await;
             }
         }
-        Err(error) => {
+
+        inner.publish(ApplicationEvent::GoalContinuation {
+            decision: active.session.goal_runtime().continuation_decision(),
+        });
+        let turn_id = uuid::Uuid::now_v7().to_string();
+        let Some(turn_model) = active.session.model() else {
             clear_goal_work_activation(&active, &key);
-            inner.publish(ApplicationEvent::RunFailed {
-                message: error.to_string(),
-            });
-            inner.finish_goal_turn_for_runtime(&active, pi_ai::Usage::default(), started, true);
-            (TurnTerminalStatus::Failed, Some(error.to_string()))
+            return;
+        };
+        if !inner.publish_turn_started(&active, &turn_id, Some(&turn_model)) {
+            clear_goal_work_activation(&active, &key);
+            return;
         }
-    };
-    if let Some(terminal) = lifecycle.commit(status, terminal_message) {
-        inner.emit_turn_terminal(terminal);
+        let mut lifecycle = OuterTurnLifecycle::new(inner.clone(), active.clone(), turn_id.clone());
+        let message = Message::Custom(CustomMessage {
+            custom_type: GOAL_CONTINUATION_CUSTOM_TYPE.to_owned(),
+            content: "Start concrete work toward the active session goal now. Use the active goal reminder as the objective and continue through the normal Application workflow.".into(),
+            display: false,
+            details: Some(serde_json::json!({
+                "goalId": key.goal_id,
+                "revision": key.revision,
+            })),
+            timestamp: pi_ai::now_millis(),
+        });
+        let started = Instant::now();
+        let continue_owner = match active
+            .session
+            .run_goal_messages(
+                vec![message],
+                GoalRunAdmission {
+                    slot: &active.goal_work_activation,
+                    owner: &key,
+                },
+            )
+            .await {
+            Ok(result) => match inner.finish_goal_turn_for_runtime(
+                &active,
+                result.usage,
+                started,
+                true,
+            ) {
+                Ok(()) => {
+                    let (status, terminal_message) = match result.stop_reason {
+                        pi_ai::StopReason::Aborted => {
+                            (TurnTerminalStatus::Aborted, result.error_message)
+                        }
+                        pi_ai::StopReason::Error => {
+                            (TurnTerminalStatus::Failed, result.error_message)
+                        }
+                        _ => (TurnTerminalStatus::Succeeded, None),
+                    };
+                    let fatal = matches!(
+                        status,
+                        TurnTerminalStatus::Failed | TurnTerminalStatus::Aborted
+                    );
+                    if let Some(terminal) = lifecycle.commit(status, terminal_message) {
+                        inner.emit_turn_terminal(terminal);
+                    }
+                    !fatal
+                }
+                Err(error) => {
+                    let message = format!("failed to charge goal usage: {error:#}");
+                    inner.publish(ApplicationEvent::RunFailed { message: message.clone() });
+                    if let Some(terminal) =
+                        lifecycle.commit(TurnTerminalStatus::Failed, Some(message))
+                    {
+                        inner.emit_turn_terminal(terminal);
+                    }
+                    false
+                }
+            },
+            Err(error) => {
+                let aborted = error.downcast_ref::<pi_agent::AbortError>().is_some();
+                let round_usage = error
+                    .downcast_ref::<crate::session::RunFailureUsage>()
+                    .map_or(pi_ai::Usage::default(), |payload| payload.usage.clone());
+                let mut message = format!("{error:#}");
+                inner.publish(ApplicationEvent::RunFailed {
+                    message: message.clone(),
+                });
+                let charge =
+                    inner.finish_goal_turn_for_runtime(&active, round_usage, started, true);
+                if let Err(charge_error) = &charge {
+                    message = format!("{message}; goal usage charge failed: {charge_error:#}");
+                }
+                // A failed charge is never masked by the abort: the
+                // terminal must carry both errors as Failed.
+                let status = if aborted && charge.is_ok() {
+                    TurnTerminalStatus::Aborted
+                } else {
+                    TurnTerminalStatus::Failed
+                };
+                if let Some(terminal) = lifecycle.commit(status, Some(message)) {
+                    inner.emit_turn_terminal(terminal);
+                }
+                false
+            }
+        };
+        inner.hold_terminal_until_queue_drained(&active).await;
+        inner.finish_parent_turn_for_runtime(&active);
+        drop(guard);
+        if !continue_owner {
+            clear_goal_work_activation(&active, &key);
+            return;
+        }
+        let state = active.session.goal_runtime().get();
+        if !goal_owner_stands(&active, &key, &state) {
+            clear_goal_work_activation(&active, &key);
+            return;
+        }
+        tokio::task::yield_now().await;
+        if !goal_owner_stands(&active, &key, &active.session.goal_runtime().get()) {
+            clear_goal_work_activation(&active, &key);
+            return;
+        }
     }
-    inner.hold_terminal_until_queue_drained(&active).await;
-    inner.finish_parent_turn_for_runtime(&active);
-    drop(turn_guard);
+}
+
+fn rekey_goal_owner(
+    active: &runtime::ApplicationRuntime,
+    key: &GoalWorkKey,
+    state: &GoalState,
+) -> Option<GoalWorkKey> {
+    let still_active = state.lifecycle_revision == key.lifecycle_revision
+        && state.current.as_ref().is_some_and(|goal| {
+            goal.id == key.goal_id && goal.lifecycle == crate::GoalLifecycle::Active
+        });
+    if !still_active {
+        return None;
+    }
+    let refreshed = GoalWorkKey {
+        goal_id: key.goal_id.clone(),
+        revision: state.revision,
+        lifecycle_revision: key.lifecycle_revision,
+        owner_token: key.owner_token,
+    };
+    let mut activation = active.goal_work_activation.lock();
+    let current = activation.as_ref()?;
+    if !goal_owner_key_matches(current, key) {
+        return None;
+    }
+    if current.revision != refreshed.revision {
+        *activation = Some(refreshed.clone());
+    }
+    Some(refreshed)
+}
+
+fn goal_owner_stands(
+    active: &runtime::ApplicationRuntime,
+    key: &GoalWorkKey,
+    state: &GoalState,
+) -> bool {
+    let owned = {
+        let activation = active.goal_work_activation.lock();
+        activation
+            .as_ref()
+            .is_some_and(|current| goal_owner_key_matches(current, key))
+    };
+    owned
+        && state.lifecycle_revision == key.lifecycle_revision
+        && state.current.as_ref().is_some_and(|goal| {
+            goal.id == key.goal_id && goal.lifecycle == crate::GoalLifecycle::Active
+        })
+}
+
+/// Queues for the turn gate without dropping the owner when a prompt is
+/// ahead. Stop, pause, and runtime replacement cancel the wait because the
+/// notification is registered before the ownership check.
+async fn admit_goal_turn(
+    active: &Arc<runtime::ApplicationRuntime>,
+    key: &GoalWorkKey,
+) -> Option<OwnedMutexGuard<()>> {
+    loop {
+        let changed = active.goal_work_changed.notified();
+        if !goal_owner_stands(active, key, &active.session.goal_runtime().get()) {
+            clear_goal_work_activation(active, key);
+            return None;
+        }
+        tokio::pin!(changed);
+        let gate = active.turn_gate.clone();
+        tokio::select! {
+            biased;
+            _ = &mut changed => continue,
+            guard = gate.lock_owned() => {
+                if goal_owner_stands(active, key, &active.session.goal_runtime().get()) {
+                    return Some(guard);
+                }
+                drop(guard);
+                clear_goal_work_activation(active, key);
+                return None;
+            }
+        }
+    }
 }
 
 fn clear_goal_work_activation(active: &runtime::ApplicationRuntime, key: &GoalWorkKey) {
     let mut activation = active.goal_work_activation.lock();
-    if activation.as_ref() == Some(key) {
+    if activation
+        .as_ref()
+        .is_some_and(|current| goal_owner_key_matches(current, key))
+    {
         *activation = None;
     }
+}
+
+/// Ownership identity: one live worker per goal id + lifecycle epoch; a
+/// usage-only revision bump is not an ownership axis.
+fn goal_owner_identity_matches(current: &GoalWorkKey, key: &GoalWorkKey) -> bool {
+    current.goal_id == key.goal_id && current.lifecycle_revision == key.lifecycle_revision
+}
+
+/// Full ownership proof: identity plus the spawn-unique token, so a
+/// successor installed after Stop (an Active-goal resume commits no epoch)
+/// is never revived into, rekeyed, or cleared by the old owner.
+fn goal_owner_key_matches(current: &GoalWorkKey, key: &GoalWorkKey) -> bool {
+    goal_owner_identity_matches(current, key) && current.owner_token == key.owner_token
 }
 
 async fn run_loop_turn(
@@ -7750,8 +8295,10 @@ async fn run_loop_turn(
     request.report(crate::LoopRunState::Started);
     let session = active.session.clone();
     let turn_id = uuid::Uuid::now_v7().to_string();
-    let turn_model = session.model();
-    if !inner.publish_turn_started(&active, &turn_id, turn_model.as_ref()) {
+    let Some(turn_model) = session.model() else {
+        return Err(pi_agent::ModelNotConfigured.to_string());
+    };
+    if !inner.publish_turn_started(&active, &turn_id, Some(&turn_model)) {
         return Err("session changed before loop turn admission completed".to_owned());
     }
     let mut lifecycle = OuterTurnLifecycle::new(inner.clone(), active.clone(), turn_id);
@@ -7952,8 +8499,9 @@ fn user_message(text: String, images: Vec<ContentBlock>) -> Message {
 #[cfg(test)]
 mod tests {
     use super::{
-        Application, ApplicationEvent, GoalToolBinding, PreparedGoalToolBinding,
-        durable_resume_error, durable_resume_notice, public_extension_model,
+        Application, ApplicationEvent, GoalToolBinding, GoalWorkKey, PreparedGoalToolBinding,
+        clear_goal_work_activation, durable_resume_error, durable_resume_notice,
+        goal_owner_stands, public_extension_model, rekey_goal_owner,
     };
     use anyhow::Context as _;
     use futures_util::FutureExt;
@@ -8075,13 +8623,14 @@ mod tests {
         crate::ResourceManager,
         crate::Session,
     ) {
-        isolated_application_parts_inner(global_settings, None, None)
-    }
+        isolated_application_parts_inner(global_settings, None, None, Vec::new())
+}
 
     fn isolated_application_parts_inner(
         global_settings: &str,
         auth_manager: Option<std::sync::Arc<crate::AuthManager>>,
         stream_fn: Option<pi_agent::StreamFn>,
+        additional_tools: Vec<pi_agent::AgentTool>,
     ) -> (
         tempfile::TempDir,
         tempfile::TempDir,
@@ -8133,7 +8682,7 @@ mod tests {
         let session =
             crate::Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
                 crate::SessionOptions {
-                    model,
+                    model: Some(model),
                     cwd: cwd.path().to_path_buf(),
                     system_prompt: String::new(),
                     thinking_level: pi_agent::ThinkingLevel::Off,
@@ -8147,7 +8696,7 @@ mod tests {
                     auth_resolver: None,
                     auth_manager,
                 },
-                Vec::new(),
+                additional_tools,
                 crate::ToolSelection::default(),
                 crate::ResourceDiscovery::Disabled,
                 workspace,
@@ -8172,7 +8721,7 @@ mod tests {
         crate::Session,
     ) {
         let (agent, cwd, faux, resources, session) =
-            isolated_application_parts_inner(global_settings, auth_manager, None);
+            isolated_application_parts_inner(global_settings, auth_manager, None, Vec::new());
         (agent, cwd, faux, resources, session)
     }
     fn isolated_application_parts_with_stream(
@@ -8185,7 +8734,7 @@ mod tests {
         crate::ResourceManager,
         crate::Session,
     ) {
-        isolated_application_parts_inner(global_settings, None, Some(stream_fn))
+        isolated_application_parts_inner(global_settings, None, Some(stream_fn), Vec::new())
     }
 
     fn resource_application(global_settings: &str) -> ApplicationFixture {
@@ -8230,6 +8779,74 @@ mod tests {
             application,
             loop_runtime: None,
         }
+    }
+
+    /// Stop takes the slot without a goal mutation and an Active-goal resume
+    /// commits nothing, so the successor's key differs from the old owner's
+    /// ONLY by its spawn-unique token. Removing the token comparison makes
+    /// this test fail: the old owner would stand in, rekey, or clear the
+    /// successor's slot.
+    #[test]
+    fn goal_owner_token_pins_stop_resume_slot_ownership() {
+        let fixture = resource_application("{}");
+        let application = fixture.application;
+        let active = application.runtime();
+        active
+            .session
+            .goal_runtime()
+            .create("aba owner regression", None)
+            .expect("create goal");
+        let state = active.session.goal_runtime().get();
+        let goal = state.current.clone().expect("goal");
+        assert_eq!(goal.lifecycle, crate::GoalLifecycle::Active);
+        let old_key = GoalWorkKey {
+            goal_id: goal.id.clone(),
+            revision: state.revision,
+            lifecycle_revision: state.lifecycle_revision,
+            owner_token: uuid::Uuid::now_v7(),
+        };
+        *active.goal_work_activation.lock() = Some(old_key.clone());
+        assert!(goal_owner_stands(
+            &active,
+            &old_key,
+            &active.session.goal_runtime().get()
+        ));
+
+        // Stop + immediate resume: successor key, same identity, new token.
+        let new_key = GoalWorkKey {
+            goal_id: goal.id.clone(),
+            revision: state.revision,
+            lifecycle_revision: state.lifecycle_revision,
+            owner_token: uuid::Uuid::now_v7(),
+        };
+        assert_ne!(old_key.owner_token, new_key.owner_token);
+        *active.goal_work_activation.lock() = Some(new_key.clone());
+        assert!(!goal_owner_stands(
+            &active,
+            &old_key,
+            &active.session.goal_runtime().get()
+        ));
+        assert_eq!(rekey_goal_owner(&active, &old_key, &state), None);
+        clear_goal_work_activation(&active, &old_key);
+        assert_eq!(
+            active.goal_work_activation.lock().clone(),
+            Some(new_key.clone()),
+            "the successor's slot must survive the old owner's exit"
+        );
+
+        // The successor keeps ownership across a usage-only revision bump,
+        // keeping its token and refreshing only the revision.
+        let mut bumped = state.clone();
+        bumped.revision = state.revision + 1;
+        assert_eq!(
+            rekey_goal_owner(&active, &new_key, &bumped).expect("successor rekeys its own slot"),
+            GoalWorkKey {
+                goal_id: goal.id,
+                revision: state.revision + 1,
+                lifecycle_revision: new_key.lifecycle_revision,
+                owner_token: new_key.owner_token,
+            }
+        );
     }
 
     #[test]
@@ -8982,6 +9599,15 @@ mod tests {
             crate::AgentCatalog::from_agents(vec![task]),
             cwd.path().join("artifacts"),
         );
+        // Fixture contract: the live registered test model is the explicit
+        // parent resolution authority. Production never defaults a parent
+        // model; a fixture without one would (correctly) fail spawn with
+        // ModelNotConfigured.
+        config.parent_model = Some(
+            session
+                .model()
+                .expect("orchestration fixture requires an explicit registered model"),
+        );
         config.idle_ttl = None;
         config.max_tools_per_agent = 64;
         let orchestration =
@@ -9184,7 +9810,7 @@ mod tests {
                 .expect("prompt")
                 .expect("accepted turn");
             started.notified().await;
-            application.abort().await;
+            application.abort().await.expect("abort running turn");
             application.wait_for_idle().await;
 
             let mut terminals = Vec::new();
@@ -9348,7 +9974,7 @@ mod tests {
             );
             let sent = tokio::time::timeout(
                 std::time::Duration::from_secs(8),
-                application.send_queued_steering_now(),
+                application.send_queued_steering_now(None),
             )
             .await
             .expect("send-now must not hang waiting for idle")
@@ -9386,6 +10012,214 @@ mod tests {
         });
     }
 
+    /// Diagnostic, not a contract. A tool that never polls `ctx.abort` holds
+    /// the agent loop. `send_queued_steering_now` then sits in
+    /// `wait_for_idle` / `active_run` join with no timeout, while
+    /// `Application::state` is a separate path and must still return.
+    ///
+    /// Pending is one `poll` of the spawned send-now. This runtime is not
+    /// started paused, so the test does not call `tokio::time::pause` or
+    /// `advance` (that would freeze `state()` and the release join) and does
+    /// not sleep 30 wall seconds. The oneshot release is cleanup so the task
+    /// does not leak. It is not an assertion that abort must wait for the tool.
+    #[test]
+    fn send_now_stays_pending_while_uncooperative_tool_holds_run() {
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let release_tx = std::sync::Mutex::new(Some(release_tx));
+        let tool_entered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_abort_at_entry = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_abort_at_release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release_rx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
+        let entered = tool_entered.clone();
+        let abort_at_entry = saw_abort_at_entry.clone();
+        let abort_at_release = saw_abort_at_release.clone();
+        let gate = pi_agent::AgentTool::new(
+            "hold_gate",
+            "diagnostic gate that ignores abort until released",
+            pi_ai::Schema::object_ordered(Vec::new()),
+            move |context| {
+                let release_rx = release_rx.clone();
+                let entered = entered.clone();
+                let abort_at_entry = abort_at_entry.clone();
+                let abort_at_release = abort_at_release.clone();
+                async move {
+                    entered.store(true, std::sync::atomic::Ordering::SeqCst);
+                    abort_at_entry.store(
+                        context.abort.is_aborted(),
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
+                    // Never select on `context.abort`. The run stays active
+                    // until the oneshot is sent. A stored send cannot be
+                    // missed the way `Notify::notify_waiters` can.
+                    if let Some(release_rx) = release_rx.lock().await.take() {
+                        let _ = release_rx.await;
+                    }
+                    abort_at_release.store(
+                        context.abort.is_aborted(),
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
+                    Ok(pi_agent::AgentToolResult::text("released"))
+                }
+            },
+        );
+        let stream_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let call_count = stream_calls.clone();
+        let stream: pi_agent::StreamFn = std::sync::Arc::new(move |model, _context, _options| {
+            let n = call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                let events = pi_ai::new_assistant_message_event_stream();
+                let writer = events.clone();
+                tokio::spawn(async move {
+                    let mut message = pi_ai::AssistantMessage::pending(&model);
+                    if n == 0 {
+                        message.content = vec![ContentBlock::ToolCall(pi_ai::ToolCall {
+                            id: "hold-1".to_owned(),
+                            name: "hold_gate".to_owned(),
+                            arguments: serde_json::json!({}),
+                            thought_signature: None,
+                        })];
+                        message.stop_reason = pi_ai::StopReason::ToolUse;
+                    } else {
+                        message.stop_reason = pi_ai::StopReason::Stop;
+                    }
+                    writer
+                        .push(pi_ai::AssistantMessageEvent::Done {
+                            reason: message.stop_reason,
+                            message: message.clone(),
+                        })
+                        .await;
+                    writer.end(Some(message)).await;
+                });
+                events
+            })
+        });
+        let (agent_dir, cwd, faux, resources, session) = isolated_application_parts_inner(
+            "{}",
+            None,
+            Some(stream),
+            vec![gate],
+        );
+        current_thread_runtime().block_on(async move {
+            session
+                .attach_resources(resources)
+                .await
+                .expect("attach resources");
+            assert!(
+                session
+                    .get_active_tool_names()
+                    .iter()
+                    .any(|name| name == "hold_gate"),
+                "gate tool must survive resource attach, got {:?}",
+                session.get_active_tool_names()
+            );
+            let application = Application::from_runtime_candidate(
+                crate::ApplicationRuntimeCandidate::new(session.clone()),
+            )
+            .await
+            .expect("publish application");
+            application
+                .prompt("hold the turn".to_owned(), Vec::new(), None)
+                .await
+                .expect("prompt")
+                .expect("accepted turn");
+            let entered_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !tool_entered.load(std::sync::atomic::Ordering::SeqCst)
+                && std::time::Instant::now() < entered_deadline
+            {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                tool_entered.load(std::sync::atomic::Ordering::SeqCst),
+                "uncooperative tool must be executing before send-now"
+            );
+            assert!(
+                !saw_abort_at_entry.load(std::sync::atomic::Ordering::SeqCst),
+                "abort must not already be set when the tool is entered"
+            );
+            application
+                .steer("inject me now".to_owned(), Vec::new())
+                .await
+                .expect("queue steering");
+            let (steering, _) = application.queued_messages().await;
+            assert!(
+                !steering.is_empty(),
+                "steering must be queued before send-now"
+            );
+            let phase_streaming_before_send = application.is_streaming();
+            let phase_turn_before_send = application.active_turn_id();
+            let send = tokio::spawn({
+                let application = application.clone();
+                async move { application.send_queued_steering_now(None).await }
+            });
+            // Deterministic pending check. Do not call `tokio::time::pause`
+            // or `advance`: this runtime is not started paused, and turning
+            // pause on would freeze `state()` and the release join. Poll the
+            // spawned send-now once. Pending means it is still inside
+            // `wait_for_idle` / `active_run` join. That is the future the
+            // browser drops at 30s; virtual time is not required to observe
+            // it, and a wall sleep would only hide the same pending state.
+            tokio::task::yield_now().await;
+            let mut send_now_pending_poll = std::pin::pin!(send);
+            let phase_send_now_pending = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(matches!(
+                    send_now_pending_poll.as_mut().poll(cx),
+                    std::task::Poll::Pending
+                ))
+            })
+            .await;
+            let state = application.state().await;
+            let phase_streaming_while_held = application.is_streaming();
+            let phase_turn_while_held = application.active_turn_id();
+            let (queued_while_held, _) = application.queued_messages().await;
+            eprintln!(
+                "send-now diagnostic: streaming_before={phase_streaming_before_send} turn_before={phase_turn_before_send:?} pause_enabled=false virtual_30s=skipped send_now_pending={phase_send_now_pending} state_streaming={} streaming_while_held={phase_streaming_while_held} turn_while_held={phase_turn_while_held:?} queued_while_held={} abort_seen_at_entry={}",
+                state.is_streaming,
+                queued_while_held.len(),
+                saw_abort_at_entry.load(std::sync::atomic::Ordering::SeqCst),
+            );
+            assert!(
+                phase_streaming_while_held,
+                "run slot must still be active while the tool ignores abort; state() already returned (state.is_streaming={})",
+                state.is_streaming
+            );
+            assert!(
+                phase_send_now_pending,
+                "send-now must still be awaiting idle; a finished task means abort already settled the tool"
+            );
+            release_tx
+                .lock()
+                .expect("release sender")
+                .take()
+                .expect("release once")
+                .send(())
+                .expect("tool is waiting on the oneshot");
+            let settled = tokio::time::timeout(std::time::Duration::from_secs(5), send_now_pending_poll)
+                .await
+                .expect("releasing the tool must let send-now finish")
+                .expect("send-now task");
+            let accepted = match &settled {
+                Ok(sent) => sent.sent == 1 && !sent.combined,
+                Err(_) => false,
+            };
+            let calls = stream_calls.load(std::sync::atomic::Ordering::SeqCst);
+            eprintln!(
+                "send-now diagnostic release: settled={settled:?} accepted_once={accepted} stream_calls={calls} abort_seen_at_release={}",
+                saw_abort_at_release.load(std::sync::atomic::Ordering::SeqCst),
+            );
+            assert!(
+                accepted,
+                "after the tool returns, send-now must accept the queued prompt exactly once, got {settled:?}"
+            );
+            assert!(
+                calls >= 2,
+                "the queued prompt must start a new model call after the held tool returns, calls={calls}"
+            );
+            application.wait_for_idle().await;
+            drop((agent_dir, cwd, faux));
+        });
+    }
+
+
     #[test]
     fn protocol_snapshot_keeps_one_runtime_generation_across_cutover() {
         let old = resource_application("{}");
@@ -9420,6 +10254,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             ));
             let next_model = next.session.model().expect("next model");
             next.start_turn("new-turn", Some(&next_model));
@@ -9511,6 +10346,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             ));
             active.session_subscription.lock().take();
             application.inner.runtime.replace_arc(next);
@@ -9999,8 +10835,17 @@ mod tests {
             let cancelled = first_runtime
                 .cancel_jobs_result(std::slice::from_ref(&spawn.job_id))
                 .expect("rollback must restore cancellation authority");
-            first_release.cancel();
             assert_eq!(cancelled, [spawn.job_id.clone()]);
+            // The spawned job owns a runner reservation, so cancellation
+            // commits a nonterminal `Cancelling` intent; the terminal
+            // `Cancelled` snapshot is persisted when the runner settles.
+            // `wait_until_idle` returns only after the runner dropped its
+            // owner guard, i.e. after its durable persist.
+            first_runtime.wait_until_idle().await;
+            // Released only after wait_until_idle: the settled runner has
+            // dropped the factory future (selected the cancel branch, typed
+            // stop), so this can no longer race the cancel settlement.
+            first_release.cancel();
             let terminal = first_runtime
                 .durable_state_for_test()
                 .expect("load sidecar after rollback cancellation");
@@ -10010,12 +10855,19 @@ mod tests {
                 .find(|job| job.id == spawn.job_id)
                 .expect("cancelled job remains durable");
             assert_eq!(persisted.status, crate::JobStatus::Cancelled);
+            // Typed intentional-stop contract: no manufactured error string;
+            // the durable cause lives on the snapshot's cancellation cause.
             assert_eq!(
                 persisted
                     .result
                     .as_ref()
-                    .and_then(|result| result.error.as_deref()),
-                Some("task cancelled"),
+                    .expect("cancelled job carries its typed result")
+                    .error,
+                None,
+            );
+            assert_eq!(
+                persisted.cancellation_cause,
+                Some(crate::CancellationCause::Task),
             );
             first
                 .application
@@ -10501,6 +11353,8 @@ mod tests {
             created_at: 1,
             started_at: None,
             finished_at: None,
+            cancellation_cause: matches!(status, crate::JobStatus::Cancelling | crate::JobStatus::Cancelled)
+                .then_some(crate::CancellationCause::Task),
             result: None,
             soft_budget_exhausted: false,
         }
@@ -10566,16 +11420,20 @@ mod tests {
             None
         );
 
-        // Queued or running orchestration jobs refuse with an actionable
-        // message naming the count.
-        for status in [crate::JobStatus::Queued, crate::JobStatus::Running] {
+        // Queued, running, or cancelling orchestration jobs refuse with an
+        // actionable message naming the count. Cancelling still owns its
+        // runner, so rewind must not treat it as settled.
+        for status in [
+            crate::JobStatus::Queued,
+            crate::JobStatus::Running,
+            crate::JobStatus::Cancelling,
+        ] {
             let refusal =
                 Application::rewind_refusal(&[job("live", status)], &[]).expect("refusal");
             assert!(refusal.contains("rewind refused"), "{refusal}");
             assert!(refusal.contains("orchestration job(s)"), "{refusal}");
             assert!(refusal.contains('1'), "{refusal}");
         }
-
         // Active workflows refuse even when no orchestration job is queued.
         for status in [
             crate::WorkflowStatus::Queued,
@@ -10782,7 +11640,7 @@ mod tests {
         let session =
             crate::Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
                 crate::SessionOptions {
-                    model,
+                    model: Some(model),
                     cwd: cwd.to_path_buf(),
                     system_prompt: String::new(),
                     thinking_level: pi_agent::ThinkingLevel::Off,
@@ -11061,7 +11919,7 @@ mod tests {
                     );
                     crate::Session::new_with_additional_tools_filtered_and_discovery(
                         crate::SessionOptions {
-                            model: request.model,
+                            model: Some(request.model),
                             cwd: child_cwd.clone(),
                             system_prompt: request.system_prompt,
                             thinking_level: pi_agent::ThinkingLevel::Off,
@@ -11096,7 +11954,7 @@ mod tests {
             crate::AgentCatalog::from_agents(vec![todo_routing_task_definition()]),
             cwd.path().join("artifacts"),
         );
-        config.parent_model = session.model().expect("parent model");
+        config.parent_model = session.model();
         config.idle_ttl = None;
         config.max_tools_per_agent = 64;
         let runtime = crate::OrchestrationRuntime::new(config, factory).expect("orchestration");
@@ -11295,7 +12153,7 @@ mod tests {
                         });
                     crate::Session::new_with_additional_tools_filtered_and_discovery(
                         crate::SessionOptions {
-                            model: request.model,
+                            model: Some(request.model),
                             cwd: child_cwd.clone(),
                             system_prompt: request.system_prompt,
                             thinking_level: pi_agent::ThinkingLevel::Off,
@@ -11327,7 +12185,7 @@ mod tests {
             crate::AgentCatalog::from_agents(vec![todo_routing_task_definition()]),
             cwd.path().join("artifacts"),
         );
-        config.parent_model = session.model().expect("parent model");
+        config.parent_model = session.model();
         config.idle_ttl = None;
         config.max_tools_per_agent = 64;
         let runtime = crate::OrchestrationRuntime::new(config, factory).expect("orchestration");
@@ -11451,7 +12309,7 @@ mod tests {
             crate::AgentCatalog::from_agents(vec![todo_routing_task_definition()]),
             cwd.path().join("artifacts"),
         );
-        config.parent_model = session.model().expect("parent model");
+        config.parent_model = session.model();
         config.idle_ttl = None;
         let runtime = crate::OrchestrationRuntime::new(config, factory).expect("orchestration");
         let application = Application::from_runtime_candidate(
@@ -11834,7 +12692,12 @@ mod tests {
                 runtime
                     .jobs(Some(std::slice::from_ref(&job_id)))
                     .iter()
-                    .all(|job| matches!(job.status, crate::JobStatus::Queued | crate::JobStatus::Running))
+                    .all(|job| matches!(
+                        job.status,
+                        crate::JobStatus::Queued
+                            | crate::JobStatus::Running
+                            | crate::JobStatus::Cancelling
+                    ))
             );
 
             fixture

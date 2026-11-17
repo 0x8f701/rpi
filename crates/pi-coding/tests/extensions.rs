@@ -141,7 +141,7 @@ async fn bootstrap_extension_application_with_agent_settings(
     std::fs::create_dir_all(&session_dir)?;
     let session = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model: model.clone(),
+            model: Some(model.clone()),
             cwd: cwd.clone(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,

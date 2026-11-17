@@ -53,8 +53,11 @@ PY
 }
 wait_ready() {
     local deadline=$((SECONDS + 30))
+    local attempt=0
     while [ "$SECONDS" -lt "$deadline" ]; do
-        if rpc '{"type":"get_state","id":"ready"}' "$evidence/ready.json" 2>/dev/null; then return 0; fi
+        attempt=$((attempt + 1))
+        # Unique id per attempt: repeated command ids replay ledger outcomes.
+        if rpc "{\"type\":\"get_state\",\"id\":\"ready-$attempt\"}" "$evidence/ready.json" 2>/dev/null; then return 0; fi
         kill -0 "$RPI_PID" 2>/dev/null || fail "listener exited before readiness"
         sleep 0.05
     done
@@ -91,8 +94,11 @@ PY
 prompt='release Web prompt survives restart'
 rpc "{\"type\":\"prompt\",\"id\":\"prompt\",\"message\":\"$prompt\"}" "$evidence/prompt.json"
 deadline=$((SECONDS + 30))
+poll=0
 while :; do
-    rpc '{"type":"get_entries","id":"entries"}' "$evidence/entries-before.json"
+    poll=$((poll + 1))
+    # Unique id per poll: repeated command ids replay ledger outcomes.
+    rpc "{\"type\":\"get_entries\",\"id\":\"entries-$poll\"}" "$evidence/entries-before.json"
     if python3 - "$evidence/entries-before.json" "$prompt" <<'PY'
 import sys
 text = open(sys.argv[1], encoding="utf-8").read()

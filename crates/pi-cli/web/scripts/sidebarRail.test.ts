@@ -1,16 +1,16 @@
 #!/usr/bin/env node
 // Collapsed-rail hit-target contract for src/styles.css.
-//
 // The desktop collapsed rail applies `pointer-events: none` to every
 // `.session-sidebar` descendant except `#rail-reopen-btn`. That exception is
-// not enough: the button lives under `.session-sidebar__head`, which still
-// matches the blanket rule, so the visible » is not hit-testable. This file
-// parses the production stylesheet (no browser) and asserts the ancestor
-// chain is re-enabled. Run through `npm run build`.
+// not enough: the button lives under `.session-sidebar__search-box` (its »
+// host row since the Sessions title row was removed), which still matches the
+// blanket rule, so the visible » is not hit-testable. This file parses the
+// production stylesheet (no browser) and asserts the ancestor chain is
+// re-enabled. Run through `npm run build`.
 //
 // Pre-fix CSS fails here because the stylesheet only excludes
 // `#rail-reopen-btn` from the none rule and never sets pointer-events:auto
-// on `.session-sidebar__head`.
+// on `.session-sidebar__search-box`.
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -30,38 +30,37 @@ const css = readFileSync(
 check('desktop collapsed-rail marker exists', css.includes('#rail-reopen-btn { display: none; }'));
 check(
   'blanket none still inerts hidden rail descendants',
-  css.includes('.session-sidebar *:not(#rail-reopen-btn):not(.session-sidebar__head)')
+  css.includes('.session-sidebar *:not(#rail-reopen-btn):not(.session-sidebar__search-box)')
     && /pointer-events:\s*none;/.test(css),
-  'missing the :not(.session-sidebar__head) carve-out',
+  'missing the :not(.session-sidebar__search-box) carve-out',
 );
 check(
-  'head ancestor AND #rail-reopen-btn re-enable pointer-events',
-  /\.session-sidebar__head,\s*\n\s*\.app-layout:not\(\.app-layout--drawer-open\) #rail-reopen-btn \{\s*\n\s*pointer-events: auto;/.test(css),
-  'pre-fix CSS never set pointer-events:auto on .session-sidebar__head, so the visible child stayed unclickable',
+  'search-box host AND #rail-reopen-btn re-enable pointer-events',
+  /\.session-sidebar__search-box,\s*\n\s*\.app-layout:not\(\.app-layout--drawer-open\) #rail-reopen-btn \{\s*\n\s*pointer-events: auto;/.test(css),
+  'pre-fix CSS never set pointer-events:auto on .session-sidebar__search-box, so the visible child stayed unclickable',
 );
 check(
   'reopen button is displayed in the collapsed desktop rail',
   /\.app-layout:not\(\.app-layout--drawer-open\) #rail-reopen-btn \{\s*\n\s*display: inline-block;/.test(css),
 );
-
-// The collapsed » lives inside .session-sidebar__head. That header once
-// declared `border-bottom: 1px solid var(--border)`, which the collapsed rail
-// kept painting as a stray divider line across the top of the 44px strip
-// right under the » (the aside base never had one). The owner of the rule is
-// the head, so the contract is: no .session-sidebar__head rule anywhere in
-// the cascade may declare a border-bottom, and no collapsed-rail override may
-// re-add a border to the » ancestor chain.
-const headRuleBlocks = css.match(/\.session-sidebar__head[^{}]*\{[^{}]*\}/g) ?? [];
+// The collapsed » lives inside .session-sidebar__search-box. The old
+// .session-sidebar__head once declared `border-bottom: 1px solid var(--border)`,
+// which the collapsed rail kept painting as a stray divider line across the
+// top of the 44px strip right under the » (the aside base never had one).
+// The contract carries over to the » host row: no .session-sidebar__search-box
+// rule anywhere in the cascade may declare a border-bottom, and no
+// collapsed-rail override may re-add a border to the » ancestor chain.
+const searchBoxRuleBlocks = css.match(/\.session-sidebar__search-box[^{}]*\{[^{}]*\}/g) ?? [];
 check(
-  'no .session-sidebar__head rule declares a border-bottom (» divider owner removed)',
-  headRuleBlocks.length !== 0 && !headRuleBlocks.join('\n').includes('border-bottom'),
-  'a border-bottom on the head paints a stray divider under the collapsed-rail »',
+  'no .session-sidebar__search-box rule declares a border-bottom (» divider owner removed)',
+  searchBoxRuleBlocks.length !== 0 && !searchBoxRuleBlocks.join('\n').includes('border-bottom'),
+  'a border-bottom on the » host row paints a stray divider under the collapsed-rail »',
 );
-const collapsedHeadRules =
-  css.match(/\.app-layout:not\(\.app-layout--drawer-open\)[^{}]*\.session-sidebar__head[^{}]*\{[^{}]*\}/g) ?? [];
+const collapsedStripRules =
+  css.match(/\.app-layout:not\(\.app-layout--drawer-open\)[^{}]*\.session-sidebar__search-box[^{}]*\{[^{}]*\}/g) ?? [];
 check(
   'collapsed-rail overrides never re-add borders to the » ancestor chain',
-  !/\bborder[a-z-]*\s*:/.test(collapsedHeadRules.join('\n')),
+  !/\bborder[a-z-]*\s*:/.test(collapsedStripRules.join('\n')),
 );
 
 const mobileStart = css.indexOf('@media (max-width: 720px) {');

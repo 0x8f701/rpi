@@ -51,14 +51,14 @@
 //       present, exactly one assistant reply whose text includes the
 //       fixture grep needle + matched path (src/deep/feature.rs) from
 //       the RAW tool result — a stub/fail grep fails the lane
-//   L3  a genuine live code_review_snapshot poll captured while the
-//       reply was in-flight is HELD unchanged (old revision/comments/
-//       active fields, request id + send/capture times tracked) and
-//       delivered only AFTER terminal; delivery FAILS if the response
-//       could be expired by the 30s pending timeout, and the App's
-//       pending settlement (timeout-timer clear) proves the response
-//       was consumed — not just shim-delivered; overlay stays idle
-//       (no resurrected Abort/dot/busy)
+//   L3  a genuine live code_review_snapshot poll captured while the reply
+//       was in-flight is delivered unchanged ONCE before the terminal wait,
+//       releasing the real single-flight (id/revision/active fields,
+//       request id + send/capture times tracked); the App's pending
+//       settlement (timeout-timer clear) proves that first delivery was
+//       consumed. The terminal sample stays idle (no Abort/dot/busy) and
+//       there is no post-terminal same-id replay — D6 owns genuinely
+//       undelivered old-epoch frames.
 //   L4  D7 reconnect recovery stays terminal-idle (no Abort/dot/busy)
 //   T6  responsive breakpoint + mobile tab bar, driven while the panel stays
 //       mounted: resizing the viewport across the 900px breakpoint fires the
@@ -103,9 +103,16 @@
 //       console errors and ZERO page errors (favicon noise filtered) —
 //       native ERR_CONNECTION_REFUSED handling is never loosened because
 //       the kill is a real 1006, not a refused connect
+//   S1  real connection epoch: a GENUINE old-generation snapshot success is
+//       held across the real 1006 kill/respawn and never delivered; the new
+//       generation sends+receives its own snapshot (different id). ONE old
+//       transport-frame failure variant replayed after the drained pending
+//       leaves the last-good projection and toasts unchanged (old frame
+//       replay only — no pending flight-pressure claim).
 
 import { chromium } from 'playwright';
 import fs from 'node:fs';
+import { selectCompletionThenSubmit } from './lib/slash-completion.mjs';
 
 const url = process.env.RPI_URL;
 const token = process.env.RPI_TOKEN || '';
@@ -432,6 +439,8 @@ async function main() {
         replayedLiveSnapshot: false,
         liveCaptureArmed: false,
         liveOrigOnMessage: null,
+        reconnectHold: null,
+        snapshotResponses: [],
       };
       let failuresRemaining = 0;
       class ObservedWebSocket extends NativeWebSocket {
@@ -460,6 +469,7 @@ async function main() {
             try {
               const parsed = typeof ev.data === 'string' ? JSON.parse(ev.data) : null;
               if (parsed && parsed.type === 'pong') state.pongs += 1;
+              if (parsed?.type === 'response' && parsed.command === 'code_review_snapshot' && parsed.id) state.snapshotResponses.push({ gen, id: parsed.id, success: parsed.success === true });
             } catch {
               /* ignore */
             }
@@ -521,10 +531,9 @@ async function main() {
         },
         /** Capture genuine live code_review_snapshot responses
          *  (isStreaming or activeCount>0) into liveSnapshotQueue.
-         *  Snapshot polls that are live are HELD (original JSON
-         *  unchanged) and delivered only after terminal — never
-         *  rewritten onto a later poll. Comment responses still
-         *  deliver immediately so Abort/dot can appear. */
+         *  Snapshots that are live are captured unchanged once (raw kept for
+         *  provenance) and delivered immediately before the terminal wait so
+         *  the real single-flight is never held; no same-id replay follows. */
         armLiveSnapshotCapture() {
           const ws = state.ws;
           if (!ws || ws.readyState !== NativeWebSocket.OPEN) {
@@ -582,6 +591,23 @@ async function main() {
             } catch {
               /* ignore */
             }
+            if (typeof origOnMessage === 'function') origOnMessage.call(ws, ev);
+          };
+        },
+        /** S: hold one GENUINE old-generation snapshot success (never delivered;
+         *  the hold is bound to this socket, so later generations still flow). */
+        holdReconnectSnapshot() {
+          const ws = state.ws;
+          if (!ws || ws.readyState !== NativeWebSocket.OPEN) throw new Error('no live websocket to hold');
+          const origOnMessage = ws.onmessage;
+          ws.onmessage = function (ev) {
+            try {
+              const parsed = typeof ev.data === 'string' ? JSON.parse(ev.data) : null;
+              if (!state.reconnectHold && parsed?.type === 'response' && parsed.command === 'code_review_snapshot' && parsed.success === true && parsed.id) {
+                state.reconnectHold = { raw: ev.data, id: parsed.id, gen: state.generation, delivered: false };
+                return;
+              }
+            } catch { /* ignore */ }
             if (typeof origOnMessage === 'function') origOnMessage.call(ws, ev);
           };
         },
@@ -795,7 +821,8 @@ async function main() {
     const desktopNavigation = await page.evaluate(() => {
       const pane = document.querySelector('.code-review__diff');
       const selected = document.querySelector('.code-review__hunk.is-selected');
-      const buttons = Array.from(document.querySelectorAll('.code-review__hunk-nav-btn'));
+      const nav = document.querySelector('[role="group"][aria-label="Hunk navigation"]');
+      const buttons = Array.from(nav?.querySelectorAll('.code-review__hunk-nav-btn') ?? []);
       if (!pane || !selected || buttons.length !== 2) return null;
       const paneRect = pane.getBoundingClientRect();
       const selectedRect = selected.getBoundingClientRect();
@@ -1342,15 +1369,19 @@ async function main() {
       fail(`L3: held snapshot request ids/capture times not tracked (${JSON.stringify(heldSnapshots)})`);
     }
     await page.screenshot({ path: `${evidence}/code-review-tool-live.png`, fullPage: true });
+    // L3: first (only) delivery of the genuine captured live frame — releases
+    // the real single-flight before the terminal wait; no same-id replay later.
+    await page.evaluate(() => window.__crDelayTest.flushDelayedLiveSnapshots());
+    let l2Exit = null; const l2ExitBefore = process.exit;
+    process.exit = (code) => { l2Exit = code; throw new Error('l2-failure-diagnostic'); };
+    try {
     await waitFor(
       page,
       ({ want, needle, pathText }) => {
         const assistant = Array.from(document.querySelectorAll('.code-review__comment--assistant .code-review__comment-text'))
           .map((el) => el.textContent || '');
         const echo = assistant.find((t) => t.includes('cr-grep-echo') && t.includes(needle) && t.includes(pathText));
-        if (!echo) return false;
-        const stub = /stub|not allowed|permission|tool (is )?unavailable|failed closed|read-only|fail(ed|ure)/i.test(echo);
-        if (stub) return false;
+        const stub = /stub|not allowed|permission|tool (is )?unavailable|failed closed|read-only|fail(ed|ure)/i.test(echo || '');
         const abort = Array.from(document.querySelectorAll('button.code-review__action--stop'))
           .some((b) => (b.textContent || '').includes('Stop'));
         const streaming = document.querySelector('.code-review__streaming') !== null;
@@ -1359,12 +1390,28 @@ async function main() {
         const input = document.querySelector('.code-review__comment-input');
         const userRestored = Array.from(document.querySelectorAll('.code-review__comment--user .code-review__comment-text'))
           .some((el) => (el.textContent || '').includes(want));
-        return !abort && !streaming && !hunkDot && !busy && input && !input.disabled && userRestored && assistant.length === 1;
+        const held = (window.__crDelay.heldSnapshots || [])[0];
+        const sample = { echoFound: !!echo, stub, abort, streaming, hunkDot, busy, input: !!input, inputDisabled: input ? input.disabled : null, userRestored, assistantCount: assistant.length, flightHeld: !!held && !window.__crDelay.replayedLiveSnapshot, heldResponseId: held?.id ?? null, heldRawCount: (window.__crDelay.delayedLiveRaw || []).length, released: !!window.__crDelay.replayedLiveSnapshot };
+        window.__l2Predicate = sample;
+        return !!echo && !stub && !abort && !streaming && !hunkDot && !busy && input && !input.disabled && userRestored && assistant.length === 1;
       },
       'L2: tool-path reply never reached terminal idle with real grep needle+path (stub/fail grep fails)',
       30000,
       { want: grepProbe, needle: grepNeedle, pathText: grepPath }
     );
+    } catch (error) {
+      if (l2Exit === null) { process.exit = l2ExitBefore; throw error; }
+      const diagnostic = await page.evaluate(() => ({
+        assistants: Array.from(document.querySelectorAll('.code-review__comment--assistant .code-review__comment-text')).map((el) => (el.textContent || '').slice(0, 2048)),
+        states: { abort: !!document.querySelector('.code-review__action--stop'), streaming: !!document.querySelector('.code-review__streaming'), hunkDot: !!document.querySelector('.code-review__hunk .code-review__streaming-dot'), busy: !!document.querySelector('.code-review__busy') },
+        error: (document.querySelector('.code-review__error')?.textContent || '').slice(0, 2048), tools: Array.from(document.querySelectorAll('.code-review__tool,.code-review__toolcall,[data-tool-status]')).map((el) => ({ status: el.getAttribute('data-tool-status') || '', text: (el.textContent || '').slice(0, 2048) })),
+      }));
+      const lastPredicate = await page.evaluate(() => window.__l2Predicate ?? null);
+      fs.writeFileSync(`${evidence}/l2-failure.json`, JSON.stringify({ ...diagnostic, lastPredicate, threads: socketFrames.received.map((f) => parseFrame(f.raw)).filter((f) => f && f.data && Array.isArray(f.data.threads)).slice(-1).flatMap((f) => f.data.threads).map((t) => ({ replyStatus: t.replyStatus, error: t.error, toolCalls: t.toolCalls, comments: (t.comments || []).filter((c) => c.role === 'assistant').map((c) => ({ role: c.role, text: (c.text || '').slice(0, 2048) })) })) }, null, 2));
+      await page.screenshot({ path: `${evidence}/l2-failure.png`, fullPage: true });
+      process.exit = l2ExitBefore; l2ExitBefore(l2Exit);
+    }
+    process.exit = l2ExitBefore;
     const grepEcho = await page.evaluate(() => {
       const el = document.querySelector('.code-review__comment--assistant .code-review__comment-text');
       return el ? (el.textContent || '') : '';
@@ -1377,9 +1424,9 @@ async function main() {
     }
     await page.screenshot({ path: `${evidence}/code-review-tool-terminal.png`, fullPage: true });
 
-    // L3: deliver the captured LIVE snapshot JSON unchanged (old
-    // revision/comments/active fields intact) AFTER terminal. Overlay
-    // must stay idle — a delayed in-flight poll cannot resurrect Abort.
+    // L3: the captured LIVE frame was already delivered once before terminal
+    // (releasing the real single-flight). This block proves its provenance and
+    // terminal-idle outcome; it does not replay the same id or claim staleness.
     const capturedLive = await page.evaluate(() => {
       const raw = (window.__crDelay.delayedLiveRaw || [])[0];
       if (typeof raw !== 'string') return null;
@@ -1401,35 +1448,25 @@ async function main() {
         userCommentPresent: Array.isArray(live.threads)
           && live.threads.some((t) => Array.isArray(t.comments)
             && t.comments.some((c) => typeof c.text === 'string' && c.text.includes('cr grep probe'))),
-        unchanged: true,
+        source: 'captured-live-frame',
       };
     });
     if (!capturedLive || (capturedLive.isStreaming !== true && !(capturedLive.activeCount > 0))) {
       fail(`L3: held snapshot was not a genuine live frame (${JSON.stringify(capturedLive)})`);
     }
-    await page.evaluate(() => {
-      window.__crDelayTest.flushDelayedLiveSnapshots();
-    });
-    await waitFor(
-      page,
-      () => window.__crDelay && window.__crDelay.replayedLiveSnapshot === true,
-      'L3: held live snapshot was never delivered after terminal',
-      5000
-    );
-    // Wait through React settlement (a render cycle) before reading the
-    // terminal DOM so a resurrected indicator cannot be missed by sampling
-    // before the app's state update flushed.
     await page.waitForTimeout(100);
+    // The earlier flush already delivered the captured frame once; settle one
+    // render cycle before sampling the terminal-idle surface.
     const lateIdle = await page.evaluate(() => ({
       abort: Array.from(document.querySelectorAll('button.code-review__action--stop'))
         .some((b) => (b.textContent || '').includes('Stop')),
       streaming: document.querySelector('.code-review__streaming') !== null,
       hunkDot: document.querySelector('.code-review__hunk .code-review__streaming-dot') !== null,
       busy: document.querySelector('.code-review__busy') !== null,
-      replayed: !!(window.__crDelay && window.__crDelay.replayedLiveSnapshot),
+      delivered: !!(window.__crDelay && window.__crDelay.replayedLiveSnapshot),
     }));
     if (lateIdle.abort || lateIdle.streaming || lateIdle.hunkDot || lateIdle.busy) {
-      fail(`L3: delayed live snapshot resurrected live UI (${JSON.stringify(lateIdle)})`);
+      fail(`L3: live snapshot first delivery left non-idle terminal UI (${JSON.stringify(lateIdle)})`);
     }
     await page.screenshot({ path: `${evidence}/code-review-late-idle.png`, fullPage: true });
 
@@ -1519,7 +1556,8 @@ async function main() {
     const mobileNavigation = await page.evaluate(() => {
       const pane = document.querySelector('.code-review__diff');
       const selected = document.querySelector('.code-review__hunk.is-selected');
-      const buttons = Array.from(document.querySelectorAll('.code-review__hunk-nav-btn'));
+      const nav = document.querySelector('[role="group"][aria-label="Hunk navigation"]');
+      const buttons = Array.from(nav?.querySelectorAll('.code-review__hunk-nav-btn') ?? []);
       if (!pane || !selected || buttons.length !== 2) return null;
       const paneRect = pane.getBoundingClientRect();
       const selectedRect = selected.getBoundingClientRect();
@@ -1663,7 +1701,15 @@ async function main() {
     );
 
     await page.fill('#prompt-input', '/review');
-    await page.press('#prompt-input', 'Enter');
+    // The inline completion popup owns the SELECTING Enter and never
+    // dispatches, so the delayed code_review_open must come from the
+    // helper's independent dispatch Enter on the settled /review token.
+    await selectCompletionThenSubmit(page, {
+      token: '/review',
+      label: 'D: /review delayed open',
+      sentFrames: socketFrames.sent,
+      dispatchType: 'code_review_open',
+    });
     await waitFor(
       page,
       () => window.__crDelay.delayedOpenIds.length > 0,
@@ -1825,6 +1871,9 @@ async function main() {
     // product reconnect attempts synchronously before any TCP socket opens so
     // Chromium never manufactures native ERR_CONNECTION_REFUSED console
     // errors while the port is down (the reconnect lane's proven seam).
+    // S: hold one GENUINE old-generation snapshot success across 1006/respawn.
+    await page.evaluate(() => window.__crDelayTest.holdReconnectSnapshot());
+    await waitFor(page, () => window.__crDelay.reconnectHold !== null, 'S: no actual snapshot success was withheld before the real kill', 15000);
     const preKillPanel = await page.evaluate(() => ({
       socketOpen: !!window.__crDelay.ws && window.__crDelay.ws.readyState === WebSocket.OPEN,
       generation: window.__crDelay.generation,
@@ -1979,6 +2028,34 @@ async function main() {
     }
     await page.screenshot({ path: `${evidence}/code-review-delay-recovered.png`, fullPage: true });
 
+    // S: real connection epoch. The GENUINE old-generation snapshot success
+    // held before the kill was never delivered; the new generation sent and
+    // received its OWN snapshot (different id). The one old transport frame
+    // replayed below is a FAILURE VARIANT of that undelivered old request —
+    // not success-then-same-id-failure pseudo-stale. onclose already drained
+    // pending at the real 1006 (take -> undefined), so this is an old
+    // transport-frame replay, NOT a pending flight-pressure claim (operations
+    // owns that).
+    await waitFor(page, (killedGen) => window.__crDelay.snapshotResponses.some((r) => r.gen > killedGen && r.success), 'S: the new generation never received its own snapshot', 20000, delayGen);
+    const sentSnapshots = socketFrames.sent.map((f) => parseFrame(f.raw)).filter((f) => f && f.type === 'code_review_snapshot');
+    const epochHold = await page.evaluate(() => {
+      const state = window.__crDelay; const hold = state.reconnectHold; return { hold, generation: state.generation, newResponse: state.snapshotResponses.find((r) => r.gen > (hold?.gen ?? -1) && r.success && r.id !== hold?.id) ?? null };
+    });
+    if (!epochHold.hold || epochHold.hold.gen !== delayGen || epochHold.hold.delivered) fail(`S: no undelivered killed-generation snapshot success was held: ${JSON.stringify(epochHold.hold)}`);
+    if (epochHold.generation <= delayGen || !epochHold.newResponse) fail(`S: the new socket generation did not receive its own snapshot (gen ${epochHold.generation})`);
+    if (epochHold.newResponse.id === epochHold.hold.id) fail('S: the new generation reused the withheld old snapshot id');
+    if (!sentSnapshots.some((f) => f.id === epochHold.newResponse.id)) fail('S: the new snapshot success has no matching request on the wire');
+    const oldSend = sentSnapshots.find((f) => f.id === epochHold.hold.id); if (!oldSend || !oldSend.sessionId) fail('S: the withheld snapshot id has no session-stamped request on the wire');
+    const replayState = await page.evaluate((raw) => {
+      const of = () => ({ label: document.querySelector('.code-review__label')?.textContent || '', totals: document.querySelector('.code-review__totals')?.textContent || '', files: document.querySelectorAll('button.code-review__file').length, toasts: document.querySelectorAll('#toasts .toast').length });
+      const ws = window.__crDelay.ws; if (!ws || ws.readyState !== WebSocket.OPEN) throw new Error('S: replay socket is not OPEN');
+      const before = of();
+      ws.dispatchEvent(new MessageEvent('message', { data: raw }));
+      return new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve({ before, after: of(), deliveries: window.__crDelay.snapshotResponses.filter((r) => r.id === JSON.parse(raw).id && !r.success).length }))));
+    }, JSON.stringify({ type: 'response', id: epochHold.hold.id, command: 'code_review_snapshot', success: false, error: 'late old-generation snapshot failure', sessionId: oldSend.sessionId }));
+    if (replayState.deliveries !== 1) fail(`S: the single old failure variant was delivered ${replayState.deliveries} times (want exactly 1)`);
+    if (JSON.stringify(replayState.after) !== JSON.stringify(replayState.before)) fail(`S: replaying the old transport frame changed last-good projection/toasts: ${JSON.stringify(replayState)}`);
+
     // D8: the whole segment ran with ZERO browser console/page errors.
     const cleanConsole = consoleErrors.filter((t) => !t.includes('favicon'));
     if (pageErrors.length) fail(`D8: page errors: ${JSON.stringify(pageErrors)}`);
@@ -2006,6 +2083,14 @@ async function main() {
         transportToasts: recovered.transportToasts,
         inlineError: recovered.inlineError,
         sidebarError: recovered.sidebarError,
+      },
+      epochReplay: {
+        held: { id: epochHold.hold.id, gen: epochHold.hold.gen, sessionId: oldSend.sessionId ?? null, delivered: epochHold.hold.delivered },
+        generation: epochHold.generation,
+        newResponseId: epochHold.newResponse.id,
+        replay: 'old transport-frame failure variant (pending drained at 1006 onclose; no flight-pressure claim)',
+        replayDeliveries: replayState.deliveries,
+        projection: { before: replayState.before, after: replayState.after },
       },
       sentOpen: sentParsed.filter((f) => f && f.type === 'code_review_open'),
       sentGetState: sentParsed.filter((f) => f && f.type === 'get_state').slice(-6),

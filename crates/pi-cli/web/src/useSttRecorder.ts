@@ -71,6 +71,8 @@ export type UseSttRecorderArgs = {
   onError: (message: string) => void;
 };
 
+type SttCapturePhase = 'idle' | 'acquiring' | 'recording' | 'stopping' | 'transcribing';
+
 export function useSttRecorder({
   getOwner,
   getDestination,
@@ -81,6 +83,8 @@ export function useSttRecorder({
 }: UseSttRecorderArgs): {
   recording: boolean;
   transcribing: boolean;
+  starting: boolean;
+  isBusy: () => boolean;
   startRecording: () => Promise<void>;
   stopRecording: () => void;
 } {
@@ -102,47 +106,62 @@ export function useSttRecorder({
   const chunksRef = useRef<Blob[]>([]);
   const timerRef = useRef<number | null>(null);
   const captureOwnerRef = useRef<string | null>(null);
-  const startingRef = useRef(false);
+  const attemptRef = useRef(0);
+  const phaseRef = useRef<SttCapturePhase>('idle');
   const unmountedRef = useRef(false);
-  const [recording, setRecording] = useState(false);
-  const [transcribing, setTranscribing] = useState(false);
+  const [phase, setPhaseState] = useState<SttCapturePhase>('idle');
+  const setPhase = useCallback((next: SttCapturePhase) => {
+    phaseRef.current = next;
+    setPhaseState(next);
+  }, []);
 
   const stopRecording = useCallback(() => {
     if (timerRef.current !== null) {
       window.clearTimeout(timerRef.current);
       timerRef.current = null;
     }
+    if (phaseRef.current === 'acquiring') {
+      attemptRef.current += 1;
+      captureOwnerRef.current = null;
+      setPhase('idle');
+      return;
+    }
+    if (phaseRef.current !== 'recording') return;
+    const attempt = attemptRef.current;
     const recorder = recorderRef.current;
     recorderRef.current = null;
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
     }
+    setPhase('stopping');
     if (recorder && recorder.state !== 'inactive') {
       try {
         recorder.stop();
       } catch (err) {
-        startingRef.current = false;
-        setRecording(false);
+        if (attemptRef.current !== attempt) return;
+        setPhase('idle');
         const captured = captureOwnerRef.current;
         if (shouldCommitSttTranscript(captured, ownerRef.current())) {
           onErrorRef.current(sttTranscribeFailedMessage(err));
         }
       }
-    } else {
-      startingRef.current = false;
-      setRecording(false);
+      return;
     }
-  }, []);
+    if (attemptRef.current === attempt) setPhase('idle');
+  }, [setPhase]);
 
   const transcribeAudio = useCallback(async (
     audioBlob: Blob,
     captured: string,
     destination: SttRecordingDestination | null,
+    attempt: number,
   ) => {
-    setTranscribing(true);
+    if (attemptRef.current !== attempt) return;
+    setPhase('transcribing');
     try {
       const wav = await blobToWav(audioBlob);
+      if (attemptRef.current !== attempt) return;
       if (!wav) {
         const result = planSttTranscribeResult({
           owner: captured,
@@ -155,6 +174,7 @@ export function useSttRecorder({
         return;
       }
       const audioBase64 = wavToBase64(new Uint8Array(await wav.arrayBuffer()));
+      if (attemptRef.current !== attempt) return;
       if (audioBase64 === null) {
         const result = planSttTranscribeResult({
           owner: captured,
@@ -167,6 +187,7 @@ export function useSttRecorder({
         return;
       }
       const raw = await sendCommandRef.current(sttTranscribeCommand(captured, audioBase64, STT_WAV_MIME));
+      if (attemptRef.current !== attempt) return;
       const result = planSttTranscribeResult({
         owner: captured,
         current: ownerRef.current(),
@@ -177,18 +198,19 @@ export function useSttRecorder({
       if (result.kind === 'error') onErrorRef.current(result.message);
       else if (result.kind === 'transcript') onTranscriptRef.current(result.text, captured, destination);
     } catch (err) {
+      if (attemptRef.current !== attempt) return;
       if (shouldCommitSttTranscript(captured, ownerRef.current())) {
         onErrorRef.current(sttTranscribeFailedMessage(err));
       }
     } finally {
+      if (attemptRef.current !== attempt) return;
       if (captureOwnerRef.current === captured) captureOwnerRef.current = null;
-      startingRef.current = false;
-      setTranscribing(false);
+      setPhase('idle');
     }
-  }, []);
+  }, [setPhase]);
 
   const startRecording = useCallback(async () => {
-    if (recording || transcribing || startingRef.current) return;
+    if (phaseRef.current !== 'idle') return;
     const planned = planSttStart({
       owner: ownerRef.current(),
       live: configuredRef.current,
@@ -201,14 +223,21 @@ export function useSttRecorder({
     const captured = planned.owner;
     const capturedDestination = destinationRef.current?.() ?? null;
     captureOwnerRef.current = captured;
-    startingRef.current = true;
+    const attempt = ++attemptRef.current;
+    setPhase('acquiring');
     let stream: MediaStream | null = null;
     try {
       stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      if (unmountedRef.current || !shouldCommitSttTranscript(captured, ownerRef.current())) {
+      if (
+        attemptRef.current !== attempt
+        || unmountedRef.current
+        || !shouldCommitSttTranscript(captured, ownerRef.current())
+      ) {
         stream.getTracks().forEach((track) => track.stop());
-        if (captureOwnerRef.current === captured) captureOwnerRef.current = null;
-        startingRef.current = false;
+        if (attemptRef.current === attempt) {
+          if (captureOwnerRef.current === captured) captureOwnerRef.current = null;
+          setPhase('idle');
+        }
         return;
       }
       const mime = selectSttRecorderMime(
@@ -222,26 +251,28 @@ export function useSttRecorder({
         if (e.data && e.data.size > 0) chunksRef.current.push(e.data);
       };
       recorder.onstop = () => {
-        setRecording(false);
+        if (attemptRef.current !== attempt) return;
         const chunks = chunksRef.current;
         chunksRef.current = [];
         if (unmountedRef.current || chunks.length === 0) {
           if (captureOwnerRef.current === captured) captureOwnerRef.current = null;
-          startingRef.current = false;
+          setPhase('idle');
           return;
         }
         const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
-        void transcribeAudio(blob, captured, capturedDestination);
+        void transcribeAudio(blob, captured, capturedDestination, attempt);
       };
+      setPhase('recording');
       recorder.start();
-      setRecording(true);
       timerRef.current = window.setTimeout(() => stopRecording(), STT_AUTO_RELEASE_MS);
     } catch (err) {
-      startingRef.current = false;
-      if (captureOwnerRef.current === captured) captureOwnerRef.current = null;
-      if (stream) {
-        stream.getTracks().forEach((track) => track.stop());
+      if (attemptRef.current !== attempt) {
+        if (stream) stream.getTracks().forEach((track) => track.stop());
+        return;
       }
+      setPhase('idle');
+      if (captureOwnerRef.current === captured) captureOwnerRef.current = null;
+      if (stream) stream.getTracks().forEach((track) => track.stop());
       if (streamRef.current) {
         streamRef.current.getTracks().forEach((track) => track.stop());
         streamRef.current = null;
@@ -250,12 +281,14 @@ export function useSttRecorder({
         onErrorRef.current(sttMicrophoneUnavailableMessage(err));
       }
     }
-  }, [recording, transcribing, stopRecording, transcribeAudio]);
+  }, [setPhase, stopRecording, transcribeAudio]);
 
   useEffect(() => {
     unmountedRef.current = false;
     return () => {
       unmountedRef.current = true;
+      attemptRef.current += 1;
+      phaseRef.current = 'idle';
       if (timerRef.current !== null) {
         window.clearTimeout(timerRef.current);
         timerRef.current = null;
@@ -276,5 +309,15 @@ export function useSttRecorder({
     };
   }, []);
 
-  return { recording, transcribing, startRecording, stopRecording };
+  const recording = phase === 'recording' || phase === 'stopping';
+  const transcribing = phase === 'transcribing';
+  const starting = phase === 'acquiring';
+  return {
+    recording,
+    transcribing,
+    starting,
+    isBusy: () => phaseRef.current !== 'idle',
+    startRecording,
+    stopRecording,
+  };
 }

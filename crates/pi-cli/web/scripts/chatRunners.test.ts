@@ -3114,6 +3114,108 @@ async function main(): Promise<void> {
   }
 
   {
+    // Connected OPEN blackhole socket: hidden->visible/pageshow must enqueue
+    // AT MOST ONE pending generation-bound liveness get_state (session-
+    // stamped, never id-less/new_session/switch_session); its 15s command
+    // timeout fails the connection and schedules the reconnect; a superseded
+    // timer must never close the replacement. runners.ts shouldWake returns
+    // false for 'connected', so the wake checks fail before the fix.
+    activeBlock = 'visible/pageshow wake probes a connected OPEN blackhole socket';
+    const page = installWakePage();
+    const store = storage();
+    const fakeTimers = timers();
+    const sockets: FakeWebSocket[] = [];
+    const registry = new RunnerRegistry({
+      fetchFn: defaultFetch(),
+      storage: store,
+      webSocketFactory: (url, protocols) => {
+        const socket = new FakeWebSocket(url, protocols);
+        sockets.push(socket);
+        return socket as unknown as WebSocket;
+      },
+      setTimeoutFn: fakeTimers.setTimeoutFn,
+      clearTimeoutFn: fakeTimers.clearTimeoutFn,
+      now: () => 100,
+      randomBytes: deterministicBytes,
+    });
+    registry.start();
+    const added = registry.add('Runner A', RUNNER_A_ORIGIN, AUTH_MARKER_A);
+    await flush();
+    sockets[0].open();
+    await waitForCommand(sockets[0], 'get_state');
+    sockets[0].respond('get_state', true, stateOf('session-a', { cwd: SAFE_CWD_A }));
+    await flush();
+    sockets[0].respond('session_list', true, { sessions: [loadedRow('session-a')] });
+    const connected = await added;
+    const boundProbes = () => commandFrames<{ type: string; sessionId?: string }>(sockets[0], 'get_state')
+      .filter((frame) => frame.sessionId === 'session-a');
+    try {
+      page.document.visibilityState = 'hidden';
+      page.dispatch('visibilitychange');
+      await flush();
+      check('connected wake stays inert while hidden', boundProbes().length === 0, JSON.stringify(boundProbes()));
+
+      page.document.visibilityState = 'visible';
+      page.dispatch('visibilitychange');
+      await flush();
+      if (boundProbes().length !== 1) {
+        throw new Error(`expected exactly one generation-bound liveness get_state probe on visible wake (sessionId 'session-a'), saw ${boundProbes().length}`);
+      }
+      check('visible wake probe rides the SAME OPEN socket', sockets.length === 1, String(sockets.length));
+      check('visible wake retains the selected runner mapping',
+        registry.snapshot()[0]?.id === connected.id
+        && registry.snapshot()[0]?.origin === RUNNER_A_ORIGIN
+        && registry.snapshot()[0]?.authority === RUNNER_A_AUTHORITY,
+        JSON.stringify(registry.snapshot()[0]));
+
+      page.dispatch('pageshow');
+      await flush();
+      if (boundProbes().length !== 1) {
+        throw new Error(`repeated pageshow while the liveness probe is pending must not enqueue a second probe, saw ${boundProbes().length}`);
+      }
+
+      if (!fakeTimers.runDelay(RUNNER_COMMAND_TIMEOUT_MS)) {
+        throw new Error('the blackholed liveness probe never armed the deterministic 15s command timeout');
+      }
+      await flush();
+      check('blackholed probe timeout fails the connection',
+        registry.snapshot()[0]?.state === 'reconnecting',
+        registry.snapshot()[0]?.state ?? '');
+      if (!fakeTimers.runDelay(RUNNER_RECONNECT_INITIAL_MS)) {
+        throw new Error('the failed liveness probe did not arm the reconnect backoff');
+      }
+      await flush();
+      if (sockets.length !== 2) {
+        throw new Error(`the probe timeout did not open the replacement socket (found ${sockets.length}, expected 2)`);
+      }
+      check('reconnect keeps the runner identity',
+        registry.snapshot()[0]?.id === connected.id,
+        registry.snapshot()[0]?.id ?? '');
+      sockets[1].open();
+      await waitForCommand(sockets[1], 'get_state');
+      sockets[1].respond('get_state', true, stateOf('session-a', { cwd: SAFE_CWD_A }));
+      await flush();
+      sockets[1].respond('session_list', true, { sessions: [loadedRow('session-a')] });
+      await flush();
+      check('replacement generation settles connected', registry.snapshot()[0]?.state === 'connected', registry.snapshot()[0]?.state ?? '');
+      fakeTimers.runDelay(RUNNER_COMMAND_TIMEOUT_MS);
+      await flush();
+      check('superseded timer cannot close the replacement socket',
+        sockets[1].readyState === FakeWebSocket.OPEN && !sockets[1].closed,
+        `${sockets[1].readyState}:${sockets[1].closed}`);
+      check('superseded timer leaves the replacement connected',
+        registry.snapshot()[0]?.state === 'connected',
+        registry.snapshot()[0]?.state ?? '');
+      check('superseded timer arms no reconnect',
+        ![...fakeTimers.scheduled.values()].some((timer) => timer.delay === RUNNER_RECONNECT_INITIAL_MS),
+        JSON.stringify([...fakeTimers.scheduled.values()].map((timer) => timer.delay)));
+    } finally {
+      registry.stop();
+      page.restore();
+    }
+  }
+
+  {
     activeBlock = 'wake retries token_required only when a token is stored';
     const page = installWakePage();
     const store = storage();

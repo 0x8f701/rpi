@@ -17,8 +17,8 @@
 #   T5  Todo/Goal/Workflow state never leaks across sessions
 #   T6  desktop rail collapse/reopen, Manage Session lifecycle/sidebar switch,
 #       header has NO feature buttons
-#   T7  Android 390x844 drawer: hamburger opens, session pick closes the
-#       drawer and restores the picked session's transcript
+#   T7  Android 390x844 drawer: feature-menu Sessions entry opens, session
+#       pick closes the drawer and restores the picked session's transcript
 #   T8  UI fork places the selected user turn in the composer only, survives
 #       refresh as one durable active row, and stays isolated from its parent
 #
@@ -87,7 +87,7 @@ EOF
     cp "$SCRIPT_DIR/lib/p0_resource_driver.mjs" "$root/playwright/lib/p0_resource_driver.mjs"
     cp "$SCRIPT_DIR/lib/p0_resource_metrics.mjs" "$root/playwright/lib/p0_resource_metrics.mjs"
     cp "$SCRIPT_DIR/lib/p0_native_session.mjs" "$root/playwright/lib/p0_native_session.mjs"
-    web_run_playwright "$url" "$evidence" "$root/playwright" "$SCRIPT_DIR/sessions_test.mjs" RPI_MOCK_PORT="$port" || pw_status=$?
+    web_run_playwright "$url" "$evidence" "$root/playwright" "$SCRIPT_DIR/sessions_test.mjs" RPI_MOCK_PORT="$port" RPI_FOCUS_CWD="$root/workspace/sessions-focus-zoo" || pw_status=$?
     if [ "$pw_status" -ne 0 ]; then
         fail "$SCENARIO: playwright lane failed (exit $pw_status) — sessions lane is playwright-only"
     fi

@@ -104,6 +104,7 @@ async function main() {
       const NativeWebSocket = window.WebSocket;
       let gen = 0;
       let current = null;
+      window.__rpiReadyGateWire = [];
 
       // Dispatch a held native open to the App's onopen exactly once: flip
       // the shadowed readyState to OPEN FIRST, then call the handler, so gate
@@ -140,6 +141,11 @@ async function main() {
             configurable: true,
           });
           current = this;
+        }
+
+        send(data) {
+          if (typeof data === 'string') window.__rpiReadyGateWire.push(data);
+          super.send(data);
         }
       }
 
@@ -254,6 +260,30 @@ async function main() {
     }
     await page.screenshot({ path: `${evidence}/readygate-active-failfast.png`, fullPage: true });
 
+    // --- Enter during the HELD bootstrap (authoritative ready not reached):
+    //     the readiness contract is NO command dispatch before authoritative
+    //     ready, and the typed draft must survive the gated window. Both are
+    //     proven on the real wire + the live composer. ---
+    const DRAFT = 'readygate pre-ready draft';
+    await page.fill('#prompt-input', DRAFT);
+    await page.press('#prompt-input', 'Enter');
+    await page.waitForTimeout(400);
+    const preReady = await page.evaluate((want) => ({
+      prompts: window.__rpiReadyGateWire.filter((raw) => {
+        try { return JSON.parse(raw).type === 'prompt'; } catch { return false; }
+      }).length,
+      draft: document.getElementById('prompt-input')?.value ?? null,
+      composer: document.getElementById('prompt-input') !== null,
+    }), DRAFT);
+    if (!preReady.composer) fail('composer was not mounted during the held bootstrap');
+    if (preReady.prompts !== 0) {
+      fail(`Enter dispatched ${preReady.prompts} prompt frame(s) before authoritative ready`);
+    }
+    await page.screenshot({ path: `${evidence}/readygate-draft-held.png`, fullPage: true });
+    if (preReady.draft !== DRAFT) {
+      fail(`Enter during bootstrap destroyed the draft (must be preserved until authoritative ready): value=${JSON.stringify(preReady.draft)}`);
+    }
+
     // Release the held open: the App's onOpen runs, the gate resolves the
     // mount auto-load, and the sidebar loads the primary session row — no
     // `load failed: not connected`.
@@ -269,6 +299,21 @@ async function main() {
     );
     await assertNoLoadFailed(page, 'after released-open sidebar load');
     await page.screenshot({ path: `${evidence}/readygate-sidebar-loaded.png`, fullPage: true });
+
+    // The preserved draft must SURVIVE the authoritative-ready bootstrap and
+    // dispatch exactly once on the next Enter — never before ready.
+    const postReady = await page.evaluate(() => document.getElementById('prompt-input')?.value ?? null);
+    if (postReady !== DRAFT) {
+      await page.screenshot({ path: `${evidence}/readygate-draft-wiped.png`, fullPage: true });
+      fail(`draft lost across the authoritative-ready bootstrap: value=${JSON.stringify(postReady)}`);
+    }
+    await page.press('#prompt-input', 'Enter');
+    await waitFor(page, (want) => {
+      const frames = window.__rpiReadyGateWire.filter((raw) => {
+        try { return JSON.parse(raw).type === 'prompt'; } catch { return false; }
+      });
+      return frames.length === 1 && (JSON.parse(frames[0]).message || '').includes(want);
+    }, 'ready Enter never dispatched the preserved draft exactly once', 15000, DRAFT);
 
     // The full Session panel is already open from the fail-fast lifecycle
     // attempt. After release its gated mount load must populate normally.

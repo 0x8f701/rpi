@@ -1194,6 +1194,7 @@ fn job_status_label(status: JobStatus) -> &'static str {
     match status {
         JobStatus::Queued => "queued",
         JobStatus::Running => "running",
+        JobStatus::Cancelling => "Cancelling",
         JobStatus::Completed => "completed",
         JobStatus::Failed => "failed",
         JobStatus::Cancelled => "cancelled",

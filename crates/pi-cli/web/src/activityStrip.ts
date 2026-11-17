@@ -72,7 +72,7 @@ export function applyTaskSpawnDetails(
     const jobId = stringField(child, 'jobId', 'job_id');
     const agentId = stringField(child, 'agentId', 'agent_id');
     const status = stringField(child, 'status');
-    if (jobId === '' || agentId === '' || (status !== 'queued' && status !== 'running')) {
+    if (jobId === '' || agentId === '' || (status !== 'queued' && status !== 'running' && status !== 'cancelling')) {
       return nextState;
     }
     return applyActivityStripEvent(
@@ -115,7 +115,17 @@ export function reconcileActivityStrip(
 ): ActivityStripState {
   const current = state?.sessionId === sessionId ? state : emptyActivityStripState(sessionId);
   if (!isStreaming) {
-    return { ...emptyActivityStripState(sessionId), terminalTurnIds: current.terminalTurnIds };
+    // Optimistic idle reset (stop tap / idle snapshot): keep the pending
+    // turn's typed identity until its typed turn_terminal lands on the
+    // ledger — dropping turnId here orphans the terminal and the
+    // settled-refill ownership check then rejects the canonical-id
+    // hydration (stuck "Saving reply…"). Every visual field still resets.
+    const pendingTerminal = current.turnId !== '' && !current.terminalTurnIds.includes(current.turnId);
+    return {
+      ...emptyActivityStripState(sessionId),
+      terminalTurnIds: current.terminalTurnIds,
+      ...(pendingTerminal ? { turnId: current.turnId } : {}),
+    };
   }
   const turnId = activeTurnId || current.turnId;
   if (turnId === '' || current.terminalTurnIds.includes(turnId)) return current;
@@ -176,7 +186,7 @@ export function applyActivityStripEvent(
       const jobId = stringField(job, 'id', 'jobId');
       const status = stringField(job, 'status');
       if (jobId === '') return current;
-      if (status === 'queued' || status === 'running') {
+      if (status === 'queued' || status === 'running' || status === 'cancelling') {
         const existing = current.children.find((child) => child.jobId === jobId);
         const jobParentId = stringField(job, 'parentId', 'parent_id');
         if (!existing && jobParentId !== 'Main') return current;

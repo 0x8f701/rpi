@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, SecondsFormat, Utc};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use pi_ai::{
     BranchSummaryMessage, CompactionSummaryMessage, ContentBlock, CustomMessage,
     CustomMessageContent, Message, Model, Usage,
@@ -926,8 +926,6 @@ pub fn fork_selected_editor_text(message: &Message) -> Option<String> {
 
 #[derive(Debug)]
 struct RecorderState {
-    path: PathBuf,
-    id: String,
     file_identity: Option<crate::SessionFileIdentity>,
     timestamp: String,
     cwd: PathBuf,
@@ -1082,53 +1080,88 @@ impl PreparedSessionResume {
             .collect();
         let active_leaf_id = self.tree.leaf_id.clone();
         Ok(SessionRecorder {
-            inner: Arc::new(Mutex::new(RecorderState {
-                path: self.path,
-                file_identity: Some(self.identity),
-                id: self.tree.header.id,
-                timestamp: self.tree.header.timestamp,
-                cwd: self.tree.header.cwd,
-                parent_session: self.tree.header.parent_session,
-                last_id: self.tree.leaf_id,
-                active_leaf_id,
-                revision: 0,
-                used_ids,
-                pending: Vec::new(),
-                requires_separator: self.requires_separator,
-                file: Some(self.file),
-                lease: Some(self.lease),
-                flushed: true,
-                has_assistant: true,
-                session_name,
-                durable: false,
-            })),
+            core: Arc::new(RecorderCore {
+                identity: SessionRecorderIdentity {
+                    id: self.tree.header.id,
+                    path: self.path,
+                },
+                diagnostics: RwLock::new(SessionRecorderDiagnostics {
+                    loader_drop_counts: (
+                        self.tree.skipped_idless,
+                        self.tree.undecodable_messages,
+                    ),
+                }),
+                state: Mutex::new(RecorderState {
+                    file_identity: Some(self.identity),
+                    timestamp: self.tree.header.timestamp,
+                    cwd: self.tree.header.cwd,
+                    parent_session: self.tree.header.parent_session,
+                    last_id: self.tree.leaf_id,
+                    active_leaf_id,
+                    revision: 0,
+                    used_ids,
+                    pending: Vec::new(),
+                    requires_separator: self.requires_separator,
+                    file: Some(self.file),
+                    lease: Some(self.lease),
+                    flushed: true,
+                    has_assistant: true,
+                    session_name,
+                    durable: false,
+                }),
+            }),
         })
     }
 }
 
+/// Immutable journal identity for one recorder generation. Moved out of the
+/// writer state so identity reads never contend on the writer lock.
+#[derive(Debug)]
+struct SessionRecorderIdentity {
+    id: String,
+    path: PathBuf,
+}
+
+/// Loader diagnostics as of the LAST SUCCESSFULLY loaded/computed journal
+/// state — deliberately not a live filesystem watcher; refreshed explicitly
+/// after successful tree loads and successful rewrites.
+#[derive(Debug)]
+struct SessionRecorderDiagnostics {
+    loader_drop_counts: (usize, usize),
+}
+
+/// Cohesive core shared by every clone of one recorder generation: immutable
+/// identity, reader-side diagnostics, and the writer state mutex.
+#[derive(Debug)]
+struct RecorderCore {
+    identity: SessionRecorderIdentity,
+    diagnostics: RwLock<SessionRecorderDiagnostics>,
+    state: Mutex<RecorderState>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionRecorder {
-    inner: Arc<Mutex<RecorderState>>,
+    core: Arc<RecorderCore>,
 }
 
 impl SessionRecorder {
     #[must_use]
     pub fn path(&self) -> PathBuf {
-        self.inner.lock().path.clone()
+        self.core.identity.path.clone()
     }
 
     #[must_use]
     pub fn id(&self) -> String {
-        self.inner.lock().id.clone()
+        self.core.identity.id.clone()
     }
 
     #[must_use]
     pub fn header(&self) -> SessionHeader {
-        let state = self.inner.lock();
+        let state = self.core.state.lock();
         SessionHeader {
             record_type: "session".to_owned(),
             version: CURRENT_SESSION_VERSION,
-            id: state.id.clone(),
+            id: self.core.identity.id.clone(),
             timestamp: state.timestamp.clone(),
             cwd: state.cwd.clone(),
             parent_session: state.parent_session.clone(),
@@ -1137,13 +1170,15 @@ impl SessionRecorder {
 
     #[must_use]
     pub fn file_identity(&self) -> Option<crate::SessionFileIdentity> {
-        self.inner.lock().file_identity
+        self.core.state.lock().file_identity
     }
 
     pub(crate) fn file_authority(&self) -> Option<(crate::fs::CapabilityRootLease, PathBuf)> {
-        let state = self.inner.lock();
+        let state = self.core.state.lock();
         let lease = state.lease.as_ref()?.clone();
-        let relative = state
+        let relative = self
+            .core
+            .identity
             .path
             .strip_prefix(lease.display_root())
             .ok()?
@@ -1157,38 +1192,38 @@ impl SessionRecorder {
     pub fn activate_writer(
         &self,
     ) -> Result<(String, PathBuf, crate::SessionFileIdentity)> {
-        let mut state = self.inner.lock();
+        let mut state = self.core.state.lock();
         if !state.flushed {
-            persist_durable(&mut state)?;
+            persist_durable(&self.core.identity, &mut state)?;
         }
         state.durable = true;
-        validate_append_writer(&mut state)
+        validate_append_writer(&self.core.identity, &mut state)
     }
 
     /// Revalidate the already-activated retained descriptor, capability root,
     /// path identity, and append position.
     pub fn writer_info(&self) -> Result<(String, PathBuf, crate::SessionFileIdentity)> {
-        validate_append_writer(&mut self.inner.lock())
+        validate_append_writer(&self.core.identity, &mut self.core.state.lock())
     }
 
     #[must_use]
     pub fn last_entry_id(&self) -> Option<String> {
-        self.inner.lock().last_id.clone()
+        self.core.state.lock().last_id.clone()
     }
 
     #[must_use]
     pub fn active_leaf_id(&self) -> Option<String> {
-        self.inner.lock().active_leaf_id.clone()
+        self.core.state.lock().active_leaf_id.clone()
     }
     /// Captures the active leaf and recorder revision for a later atomic append.
     #[must_use]
     pub fn append_token(&self) -> SessionAppendToken {
-        let state = self.inner.lock();
+        let state = self.core.state.lock();
         append_token_from_state(&state)
     }
 
     pub fn branch(&self, entry_id: &str) -> Result<()> {
-        let mut state = self.inner.lock();
+        let mut state = self.core.state.lock();
         if !state.used_ids.contains(entry_id) {
             bail!("Entry not found: {entry_id}");
         }
@@ -1200,7 +1235,7 @@ impl SessionRecorder {
     }
 
     pub fn reset_leaf(&self) {
-        let mut state = self.inner.lock();
+        let mut state = self.core.state.lock();
         if state.active_leaf_id.take().is_some() {
             state.revision = state.revision.saturating_add(1);
         }
@@ -1222,7 +1257,7 @@ impl SessionRecorder {
         usage: Option<&Usage>,
         from_hook: Option<bool>,
     ) -> Result<String> {
-        let mut state = self.inner.lock();
+        let mut state = self.core.state.lock();
         if let Some(entry_id) = branch_from_id
             && !state.used_ids.contains(entry_id)
         {
@@ -1250,7 +1285,7 @@ impl SessionRecorder {
         if let Some(from_hook) = from_hook {
             fields.insert("fromHook".to_owned(), Value::Bool(from_hook));
         }
-        let result = append_entry(&mut state, "branch_summary", Value::Object(fields));
+        let result = append_entry(&self.core.identity, &mut state, "branch_summary", Value::Object(fields));
         if result.is_err() {
             state.active_leaf_id = previous_active_leaf_id;
             state.revision = previous_revision;
@@ -1259,7 +1294,7 @@ impl SessionRecorder {
     }
 
     pub fn record_label(&self, target_id: &str, label: Option<&str>) -> Result<String> {
-        let mut state = self.inner.lock();
+        let mut state = self.core.state.lock();
         if !state.used_ids.contains(target_id) {
             bail!("Entry not found: {target_id}");
         }
@@ -1270,7 +1305,7 @@ impl SessionRecorder {
         if let Some(label) = label {
             fields.insert("label".to_owned(), json!(label));
         }
-        let result = append_entry(&mut state, "label", Value::Object(fields));
+        let result = append_entry(&self.core.identity, &mut state, "label", Value::Object(fields));
         if result.is_ok() {
             state.last_id = previous_last_id;
             state.active_leaf_id = previous_active_leaf_id;
@@ -1288,7 +1323,7 @@ impl SessionRecorder {
     /// existing name shadows the older marker (the newest wins on resolve).
     pub fn record_checkpoint(&self, name: &str) -> Result<String> {
         let normalized = normalize_checkpoint_name(name)?;
-        let mut state = self.inner.lock();
+        let mut state = self.core.state.lock();
         let target_id = state
             .last_id
             .clone()
@@ -1298,7 +1333,7 @@ impl SessionRecorder {
         let mut fields = Map::new();
         fields.insert("name".to_owned(), Value::String(normalized));
         fields.insert("targetId".to_owned(), Value::String(target_id));
-        let result = append_entry(&mut state, "checkpoint", Value::Object(fields));
+        let result = append_entry(&self.core.identity, &mut state, "checkpoint", Value::Object(fields));
         if result.is_ok() {
             state.last_id = previous_last_id;
             state.active_leaf_id = previous_active_leaf_id;
@@ -1307,7 +1342,7 @@ impl SessionRecorder {
     }
 
     pub fn fork_from(&self, entry_id: Option<&str>) {
-        let mut state = self.inner.lock();
+        let mut state = self.core.state.lock();
         let entry_id = entry_id.map(str::to_owned);
         if state.active_leaf_id != entry_id || state.last_id != entry_id {
             state.last_id.clone_from(&entry_id);
@@ -1317,12 +1352,12 @@ impl SessionRecorder {
     }
 
     pub fn record_message(&self, message: &Message) -> Result<String> {
-        let mut state = self.inner.lock();
+        let mut state = self.core.state.lock();
         let previous_has_assistant = state.has_assistant;
         if matches!(message, Message::Assistant(_)) {
             state.has_assistant = true;
         }
-        match append_entry(&mut state, "message", json!({ "message": message })) {
+        match append_entry(&self.core.identity, &mut state, "message", json!({ "message": message })) {
             Ok(id) => Ok(id),
             Err(error) => {
                 state.has_assistant = previous_has_assistant;
@@ -1340,8 +1375,8 @@ impl SessionRecorder {
         if let Some(data) = data {
             fields.insert("data".to_owned(), data);
         }
-        let mut state = self.inner.lock();
-        append_entry(&mut state, "custom", Value::Object(fields))
+        let mut state = self.core.state.lock();
+        append_entry(&self.core.identity, &mut state, "custom", Value::Object(fields))
     }
 
     /// Compare-and-appends a typed custom record after validating the live tree.
@@ -1359,11 +1394,11 @@ impl SessionRecorder {
         T: serde::Serialize,
         F: FnOnce(&SessionTree) -> Result<()>,
     {
-        let mut state = self.inner.lock();
+        let mut state = self.core.state.lock();
         if state.active_leaf_id != expected.active_leaf_id || state.revision != expected.revision {
             bail!("session changed before durable custom append");
         }
-        let tree = session_tree_from_state(&state)?;
+        let tree = session_tree_from_state(&self.core.identity, &state)?;
         validate(&tree)?;
         let mut fields = Map::new();
         fields.insert(
@@ -1371,7 +1406,7 @@ impl SessionRecorder {
             Value::String(custom_type.to_owned()),
         );
         fields.insert("data".to_owned(), serde_json::to_value(data)?);
-        append_entry_durable(&mut state, "custom", Value::Object(fields))
+        append_entry_durable(&self.core.identity, &mut state, "custom", Value::Object(fields))
     }
 
     pub fn record_custom_message(&self, message: &CustomMessage) -> Result<String> {
@@ -1381,8 +1416,8 @@ impl SessionRecorder {
         };
         object.remove("role");
         object.remove("timestamp");
-        let mut state = self.inner.lock();
-        append_entry(&mut state, "custom_message", fields)
+        let mut state = self.core.state.lock();
+        append_entry(&self.core.identity, &mut state, "custom_message", fields)
     }
 
     /// Record the complete Todo state and make it crash-durable before returning.
@@ -1396,7 +1431,7 @@ impl SessionRecorder {
     }
 
     pub fn record_todo_snapshot_record(&self, snapshot: &TodoSnapshotRecord) -> Result<String> {
-        let mut recorder = self.inner.lock();
+        let mut recorder = self.core.state.lock();
         let mut payload = json!({ "state": snapshot.state });
         if let Some(status) = snapshot.execution_status {
             payload["executionStatus"] = serde_json::to_value(status)?;
@@ -1404,7 +1439,7 @@ impl SessionRecorder {
         if let Some(reason) = &snapshot.failure_reason {
             payload["failureReason"] = serde_json::to_value(reason)?;
         }
-        append_entry_durable(&mut recorder, "todo_snapshot", payload)
+        append_entry_durable(&self.core.identity, &mut recorder, "todo_snapshot", payload)
     }
 
     pub fn latest_todo_state(&self) -> Result<Option<TodoState>> {
@@ -1416,8 +1451,9 @@ impl SessionRecorder {
     }
 
     pub fn record_model_change(&self, provider: &str, model_id: &str) -> Result<String> {
-        let mut state = self.inner.lock();
+        let mut state = self.core.state.lock();
         append_entry(
+            &self.core.identity,
             &mut state,
             "model_change",
             json!({ "provider": provider, "modelId": model_id }),
@@ -1425,8 +1461,9 @@ impl SessionRecorder {
     }
 
     pub fn record_thinking_level(&self, thinking_level: &str) -> Result<String> {
-        let mut state = self.inner.lock();
+        let mut state = self.core.state.lock();
         append_entry(
+            &self.core.identity,
             &mut state,
             "thinking_level_change",
             json!({ "thinkingLevel": thinking_level }),
@@ -1461,7 +1498,7 @@ impl SessionRecorder {
         usage: Option<&Usage>,
         from_hook: Option<bool>,
     ) -> Result<String> {
-        let mut state = self.inner.lock();
+        let mut state = self.core.state.lock();
         let mut fields = Map::new();
         fields.insert("summary".to_owned(), Value::String(summary.to_owned()));
         if let Some(first_kept_entry_id) = first_kept_entry_id {
@@ -1484,13 +1521,14 @@ impl SessionRecorder {
         if let Some(from_hook) = from_hook {
             fields.insert("fromHook".to_owned(), Value::Bool(from_hook));
         }
-        append_entry(&mut state, "compaction", Value::Object(fields))
+        append_entry(&self.core.identity, &mut state, "compaction", Value::Object(fields))
     }
 
     pub fn record_session_name(&self, name: &str) -> Result<Option<String>> {
         let normalized = normalize_session_name(name);
-        let mut state = self.inner.lock();
+        let mut state = self.core.state.lock();
         append_entry(
+            &self.core.identity,
             &mut state,
             "session_info",
             json!({ "name": normalized.as_deref().unwrap_or_default() }),
@@ -1501,24 +1539,46 @@ impl SessionRecorder {
 
     #[must_use]
     pub fn session_name(&self) -> Option<String> {
-        self.inner.lock().session_name.clone()
+        self.core.state.lock().session_name.clone()
     }
 
     pub fn tree(&self) -> Result<SessionTree> {
-        session_tree_from_state(&self.inner.lock())
+        // Hold the writer guard through the short diagnostics publication
+        // (writer -> diag order; readers take diag only): a temporary guard
+        // dropped here could let this stale load overwrite a concurrent
+        // rewind's fresher counts.
+        let state = self.core.state.lock();
+        let tree = session_tree_from_state(&self.core.identity, &state)?;
+        self.refresh_diagnostics_from_tree(&tree);
+        Ok(tree)
+    }
+
+    fn refresh_diagnostics_from_tree(&self, tree: &SessionTree) {
+        *self.core.diagnostics.write() = SessionRecorderDiagnostics {
+            loader_drop_counts: (tree.skipped_idless, tree.undecodable_messages),
+        };
+    }
+
+    /// Loader diagnostics as of the last successful journal load — the single
+    /// count fact, read without the writer lock.
+    #[must_use]
+    pub fn loader_drop_counts(&self) -> (usize, usize) {
+        self.core.diagnostics.read().loader_drop_counts
     }
 
     /// Returns a consistent tree and append token captured under one recorder lock.
     pub fn tree_with_append_token(&self) -> Result<(SessionTree, SessionAppendToken)> {
-        let state = self.inner.lock();
-        let tree = session_tree_from_state(&state)?;
-        Ok((tree, append_token_from_state(&state)))
+        let state = self.core.state.lock();
+        let tree = session_tree_from_state(&self.core.identity, &state)?;
+        let token = append_token_from_state(&state);
+        self.refresh_diagnostics_from_tree(&tree);
+        Ok((tree, token))
     }
 
     /// Captures every parent attribute needed by a durable fork while the
     /// recorder mutation lock prevents branch navigation or appends.
     pub fn capture_fork_point(&self) -> Result<ParentForkPoint> {
-        let state = self.inner.lock();
+        let state = self.core.state.lock();
         // A live fork is authoritative only while the recorder still owns its
         // retained descriptor. Falling back to `state.path` here would reopen
         // a mutable pathname and could materialize a replacement inode rather
@@ -1526,26 +1586,28 @@ impl SessionRecorder {
         if state.flushed && state.file.is_none() {
             bail!("session append writer is unavailable for live fork capture");
         }
-        let (tree, raw_records) = fork_tree_and_raw_records_from_state(&state)?;
+        let (tree, raw_records) = fork_tree_and_raw_records_from_state(&self.core.identity, &state)?;
         let lease = state
             .lease
             .as_ref()
             .cloned()
             .ok_or_else(|| anyhow!("session file authority is unavailable"))?;
-        let relative = state
+        let relative = self
+            .core
+            .identity
             .path
             .strip_prefix(lease.display_root())
             .with_context(|| {
                 format!(
                     "session {} is outside retained root {}",
-                    state.path.display(),
+                    self.core.identity.path.display(),
                     lease.display_root().display()
                 )
             })?
             .to_path_buf();
         Ok(ParentForkPoint {
-            parent_session_id: state.id.clone(),
-            parent_session_path: state.path.clone(),
+            parent_session_id: self.core.identity.id.clone(),
+            parent_session_path: self.core.identity.path.clone(),
             parent_file_identity: state.file_identity,
             parent_active_leaf_id: state.active_leaf_id.clone(),
             parent_revision: state.revision,
@@ -1569,15 +1631,15 @@ impl SessionRecorder {
     /// past the first record (`keep == 0`) or to the end (`keep >= total`)
     /// is refused so a rewind can never leave an empty or unchanged journal.
     pub fn rewind_to(&self, keep: usize) -> Result<SessionRewindOutcome> {
-        let mut state = self.inner.lock();
+        let mut state = self.core.state.lock();
         // Flush pending records so the on-disk file holds the full record set
         // before the cut is located and the tail is archived.
         let previous_has_assistant = state.has_assistant;
         state.has_assistant = true;
-        let flush = persist(&mut state);
+        let flush = persist(&self.core.identity, &mut state);
         state.has_assistant = previous_has_assistant;
         flush?;
-        let tree = session_tree_from_state(&state)?;
+        let tree = session_tree_from_state(&self.core.identity, &state)?;
         let total = tree.entries.len();
         anyhow::ensure!(
             keep >= 1,
@@ -1590,7 +1652,7 @@ impl SessionRecorder {
         // Locate the kept record through a cloned retained descriptor. The
         // append-mode writer may sit at EOF, so reset the clone before reading.
         let cut_id = tree.entries[keep].id.clone();
-        let session_path = state.path.clone();
+        let session_path = self.core.identity.path.clone();
         let file = state
             .file
             .as_ref()
@@ -1626,9 +1688,33 @@ impl SessionRecorder {
         let cut_offset = cut_offset.ok_or_else(|| {
             anyhow!("rewind cut record {cut_id} was not found in the session file")
         })?;
+        // Retained-prefix diagnostics, computed BEFORE the truncate mutation:
+        // only blank lines are skipped, every other parse failure propagates
+        // with path and line context.
+        let mut retained_values = Vec::new();
+        for (line_index, line) in bytes[..cut_offset as usize]
+            .split(|byte| *byte == b'\n')
+            .enumerate()
+        {
+            let trimmed = trim_ascii_whitespace(line);
+            if trimmed.is_empty() {
+                continue;
+            }
+            retained_values.push(serde_json::from_slice::<Value>(trimmed).with_context(
+                || {
+                    format!(
+                        "parsing retained session {} line {} for rewind diagnostics",
+                        session_path.display(),
+                        line_index + 1
+                    )
+                },
+            )?);
+        }
+        let retained_tree =
+            session_tree_from_values(&self.core.identity.path, &retained_values)?;
         // Archive the dropped tail verbatim before truncating.
         let tail = bytes[(cut_offset as usize)..].to_vec();
-        let archive_path = archive_rewind_tail(&mut state, &tail)?;
+        let archive_path = archive_rewind_tail(&self.core.identity, &mut state, &tail)?;
         // Truncate and sync; the file was opened append-mode, so subsequent
         // record writes land at the new end automatically.
         let file = state
@@ -1657,6 +1743,9 @@ impl SessionRecorder {
             .and_then(|entry| entry.name.as_deref())
             .and_then(normalize_session_name);
         state.flushed = true;
+        // The retained diagnostics were computed before the truncate; publish
+        // them now that the mutation fully succeeded.
+        self.refresh_diagnostics_from_tree(&retained_tree);
         Ok(SessionRewindOutcome {
             archive_path,
             dropped_entries: total - keep,
@@ -1665,10 +1754,10 @@ impl SessionRecorder {
     }
 
     pub fn persist_now(&self) -> Result<()> {
-        let mut state = self.inner.lock();
+        let mut state = self.core.state.lock();
         let previous_has_assistant = state.has_assistant;
         state.has_assistant = true;
-        if let Err(error) = persist(&mut state) {
+        if let Err(error) = persist(&self.core.identity, &mut state) {
             state.has_assistant = previous_has_assistant;
             return Err(error);
         }
@@ -1678,10 +1767,10 @@ impl SessionRecorder {
 
     /// Like [`persist_now`] but forces a durable append (write + flush + fsync).
     pub fn persist_now_durable(&self) -> Result<()> {
-        let mut state = self.inner.lock();
+        let mut state = self.core.state.lock();
         let previous_has_assistant = state.has_assistant;
         state.has_assistant = true;
-        if let Err(error) = persist_durable(&mut state) {
+        if let Err(error) = persist_durable(&self.core.identity, &mut state) {
             state.has_assistant = previous_has_assistant;
             return Err(error);
         }
@@ -1694,7 +1783,7 @@ impl SessionRecorder {
     /// created by this recorder. Used to roll back an unpublished runtime
     /// candidate after a later initialization step fails.
     pub fn discard_persisted(&self) -> Result<()> {
-        let mut state = self.inner.lock();
+        let mut state = self.core.state.lock();
         let identity = state
             .file_identity
             .ok_or_else(|| anyhow!("session file identity is unavailable"))?;
@@ -1703,7 +1792,9 @@ impl SessionRecorder {
             .as_ref()
             .cloned()
             .ok_or_else(|| anyhow!("session directory capability is unavailable"))?;
-        let relative = state
+        let relative = self
+            .core
+            .identity
             .path
             .strip_prefix(lease.display_root())
             .context("session path is outside retained session root")?
@@ -1730,12 +1821,12 @@ impl SessionRecorder {
     /// Mark this recorder as durable so all subsequent appends use
     /// write+flush+fsync from the header onward.
     pub fn set_durable(&self) {
-        self.inner.lock().durable = true;
+        self.core.state.lock().durable = true;
     }
 
     pub fn close(&self) -> Result<()> {
-        let mut state = self.inner.lock();
-        persist_durable(&mut state)?;
+        let mut state = self.core.state.lock();
+        persist_durable(&self.core.identity, &mut state)?;
         if let Some(file) = state.file.as_mut() {
             file.flush().context("flushing session file")?;
             file.sync_all().context("syncing session file")?;
@@ -1924,26 +2015,30 @@ pub fn start_session_in_with_kind(
         header["sessionKind"] = json!(kind.header_value());
     }
     let recorder = SessionRecorder {
-        inner: Arc::new(Mutex::new(RecorderState {
-            path,
-            id,
-            timestamp,
-            cwd,
-            parent_session,
-            file_identity: None,
-            last_id: None,
-            active_leaf_id: None,
-            revision: 0,
-            used_ids: HashSet::new(),
-            pending: vec![header],
-            requires_separator: false,
-            file: None,
-            flushed: false,
-            lease: Some(lease),
-            has_assistant: false,
-            session_name: None,
-            durable: false,
-        })),
+        core: Arc::new(RecorderCore {
+            identity: SessionRecorderIdentity { id, path },
+            diagnostics: RwLock::new(SessionRecorderDiagnostics {
+                loader_drop_counts: (0, 0),
+            }),
+            state: Mutex::new(RecorderState {
+                timestamp,
+                cwd,
+                parent_session,
+                file_identity: None,
+                last_id: None,
+                active_leaf_id: None,
+                revision: 0,
+                used_ids: HashSet::new(),
+                pending: vec![header],
+                requires_separator: false,
+                file: None,
+                flushed: false,
+                lease: Some(lease),
+                has_assistant: false,
+                session_name: None,
+                durable: false,
+            }),
+        }),
     };
     if has_explicit_id {
         recorder
@@ -2257,32 +2352,39 @@ fn create_forked_session_from_tree(
     pending.extend(retained.rows);
     pending.extend(retained.labels);
 
+    let fork_tree = session_tree_from_values(&path, &pending)?;
+    let fork_diagnostics = SessionRecorderDiagnostics {
+        loader_drop_counts: (fork_tree.skipped_idless, fork_tree.undecodable_messages),
+    };
+
     let recorder = SessionRecorder {
-        inner: Arc::new(Mutex::new(RecorderState {
-            path,
-            file_identity: None,
-            id,
-            timestamp,
-            cwd: tree.header.cwd,
-            parent_session,
-            last_id: retained.leaf_id.clone(),
-            active_leaf_id: retained.leaf_id,
-            revision: 0,
-            used_ids: retained.used_ids,
-            pending,
-            requires_separator: false,
-            file: None,
-            lease: Some(lease),
-            flushed: false,
-            has_assistant: retained.has_assistant,
-            session_name: retained.session_name,
-            durable: persist_immediately,
-        })),
+        core: Arc::new(RecorderCore {
+            identity: SessionRecorderIdentity { id, path },
+            diagnostics: RwLock::new(fork_diagnostics),
+            state: Mutex::new(RecorderState {
+                timestamp,
+                cwd: tree.header.cwd,
+                parent_session,
+                file_identity: None,
+                last_id: retained.leaf_id.clone(),
+                active_leaf_id: retained.leaf_id,
+                revision: 0,
+                used_ids: retained.used_ids,
+                pending,
+                requires_separator: false,
+                file: None,
+                lease: Some(lease),
+                flushed: false,
+                has_assistant: retained.has_assistant,
+                session_name: retained.session_name,
+                durable: persist_immediately,
+            }),
+        }),
     };
     if persist_immediately {
         recorder.persist_now_durable()?;
     } else if retained.has_assistant {
-        persist(&mut recorder.inner.lock())?;
+        persist(&recorder.core.identity, &mut recorder.core.state.lock())?;
     }
     Ok(recorder)
 }
@@ -2317,28 +2419,37 @@ pub(crate) fn create_durable_forked_child(
     })];
     pending.extend(retained.rows);
     pending.extend(retained.labels);
+    let fork_tree = session_tree_from_values(&path, &pending)?;
+    let fork_diagnostics = SessionRecorderDiagnostics {
+        loader_drop_counts: (fork_tree.skipped_idless, fork_tree.undecodable_messages),
+    };
 
     let recorder = SessionRecorder {
-        inner: Arc::new(Mutex::new(RecorderState {
-            path,
-            file_identity: None,
-            id: child_session_id.to_owned(),
-            timestamp,
-            cwd: fork.tree.header.cwd,
-            parent_session,
-            last_id: retained.leaf_id.clone(),
-            active_leaf_id: retained.leaf_id,
-            revision: 0,
-            used_ids: retained.used_ids,
-            pending,
-            requires_separator: false,
-            file: None,
-            lease: Some(child_root.clone()),
-            flushed: false,
-            has_assistant: retained.has_assistant,
-            session_name: retained.session_name,
-            durable: true,
-        })),
+        core: Arc::new(RecorderCore {
+            identity: SessionRecorderIdentity {
+                id: child_session_id.to_owned(),
+                path,
+            },
+            diagnostics: RwLock::new(fork_diagnostics),
+            state: Mutex::new(RecorderState {
+                timestamp,
+                cwd: fork.tree.header.cwd,
+                parent_session,
+                file_identity: None,
+                last_id: retained.leaf_id.clone(),
+                active_leaf_id: retained.leaf_id,
+                revision: 0,
+                used_ids: retained.used_ids,
+                pending,
+                requires_separator: false,
+                file: None,
+                lease: Some(child_root.clone()),
+                flushed: false,
+                has_assistant: retained.has_assistant,
+                session_name: retained.session_name,
+                durable: true,
+            }),
+        }),
     };
     if let Err(error) = recorder.persist_now_durable() {
         if is_already_exists(&error) {
@@ -3249,34 +3360,40 @@ pub fn fork_prepared_session_in(
         .rev()
         .find(|entry| entry.entry_type == "session_info")
         .and_then(|entry| entry.name.clone());
+    let fork_tree = session_tree_from_values(&path, &pending)?;
+    let fork_diagnostics = SessionRecorderDiagnostics {
+        loader_drop_counts: (fork_tree.skipped_idless, fork_tree.undecodable_messages),
+    };
     let recorder = SessionRecorder {
-        inner: Arc::new(Mutex::new(RecorderState {
-            path,
-            id,
-            timestamp,
-            cwd: target_cwd,
-            parent_session,
-            file_identity: None,
-            last_id: leaf_id.clone(),
-            active_leaf_id: leaf_id,
-            revision: 0,
-            used_ids,
-            pending,
-            requires_separator: false,
-            file: None,
-            flushed: false,
-            has_assistant,
-            session_name,
-            durable: false,
-            lease: Some(lease),
-        })),
+        core: Arc::new(RecorderCore {
+            identity: SessionRecorderIdentity { id, path },
+            diagnostics: RwLock::new(fork_diagnostics),
+            state: Mutex::new(RecorderState {
+                timestamp,
+                cwd: target_cwd,
+                parent_session,
+                file_identity: None,
+                last_id: leaf_id.clone(),
+                active_leaf_id: leaf_id,
+                revision: 0,
+                used_ids,
+                pending,
+                requires_separator: false,
+                file: None,
+                flushed: false,
+                has_assistant,
+                session_name,
+                durable: false,
+                lease: Some(lease),
+            }),
+        }),
     };
     if has_explicit_id {
         recorder
             .persist_now()
             .context("reserving explicit fork session id")?;
     } else if has_assistant {
-        persist(&mut recorder.inner.lock())?;
+        persist(&recorder.core.identity, &mut recorder.core.state.lock())?;
     }
     Ok(recorder)
 }
@@ -3340,26 +3457,30 @@ pub fn start_durable_child_session_in_with_kind(
         header["sessionKind"] = json!(kind.header_value());
     }
     let recorder = SessionRecorder {
-        inner: Arc::new(Mutex::new(RecorderState {
-            path,
-            id,
-            timestamp,
-            cwd,
-            parent_session: Some(parent_session_str),
-            file_identity: None,
-            last_id: None,
-            active_leaf_id: None,
-            revision: 0,
-            used_ids: HashSet::new(),
-            pending: vec![header],
-            requires_separator: false,
-            file: None,
-            flushed: false,
-            lease: Some(lease),
-            has_assistant: false,
-            session_name: None,
-            durable: true,
-        })),
+        core: Arc::new(RecorderCore {
+            identity: SessionRecorderIdentity { id, path },
+            diagnostics: RwLock::new(SessionRecorderDiagnostics {
+                loader_drop_counts: (0, 0),
+            }),
+            state: Mutex::new(RecorderState {
+                timestamp,
+                cwd,
+                parent_session: Some(parent_session_str),
+                file_identity: None,
+                last_id: None,
+                active_leaf_id: None,
+                revision: 0,
+                used_ids: HashSet::new(),
+                pending: vec![header],
+                requires_separator: false,
+                file: None,
+                flushed: false,
+                lease: Some(lease),
+                has_assistant: false,
+                session_name: None,
+                durable: true,
+            }),
+        }),
     };
     // Durable-append the header immediately so the file exists on disk.
     recorder
@@ -3380,7 +3501,7 @@ pub fn start_durable_child_session_in_with_kind(
 pub fn resume_durable_child_session(path: impl AsRef<Path>) -> Result<SessionRecorder> {
     let prepared = PreparedSessionResume::prepare_path(path)?;
     let mut recorder = prepared.into_recorder()?;
-    recorder.inner.lock().durable = true;
+    recorder.core.state.lock().durable = true;
     Ok(recorder)
 }
 
@@ -3391,7 +3512,7 @@ pub fn resume_durable_child_session_from_prepared(
     prepared: PreparedSessionResume,
 ) -> Result<SessionRecorder> {
     let mut recorder = prepared.into_recorder()?;
-    recorder.inner.lock().durable = true;
+    recorder.core.state.lock().durable = true;
     Ok(recorder)
 }
 pub fn load_session_tree(path: impl AsRef<Path>) -> Result<SessionTree> {
@@ -5081,13 +5202,17 @@ fn normalize_checkpoint_name(name: &str) -> Result<String> {
 /// next to the session file (same directory, same record serialization, no
 /// header). Writes with `create_new` and bumps a numeric suffix on collision
 /// so an archive can never overwrite an earlier one. fsyncs before returning.
-fn archive_rewind_tail(state: &mut RecorderState, tail: &[u8]) -> Result<PathBuf> {
-    ensure_session_parent(state)?;
+fn archive_rewind_tail(
+    identity: &SessionRecorderIdentity,
+    state: &mut RecorderState,
+    tail: &[u8],
+) -> Result<PathBuf> {
+    ensure_session_parent(identity, state)?;
     let lease = state
         .lease
         .as_ref()
         .ok_or_else(|| anyhow!("session directory capability is unavailable"))?;
-    let file_name = state
+    let file_name = identity
         .path
         .file_name()
         .and_then(|name| name.to_str())
@@ -5115,7 +5240,10 @@ fn archive_rewind_tail(state: &mut RecorderState, tail: &[u8]) -> Result<PathBuf
     }
     bail!("rewind archive collision limit exceeded")
 }
-fn fork_tree_and_raw_records_from_state(state: &RecorderState) -> Result<(SessionTree, Vec<Value>)> {
+fn fork_tree_and_raw_records_from_state(
+    identity: &SessionRecorderIdentity,
+    state: &RecorderState,
+) -> Result<(SessionTree, Vec<Value>)> {
     let mut values = if state.flushed {
         let file = state
             .file
@@ -5124,7 +5252,7 @@ fn fork_tree_and_raw_records_from_state(state: &RecorderState) -> Result<(Sessio
         read_session_values_from_file(
             file.try_clone()
                 .context("cloning attached session handle for fork capture")?,
-            &state.path,
+            &identity.path,
         )?
     } else {
         Vec::new()
@@ -5134,7 +5262,7 @@ fn fork_tree_and_raw_records_from_state(state: &RecorderState) -> Result<(Sessio
     } else {
         values.clone_from(&state.pending);
     }
-    let mut tree = session_tree_from_values(&state.path, &values)?;
+    let mut tree = session_tree_from_values(&identity.path, &values)?;
     tree.active_leaf_id.clone_from(&state.active_leaf_id);
     let raw_records = values.into_iter().skip(1).collect();
     Ok((tree, raw_records))
@@ -5147,13 +5275,16 @@ fn append_token_from_state(state: &RecorderState) -> SessionAppendToken {
     }
 }
 
-fn session_tree_from_state(state: &RecorderState) -> Result<SessionTree> {
+fn session_tree_from_state(
+    identity: &SessionRecorderIdentity,
+    state: &RecorderState,
+) -> Result<SessionTree> {
     let mut tree = if state.flushed {
         let persisted = if let Some(file) = state.file.as_ref() {
             load_session_tree_from_file(
                 file.try_clone()
                     .context("cloning attached session handle for tree load")?,
-                &state.path,
+                &identity.path,
             )?
         } else {
             bail!("session append writer is unavailable for tree projection");
@@ -5177,7 +5308,7 @@ fn session_tree_from_state(state: &RecorderState) -> Result<SessionTree> {
                     .collect::<std::result::Result<Vec<_>, _>>()?,
             );
             values.extend(state.pending.iter().cloned());
-            let mut combined = session_tree_from_values(&state.path, &values)?;
+            let mut combined = session_tree_from_values(&identity.path, &values)?;
             combined.skipped_idless = combined
                 .skipped_idless
                 .saturating_add(persisted.skipped_idless);
@@ -5187,7 +5318,7 @@ fn session_tree_from_state(state: &RecorderState) -> Result<SessionTree> {
             combined
         }
     } else {
-        session_tree_from_values(&state.path, &state.pending)?
+        session_tree_from_values(&identity.path, &state.pending)?
     };
     tree.active_leaf_id.clone_from(&state.active_leaf_id);
     Ok(tree)
@@ -5206,12 +5337,17 @@ fn is_already_exists(error: &anyhow::Error) -> bool {
     })
 }
 
-fn append_entry(state: &mut RecorderState, entry_type: &str, fields: Value) -> Result<String> {
+fn append_entry(
+    identity: &SessionRecorderIdentity,
+    state: &mut RecorderState,
+    entry_type: &str,
+    fields: Value,
+) -> Result<String> {
     let previous_last_id = state.last_id.clone();
     let previous_active_leaf_id = state.active_leaf_id.clone();
     let previous_pending_len = state.pending.len();
     let id = prepare_entry(state, entry_type, fields);
-    if let Err(error) = persist(state) {
+    if let Err(error) = persist(identity, state) {
         state.last_id = previous_last_id;
         state.active_leaf_id = previous_active_leaf_id;
         state.used_ids.remove(&id);
@@ -5223,6 +5359,7 @@ fn append_entry(state: &mut RecorderState, entry_type: &str, fields: Value) -> R
 }
 
 fn append_entry_durable(
+    identity: &SessionRecorderIdentity,
     state: &mut RecorderState,
     entry_type: &str,
     fields: Value,
@@ -5238,7 +5375,7 @@ fn append_entry_durable(
         .context("reading session length before durable append")?
         .map(|metadata| metadata.len());
     let id = prepare_entry(state, entry_type, fields);
-    if let Err(error) = persist_durable(state) {
+    if let Err(error) = persist_durable(identity, state) {
         state.last_id = previous_last_id;
         state.active_leaf_id = previous_active_leaf_id;
         state.used_ids.remove(&id);
@@ -5282,12 +5419,15 @@ fn prepare_entry(state: &mut RecorderState, entry_type: &str, fields: Value) -> 
 /// The auto-id startup path keeps the file unwritten until the first flush, so
 /// the directory can legitimately be empty on disk; this makes the first flush
 /// succeed regardless. No-op when the parent already exists.
-fn ensure_session_parent(state: &mut RecorderState) -> Result<()> {
+fn ensure_session_parent(
+    identity: &SessionRecorderIdentity,
+    state: &mut RecorderState,
+) -> Result<()> {
     if state.lease.is_none() {
-        let parent = state
+        let parent = identity
             .path
             .parent()
-            .ok_or_else(|| anyhow!("session path {} has no parent", state.path.display()))?;
+            .ok_or_else(|| anyhow!("session path {} has no parent", identity.path.display()))?;
         state.lease = Some(open_session_store_lease(
             parent,
             RootCreation::CreateDirectory,
@@ -5313,6 +5453,7 @@ fn open_session_store_lease(
 }
 
 fn validate_append_writer(
+    identity: &SessionRecorderIdentity,
     state: &mut RecorderState,
 ) -> Result<(String, PathBuf, crate::SessionFileIdentity)> {
     let expected_identity = state
@@ -5332,7 +5473,7 @@ fn validate_append_writer(
         .as_ref()
         .ok_or_else(|| anyhow!("session directory capability is unavailable"))?;
     lease.validate_live_root()?;
-    let relative = state
+    let relative = identity
         .path
         .strip_prefix(lease.display_root())
         .context("session path is outside retained session root")?;
@@ -5344,12 +5485,15 @@ fn validate_append_writer(
     }
     file.seek(SeekFrom::End(0))
         .context("seeking session append writer")?;
-    Ok((state.id.clone(), state.path.clone(), expected_identity))
+    Ok((identity.id.clone(), identity.path.clone(), expected_identity))
 }
 
-fn persist_durable(state: &mut RecorderState) -> Result<()> {
+fn persist_durable(
+    identity: &SessionRecorderIdentity,
+    state: &mut RecorderState,
+) -> Result<()> {
     if !state.flushed {
-        create_session_file(state)?;
+        create_session_file(identity, state)?;
         return Ok(());
     }
     if !state.pending.is_empty()
@@ -5362,12 +5506,15 @@ fn persist_durable(state: &mut RecorderState) -> Result<()> {
     Ok(())
 }
 
-fn create_session_file(state: &mut RecorderState) -> Result<()> {
-    ensure_session_parent(state)?;
-    let name = state
+fn create_session_file(
+    identity: &SessionRecorderIdentity,
+    state: &mut RecorderState,
+) -> Result<()> {
+    ensure_session_parent(identity, state)?;
+    let name = identity
         .path
         .file_name()
-        .ok_or_else(|| anyhow!("session path {} has no file name", state.path.display()))?;
+        .ok_or_else(|| anyhow!("session path {} has no file name", identity.path.display()))?;
     let lease = state
         .lease
         .as_ref()
@@ -5388,17 +5535,137 @@ fn create_session_file(state: &mut RecorderState) -> Result<()> {
     Ok(())
 }
 
-fn persist(state: &mut RecorderState) -> Result<()> {
+/// Test-only gate blocking a recorder's append mid-I/O; keyed by recorder
+/// path so parallel tests never interfere.
+#[cfg(test)]
+pub(crate) mod append_test_gate {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Condvar};
+    use std::time::Duration;
+
+    struct GateState {
+        entered: bool,
+        released: bool,
+    }
+
+    struct GateShared {
+        state: std::sync::Mutex<GateState>,
+        entered: Condvar,
+        released: Condvar,
+    }
+
+    struct Armed {
+        path: PathBuf,
+        shared: Arc<GateShared>,
+    }
+
+    static ARMED: std::sync::Mutex<Vec<Armed>> = std::sync::Mutex::new(Vec::new());
+
+    /// Gate handle; Drop releases the blocked append and disarms it.
+    pub(crate) struct AppendGate {
+        shared: Arc<GateShared>,
+    }
+
+    impl AppendGate {
+        /// Arms the gate for the recorder at `path`; its next append blocks.
+        pub(crate) fn arm(path: &Path) -> Self {
+            let shared = Arc::new(GateShared {
+                state: std::sync::Mutex::new(GateState {
+                    entered: false,
+                    released: false,
+                }),
+                entered: Condvar::new(),
+                released: Condvar::new(),
+            });
+            ARMED
+                .lock()
+                .expect("append test gate registry")
+                .push(Armed {
+                    path: path.to_path_buf(),
+                    shared: shared.clone(),
+                });
+            Self { shared }
+        }
+
+        /// Bounded wait for the gated append to reach the blocking point.
+        pub(crate) fn wait_entered(&self, timeout: Duration) -> bool {
+            let mut state = self.shared.state.lock().expect("append test gate state");
+            while !state.entered {
+                let (guard, wait) = self
+                    .shared
+                    .entered
+                    .wait_timeout(state, timeout)
+                    .expect("append test gate wait");
+                state = guard;
+                if wait.timed_out() && !state.entered {
+                    return false;
+                }
+            }
+            true
+        }
+
+        /// Releases the blocked append. Idempotent; also runs on Drop.
+        pub(crate) fn release(&self) {
+            let mut state = self.shared.state.lock().expect("append test gate state");
+            state.released = true;
+            self.shared.released.notify_all();
+        }
+    }
+
+    impl Drop for AppendGate {
+        fn drop(&mut self) {
+            self.release();
+            let mut armed = ARMED.lock().expect("append test gate registry");
+            if let Some(position) = armed
+                .iter()
+                .position(|gate| Arc::ptr_eq(&gate.shared, &self.shared))
+            {
+                armed.remove(position);
+            }
+        }
+    }
+
+    /// Blocking point called by `persist` while the recorder state lock is held.
+    pub(crate) fn wait_while_armed(path: &Path) {
+        let shared = {
+            let armed = ARMED.lock().expect("append test gate registry");
+            match armed
+                .iter()
+                .find(|gate| gate.path.as_path() == path)
+                .map(|gate| gate.shared.clone())
+            {
+                Some(shared) => shared,
+                None => return,
+            }
+        };
+        let mut state = shared.state.lock().expect("append test gate state");
+        state.entered = true;
+        shared.entered.notify_all();
+        while !state.released {
+            state = shared
+                .released
+                .wait(state)
+                .expect("append test gate release wait");
+        }
+    }
+}
+
+fn persist(
+    identity: &SessionRecorderIdentity,
+    state: &mut RecorderState,
+) -> Result<()> {
     if !state.durable && !state.has_assistant {
         return Ok(());
     }
     if !state.flushed {
-        create_session_file(state)?;
+        create_session_file(identity, state)?;
         return Ok(());
     }
     if !state.pending.is_empty()
         && let Some(file) = state.file.as_mut()
     {
+        #[cfg(test)]
+        append_test_gate::wait_while_armed(&identity.path);
         if state.durable {
             write_records_durable(file, &state.pending, state.requires_separator)?;
         } else {
@@ -5687,33 +5954,40 @@ mod tests {
         let timestamp = iso_now();
         let path = new_session_path(directory, &timestamp, &id, false);
         SessionRecorder {
-            inner: Arc::new(Mutex::new(RecorderState {
-                path,
-                id: id.clone(),
-                file_identity: None,
-                timestamp: timestamp.clone(),
-                cwd: directory.to_path_buf(),
-                parent_session: None,
-                last_id: None,
-                active_leaf_id: None,
-                revision: 0,
-                used_ids: HashSet::new(),
-                pending: vec![json!({
-                    "type": "session",
-                    "version": CURRENT_SESSION_VERSION,
-                    "id": id,
-                    "timestamp": timestamp,
-                    "cwd": directory,
-                    "parentSession": null,
-                })],
-                requires_separator: false,
-                file: None,
-                lease: Some(lease),
-                flushed: false,
-                has_assistant: false,
-                session_name: None,
-                durable: false,
-            })),
+            core: Arc::new(RecorderCore {
+                identity: SessionRecorderIdentity {
+                    id: id.clone(),
+                    path: path.clone(),
+                },
+                diagnostics: RwLock::new(SessionRecorderDiagnostics {
+                    loader_drop_counts: (0, 0),
+                }),
+                state: Mutex::new(RecorderState {
+                    file_identity: None,
+                    timestamp: timestamp.clone(),
+                    cwd: directory.to_path_buf(),
+                    parent_session: None,
+                    last_id: None,
+                    active_leaf_id: None,
+                    revision: 0,
+                    used_ids: HashSet::new(),
+                    pending: vec![json!({
+                        "type": "session",
+                        "version": CURRENT_SESSION_VERSION,
+                        "id": id,
+                        "timestamp": timestamp,
+                        "cwd": directory,
+                        "parentSession": null,
+                    })],
+                    requires_separator: false,
+                    file: None,
+                    lease: Some(lease),
+                    flushed: false,
+                    has_assistant: false,
+                    session_name: None,
+                    durable: false,
+                }),
+            }),
         }
     }
     #[test]
@@ -6100,38 +6374,45 @@ mod tests {
         let path = directory.join("session.jsonl");
         fs::write(&path, b"occupied").expect("occupy session path");
         let recorder = SessionRecorder {
-            inner: Arc::new(Mutex::new(RecorderState {
-                path: path.clone(),
-                id: Uuid::now_v7().to_string(),
-                file_identity: None,
-                timestamp: "2026-01-01T00:00:00.000Z".to_owned(),
-                cwd: directory.clone(),
-                parent_session: None,
-                last_id: None,
-                active_leaf_id: None,
-                revision: 0,
-                used_ids: HashSet::new(),
-                pending: vec![json!({
-                    "type": "session",
-                    "version": CURRENT_SESSION_VERSION,
-                    "id": "test-session",
-                    "timestamp": "2026-01-01T00:00:00.000Z",
-                    "cwd": directory,
-                })],
-                requires_separator: false,
-                file: None,
-                lease: None,
-                flushed: false,
-                has_assistant: false,
-                session_name: None,
-                durable: false,
-            })),
+            core: Arc::new(RecorderCore {
+                identity: SessionRecorderIdentity {
+                    id: Uuid::now_v7().to_string(),
+                    path: path.clone(),
+                },
+                diagnostics: RwLock::new(SessionRecorderDiagnostics {
+                    loader_drop_counts: (0, 0),
+                }),
+                state: Mutex::new(RecorderState {
+                    file_identity: None,
+                    timestamp: "2026-01-01T00:00:00.000Z".to_owned(),
+                    cwd: directory.clone(),
+                    parent_session: None,
+                    last_id: None,
+                    active_leaf_id: None,
+                    revision: 0,
+                    used_ids: HashSet::new(),
+                    pending: vec![json!({
+                        "type": "session",
+                        "version": CURRENT_SESSION_VERSION,
+                        "id": "test-session",
+                        "timestamp": "2026-01-01T00:00:00.000Z",
+                        "cwd": directory,
+                    })],
+                    requires_separator: false,
+                    file: None,
+                    lease: None,
+                    flushed: false,
+                    has_assistant: false,
+                    session_name: None,
+                    durable: false,
+                }),
+            }),
         };
         let assistant = Message::Assistant(pi_ai::AssistantMessage::pending(&Model::default()));
 
         assert!(recorder.record_message(&assistant).is_err());
         {
-            let state = recorder.inner.lock();
+            let state = recorder.core.state.lock();
             assert!(state.last_id.is_none());
             assert!(state.used_ids.is_empty());
             assert_eq!(state.pending.len(), 1);
@@ -7220,7 +7501,7 @@ mod tests {
             );
 
             let recorder = resume_session(&path).expect("resume session for append");
-            recorder.inner.lock().file = Some(File::open(&path).expect("open read-only session"));
+            recorder.core.state.lock().file = Some(File::open(&path).expect("open read-only session"));
             recorder
                 .record_message(&Message::user_text("second", 0))
                 .expect_err("read-only append must fail");
@@ -7229,7 +7510,7 @@ mod tests {
                 original
             );
             {
-                let mut state = recorder.inner.lock();
+                let mut state = recorder.core.state.lock();
                 assert!(state.requires_separator);
                 assert!(state.pending.is_empty());
                 state.file = Some(
@@ -8285,28 +8566,35 @@ mod tests {
         let occupied = directory.join("session.jsonl");
         fs::write(&occupied, b"occupied").expect("occupy path");
         let recorder = SessionRecorder {
-            inner: Arc::new(Mutex::new(RecorderState {
-                path: occupied,
-                id: "summary-session".to_owned(),
-                file_identity: None,
-                timestamp: "2026-01-01T00:00:00.000Z".to_owned(),
-                cwd: directory.clone(),
-                parent_session: None,
-                last_id: Some("b".to_owned()),
-                active_leaf_id: Some("b".to_owned()),
-                revision: 0,
-                used_ids: HashSet::from(["a".to_owned(), "b".to_owned()]),
-                pending: vec![
-                    json!({"type":"session", "version":CURRENT_SESSION_VERSION, "id":"summary-session", "timestamp":"2026-01-01T00:00:00.000Z", "cwd":directory}),
-                ],
-                requires_separator: false,
-                file: None,
-                lease: None,
-                flushed: false,
-                has_assistant: true,
-                session_name: None,
-                durable: false,
-            })),
+            core: Arc::new(RecorderCore {
+                identity: SessionRecorderIdentity {
+                    id: "summary-session".to_owned(),
+                    path: occupied,
+                },
+                diagnostics: RwLock::new(SessionRecorderDiagnostics {
+                    loader_drop_counts: (0, 0),
+                }),
+                state: Mutex::new(RecorderState {
+                    file_identity: None,
+                    timestamp: "2026-01-01T00:00:00.000Z".to_owned(),
+                    cwd: directory.clone(),
+                    parent_session: None,
+                    last_id: Some("b".to_owned()),
+                    active_leaf_id: Some("b".to_owned()),
+                    revision: 0,
+                    used_ids: HashSet::from(["a".to_owned(), "b".to_owned()]),
+                    pending: vec![
+                        json!({"type":"session", "version":CURRENT_SESSION_VERSION, "id":"summary-session", "timestamp":"2026-01-01T00:00:00.000Z", "cwd":directory}),
+                    ],
+                    requires_separator: false,
+                    file: None,
+                    lease: None,
+                    flushed: false,
+                    has_assistant: true,
+                    session_name: None,
+                    durable: false,
+                }),
+            }),
         };
         assert!(
             recorder
@@ -8314,7 +8602,7 @@ mod tests {
                 .is_err()
         );
         assert_eq!(recorder.active_leaf_id().as_deref(), Some("b"));
-        assert_eq!(recorder.inner.lock().pending.len(), 1);
+        assert_eq!(recorder.core.state.lock().pending.len(), 1);
         fs::remove_dir_all(directory).expect("remove test directory");
     }
 
@@ -8624,7 +8912,7 @@ mod tests {
             !directory.exists(),
             "prune removes the empty session directory"
         );
-        recorder.inner.lock().lease = None;
+        recorder.core.state.lock().lease = None;
         recorder
             .persist_now()
             .expect("persist must recreate the removed directory");
@@ -8651,7 +8939,7 @@ mod tests {
             !directory.exists(),
             "prune removes the empty durable directory"
         );
-        recorder.inner.lock().lease = None;
+        recorder.core.state.lock().lease = None;
         recorder
             .persist_now_durable()
             .expect("durable persist must recreate the removed directory");
@@ -9540,5 +9828,152 @@ mod tests {
         .expect("durable child session");
         let header = read_header(&recorder.path());
         assert!(header.get("sessionKind").is_none());
+    }
+}
+
+/// Regression tests for the lock-free identity/diagnostics read boundary:
+/// metadata reads must return while the writer state lock is held, and
+/// diagnostics must follow actual rewrites (rewind lowers, fork raw rows
+/// carry the copied malformed records).
+#[cfg(test)]
+mod recorder_core_boundary_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    const BOUNDED_DEADLINE: Duration = Duration::from_secs(5);
+
+    fn write_lenient_fixture(path: &Path, cwd: &Path, with_idless_row: bool) {
+        let header = json!({
+            "type": "session",
+            "version": CURRENT_SESSION_VERSION,
+            "id": "01loaderdrop0000000000000000",
+            "timestamp": "2026-01-01T00:00:00.000Z",
+            "cwd": cwd.to_string_lossy(),
+        });
+        let bad_message = |id: &str, timestamp: &str| {
+            json!({
+                "type": "message",
+                "id": id,
+                "parentId": Value::Null,
+                "timestamp": timestamp,
+                "message": "not-a-message-object",
+            })
+        };
+        let mut lines = vec![
+            header.to_string(),
+            bad_message("row-1", "2026-01-01T00:00:01.000Z").to_string(),
+            bad_message("row-2", "2026-01-01T00:00:02.000Z").to_string(),
+            bad_message("row-3", "2026-01-01T00:00:03.000Z").to_string(),
+        ];
+        if with_idless_row {
+            lines.push(
+                json!({
+                    "type": "note",
+                    "timestamp": "2026-01-01T00:00:04.000Z",
+                })
+                .to_string(),
+            );
+        }
+        std::fs::write(path, lines.join("\n")).expect("write fixture");
+    }
+
+    fn resumed_fixture(
+        with_idless_row: bool,
+    ) -> (tempfile::TempDir, tempfile::TempDir, SessionRecorder) {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let sessions = tempfile::tempdir().expect("sessions");
+        let path = sessions.path().join("fixture.jsonl");
+        write_lenient_fixture(&path, cwd.path(), with_idless_row);
+        let recorder = resume_session(&path).expect("resume fixture");
+        (cwd, sessions, recorder)
+    }
+
+    #[test]
+    fn recorder_metadata_reads_do_not_block_on_writer_lock() {
+        let (_cwd, _sessions, recorder) = resumed_fixture(true);
+        let expected_id = recorder.id();
+        let expected_path = recorder.path();
+        let expected_counts = recorder.loader_drop_counts();
+        assert_eq!(expected_counts.0, 1, "idless row loads as skipped_idless");
+        assert!(expected_counts.1 >= 1, "undecodable rows load");
+
+        let (writer_holding_sender, writer_holding) = mpsc::channel::<()>();
+        let (writer_release_sender, writer_release) = mpsc::channel::<()>();
+        let core = Arc::clone(&recorder.core);
+        let writer = std::thread::spawn(move || {
+            let _guard = core.state.lock();
+            writer_holding_sender.send(()).expect("signal writer hold");
+            writer_release.recv().expect("writer release");
+        });
+        writer_holding
+            .recv_timeout(BOUNDED_DEADLINE)
+            .expect("writer thread took the recorder state lock");
+
+        let (reader_done_sender, reader_done) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let started = Instant::now();
+            let id = recorder.id();
+            let path = recorder.path();
+            let counts = recorder.loader_drop_counts();
+            reader_done_sender
+                .send((started.elapsed(), id, path, counts))
+                .expect("signal reads done");
+        });
+        let (elapsed, id, path, counts) = reader_done
+            .recv_timeout(BOUNDED_DEADLINE)
+            .expect("metadata reads must not block on the writer state lock");
+        assert_eq!(id, expected_id);
+        assert_eq!(path, expected_path);
+        assert_eq!(counts, expected_counts);
+        assert!(
+            elapsed < BOUNDED_DEADLINE,
+            "metadata reads completed in {elapsed:?} under a held writer lock"
+        );
+
+        writer_release_sender.send(()).expect("release writer");
+        writer.join().expect("writer thread");
+        reader.join().expect("reader thread");
+    }
+
+    #[test]
+    fn rewind_refreshes_diagnostics_from_retained_prefix() {
+        let (_cwd, _sessions, recorder) = resumed_fixture(true);
+        let before = recorder.loader_drop_counts();
+        assert_eq!(before.0, 1, "the idless row is in the loaded journal");
+
+        recorder.rewind_to(1).expect("rewind to the first record");
+        let after = recorder.loader_drop_counts();
+        assert_eq!(
+            after.0, 0,
+            "the idless row was truncated with the rewind tail"
+        );
+        assert!(
+            after.1 < before.1,
+            "undecodable count must follow the retained prefix: before={before:?} after={after:?}"
+        );
+    }
+
+    #[test]
+    fn durable_fork_seeds_diagnostics_from_retained_raw_rows() {
+        let (_cwd, _sessions, source) = resumed_fixture(false);
+        let fork_point = source.capture_fork_point().expect("capture fork point");
+        let child_root = tempfile::tempdir().expect("child root");
+        let lease = open_session_store_lease(
+            child_root.path(),
+            crate::fs::RootCreation::CreateDirectory,
+        )
+        .expect("child root lease");
+        let child = create_durable_forked_child(
+            fork_point,
+            &lease,
+            &Uuid::now_v7().to_string(),
+        )
+        .expect("durable forked child");
+        let counts = child.loader_drop_counts();
+        assert!(
+            counts.1 >= 1,
+            "the retained raw undecodable row is copied into the fork: {counts:?}"
+        );
     }
 }

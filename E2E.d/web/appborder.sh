@@ -9,11 +9,12 @@
 #   - header border-bottom and .app-main > footer border-top match;
 #   - .session-sidebar has NO border-right on desktop;
 #   - #transcript background resolves to --bg and scrollbar-gutter is stable;
-#   - rail collapse via #sidebar-toggle-btn keeps the .app-main edge;
+#   - rail collapse via #sidebar-collapse-btn keeps the .app-main edge;
 #   - ordinary panels share ONE desktop height resizer (#panel-drawer-resizer):
 #     pointer + keyboard + 25–90vh bounds + localStorage `rpi-panel-drawer-size`;
-#   - SessionSidebar header #sidebar-collapse-btn folds desktop rail / closes
-#     mobile drawer; #rail-reopen-btn + header ☰ remain;
+#   - SessionSidebar search-row #sidebar-collapse-btn («) folds desktop rail /
+#     closes mobile drawer; #rail-reopen-btn (», same row) restores; the header
+#     feature menu's Sessions entry (#sidebar-menu-item) drives the mobile drawer;
 #   - mobile (390x844): flush edges, zero horizontal overflow, resizer hidden.
 #
 # The color assertion resolves the --border-strong token through a probe
@@ -35,6 +36,7 @@ E2E_DIR="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd -P)"
 
 SCENARIO="web-appborder"
 TOKEN="web-appborder-e2e-token-$$-$(date +%s)"
+export MOCK_REASONING=1  # B7 thinking regression needs reasoning_content deltas ("presentation thinking turn")
 
 # ---------------------------------------------------------------------------
 main() {

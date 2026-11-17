@@ -55,6 +55,10 @@
 //   - #command-btn is LEFT of #prompt-input in the composer row
 //   - opening the command picker lists /compact, /skill, /review
 //   - choosing /review inserts the draft WITHOUT auto-submitting
+//   - the inline slash-autocomplete popup OWNS the selecting Enter and never
+//     dispatches: the first Enter settles the token and dismisses the popup,
+//     and the INDEPENDENT second Enter dispatches the command
+//     (lib/slash-completion.mjs drives that contract at every slash site)
 //   - Enter opens the real review panel: HEAD→working-tree comparison label,
 //     the dirty file row, and the changed diff lines (deletion + addition)
 //   - the dirty file renders TWO separated hunks; the SECOND hunk's comment
@@ -126,14 +130,12 @@
 //   - mobile (≤900px): Files→Diff→Thread tab transitions, composer visible
 //     without scrolling, Back-to-diff, and button.code-review__close removes
 //     #code-review-panel from the DOM; `.code-review__thread-resizer` hidden
-//   - the outer shell (#code-review-panel) is a FULL-viewport fixed overlay:
-//     rect ≈ (0,0), width == innerWidth/visualViewport width, height ==
-//     innerHeight/visualViewport height on desktop 1360x900 and mobile
-//     390x844 — a 400px width rail, 94vw route gutter, bottom-drawer top
-//     offset, top-header inset, or 90vh/drawer-height height each FAIL here
-//     by name; the header/body stay inside the shell and the page behind it
-//     does not scroll. Closing unmounts the panel AND restores the prior app
-//     layout (scroll position, composer rect, focus).
+//   - the outer shell (section.code-review-panel) matches the Files section:
+//     left 0, right edge at the viewport, top at the measured header, bottom
+//     at the viewport, padding 0, and .code-review flush with the section.
+//     The session rail and New Session are not the top hit. Desktop 1440,
+//     phone 390, iPad portrait 820, and landscape 1180 each fail a rail inset
+//     or outer gutter by name. Closing restores the prior app layout.
 //   - desktop thread column: `.code-review__thread-resizer` ARIA separator,
 //     `--code-review-thread-width` (default 280, bounds 240–480), pointer +
 //     keyboard + localStorage `rpi-code-review-thread-width` reload persistence
@@ -161,8 +163,8 @@
 //     from=origin/master includeWorkingTree=true and no `to` key (the
 //     parser contract), the comparison label names origin/master → working
 //     tree over a non-empty diff (the dirty file row is present), the
-//     fullscreen shell contract holds on desktop 1360x900 AND mobile
-//     390x844 (assertCrShellGeometry both), the exact command result is
+//     header-to-footer shell contract holds on desktop 1360x900 AND mobile
+//     390x844 (assertCrShellGeometry / assertCrMobileShellGeometry), the exact command result is
 //     screenshotted, and the × close unmounts the panel and restores the
 //     prior app layout (scroll, composer rect, focus)
 //   - Command copy: real-browser click, keyboard Enter, and mobile ≥40×40
@@ -236,21 +238,20 @@
 //     second file keeps the first history and opens its own conversation;
 //     Back and the drawer close keep the owner and send no close for
 //     the wrong path (desktop ≥1280 and mobile 390×844)
-//   - Files fullscreen (files.fullscreen, after files.ask): desktop 1360×900
-//     and mobile 390×844 go normal → expanded → restored, then close from
-//     fullscreen. Expanded hides the App global header, pins the explorer
-//     top at 0, and keeps Restore/Close reachable. Restore and close recover
-//     the original header geometry before the next paint. Ask state from
-//     the preceding journey stays. Chat has no fullscreen control.
+//   - Files max layout (files.fullscreen, after files.ask): desktop 1280×900
+//     and mobile 390×844 open Files over the app body with the global header
+//     visible and the whole composer footer hidden at 0px (footer-hide
+//     contract). There is no expand control. Close then reopen
+//     keeps the Ask draft and tab. A custom tree width survives that reopen,
+//     a fresh session starts at 29, and a stored 29 is not treated as a
+//     derived home step. Ask fills the remaining height with Source visible
+//     on desktop; mobile reaches both.
 //   - files.selection-cache-compaction: retained Ask lines 4–7 survive real
-//     paging through cursor 40000 and match the prompt and accepted context.
 //   - Dependency map (files.map, after files.selection): the committed clean
-//     MapRoot.sol opens its Map surface on the owner: an actual rendered SVG
-//     diagram with the selected root, the resolved ./MapDep.sol neighbor, the
-//     external forge-std/Test.sol import, the unresolved ./MissingMap.sol
-//     import, and the reverse MapCaller.sol dependent; node-list buttons open
-//     the exact neighbor through the owner; switching to another file while
-//     the map request is still in flight paints no map for the wrong file.
+//     MapRoot.sol opens its directory graph. Search then the tree selects
+//     directory beta; the request path is beta and the nodes are only beta.
+//     The relation list shows the fixture import arrow and source purpose.
+//     A held alpha response after the beta or workspace switch paints nothing.
 //   - committed-then-deleted nested deployments/sepolia/deploy.json keeps its
 //     changed-file catalog row visible (virtual git-only D) while the
 //     unavailable virtual directories are hidden: no expandable dir row for
@@ -270,7 +271,9 @@ import { chromium } from 'playwright';
 import fs from 'node:fs';
 import path from 'node:path';
 import WebSocket from 'ws';
-import { createFreshSessionViaManage } from './lib/session-lifecycle.mjs';
+import { closeManageSession, createFreshSessionViaManage, openManageSession } from './lib/session-lifecycle.mjs';
+import { clickFeature, openSessionsDrawer } from './lib/feature-menu.mjs';
+import { selectCompletionThenSubmit } from './lib/slash-completion.mjs';
 
 const url = process.env.RPI_URL;
 const token = process.env.RPI_TOKEN || '';
@@ -297,10 +300,13 @@ const solMapRootFile = process.env.RPI_SOL_MAP_ROOT_FILE || 'MapRoot.sol';
 const solMapDepFile = process.env.RPI_SOL_MAP_DEP_FILE || 'MapDep.sol';
 const solMapCallerFile = process.env.RPI_SOL_MAP_CALLER_FILE || 'MapCaller.sol';
 const skillDesc = process.env.RPI_SKILL_DESC || 'Greet skill for E2E';
+const parentCwd = process.env.RPI_PARENT_CWD || '';
+const childCommit = process.env.RPI_CHILD_COMMIT || '';
 const INJECT_FAIL = process.env.INJECT_FAIL === '1';
 
 const FILES_IDS = [
   'files.solidity-preview',
+  'files.nongit',
   'files.boot',
   'files.desktop-open',
   'files.git-tree',
@@ -314,6 +320,7 @@ const FILES_IDS = [
   'files.reopen',
   'files.tablet',
   'files.ask',
+  'files.citations',
   'files.selection',
   'files.map',
   'files.fullscreen',
@@ -327,9 +334,13 @@ const FILES_IDS = [
 // /favicon.ico automatically; the fixture server has none) and the
 // sandboxed HTML preview iframe reading localStorage (sandbox="" has no
 // allow-same-origin; that throw is the isolation contract).
-function isKnownConsoleNoise(text) {
-  return text.includes('favicon')
-    || text.includes("The document is sandboxed and lacks the 'allow-same-origin' flag")
+function isKnownConsoleNoise(message) {
+  const text = typeof message === 'string' ? message : message.text();
+  const url = typeof message === 'string' ? '' : message.location()?.url || '';
+  let path = '';
+  try { path = url ? new URL(url).pathname : ''; } catch { path = ''; }
+  return text === 'Failed to load resource: the server responded with a status of 404 (Not Found)' && path === '/favicon.ico'
+    || text === "Failed to read the 'localStorage' property from 'Window': The document is sandboxed and lacks the 'allow-same-origin' flag."
     || text === "Blocked script execution in 'about:srcdoc' because the document's frame is sandboxed and the 'allow-scripts' permission is not set.";
 }
 
@@ -473,6 +484,16 @@ async function crAppLayout(page) {
       scrollY: (document.scrollingElement || document.documentElement).scrollTop,
       scrollHeight: (document.scrollingElement || document.documentElement).scrollHeight,
       composer: r ? { x: r.x, y: r.y, w: r.width, h: r.height } : null,
+      footer: (() => {
+        const f = document.querySelector('.app-main > footer');
+        if (!f) return null;
+        const fr = f.getBoundingClientRect();
+        return {
+          display: getComputedStyle(f).display,
+          heightVar: Number.parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--app-footer-height')) || 0,
+          rectH: fr ? fr.height : 0,
+        };
+      })(),
       activeId: document.activeElement?.id || '',
     };
   });
@@ -489,33 +510,76 @@ async function crShellGeometry(page) {
     const head = p.querySelector('.code-review__head')?.getBoundingClientRect() || null;
     const body = p.querySelector('.code-review')?.getBoundingClientRect() || null;
     const vv = window.visualViewport;
+    const root = getComputedStyle(document.documentElement);
+    const px = (name) => {
+      const raw = root.getPropertyValue(name).trim();
+      const value = Number.parseFloat(raw);
+      return raw.endsWith('px') && Number.isFinite(value) ? value : null;
+    };
     return {
-      x: r.x, y: r.y, w: r.width, h: r.height,
+      x: r.x, y: r.y, w: r.width, h: r.height, bottom: r.bottom,
       innerW: window.innerWidth, innerH: window.innerHeight,
       vvW: vv ? vv.width : window.innerWidth,
       vvH: vv ? vv.height : window.innerHeight,
       position: cs.position,
+      headerHeight: px('--app-header-height'),
+      footerHeight: px('--app-footer-height'),
+      pad: `${cs.paddingTop} ${cs.paddingRight} ${cs.paddingBottom} ${cs.paddingLeft}`,
+      covered: (() => {
+        const hit = (node) => {
+          const box = node?.getBoundingClientRect();
+          if (!box || box.width < 1 || box.height < 1) return false;
+          const el = document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2);
+          return !!el && (el === node || node.contains(el));
+        };
+        return {
+          sidebar: hit(document.querySelector('.session-sidebar')),
+          newSession: hit(document.getElementById('sidebar-manage-btn')),
+        };
+      })(),
       head, body,
+      composer: (() => {
+        const c = p.querySelector('.code-review__composer textarea');
+        const cr = c?.getBoundingClientRect() || null;
+        return {
+          rect: cr ? { h: Math.round(cr.height) } : null,
+          hitInside: !!cr && (() => { const t = document.elementFromPoint(cr.x + cr.width / 2, cr.y + Math.min(cr.height / 2, Math.max(cr.height - 1, 1))); return !!t && (t === c || c.contains(t)); })(),
+        };
+      })(),
       docScrollW: document.documentElement.scrollWidth,
       docScrollH: document.documentElement.scrollHeight,
     };
   });
 }
 
-/** Full-viewport shell contract. Every failure names the regression class it
- *  proves, so a geometry regression is never a generic size mismatch:
- *  width-rail (shared drawer 400px base), route gutter (94vw max-width),
- *  bottom drawer / top-header inset (y>0), 90vh/drawer height (h mismatch),
- *  header/body escape, page scroll behind the shell. */
+/** Files-section shell: left 0, right at the viewport, top at the measured
+ *  header, bottom at the viewport while the main footer is hidden, padding
+ *  0, and .code-review flush with the section. A rail inset, outer gutter,
+ *  or rail/New Session hit fails here. */
 function assertCrShellGeometry(g, label) {
   if (!g) fail(`${label}: #code-review-panel missing for shell geometry assertions`);
-  if (Math.abs(g.x) > 1) fail(`${label}: shell not flush left (x=${g.x}) — route-gutter/width-rail regression ${JSON.stringify(g)}`);
-  if (Math.abs(g.y) > 1) fail(`${label}: shell not flush top (y=${g.y}, position=${g.position}, head=${JSON.stringify(g.head)}, body=${JSON.stringify(g.body)}) — bottom-drawer/top-header-inset regression`);
-  if (Math.abs(g.w - g.innerW) > 1 || Math.abs(g.w - g.vvW) > 1) {
-    fail(`${label}: shell width ${g.w} != viewport ${g.innerW} (visualViewport ${g.vvW}) — width-rail regression ${JSON.stringify(g)}`);
+  if (Math.abs(g.x) > 1 || Math.abs(g.innerW - g.x - g.w) > 1) {
+    fail(`${label}: review shell must match the Files section box (left 0, right at viewport ${g.innerW}; got x=${g.x} w=${g.w})`);
   }
-  if (Math.abs(g.h - g.innerH) > 2 || Math.abs(g.h - g.vvH) > 2) {
-    fail(`${label}: shell height ${g.h} != viewport ${g.innerH} (visualViewport ${g.vvH}) — 90vh/drawer-height regression ${JSON.stringify(g)}`);
+  if (g.pad !== '0px 0px 0px 0px') fail(`${label}: section.code-review-panel padding must be 0, got ${g.pad}`);
+  if (!g.body || Math.abs(g.body.x - g.x) > 1 || Math.abs(g.body.y - g.y) > 1 || Math.abs(g.body.width - g.w) > 1 || Math.abs(g.body.height - g.h) > 1) {
+    fail(`${label}: .code-review must share the section bounds (no outer gutter) shell=${g.x},${g.y},${g.w}x${g.h} inner=${g.body ? `${g.body.x},${g.body.y},${g.body.width}x${g.body.height}` : 'missing'}`);
+  }
+  if (g.covered?.sidebar || g.covered?.newSession) {
+    fail(`${label}: session rail or New Session is the top hit ${JSON.stringify(g.covered)}`);
+  }
+  const headerHeight = g.headerHeight;
+  if (g.footerHeight !== 0) fail(`${label}: review open must hide the WHOLE mounted composer footer (--app-footer-height=${g.footerHeight}, expected 0px)`);
+  const footerTop = g.innerH;
+  if (headerHeight === null || headerHeight === undefined || Math.abs(g.y - headerHeight) > 1) {
+    fail(`${label}: shell must start at the app header bottom (y=${g.y}, --app-header-height=${headerHeight}) — full-viewport cover or drawer-height regression`);
+  }
+  if (Math.abs(g.w - (g.innerW - g.x)) > 2) {
+    fail(`${label}: shell width ${g.w} does not fill from x=${g.x} to viewport ${g.innerW} — width-rail/route-gutter regression ${JSON.stringify(g)}`);
+  }
+  const expectedH = footerTop === null ? null : footerTop - headerHeight;
+  if (expectedH === null || Math.abs(g.h - expectedH) > 2 || Math.abs(g.bottom - footerTop) > 1) {
+    fail(`${label}: shell height ${g.h} must stop at the viewport bottom while the composer footer is hidden (bottom=${g.bottom}, viewport ${g.innerH}, header ${headerHeight}) — 90vh/100dvh or footer-visible regression ${JSON.stringify(g)}`);
   }
   if (g.position !== 'fixed') fail(`${label}: shell position must be fixed (got "${g.position}")`);
   if (g.head && (g.head.top < g.y - 1 || g.head.bottom > g.y + g.h + 1)) {
@@ -525,7 +589,7 @@ function assertCrShellGeometry(g, label) {
     fail(`${label}: body escapes the shell rect (body ${g.body.top}..${g.body.bottom}, shell ${g.y}..${g.y + g.h})`);
   }
   if (g.docScrollW > g.innerW + 1 || g.docScrollH > g.innerH + 1) {
-    fail(`${label}: page scrolls behind the fullscreen shell (doc ${g.docScrollW}x${g.docScrollH} vs viewport ${g.innerW}x${g.innerH})`);
+    fail(`${label}: page scrolls behind the shell (doc ${g.docScrollW}x${g.docScrollH} vs viewport ${g.innerW}x${g.innerH})`);
   }
 }
 
@@ -543,66 +607,17 @@ function assertCrLayoutRestored(before, after, label) {
   if (after.scrollY !== before.scrollY || after.scrollHeight !== before.scrollHeight) {
     fail(`${label}: page scroll changed across panel close (before ${before.scrollY}/${before.scrollHeight}, after ${after.scrollY}/${after.scrollHeight})`);
   }
-  if (after.activeId !== before.activeId) {
-    fail(`${label}: focus not restored after panel close (before "${before.activeId}", after "${after.activeId}")`);
+  if (after.activeId !== 'prompt-input') {
+    fail(`${label}: close must auto-focus the prompt draft before any manual focus (before "${before.activeId}", after "${after.activeId}")`);
+  }
+  if (!after.footer || after.footer.display === 'none' || after.footer.heightVar <= 0 || Math.abs(after.footer.heightVar - after.footer.rectH) > 1) {
+    fail(`${label}: close must restore the whole composer footer (--app-footer-height>0 matching the live rect): ${JSON.stringify(after.footer)}`);
   }
 }
 
-/** Mobile (≤768px) shell contract — the code review workspace is a fixed,
- *  full-WIDTH overlay that sits between the app header and the app footer so
- *  the composer stays reachable (styles.css `.code-review-panel`
- *  @media (max-width: 768px): `inset: var(--app-header-height) 0
- *  var(--app-footer-height, 0px) 0`; the ≥769px rule is the full-viewport
- *  contract asserted by assertCrShellGeometry). Both insets are the SAME
- *  measured integers App writes to <html>, so this is the product's own
- *  geometry — and every drawer regression still fails here by name: a 400px
- *  rail, the 94vw route gutter, a right-aligned/bottom drawer, a 90vh height,
- *  a shell covering the composer, or a page that scrolls behind it. */
+/** Same Files-flush shell as assertCrShellGeometry, at the caller's viewport. */
 async function assertCrMobileShellGeometry(page, label) {
-  const probe = await page.evaluate(() => {
-    const p = document.getElementById('code-review-panel');
-    if (!p) return null;
-    const r = p.getBoundingClientRect();
-    const cs = getComputedStyle(p);
-    const root = getComputedStyle(document.documentElement);
-    const px = (name) => {
-      const raw = root.getPropertyValue(name).trim();
-      const value = Number.parseFloat(raw);
-      return raw.endsWith('px') && Number.isFinite(value) ? value : null;
-    };
-    return {
-      x: r.x, y: r.y, w: r.width, bottom: r.bottom,
-      innerW: window.innerWidth, innerH: window.innerHeight,
-      position: cs.position,
-      headerHeight: px('--app-header-height'),
-      footerHeight: px('--app-footer-height'),
-      head: p.querySelector('.code-review__head')?.getBoundingClientRect() || null,
-      body: p.querySelector('.code-review')?.getBoundingClientRect() || null,
-      docScrollW: document.documentElement.scrollWidth,
-      docScrollH: document.documentElement.scrollHeight,
-    };
-  });
-  if (!probe) fail(`${label}: #code-review-panel missing for the mobile shell geometry assertions`);
-  if (probe.position !== 'fixed') fail(`${label}: mobile shell position must be fixed (got "${probe.position}")`);
-  if (Math.abs(probe.x) > 1 || Math.abs(probe.w - probe.innerW) > 1) {
-    fail(`${label}: mobile shell must span the viewport width (x=${probe.x}, w=${probe.w}, viewport=${probe.innerW}) — width-rail/route-gutter regression`);
-  }
-  if (probe.headerHeight === null || Math.abs(probe.y - probe.headerHeight) > 1) {
-    fail(`${label}: mobile shell must start at the app header's bottom (y=${probe.y}, --app-header-height=${probe.headerHeight}) — top-header inset regression`);
-  }
-  const footerTop = probe.footerHeight === null ? null : probe.innerH - probe.footerHeight;
-  if (footerTop === null || Math.abs(probe.bottom - footerTop) > 1) {
-    fail(`${label}: mobile shell must end at the app footer's top (bottom=${probe.bottom}, expected ${footerTop}, --app-footer-height=${probe.footerHeight}) — the composer must stay reachable`);
-  }
-  if (probe.head && (probe.head.top < probe.y - 1 || probe.head.bottom > probe.bottom + 1)) {
-    fail(`${label}: header escapes the mobile shell rect (head ${probe.head.top}..${probe.head.bottom}, shell ${probe.y}..${probe.bottom})`);
-  }
-  if (probe.body && (probe.body.top < probe.y - 1 || probe.body.bottom > probe.bottom + 1)) {
-    fail(`${label}: body escapes the mobile shell rect (body ${probe.body.top}..${probe.body.bottom}, shell ${probe.y}..${probe.bottom})`);
-  }
-  if (probe.docScrollW > probe.innerW + 1 || probe.docScrollH > probe.innerH + 1) {
-    fail(`${label}: page scrolls behind the mobile shell (doc ${probe.docScrollW}x${probe.docScrollH} vs viewport ${probe.innerW}x${probe.innerH})`);
-  }
+  assertCrShellGeometry(await crShellGeometry(page), label);
 }
 
 /** True when the picker has drilled into skills mode (the `Skills` header is
@@ -758,10 +773,18 @@ async function readClipboardText(page) {
   return page.evaluate(async () => navigator.clipboard.readText());
 }
 
+/** Payload fingerprint for failure messages: length + djb2, never the text. */
+const textHash = (text) => {
+  let h = 5381;
+  for (let i = 0; i < text.length; i += 1) h = ((h * 33) ^ text.charCodeAt(i)) >>> 0;
+  return `${text.length}:${h.toString(16)}`;
+};
+
 async function assertCommandCopyButton(page, selector, {
   expectedClipboard,
   secret = 'supersecret',
   keyboard = false,
+  frames = [],
 }) {
   await waitFor(
     page,
@@ -773,28 +796,88 @@ async function assertCommandCopyButton(page, selector, {
     20000,
     selector
   );
-  const button = page.locator(selector).last();
-  if (keyboard) {
-    await button.focus();
-    const focused = await page.evaluate((sel) => {
-      const btn = [...document.querySelectorAll(sel)].at(-1);
-      return !!btn && document.activeElement === btn;
-    }, selector);
-    if (!focused) fail(`command-copy ${selector}: keyboard focus never landed on the copy button`);
-    await page.keyboard.press('Enter');
-  } else {
-    await button.click();
+  const button = await page.locator(selector).last().elementHandle();
+  if (!button) fail(`command-copy ${selector}: no copy button handle to act on`);
+  // Identifiers only: which transcript row owns this button, observed for replacement during the click.
+  const rowBefore = await page.evaluate((btn) => {
+    const row = btn?.closest('[data-item-id]') || null;
+    const trace = window.__copyRowTrace = {
+      row, removed: false, addedItemIds: [],
+      toolCallId: row?.querySelector('[data-tool-call-id]')?.getAttribute('data-tool-call-id') || '',
+    };
+    trace.observer = new MutationObserver(() => {
+      if (trace.row && !trace.row.isConnected) trace.removed = true;
+      if (!trace.toolCallId) return;
+      for (const candidate of document.querySelectorAll('[data-item-id]')) {
+        const card = candidate.querySelector('[data-tool-call-id]');
+        const itemId = candidate.getAttribute('data-item-id');
+        if (card?.getAttribute('data-tool-call-id') === trace.toolCallId
+          && candidate !== trace.row && !trace.addedItemIds.includes(itemId)) trace.addedItemIds.push(itemId);
+      }
+    });
+    trace.observer.observe(document.getElementById('transcript') || document.body, { childList: true, subtree: true });
+    return {
+      itemId: trace.row?.getAttribute('data-item-id') ?? null,
+      toolCallId: trace.toolCallId,
+      status: trace.row?.querySelector('[data-tool-status]')?.getAttribute('data-tool-status') ?? null,
+    };
+  }, button);
+  let primaryError = null;
+  try {
+    if (keyboard) {
+      await button.focus();
+      const focused = await page.evaluate((el) => document.activeElement === el, button);
+      if (!focused) fail(`command-copy ${selector}: keyboard focus never landed on the copy button`);
+      await page.keyboard.press('Enter');
+    } else {
+      await button.click();
+    }
+    // Wall-clock polling on the SAME pinned handle: the observation must not depend on rendering rAF.
+    await page.waitForFunction(
+      (btn) => !!btn && btn.isConnected
+        && (btn.textContent || '').trim() === 'copied' && (btn.getAttribute('aria-label') || '') === 'Command copied',
+      button,
+      { timeout: 10000, polling: 25 }
+    );
+  } catch (error) {
+    // Failure only: clipboard first, compared by boolean/length/hash — never the payload or the secret.
+    const actual = await readClipboardText(page);
+    const observed = await page.evaluate(({ sel, btn }) => {
+      const live = document.querySelectorAll(sel);
+      const trace = window.__copyRowTrace || {};
+      const last = live[live.length - 1] || null;
+      return {
+        label: btn && btn.isConnected ? (btn.textContent || '').trim() : null,
+        aria: btn && btn.isConnected ? btn.getAttribute('aria-label') : null,
+        hasFocus: document.hasFocus(),
+        visibilityState: document.visibilityState,
+        buttonCount: live.length,
+        handleConnected: !!(btn && btn.isConnected),
+        handleIsLast: live.length > 0 && btn === last,
+        rowRemoved: trace.removed === true,
+        rowAddedItemIds: trace.addedItemIds || [],
+        rowAfterItemId: last ? last.closest('[data-item-id]')?.getAttribute('data-item-id') ?? null : null,
+      };
+    }, { sel: selector, btn: button });
+    const stateStamp = [...frames].reverse().map((raw) => {
+      try { return JSON.parse(raw); } catch { return null; }
+    }).find((frame) => frame && frame.type === 'response' && /get_(messages|state)/.test(String(frame.command || '')));
+    error.message = `${error.message} (observed=${JSON.stringify({ rowBefore, ...observed,
+      generationStamp: stateStamp ? { command: stateStamp.command, id: stateStamp.id, ts: stateStamp.timestamp ?? null } : null,
+      clipboardMatchesExpected: actual === expectedClipboard, clipboardLen: actual.length, clipboardHash: textHash(actual),
+      expectedLen: expectedClipboard.length, expectedHash: textHash(expectedClipboard), secretLeaked: actual.includes(secret) })})`;
+    primaryError = error;
   }
-  await waitFor(
-    page,
-    (sel) => {
-      const btn = [...document.querySelectorAll(sel)].at(-1);
-      return !!btn && (btn.textContent || '').trim() === 'copied' && (btn.getAttribute('aria-label') || '') === 'Command copied';
-    },
-    `command-copy ${selector}: ${keyboard ? 'keyboard' : 'click'} did not flash copied / Command copied`,
-    10000,
-    selector
-  );
+  // Observer cleanup is part of the assertion: its failure is never swallowed.
+  try {
+    await page.evaluate(() => { window.__copyRowTrace?.observer?.disconnect(); });
+  } catch (cleanupError) {
+    const cleanupLabel = `command-copy ${selector}: observer cleanup failed`;
+    throw primaryError
+      ? new AggregateError([primaryError, cleanupError], `${cleanupLabel} (primary failure is errors[0])`)
+      : new Error(cleanupLabel, { cause: cleanupError });
+  }
+  if (primaryError) throw primaryError;
   const copied = await readClipboardText(page);
   if (copied !== expectedClipboard) {
     fail(`command-copy ${selector}: clipboard was not the exact redacted multiline payload (got=${JSON.stringify(copied)})`);
@@ -802,16 +885,16 @@ async function assertCommandCopyButton(page, selector, {
   if (copied.includes(secret)) {
     fail(`command-copy ${selector}: clipboard recovered the hidden secret`);
   }
-  await waitFor(
-    page,
-    (sel) => {
-      const btn = [...document.querySelectorAll(sel)].at(-1);
-      return !!btn && (btn.textContent || '').trim() === 'copy' && (btn.getAttribute('aria-label') || '') === 'Copy command';
-    },
-    `command-copy ${selector}: success flash did not reset to idle Copy command`,
-    4000,
-    selector
-  );
+  try {
+    await page.waitForFunction(
+      (btn) => !!btn && btn.isConnected
+        && (btn.textContent || '').trim() === 'copy' && (btn.getAttribute('aria-label') || '') === 'Copy command',
+      button,
+      { timeout: 4000, polling: 25 }
+    );
+  } catch {
+    fail(`command-copy ${selector}: success flash did not reset to idle Copy command`);
+  }
 }
 
 
@@ -863,39 +946,23 @@ async function ordinaryClick(page, selector, label) {
   await page.locator(selector).click();
 }
 
-async function ensureFilesToggleHittable(page) {
-  const toggle = page.locator('#file-explorer-toggle-btn');
-  if (await toggle.isVisible()) return;
-  const hamburger = page.locator('#sidebar-toggle-btn');
-  if (await hamburger.count()) {
-    const pressed = await hamburger.getAttribute('aria-pressed');
-    if (pressed !== 'true') {
-      await hamburger.click({ force: true });
-    }
+async function revealSessionRail(page, label) {
+  const graph = page.getByRole('button', { name: 'Close dependency graph' });
+  if (await graph.count()) await graph.click();
+  if (await page.locator(FILES_DRAWER_CLOSE).count()) await page.locator(FILES_DRAWER_CLOSE).click();
+  if (!await page.evaluate(() => document.querySelector('.app-layout')?.classList.contains('app-layout--drawer-open') === true)) {
+    await openSessionsDrawer(page);
   }
-  await waitFor(
-    page,
-    () => {
-      const btn = document.getElementById('file-explorer-toggle-btn');
-      if (!btn) return false;
-      const style = getComputedStyle(btn);
-      const box = btn.getBoundingClientRect();
-      return style.display !== 'none'
-        && style.visibility !== 'hidden'
-        && style.opacity !== '0'
-        && box.width > 0
-        && box.height > 0
-        && box.bottom > 0
-        && box.top < window.innerHeight;
-    },
-    '#file-explorer-toggle-btn never became hittable'
-  );
+  await waitFor(page, () => {
+    const button = document.getElementById('sidebar-manage-btn');
+    const box = button?.getBoundingClientRect();
+    return box && box.width > 0 && box.height > 0;
+  }, `${label}: session manage control is not visible`, 20000);
 }
 
 async function openFileExplorer(page) {
   if ((await page.locator('section.file-explorer[aria-label="File explorer"]').count()) > 0) return;
-  await ensureFilesToggleHittable(page);
-  await page.locator('#file-explorer-toggle-btn').click({ force: true });
+  await clickFeature(page, '#file-explorer-toggle-btn');
   await waitFor(
     page,
     () => document.querySelector('section.file-explorer[aria-label="File explorer"]') !== null,
@@ -967,26 +1034,50 @@ async function clickFilesRow(page, filePath, options = {}) {
   // tree starts collapsed and the content pane owns the body. A user taps the
   // header "Expand file tree" toggle to reach the rows — the lane must too.
   await expandFilesTree(page);
-  await row.scrollIntoViewIfNeeded();
-  await row.evaluate((node) => {
+  // Sample center, scrollTop, and hit identity in one layout turn. A later
+  // boundingBox() is a different snapshot and can land on a sibling row.
+  const placed = await row.evaluate((node) => {
     const tree = node.closest('.file-explorer__tree-viewport');
-    const list = tree?.querySelector('.file-explorer__tree-list');
-    const search = tree?.querySelector('[data-testid="file-explorer-search"]')
-      ?? document.querySelector('[data-testid="file-explorer-search"]');
-    if (!tree || !list) throw new Error('file row has no tree list');
-    const bounds = tree.getBoundingClientRect();
-    const top = search?.getBoundingClientRect().bottom ?? bounds.top;
-    const rect = node.getBoundingClientRect();
-    list.scrollTop += rect.top + rect.height / 2 - (top + bounds.bottom) / 2;
+    const list = node.closest('.file-explorer__tree-list');
+    if (!tree || !list) return { error: 'file row has no tree list' };
+    const before = node.getBoundingClientRect();
+    const bounds = list.getBoundingClientRect();
+    list.scrollTop += before.top + before.height / 2 - (bounds.top + bounds.bottom) / 2;
+    const after = node.getBoundingClientRect();
+    const next = list.getBoundingClientRect();
+    const round = (rect) => ({ x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height) });
+    const point = { x: after.left + after.width / 2, y: after.top + after.height / 2 };
+    const el = document.elementFromPoint(point.x, point.y);
+    const hitRect = el?.getBoundingClientRect();
+    const hitRow = el?.closest('button.file-explorer__row');
+    return {
+      before: round(before),
+      after: round(after),
+      tree: round(next),
+      scrollTop: list.scrollTop,
+      clientHeight: list.clientHeight,
+      inside: after.width > 0 && after.height > 0 && after.top >= next.top && after.bottom <= next.bottom,
+      point: { x: point.x, y: point.y },
+      row: el === node || hitRow === node,
+      tag: el?.tagName || '',
+      className: typeof el?.className === 'string' ? el.className : '',
+      testid: el?.getAttribute('data-testid') || '',
+      rect: hitRect ? round(hitRect) : null,
+      hitTitle: hitRow?.getAttribute('title') || '',
+      targetTitle: node.getAttribute('title') || '',
+    };
   });
-  const box = await row.boundingBox();
-  if (!box) fail(`File Explorer row ${filePath} has no box`);
-  const hit = await page.evaluate(({ x, y }) => {
-    const el = document.elementFromPoint(x, y);
-    return el?.closest('button.file-explorer__row') != null;
-  }, { x: box.x + box.width / 2, y: box.y + box.height / 2 });
-  if (!hit) {
-    fail(`File Explorer row ${filePath} is not the top element at its center`);
+  if (placed.error) fail(`${filePath}: ${placed.error}`);
+  const rowBlocker = { ...placed, row: placed.after, targetIsHit: placed.row === true };
+  if (!placed.inside) {
+    const error = new Error(`File Explorer row ${filePath} is outside the tree scroller`);
+    error.rowBlocker = rowBlocker;
+    throw error;
+  }
+  if (!placed.row) {
+    const error = new Error(`File Explorer row ${filePath} is not the top element at its center`);
+    error.rowBlocker = rowBlocker;
+    throw error;
   }
   await row.click(options.button ? { button: options.button } : undefined);
 }
@@ -1017,7 +1108,7 @@ async function filesChromeContract(page, { desktopResizer }) {
     const search = treeRegion?.querySelector('[data-testid="file-explorer-search"]')
       ?? document.querySelector('[data-testid="file-explorer-search"]');
     const layout = document.querySelector('.app-layout');
-    const resizer = document.getElementById('file-explorer-resizer');
+    const explorer = document.querySelector('section.file-explorer')?.getBoundingClientRect();
     const box = (node) => {
       if (!node) return null;
       const rect = node.getBoundingClientRect();
@@ -1075,8 +1166,9 @@ async function filesChromeContract(page, { desktopResizer }) {
       orphans: document.querySelector('[data-orphans="true"]') !== null,
       filesOpen: layout?.classList.contains('app-layout--files-open') === true,
       togglePressed: document.getElementById('file-explorer-toggle-btn')?.getAttribute('aria-pressed') || '',
-      resizerPresent: resizer !== null,
-      resizerDisplay: resizer ? getComputedStyle(resizer).display : 'missing',
+      explorerLeft: explorer ? Math.round(explorer.left) : null,
+      explorerRight: explorer ? Math.round(window.innerWidth - explorer.right) : null,
+      outerResizer: document.getElementById('file-explorer-resizer') != null,
     };
   });
   if (!chrome.hideGone) fail('obsolete Files title close (hide-btn / title-button) is still mounted');
@@ -1163,10 +1255,9 @@ async function filesChromeContract(page, { desktopResizer }) {
     fail(`tree collapse/reopen changed search/file/Ask (${JSON.stringify({ query, activeBefore, askBefore, restored })})`);
   }
   await search.fill('');
-  if (desktopResizer) {
-    if (!chrome.resizerPresent) fail('#file-explorer-resizer missing on desktop');
-  } else if (chrome.resizerDisplay !== 'none' && chrome.resizerDisplay !== 'missing') {
-    fail(`#file-explorer-resizer must be hidden in overlay (display=${chrome.resizerDisplay})`);
+  if (chrome.outerResizer) fail('obsolete #file-explorer-resizer is still mounted');
+  if (desktopResizer && (chrome.explorerLeft !== 0 || chrome.explorerRight !== 0)) {
+    fail(`desktop Files is not the full viewport width (${JSON.stringify({ left: chrome.explorerLeft, right: chrome.explorerRight })})`);
   }
 }
 
@@ -1325,9 +1416,11 @@ async function assertFilesStatusColumn(page, sentFrames, label, { chip44 = false
   }
   const diffFramesAfter = filesWsOf(sentFrames, 'file_explorer_diff', dirtyFile).length;
   const allDiffAfter = filesWsOf(sentFrames, 'file_explorer_diff').length;
-  const expectedRequests = diffFramesBefore === 0 ? 1 : 0;
-  if (diffFramesAfter !== diffFramesBefore + expectedRequests || allDiffAfter !== allDiffBefore + expectedRequests) {
-    fail(`${label}: status chip diff requests disagree with the already-loaded file cache`);
+  const dirtyDelta = diffFramesAfter - diffFramesBefore;
+  const allDelta = allDiffAfter - allDiffBefore;
+  if (dirtyDelta < 0 || dirtyDelta > 1 || allDelta !== dirtyDelta) {
+    const requests = filesWsOf(sentFrames, 'file_explorer_diff').map((frame) => frame.path);
+    fail(`${label}: status chip diff requests disagree with the already-loaded file cache (${JSON.stringify({ dirtyFile, before: diffFramesBefore, after: diffFramesAfter, allBefore: allDiffBefore, allAfter: allDiffAfter, dirtyDelta, allDelta, requests })})`);
   }
 }
 
@@ -1374,7 +1467,11 @@ async function mutateFilesGeometry(page) {
     const el = document.querySelector('[data-testid="file-explorer-divider"]');
     return Number(el?.getAttribute('aria-valuenow') || '0');
   });
-  await divider.click();
+  await page.focus('[data-testid="file-explorer-divider"]');
+  const focused = await page.evaluate(() => document.activeElement?.getAttribute('data-testid') || document.activeElement?.tagName || '');
+  if (focused !== 'file-explorer-divider') {
+    fail(`divider keyboard target is ${focused}, not the ARIA separator`);
+  }
   await page.keyboard.press('ArrowRight');
   await page.keyboard.press('ArrowRight');
   await waitFor(
@@ -1382,9 +1479,9 @@ async function mutateFilesGeometry(page) {
     (start) => {
       const now = Number(document.querySelector('[data-testid="file-explorer-divider"]')?.getAttribute('aria-valuenow') || '0');
       const pct = getComputedStyle(document.querySelector('[data-testid="file-explorer-layout"]')).getPropertyValue('--file-explorer-tree-pct').trim();
-      return Number.isFinite(now) && now !== start && now !== 34 && pct !== '34%' && pct !== '';
+      return now === start + 4 && pct === `${start + 4}%`;
     },
-    'divider keyboard move did not leave the default 34% tree split',
+    'divider keyboard move did not advance the ARIA separator by two ArrowRight steps',
     25000,
     before
   );
@@ -1410,7 +1507,7 @@ async function mutateFilesGeometry(page) {
   });
   await waitFor(
     page,
-    () => {
+    (start) => {
       const tree = document.querySelector('[data-testid="file-explorer-tree"] .file-explorer__tree-list');
       const content = document.querySelector('.file-explorer__markdown, .file-explorer__code');
       const now = Number(document.querySelector('[data-testid="file-explorer-divider"]')?.getAttribute('aria-valuenow') || '0');
@@ -1418,10 +1515,12 @@ async function mutateFilesGeometry(page) {
       return tree != null && content != null
         && tree.scrollTop > 0
         && content.scrollTop > 0
-        && Number.isFinite(now) && now !== 34
-        && pct !== '34%' && pct !== '';
+        && now === start + 4
+        && pct === `${start + 4}%`;
     },
-    'S0 treePct/treeScroll/contentScroll did not become non-default/nonzero'
+    'S0 treePct/treeScroll/contentScroll did not keep the moved separator and nonzero scroll',
+    25000,
+    before
   );
 }
 
@@ -1429,7 +1528,7 @@ async function mutateFilesGeometry(page) {
 
 async function assertSendReclaimed(page, label) {
   const proof = await page.evaluate(() => {
-    const leftover = document.querySelectorAll('.file-explorer, #file-explorer-resizer, #file-explorer-close-btn').length;
+    const leftover = document.querySelectorAll('.file-explorer, #file-explorer-close-btn').length;
     const send = document.getElementById('send-btn');
     const layout = document.querySelector('.app-layout');
     if (!send) return { leftover, filesOpen: layout?.classList.contains('app-layout--files-open') === true, sendHit: false, covered: true };
@@ -1446,7 +1545,7 @@ async function assertSendReclaimed(page, label) {
       leftover,
       filesOpen: layout?.classList.contains('app-layout--files-open') === true,
       sendHit: top?.closest('#send-btn') != null,
-      formerIsFiles: former?.closest('.file-explorer, #file-explorer-resizer, #file-explorer-close-btn') != null,
+      formerIsFiles: former?.closest('.file-explorer, #file-explorer-close-btn') != null,
       togglePressed: document.getElementById('file-explorer-toggle-btn')?.getAttribute('aria-pressed') || '',
       toggleLabel: document.getElementById('file-explorer-toggle-btn')?.getAttribute('aria-label') || '',
       transcriptWidth: tbox ? Math.round(tbox.width) : null,
@@ -1594,7 +1693,7 @@ async function filesSurfaceProof(page) {
     const content = document.querySelector('[data-testid="file-explorer-content"]');
     const tree = document.querySelector('[data-testid="file-explorer-tree"]');
     const surface = document.querySelector('.file-explorer__surface');
-    const checked = surface?.querySelector('[aria-checked="true"]');
+    const pressed = surface?.querySelector('[aria-pressed="true"]');
     const treeTop = tree?.getBoundingClientRect().top ?? -1;
     const contentTop = content?.getBoundingClientRect().top ?? -1;
     const surfaceBox = surface?.getBoundingClientRect();
@@ -1603,7 +1702,7 @@ async function filesSurfaceProof(page) {
       surfaceInHead: !!head?.querySelector('.file-explorer__surface, [aria-label="File surface"]'),
       surfaceInContent: !!content?.contains(surface),
       surfaceAboveContentBody: !!(surfaceBox && contentBox && surfaceBox.top <= contentBox.top + 2),
-      checked: (checked?.textContent || '').replace(/\s+/g, ' ').trim(),
+      checked: (pressed?.textContent || '').replace(/\s+/g, ' ').trim(),
       label: surface?.getAttribute('aria-label') || '',
       markdown: !!document.querySelector('.file-explorer__markdown'),
       code: !!document.querySelector('pre.file-explorer__code'),
@@ -1899,8 +1998,12 @@ async function runFileExplorerPreviewJourney(page) {
   await laneShot(page, 'files-desktop-tree-icons-selected.png', { fullPage: true });
   await hideFileExplorer(page, 'preview journey hide');
 
+  const previewWasWide = await page.evaluate(() => window.innerWidth > 720);
   await page.setViewportSize({ width: 390, height: 844 });
   await waitFor(page, () => window.innerWidth === 390 && window.innerHeight === 844, 'mobile viewport did not become 390x844 for preview');
+  if (previewWasWide) {
+    await waitFor(page, () => window.matchMedia('(max-width: 720px)').matches && document.querySelector('.app-layout')?.classList.contains('app-layout--drawer-open') !== true, 'preview mobile sessions drawer did not settle closed');
+  }
   await openFileExplorer(page);
   await clickFilesRow(page, previewMarkdownFile);
   await waitFor(
@@ -2081,13 +2184,13 @@ async function runFileExplorerAcceptance(page, sentFrames, receivedFrames) {
     },
     'file tree split Home did not clamp to the 22% minimum'
   );
-  for (let step = 0; step < (34 - 22) / 2; step++) {
+  for (let step = 0; step < (30 - 22) / 2; step++) {
     await page.keyboard.press('ArrowRight');
   }
   await waitFor(
     page,
-    () => Number(document.querySelector('[data-testid="file-explorer-divider"]')?.getAttribute('aria-valuenow')) === 34,
-    'file tree split never returned to the shipped 34% default'
+    () => Number(document.querySelector('[data-testid="file-explorer-divider"]')?.getAttribute('aria-valuenow')) === 30,
+    'file tree split never reached the custom 30% width'
   );
   recordFiles('files.tree-split');
 
@@ -2179,7 +2282,7 @@ async function runFileExplorerAcceptance(page, sentFrames, receivedFrames) {
     fail(`S0 fields missing (${JSON.stringify(s0)})`);
   }
   const s0Pct = Number.parseFloat(String(s0.dividerNow));
-  if (!Number.isFinite(s0Pct) || s0Pct === 34 || s0.treePct === '34%' || s0.treePct === '') {
+  if (!Number.isFinite(s0Pct) || s0Pct === 29 || s0.treePct === '29%' || s0.treePct === '') {
     fail(`S0 treePct must be non-default (got divider=${s0.dividerNow} pct=${s0.treePct})`);
   }
   if (!(s0.treeScroll > 0) || !(s0.contentScroll > 0)) {
@@ -2248,19 +2351,201 @@ async function runFileExplorerAcceptance(page, sentFrames, receivedFrames) {
   if (tabletRestored.activeTitle !== s0.activeTitle) fail('tablet reopen lost the active Files row');
   recordFiles('files.tablet');
 
+
   await runFileAskJourney(page, sentFrames);
   recordFiles('files.ask');
+  await hideFileExplorer(page, 'citation prompt');
+  const citationOwner = await displayedExplorerSession(page);
+  await page.fill('#prompt-input', 'render workspace citations');
+  await page.press('#prompt-input', 'Enter');
+  await waitFor(page, () => [...document.querySelectorAll('#transcript code.md-code-path')].some((node) => node.getAttribute('data-md-path') === 'unique.rs'), 'citation reply did not render the unique file', 30000);
+  const citationNames = await page.evaluate(() => [...document.querySelectorAll('#transcript code.md-code-path')].map((node) => node.getAttribute('data-md-path')));
+  for (const name of ['unique.rs', 'deposit_logs.rs', 'daemon.rs', 'prove_bridge.rs']) {
+    if (!citationNames.includes(name)) fail(`citation reply missing ${name}: ${JSON.stringify(citationNames)}`);
+  }
+  const proveUnique = async (label) => {
+    await hideFileExplorer(page, `${label} before unique`);
+    const before = sentFrames.length;
+    await page.locator('#transcript code.md-code-path[data-md-path="unique.rs"]').last().click();
+    await waitFor(page, () => (document.querySelector('[aria-label="Selected file"] pre.file-explorer__code')?.textContent || '').includes('CITE-UNIQUE'), `${label}: unique.rs content did not open`, 20000);
+    const reads = sentFrames.slice(before).map(parseSentFrame).filter((frame) => frame?.type === 'file_explorer_read' && frame.path === 'unique.rs');
+    const probe = reads.filter((frame) => frame.maxLines === 1);
+    const response = receivedFrames.slice(before).map(parseSentFrame).find((frame) => frame?.type === 'response' && frame.id === probe[0]?.id);
+    const searches = sentFrames.slice(before).map(parseSentFrame).filter((frame) => frame?.type === 'file_explorer_search');
+    if (probe.length !== 1 || probe[0].sessionId !== citationOwner || response?.success !== true || response?.data?.path !== 'unique.rs' || searches.length !== 0) {
+      fail(`${label}: unique open was not the direct unique.rs read (${JSON.stringify({ probe, response, searches })})`);
+    }
+  };
+  const proveAmbiguous = async (name, label) => {
+    const stem = name.slice(0, -3);
+    const copyA = `psy-node/bridge/${name}`;
+    const copyB = `psy-node-fix/bridge/${name}`;
+    await hideFileExplorer(page, `${label} before ${name}`);
+    const before = sentFrames.length;
+    await page.locator(`#transcript code.md-code-path[data-md-path="${name}"]`).last().click();
+    await waitFor(page, (paths) => {
+      const shown = [...document.querySelectorAll('[data-testid="file-explorer-search-results"] .file-explorer__row .file-explorer__row-path')].map((node) => node.textContent || '');
+      return shown.length === 2 && shown.includes(paths.copyA) && shown.includes(paths.copyB);
+    }, `${label}: ${name} did not list exactly its two full paths`, 20000, { copyA, copyB });
+    const reads = sentFrames.slice(before).map(parseSentFrame).filter((frame) => frame?.type === 'file_explorer_read' && frame.path === name);
+    if (reads.length === 0 || reads.some((frame) => frame.sessionId !== citationOwner)) fail(`${label}: missing-file read was not owner scoped (${JSON.stringify(reads)})`);
+    await page.locator('[data-testid="file-explorer-search-results"] .file-explorer__row', { hasText: copyA }).click();
+    await waitFor(page, (marker) => (document.querySelector('pre.file-explorer__code')?.textContent || '').includes(marker), `${label}: ${copyA} did not open`, 20000, `COPY-A-${stem}`);
+    await hideFileExplorer(page, `${label} after ${copyA}`);
+    await page.locator(`#transcript code.md-code-path[data-md-path="${name}"]`).last().click();
+    await page.locator('[data-testid="file-explorer-search-results"] .file-explorer__row', { hasText: copyB }).click();
+    await waitFor(page, (marker) => (document.querySelector('pre.file-explorer__code')?.textContent || '').includes(marker), `${label}: ${copyB} did not open`, 20000, `COPY-B-${stem}`);
+    await laneShot(page, `${label.startsWith('mobile') ? 'files-citations-mobile' : 'files-citations-desktop'}-${stem}.png`, { fullPage: false });
+    await hideFileExplorer(page, `${label} after ${copyB}`);
+  };
+  // One directory citation per breakpoint, each against a DIFFERENT public
+  // fixture directory. An accepted file open now auto-reveals (and CACHES)
+  // its parent chain, so a directory citation that follows any file or
+  // ambiguous citation finds its target already listed: the panel's reveal
+  // correctly skips the cached dir, and the only later bridge list is the
+  // unrelated serialized mount refresh — so the exact "validate then reveal"
+  // wire pair could only be sampled by luck. Both breakpoint runs therefore
+  // execute BEFORE every file/ambiguous citation and each opens a directory
+  // that no citation has touched yet.
+  //   target.href   transcript link + workspace-relative directory
+  //   target.parent its expandable parent row (must be re-expanded by reveal)
+  //   target.child  a real listing-backed child row (proves the dir settled)
+  const proveDirectoryCitation = async (label, target) => {
+    if (label.startsWith('mobile')) {
+      await page.locator('#transcript code.md-code-path[data-md-path="unique.rs"]').last().click();
+      await waitFor(page, () => document.querySelector('section.file-explorer') !== null, `${label}: unique.rs did not open Files`, 20000);
+    } else {
+      await openFileExplorer(page);
+    }
+    // The search box lives in the tree pane; on narrow viewports Files opens
+    // tree-collapsed (content layout), so a REAL 'Expand file tree' toggle
+    // click must expose it first — never a forced DOM set. Desktop (expanded)
+    // has no Expand-labeled toggle and goes straight through.
+    const expandTree = page.locator('button[aria-label="Expand file tree"]');
+    if (await expandTree.count() && await expandTree.isVisible()) await expandTree.click();
+    await waitFor(page, () => document.querySelector('[data-testid="file-explorer-search"]')?.offsetParent !== null, `${label}: file tree did not expand to expose the search box`, 10000);
+    // The kept candidate list is the DOCUMENTED choice-mode convenience
+    // (FEATURES: picking a row keeps the list; a search edit, a directory
+    // choice, or an accepted markdown open clears it). Exit it with a REAL
+    // user-visible search edit — type a changing query (proves the input is
+    // editable in choices mode and the edit clears the candidates), then
+    // clear the query so the plain tree owns the pane.
+    await page.locator('[data-testid="file-explorer-search"]').fill('zz-no-match');
+    await waitFor(
+      page,
+      () => document.querySelector('[data-testid="file-explorer-search"]')?.value === 'zz-no-match'
+        && document.querySelector('[data-file-ambiguous-choice]') === null,
+      `${label}: a search edit must be accepted in choices mode and clear the candidates`,
+    );
+    await page.locator('[data-testid="file-explorer-search"]').fill('');
+    await waitFor(
+      page,
+      () => document.querySelector('[data-testid="file-explorer-search"]')?.value === ''
+        && document.querySelector('[data-testid="file-explorer-search-results"]') === null,
+      `${label}: clearing the query did not restore the tree before collapsing ${target.parent}`,
+    );
+    const parent = page.locator(`button.file-explorer__row--dir[title="${target.parent}"]`);
+    if (await parent.count()) {
+      if ((await parent.getAttribute('aria-expanded')) === 'true') await parent.click();
+      await waitFor(
+        page,
+        (dir) => document.querySelector(`button.file-explorer__row--dir[title="${dir}"]`)?.getAttribute('aria-expanded') === 'false',
+        `${label}: ${target.parent} did not collapse before the directory citation`,
+        25000,
+        target.parent,
+      );
+    }
+    await hideFileExplorer(page, `${label} before directory citation`);
+    const before = sentFrames.length;
+    await page.locator(`#transcript a[href="${target.href}"]`).last().click();
+    await waitFor(page, (want) => {
+      const tree = document.querySelector('[data-testid="file-explorer-tree"]');
+      const layout = document.querySelector('[data-testid="file-explorer-layout"]')?.getAttribute('data-layout') || '';
+      const parentRow = document.querySelector(`button.file-explorer__row--dir[title="${want.parent}"]`);
+      const targetRow = document.querySelector(`button.file-explorer__row--dir[title="${want.href}"]`);
+      const child = [...document.querySelectorAll('button.file-explorer__row')].some((row) => (row.getAttribute('title') || '') === want.child);
+      const treeBox = tree?.getBoundingClientRect();
+      const mobile = window.matchMedia('(max-width: 720px)').matches;
+      return tree != null
+        && tree.hasAttribute('hidden') === false
+        && treeBox != null
+        && treeBox.width > 0
+        && treeBox.height > 0
+        && (!mobile || layout === 'tree')
+        && parentRow?.getAttribute('aria-expanded') === 'true'
+        && targetRow?.getAttribute('aria-expanded') === 'true'
+        && child;
+    }, `${label}: ${target.href} citation did not expand its parent and child`, 20000, target);
+    const sent = sentFrames.slice(before).map(parseSentFrame);
+    const read = sent.find((frame) => frame?.type === 'file_explorer_read' && frame.path === target.href && frame.maxLines === 1);
+    const listed = sent.filter((frame) => frame?.type === 'file_explorer_list' && (frame.path === target.parent || frame.path === target.href));
+    const response = receivedFrames.map(parseSentFrame).find((frame) => frame?.type === 'response' && frame.id === read?.id);
+    const targetLists = listed.filter((frame) => frame.path === target.href && frame.sessionId === citationOwner);
+    if (!read || read.sessionId !== citationOwner || response?.success !== false || response?.data?.code !== 'directory_unavailable' || targetLists.length < 2) {
+      fail(`${label}: directory citation did not validate then reveal ${target.href} (${JSON.stringify({ read, response, listed })})`);
+    }
+    const parentListed = sentFrames.map(parseSentFrame).some((frame) => frame?.type === 'file_explorer_list' && frame.path === target.parent && frame.sessionId === citationOwner);
+    if (!parentListed) {
+      fail(`${label}: directory citation has no owner parent list (${JSON.stringify(listed)})`);
+    }
+    const directoryTarget = page.locator(`button.file-explorer__row--dir[title="${target.href}"]`);
+    await directoryTarget.scrollIntoViewIfNeeded();
+    const directoryBox = await directoryTarget.boundingBox();
+    if (!directoryBox || directoryBox.width <= 0 || directoryBox.height <= 0) {
+      fail(`${label}: ${target.href} is not visible in the tree viewport`);
+    }
+    await laneShot(page, `${label.startsWith('mobile') ? 'files-directory-citation-mobile' : 'files-directory-citation-desktop'}.png`, { fullPage: false });
+    await hideFileExplorer(page, `${label} after directory citation`);
+  };
+  // Directory citations FIRST, at both breakpoints, before ANY file or
+  // ambiguous citation: each target is then cold at its own turn (the
+  // desktop target's chain is untouched, and the mobile target's directory
+  // family — psy-node-fix — is untouched because the desktop run only
+  // reveals psy-node/*). The exact-one-count rules, timeouts, owner scoping
+  // and DOM waits above are unchanged.
+  const directoryCitationTargets = {
+    'desktop citation': { href: 'psy-node/bridge', parent: 'psy-node', child: 'psy-node/bridge/deposit_logs.rs' },
+    'mobile citation': { href: 'psy-node-fix/bridge', parent: 'psy-node-fix', child: 'psy-node-fix/bridge/deposit_logs.rs' },
+  };
+  const citationViewport = page.viewportSize();
+  for (const label of ['desktop citation', 'mobile citation']) {
+    if (label.startsWith('mobile')) {
+      await page.setViewportSize({ width: 390, height: 844 });
+      await waitFor(page, () => window.innerWidth === 390, 'citation mobile viewport');
+    }
+    await proveDirectoryCitation(label, directoryCitationTargets[label]);
+  }
+  for (const label of ['desktop citation', 'mobile citation']) {
+    if (label.startsWith('mobile')) {
+      await page.setViewportSize({ width: 390, height: 844 });
+      await waitFor(page, () => window.innerWidth === 390, 'citation mobile viewport');
+    } else if (citationViewport != null) {
+      await page.setViewportSize(citationViewport);
+      await waitFor(page, (size) => window.innerWidth === size.width && window.innerHeight === size.height, 'citation desktop viewport restore', 10000, citationViewport);
+    }
+    await proveUnique(label);
+    for (const name of ['deposit_logs.rs', 'daemon.rs', 'prove_bridge.rs']) await proveAmbiguous(name, label);
+  }
+  await page.setViewportSize({ width: 1360, height: 900 });
+  recordFiles('files.citations');
+  await openFileExplorer(page);
+  await page.locator('[data-testid="file-explorer-search"]').fill('');
+  await waitFor(page, () => document.querySelector('[data-testid="file-explorer-search"]')?.value === '' && document.querySelector('[data-testid="file-explorer-search-results"]') === null, 'citation search did not clear before source selection');
+  await hideFileExplorer(page, 'citation search clear');
 
   await runFileSelectionJourney(page, sentFrames, await displayedExplorerSession(page));
   recordFiles('files.selection');
-  await runFileMapJourney(page, sentFrames);
+  await runFileMapJourney(page, sentFrames, receivedFrames);
   recordFiles('files.map');
   await runFilesFullscreenJourney(page);
   recordFiles('files.fullscreen');
-
   await hideFileExplorer(page, 'tablet hide before mobile');
+  const mobileWasWide = await page.evaluate(() => window.innerWidth > 720);
   await page.setViewportSize({ width: 390, height: 844 });
   await waitFor(page, () => window.innerWidth === 390 && window.innerHeight === 844, 'mobile viewport did not become 390x844');
+  if (mobileWasWide) {
+    await waitFor(page, () => window.matchMedia('(max-width: 720px)').matches && document.querySelector('.app-layout')?.classList.contains('app-layout--drawer-open') !== true, 'files mobile sessions drawer did not settle closed');
+  }
   await openFileExplorer(page);
   await filesChromeContract(page, { desktopResizer: false });
   const closeBox = await page.locator(FILES_DRAWER_CLOSE).boundingBox();
@@ -2268,7 +2553,7 @@ async function runFileExplorerAcceptance(page, sentFrames, receivedFrames) {
     fail(`mobile drawer close is ${closeBox?.width ?? -1}x${closeBox?.height ?? -1}, need >=44x44`);
   }
   await clickFilesRow(page, markdownFile);
-  await page.getByRole('radio', { name: 'Preview', exact: true }).click();
+  await page.getByRole('button', { name: 'Preview', exact: true }).click();
   await waitFor(
     page,
     () => document.querySelector('.file-explorer__markdown') !== null,
@@ -2318,25 +2603,34 @@ async function displayedExplorerSession(page) {
   return page.evaluate(() => document.getElementById('session-lifecycle')?.dataset.displayedSessionId || '');
 }
 
+function askBoundTo(path) {
+  const dock = document.querySelector('section.file-conversation');
+  const active = document.querySelector('button.file-explorer__row--active')?.getAttribute('title') || '';
+  return dock != null
+    && dock.getAttribute('aria-label') === 'File conversation'
+    && (dock.getAttribute('data-session-id') || '') !== ''
+    && active === path;
+}
+
 async function clickVisibleAsk(page, label) {
-  const ask = page.getByRole('radio', { name: 'Ask about this file' });
+  const ask = page.getByRole('textbox', { name: 'File question' });
   await waitFor(
     page,
     () => {
-      const control = document.querySelector('[data-testid="file-explorer-ask-toggle"]');
-      if (!control || control.getAttribute('aria-label') !== 'Ask about this file') return false;
+      const control = document.querySelector('textarea[aria-label="File question"]');
+      if (!control) return false;
       const box = control.getBoundingClientRect();
       return box.width > 0 && box.height > 0 && getComputedStyle(control).visibility !== 'hidden';
     },
-    `${label}: Ask about this file is not a visible control`
+    `${label}: File question is not a visible control`
   );
   const box = await ask.boundingBox();
-  if (!box || box.width < 1 || box.height < 1) fail(`${label}: Ask control has no visible box`);
+  if (!box || box.width < 1 || box.height < 1) fail(`${label}: File question has no visible box`);
   const hit = await page.evaluate(({ x, y }) => {
     const el = document.elementFromPoint(x, y);
-    return el?.closest('[data-testid="file-explorer-ask-toggle"]') != null;
+    return el?.closest('textarea[aria-label="File question"]') != null;
   }, { x: box.x + box.width / 2, y: box.y + Math.min(box.height / 2, 12) });
-  if (!hit) fail(`${label}: Ask control is covered at its visible center`);
+  if (!hit) fail(`${label}: File question is covered at its visible center`);
   await ask.click();
 }
 
@@ -2358,7 +2652,7 @@ async function assertAskChrome(page, filePath, label, { touch = false, source = 
     const section = document.querySelector('section.file-explorer');
     const header = document.querySelector('.file-explorer__head');
     const dock = document.querySelector('section.file-conversation');
-    const sourceNode = document.querySelector('[data-testid="file-explorer-ask-split"] pre.file-explorer__code');
+    const sourceNode = document.querySelector('[data-testid="file-explorer-content"][aria-label="Selected file"] pre.file-explorer__code');
     const footer = dock?.querySelector('.file-conversation__actions');
     const boxOf = (node) => {
       if (!node) return null;
@@ -2376,15 +2670,17 @@ async function assertAskChrome(page, filePath, label, { touch = false, source = 
     const visible = (box) => box != null && !box.hidden && box.width > 0 && box.height > 0
       && box.y < window.innerHeight && box.y + box.height > 0;
     const lines = Array.from(sourceNode?.querySelectorAll('.file-explorer__line-text') || []).map((el) => el.textContent || '');
-    const split = document.querySelector('[data-testid="file-explorer-ask-split"]')?.getBoundingClientRect();
-    const inside = (box) => split != null && box != null && box.x >= split.x - 1 && box.x + box.width <= split.x + split.width + 1
-      && box.y >= split.y - 1 && box.y + box.height <= split.y + split.height + 1;
+    const body = document.querySelector('.file-explorer__body')?.getBoundingClientRect();
+    const inside = (box) => body != null && box != null && box.x >= body.x - 1 && box.x + box.width <= body.x + body.width + 1
+      && box.y >= body.y - 1 && box.y + box.height <= body.y + body.height + 1;
     const sideBySide = sourceBox != null && dockBox != null && sourceBox.x + sourceBox.width <= dockBox.x + 1
       && sourceBox.y < dockBox.y + dockBox.height && dockBox.y < sourceBox.y + sourceBox.height;
     const stacked = sourceBox != null && dockBox != null && sourceBox.y + sourceBox.height <= dockBox.y + 1
       && sourceBox.height >= 120 && dockBox.height >= 120;
     return {
-      pathText: dock?.querySelector('.file-conversation__path')?.textContent || '',
+      pathText: document.querySelector('button.file-explorer__row--active')?.getAttribute('title') || '',
+      dockLabel: dock?.getAttribute('aria-label') || '',
+      conversationId: dock?.getAttribute('data-conversation-id') ?? null,
       sourceIntact: JSON.stringify(lines) === JSON.stringify(expectedLines),
       lines,
       headerVisible: visible(headerBox) && headerBox.y >= -1,
@@ -2395,13 +2691,14 @@ async function assertAskChrome(page, filePath, label, { touch = false, source = 
       dockWidth: dockBox?.width ?? 0,
       windowWidth: window.innerWidth,
       integrated: visible(sourceBox) && visible(dockBox) && inside(sourceBox) && inside(dockBox) && (sideBySide || stacked),
-      askHeight: document.querySelector('[data-testid="file-explorer-ask-toggle"]')?.getBoundingClientRect().height ?? 0,
+      askHeight: document.querySelector('textarea[aria-label="File question"]')?.getBoundingClientRect().height ?? 0,
       drawerInside: section != null && section.getBoundingClientRect().width <= window.innerWidth + 1,
+      bodyWidth: body ? Math.round(body.width) : 0,
       overflow: document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1,
     };
   }, SOLIDITY_SOURCE_LINES);
-  if (chrome.pathText !== 'No file' && chrome.pathText !== filePath) {
-    fail(`${label}: Ask dock path is ${JSON.stringify(chrome.pathText)}, not ${filePath} or the pre-open placeholder`);
+  if (chrome.dockLabel !== 'File conversation' || chrome.pathText !== filePath) {
+    fail(`${label}: Ask dock is not bound to ${filePath} (path=${JSON.stringify(chrome.pathText)} label=${JSON.stringify(chrome.dockLabel)} id=${JSON.stringify(chrome.conversationId)})`);
   }
   if (source) {
     if (!chrome.sourceIntact) {
@@ -2425,7 +2722,7 @@ async function selectSourceRange(page, startLine, endLine, label) {
   const selected = await page.evaluate(({ startLine: start, endLine: end }) => {
     const startNode = document.querySelector(`#file-explorer-line-${start} .file-explorer__line-text`);
     const endNode = document.querySelector(`#file-explorer-line-${end} .file-explorer__line-text`);
-    const root = document.querySelector('[data-testid="file-explorer-ask-split"] pre.file-explorer__code');
+    const root = document.querySelector('[data-testid="file-explorer-content"][aria-label="Selected file"] pre.file-explorer__code');
     if (!startNode || !endNode || !root?.contains(startNode) || !root.contains(endNode)) return false;
     const range = document.createRange();
     range.setStart(startNode, 0);
@@ -2540,13 +2837,54 @@ async function assertSelectionFloat(page, startLine, endLine, label) {
     const pane = document.querySelector('[data-testid="file-explorer-content"]');
     const bar = document.querySelector('[data-testid="file-selection-actions"]');
     const code = document.querySelector('pre.file-explorer__code');
+    const box = (node) => {
+      if (!node || node.getClientRects().length === 0) return null;
+      const rect = node.getBoundingClientRect();
+      const computed = getComputedStyle(node);
+      return {
+        top: rect.top,
+        right: rect.right,
+        bottom: rect.bottom,
+        left: rect.left,
+        width: rect.width,
+        height: rect.height,
+        position: computed.position,
+        topStyle: computed.top,
+        leftStyle: computed.left,
+        maxHeight: computed.maxHeight,
+        heightStyle: computed.height,
+        overflow: computed.overflow,
+        visibility: computed.visibility,
+      };
+    };
+    const paneBox = pane?.getBoundingClientRect();
     const lines = [];
+    const lineBoxes = [];
     for (let line = start; line <= end; line += 1) {
       const node = document.getElementById(`file-explorer-line-${line}`);
-      if (node) lines.push(node.getBoundingClientRect());
+      const rect = node?.getBoundingClientRect();
+      if (!rect || rect.width <= 0 || rect.height <= 0) {
+        lineBoxes.push({ line, missing: true });
+        continue;
+      }
+      lines.push(rect);
+      const onPane = paneBox != null
+        && rect.bottom > paneBox.top && rect.top < paneBox.bottom
+        && rect.right > paneBox.left && rect.left < paneBox.right;
+      lineBoxes.push({
+        line,
+        top: rect.top,
+        bottom: rect.bottom,
+        left: rect.left,
+        right: rect.right,
+        height: rect.height,
+        offPane: paneBox != null && !onPane,
+      });
     }
-    const paneBox = pane?.getBoundingClientRect();
     const barBox = bar?.getBoundingClientRect();
+    const floatNode = document.querySelector('.file-explorer__selection-float');
+    const popupNode = document.querySelector('[data-testid="file-selection-blame-list"]');
+    const sourceNode = document.querySelector('.file-explorer__source');
     const selection = lines.length === 0 ? null : {
       top: Math.min(...lines.map((rect) => rect.top)),
       bottom: Math.max(...lines.map((rect) => rect.bottom)),
@@ -2554,6 +2892,7 @@ async function assertSelectionFloat(page, startLine, endLine, label) {
       right: Math.max(...lines.map((rect) => rect.right)),
     };
     const style = bar ? getComputedStyle(bar) : null;
+    const floatStyle = floatNode ? getComputedStyle(floatNode) : null;
     const inside = paneBox && barBox
       && barBox.left >= paneBox.left + edge - 0.5
       && barBox.right <= paneBox.right - edge + 0.5
@@ -2564,27 +2903,69 @@ async function assertSelectionFloat(page, startLine, endLine, label) {
       && barBox.bottom > selection.top + 0.5
       && barBox.left < selection.right - 0.5
       && barBox.right > selection.left + 0.5;
-    const roomBelow = paneBox && selection ? paneBox.bottom - selection.bottom >= (barBox?.height ?? 0) + edge : false;
-    const roomAbove = paneBox && selection ? selection.top - paneBox.top >= (barBox?.height ?? 0) + edge : false;
-    const ask = bar?.querySelector('[data-testid="file-selection-ask"]');
+    const sourceBox = sourceNode?.getBoundingClientRect();
+    const usableTop = paneBox && sourceBox ? Math.max(paneBox.top, sourceBox.top) : null;
+    const usableBottom = paneBox && sourceBox ? Math.min(paneBox.bottom, sourceBox.bottom) : null;
+    const roomBelow = usableBottom != null && selection
+      ? usableBottom - selection.bottom >= (barBox?.height ?? 0) + edge + edge
+      : false;
+    const roomAbove = usableTop != null && selection
+      ? selection.top - usableTop >= (barBox?.height ?? 0) + edge + edge
+      : false;
     const blame = bar?.querySelector('[data-testid="file-selection-blame"]');
     const close = bar?.querySelector('[data-testid="file-selection-close"]');
+    const question = document.querySelector('textarea.file-conversation__input');
+    const caption = document.querySelector('.file-conversation__context');
+    const questionBox = question?.getBoundingClientRect();
+    const captionBox = caption?.getBoundingClientRect();
     const target = (node) => {
       if (!node) return 0;
       const rect = node.getBoundingClientRect();
       return Math.min(rect.width, rect.height);
     };
+    const codeBox = code?.getBoundingClientRect();
     return {
       outsideSource: bar != null && code != null && !code.contains(bar),
       position: style?.position || '',
       inside,
       overlaps: overlaps === true,
       room: roomBelow || roomAbove,
-      ask: ask?.getAttribute('aria-label') || '',
       blame: blame?.getAttribute('aria-label') || '',
       close: close?.getAttribute('aria-label') || '',
-      targets: [target(ask), target(blame), target(close)],
+      targets: [target(blame), target(close)],
       narrow: window.matchMedia('(max-width: 720px)').matches,
+      question: question?.getAttribute('aria-label') || '',
+      questionVisible: questionBox != null && questionBox.width > 0 && questionBox.height > 0,
+      caption: caption?.textContent || '',
+      captionVisible: captionBox != null && captionBox.width > 0 && captionBox.height > 0,
+      geometry: {
+        viewport: { width: window.innerWidth, height: window.innerHeight },
+        pane: box(pane),
+        source: box(sourceNode),
+        code: codeBox == null ? null : {
+          top: codeBox.top,
+          right: codeBox.right,
+          bottom: codeBox.bottom,
+          left: codeBox.left,
+          width: codeBox.width,
+          height: codeBox.height,
+          scrollTop: code.scrollTop,
+          scrollHeight: code.scrollHeight,
+          clientHeight: code.clientHeight,
+        },
+        selection,
+        lines: lineBoxes,
+        linesOffPane: lineBoxes.filter((entry) => entry.offPane === true).map((entry) => entry.line),
+        bar: box(bar),
+        float: box(floatNode),
+        popup: box(popupNode),
+        anchor: floatNode == null ? null : {
+          top: floatNode.style.top,
+          left: floatNode.style.left,
+          placement: floatNode.getAttribute('data-placement'),
+          position: floatStyle?.position || '',
+        },
+      },
     };
   }, { start: startLine, end: endLine, edge: SELECTION_EDGE_PX });
   if (!proof.outsideSource || proof.position === 'static') {
@@ -2592,8 +2973,14 @@ async function assertSelectionFloat(page, startLine, endLine, label) {
   }
   if (!proof.inside) fail(`${label}: floating bar is not inside the content pane by ${SELECTION_EDGE_PX}px (${JSON.stringify(proof)})`);
   if (proof.room && proof.overlaps) fail(`${label}: floating bar overlaps the selection while space exists (${JSON.stringify(proof)})`);
-  if (proof.ask !== 'Ask' || proof.blame !== 'Blame' || proof.close !== 'Close selection') {
-    fail(`${label}: floating actions are not named Ask, Blame, and Close selection (${JSON.stringify(proof)})`);
+  if (proof.blame !== 'Blame' || proof.close !== 'Close selection') {
+    fail(`${label}: floating actions are not named Blame and Close selection (${JSON.stringify(proof)})`);
+  }
+  if (proof.question !== 'File question' || !proof.questionVisible) {
+    fail(`${label}: Ask question is not the visible File question box (${JSON.stringify(proof)})`);
+  }
+  if (proof.caption !== `Selection lines ${startLine}–${endLine}` || !proof.captionVisible) {
+    fail(`${label}: Ask dock caption is not the visible selected range (${JSON.stringify(proof)})`);
   }
   if (proof.narrow && proof.targets.some((size) => size < 44)) {
     fail(`${label}: narrow floating actions are under 44px (${JSON.stringify(proof.targets)})`);
@@ -2603,14 +2990,14 @@ async function assertSelectionFloat(page, startLine, endLine, label) {
 async function assertToolbarAlignment(page, label) {
   const aligned = await page.evaluate(() => {
     const search = document.querySelector('[data-testid="file-explorer-search"]');
-    const source = Array.from(document.querySelectorAll('.file-explorer__surface [role="radio"]'))
+    const surface = document.querySelector('.file-explorer__surface');
+    const source = Array.from(surface?.querySelectorAll('button') || [])
       .find((node) => (node.textContent || '').trim() === 'Source');
     const treeHidden = document.querySelector('[data-testid="file-explorer-tree"]')?.hidden === true;
-    if (!search || !source || search.getClientRects().length === 0 || source.getClientRects().length === 0) {
-      return { comparable: false, treeHidden };
-    }
-    const searchBox = search.getBoundingClientRect();
-    const sourceBox = source.getBoundingClientRect();
+    const searchBox = search?.getClientRects().length ? search.getBoundingClientRect() : null;
+    if (!surface) return { comparable: true, noSurface: true, treeHidden, search: searchBox != null };
+    const sourceBox = source?.getClientRects().length ? source.getBoundingClientRect() : null;
+    if (!searchBox || !sourceBox) return { comparable: false, treeHidden, search: searchBox != null, source: sourceBox != null };
     return {
       comparable: true,
       treeHidden,
@@ -2620,8 +3007,9 @@ async function assertToolbarAlignment(page, label) {
   });
   if (!aligned.comparable) {
     if (aligned.treeHidden) return;
-    fail(`${label}: Search and Source toolbars are not both measurable`);
+    fail(`${label}: Search and Source toolbars are not both measurable (${JSON.stringify(aligned)})`);
   }
+  if (aligned.noSurface) return;
   if (aligned.top > SELECTION_STABLE_PX || aligned.bottom > SELECTION_STABLE_PX) {
     fail(`${label}: Search and Source toolbar edges differ (${JSON.stringify(aligned)})`);
   }
@@ -2677,8 +3065,7 @@ async function openDeepLinkedSource(page, filePath, line, label) {
 async function assertLongSourceRoundTrip(page, label, leave, back) {
   const active = await page.evaluate(() => document.querySelector('button.file-explorer__row--active')?.getAttribute('title') || '');
   await clickFilesRow(page, markdownFile);
-  const source = page.getByRole('radio', { name: 'Source', exact: true });
-  if (await source.count()) await source.click();
+  await page.getByRole('button', { name: 'Source', exact: true }).click();
   await waitFor(page, () => {
     const code = document.querySelector('pre.file-explorer__code');
     return code != null && code.scrollHeight > code.clientHeight + 8;
@@ -2755,46 +3142,49 @@ async function runFileSelectionJourney(page, sentFrames, owner) {
     if ((await page.locator('section.file-explorer').count()) === 0) await openFileExplorer(page);
     await expandFilesTree(page);
     await clickFilesRow(page, solFile);
-    const sourceRadio = page.getByRole('radio', { name: 'Source' });
-    if (await sourceRadio.count()) await sourceRadio.click();
+    const sourceButton = page.getByRole('button', { name: 'Source', exact: true });
+    if (await sourceButton.count()) await sourceButton.click();
     await waitFor(page, () => {
       const code = document.querySelector('pre.file-explorer__code');
       return code != null && code.getClientRects().length > 0;
     }, `files.selection ${leg.label}: source missing`);
-    let narrowLayout;
     if (leg.contentWidth) {
-      narrowLayout = await page.evaluate(() => ({
-        drawerWidth: Number(document.getElementById('file-explorer-resizer')?.getAttribute('aria-valuenow')),
-        treePct: Number(document.querySelector('[data-testid="file-explorer-divider"]')?.getAttribute('aria-valuenow')),
-      }));
-      if (!(narrowLayout.drawerWidth > 0 && narrowLayout.treePct > 0)) {
-        fail(`files.selection ${leg.label}: resize controls missing (${JSON.stringify(narrowLayout)})`);
-      }
-      // Content width is the flex remainder after tree + divider, not its inline width.
-      await page.locator('#file-explorer-resizer').press('Home');
-      await twoFrames(page);
       const split = await page.locator('[data-testid="file-explorer-layout"]').boundingBox();
       const divider = await page.locator('[data-testid="file-explorer-divider"]').boundingBox();
-      if (!split || !divider) fail(`files.selection ${leg.label}: split geometry missing`);
+      if (!split || !divider) fail(`files.selection ${leg.label}: tree divider missing`);
       await page.mouse.move(divider.x + divider.width / 2, divider.y + divider.height / 2);
       await page.mouse.down();
-      const treePct = Math.floor((split.width - leg.contentWidth - divider.width) / split.width * 100);
-      await page.mouse.move(split.x + split.width * treePct / 100, divider.y + divider.height / 2);
+      await page.mouse.move(split.x + split.width * 0.4, divider.y + divider.height / 2);
       await page.mouse.up();
       await twoFrames(page);
-      const pane = await page.locator('[data-testid="file-explorer-content"]').boundingBox();
-      const resizer = await page.locator('#file-explorer-resizer').boundingBox();
-      if (!pane || !resizer) fail(`files.selection ${leg.label}: content resize geometry missing`);
-      // Tree percentages round to integers; the outer pixel resizer supplies the remainder.
-      const drawerDelta = (leg.contentWidth - pane.width) / (1 - treePct / 100);
-      await page.mouse.move(resizer.x + resizer.width / 2, resizer.y + resizer.height / 2);
-      await page.mouse.down();
-      await page.mouse.move(resizer.x + resizer.width / 2 - drawerDelta, resizer.y + resizer.height / 2);
-      await page.mouse.up();
-      await waitFor(page, (width) => {
-        const pane = document.querySelector('[data-testid="file-explorer-content"]');
-        return pane != null && Math.abs(pane.getBoundingClientRect().width - width) <= 1;
-      }, `files.selection ${leg.label}: content pane is not ${leg.contentWidth}px`, 10000, leg.contentWidth);
+      const contentWidth = async () => page.evaluate(() => document.querySelector('[data-testid="file-explorer-content"]')?.getBoundingClientRect().width ?? null);
+      let low = 721;
+      let high = 1360;
+      let width = null;
+      let matched = false;
+      for (let step = 0; step < 10; step += 1) {
+        const candidate = Math.round((low + high) / 2);
+        await page.setViewportSize({ width: candidate, height: 900 });
+        await twoFrames(page);
+        width = await contentWidth();
+        if (width == null) fail(`files.selection ${leg.label}: content pane missing at viewport ${candidate}`);
+        if (Math.abs(width - leg.contentWidth) <= 1) {
+          matched = true;
+          break;
+        }
+        if (width < leg.contentWidth) low = candidate + 1;
+        else high = candidate - 1;
+      }
+      if (!matched) {
+        const widths = await page.evaluate(() => ({
+          viewport: window.innerWidth,
+          layout: document.querySelector('[data-testid="file-explorer-layout"]')?.getBoundingClientRect().width,
+          tree: document.querySelector('[data-testid="file-explorer-tree"]')?.getBoundingClientRect().width,
+          content: document.querySelector('[data-testid="file-explorer-content"]')?.getBoundingClientRect().width,
+          ask: document.querySelector('section.file-conversation')?.getBoundingClientRect().width,
+        }));
+        fail(`files.selection ${leg.label}: content pane is not ${leg.contentWidth}px ${JSON.stringify(widths)}`);
+      }
     }
     await assertToolbarAlignment(page, `${leg.label} toolbars`);
     const before = await sourceGeometry(page);
@@ -2815,18 +3205,19 @@ async function runFileSelectionJourney(page, sentFrames, owner) {
     if (!kept) fail(`${leg.label}: pointer on the floating bar did not preserve the selected range`);
     await laneShot(page, `files-selection-${leg.label}-selected.png`);
     if (leg.wire) {
-      await page.getByRole('button', { name: 'Ask', exact: true }).click();
-      await waitFor(page, ({ startLine: start, endLine: end }) => document.activeElement === document.querySelector('textarea.file-conversation__input')
+      await page.getByRole('textbox', { name: 'File question' }).click();
+      await waitFor(page, ({ startLine: start, endLine: end }) => document.activeElement === document.querySelector('textarea[aria-label="File question"]')
         && (document.querySelector('.file-conversation__context')?.textContent || '') === `Selection lines ${start}\u2013${end}`,
-        `${leg.label}: Ask did not focus the dock with the selected range`, 25000, { startLine, endLine });
+        `${leg.label}: File question did not focus with the selected range`, 25000, { startLine, endLine });
       const question = `files-selection-${leg.label}-${laneNonce || 'lane'}`;
       await sendFileQuestion(page, question, `${leg.label} selection ask`);
-      const prompt = sentFrames.slice(frameMark).map(parseSentFrame).filter((frame) => frame?.type === 'file_conversation_prompt').at(-1);
+      await waitForFixtureReply(page, question, `${leg.label} selection ask`);
+      const promptFrames = sentFrames.slice(frameMark).map(parseSentFrame).filter((frame) => frame?.type === 'file_conversation_prompt');
+      const prompt = promptFrames.at(-1);
       if (!prompt || prompt.sessionId !== owner || prompt.selection?.startLine !== startLine || prompt.selection?.endLine !== endLine) {
         fail(`${leg.label}: selected prompt is not the exact owner range (${JSON.stringify(prompt)})`);
       }
-      await waitForFixtureReply(page, question, `${leg.label} selection ask`);
-      if (await sourceRadio.count()) await sourceRadio.click();
+      if (await sourceButton.count()) await sourceButton.click();
       await waitFor(page, () => {
         const code = document.querySelector('pre.file-explorer__code');
         return code != null && code.getClientRects().length > 0;
@@ -2901,32 +3292,16 @@ async function runFileSelectionJourney(page, sentFrames, owner) {
     geometryShift(beforeBlame, await sourceGeometry(page), `${leg.label} dismiss`);
     await laneShot(page, `files-selection-${leg.label}-closed.png`);
     if (leg.contentWidth) {
-      const split = await page.locator('[data-testid="file-explorer-layout"]').boundingBox();
-      const divider = await page.locator('[data-testid="file-explorer-divider"]').boundingBox();
-      const resizer = await page.locator('#file-explorer-resizer').boundingBox();
-      const drawer = await page.locator('section.file-explorer').boundingBox();
-      if (!split || !divider || !resizer || !drawer) fail(`files.selection ${leg.label}: restore geometry missing`);
-      await page.mouse.move(divider.x + divider.width / 2, divider.y + divider.height / 2);
-      await page.mouse.down();
-      await page.mouse.move(split.x + split.width * narrowLayout.treePct / 100, divider.y + divider.height / 2);
-      await page.mouse.up();
-      await page.mouse.move(resizer.x + resizer.width / 2, resizer.y + resizer.height / 2);
-      await page.mouse.down();
-      await page.mouse.move(resizer.x + resizer.width / 2 + drawer.width - narrowLayout.drawerWidth, resizer.y + resizer.height / 2);
-      await page.mouse.up();
+      await page.setViewportSize({ width: leg.width, height: leg.height });
+      await waitFor(page, (size) => window.innerWidth === size.width && window.innerHeight === size.height, `files.selection ${leg.label}: viewport did not restore`, 10000, leg);
     }
   }
   await page.setViewportSize({ width: 1360, height: 900 });
   await waitFor(page, () => window.innerWidth === 1360 && window.innerHeight === 900, 'files.selection fullscreen viewport', 10000);
   if ((await page.locator('section.file-explorer').count()) === 0) await openFileExplorer(page);
-  const expand = page.locator('#file-explorer-expand-btn');
-  if (await expand.count()) {
-    await expand.click();
-    await waitFor(page, () => document.querySelector('.app-layout')?.classList.contains('app-layout--files-expanded') === true, 'files.selection fullscreen did not expand', 10000);
-  }
   await clickFilesRow(page, solFile);
-  const fullscreenRadio = page.getByRole('radio', { name: 'Source' });
-  if (await fullscreenRadio.count()) await fullscreenRadio.click();
+  const fullscreenSource = page.getByRole('button', { name: 'Source', exact: true });
+  if (await fullscreenSource.count()) await fullscreenSource.click();
   await waitFor(page, () => document.querySelector('pre.file-explorer__code')?.getClientRects().length > 0, 'files.selection fullscreen source missing');
   await assertToolbarAlignment(page, 'fullscreen toolbars');
   const fullscreenBefore = await sourceGeometry(page);
@@ -2942,8 +3317,6 @@ async function runFileSelectionJourney(page, sentFrames, owner) {
   await assertSelectionDismiss(page, 'fullscreen');
   geometryShift(fullscreenBefore, await sourceGeometry(page), 'fullscreen dismiss');
   await laneShot(page, 'files-selection-fullscreen-closed.png');
-  const restore = page.getByRole('button', { name: 'Restore file explorer' });
-  if (await restore.count()) await restore.click();
   await expandFilesTree(page);
   await clickFilesRow(page, cleanFile);
   await waitFor(page, (want) => (document.querySelector('button.file-explorer__row--active')?.getAttribute('title') || '') === want, 'files.selection: clean file did not become active', 25000, cleanFile);
@@ -3058,34 +3431,29 @@ async function runSelectionCacheCompactionJourney(page, sentFrames, receivedFram
   await waitForFixtureReply(page, question, label);
 }
 
-// files.map: the current-file dependency map on the owner. The committed
-// clean MapRoot.sol is a real extractor fixture: ./MapDep.sol resolves (the
-// forward neighbor), forge-std/Test.sol is external, ./MissingMap.sol is
-// unresolved (no supported relative candidate in the bounded scan), and
-// MapCaller.sol imports the root back (the reverse dependent). Purpose is
-// the fixture's verbatim natspec, never a generated description. The map
-// renders through MarkdownBody's shared Mermaid surface (actual SVG);
-// file navigation is the node list's exact open through the existing
-// explorer owner. Stale request proof: the response that lands after the
-// user switched files never paints a map for the wrong file.
-async function runFileMapJourney(page, sentFrames) {
-  await page.setViewportSize({ width: 1360, height: 900 });
-  await waitFor(page, () => window.innerWidth === 1360 && window.innerHeight === 900, 'files.map desktop viewport', 10000);
+// files.map: MapRoot.sol is the open alpha file. Search, then the tree,
+// selects directory beta. The request path is beta and painted nodes are
+// only beta. The relation list shows the fixture import arrow and source
+// purpose. A held alpha response after beta or a workspace switch paints nothing.
+async function runFileMapJourney(page, sentFrames, receivedFrames) {
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await waitFor(page, () => window.innerWidth === 1280 && window.innerHeight === 900, 'files.map desktop viewport', 10000);
   if ((await page.locator('section.file-explorer').count()) === 0) await openFileExplorer(page);
+  const leftoverSelection = page.getByRole('button', { name: 'Close selection', exact: true });
+  if (await leftoverSelection.count()) await leftoverSelection.click();
   await expandFilesTree(page);
   await clickFilesRow(page, solMapRootFile);
-  const mapToggle = page.getByRole('radio', { name: 'Dependency map for this file' });
+  const mapToggle = page.getByRole('button', { name: 'Graph' });
   await waitFor(
     page,
     () => {
       const control = document.querySelector('[data-testid="file-explorer-map-toggle"]');
-      return control != null
-        && control.getBoundingClientRect().width > 0
-        && control.getBoundingClientRect().height > 0;
+      return control != null && control.getAttribute('aria-label') === 'Graph' && control.getBoundingClientRect().width > 0;
     },
     'files.map: Map surface control is not visible for the file tab',
     25000,
   );
+  const rootMapMark = sentFrames.length;
   await mapToggle.click();
   await waitFor(
     page,
@@ -3097,150 +3465,145 @@ async function runFileMapJourney(page, sentFrames) {
   const mapProof = await page.evaluate(({ rootPath, depPath, callerPath }) => {
     const pane = document.querySelector('[data-testid="file-explorer-map-pane"]');
     const svg = pane?.querySelector('svg');
-    const nodes = Array.from(document.querySelectorAll('[data-testid="file-dependency-map-nodes"] button.file-explorer__map-node[data-map-node-path]'));
-    const outgoing = document.querySelector('[data-testid="file-dependency-map-outgoing"]')?.textContent || '';
-    const incoming = document.querySelector('[data-testid="file-dependency-map-incoming"]')?.textContent || '';
-    const coverage = document.querySelector('[data-testid="file-dependency-map-coverage"]')?.textContent || '';
+    const text = svg?.textContent || '';
     return {
       svg: svg != null && svg.getBoundingClientRect().width > 0,
-      selected: nodes.find((node) => node.getAttribute('aria-current') === 'true')?.getAttribute('data-map-node-path') || '',
-      nodePaths: nodes.map((node) => node.getAttribute('data-map-node-path') || ''),
-      outgoingHasDep: outgoing.includes(depPath) && nodes.some((node) => node.getAttribute('data-map-node-path') === depPath && (node.textContent || '').includes('MapDepVault')),
-      outgoingExternal: outgoing.includes('unresolved forge-std/Test.sol'),
-      outgoingUnresolved: outgoing.includes('unresolved ./MissingMap.sol'),
-      incomingHasCaller: incoming.includes(callerPath),
-      purposeRoot: nodes.some((node) => node.getAttribute('data-map-node-path') === rootPath && (node.textContent || '').includes('Root ledger contract for the map fixture')),
-      purposeCaller: nodes.some((node) => node.getAttribute('data-map-node-path') === callerPath && (node.textContent || '').includes('Caller contract for the map fixture')),
-      coverageHonest: coverage.includes('Visible workspace entries only') && coverage.includes('Coverage is incomplete.'),
+      root: text.includes(rootPath),
+      dep: text.includes(depPath),
+      caller: text.includes(callerPath),
+      edge: text.includes('import'),
+      interactiveNodes: document.querySelector('[data-map-node-path]') != null,
       svgNoScript: svg?.querySelector('script, foreignObject') == null,
     };
   }, { rootPath: solMapRootFile, depPath: solMapDepFile, callerPath: solMapCallerFile });
-  if (!mapProof.svg) fail('files.map: the rendered diagram SVG has no visible box');
-  if (mapProof.svgNoScript === false) fail('files.map: the rendered SVG carries script/foreignObject');
-  if (mapProof.selected !== solMapRootFile) fail(`files.map: the selected node is ${JSON.stringify(mapProof.selected)}, not ${solMapRootFile}`);
-  if (mapProof.nodePaths.length !== 3
-    || !mapProof.nodePaths.includes(solMapRootFile)
-    || !mapProof.nodePaths.includes(solMapDepFile)
-    || !mapProof.nodePaths.includes(solMapCallerFile)) {
-    fail(`files.map: node list is ${JSON.stringify(mapProof.nodePaths)}, expected the root plus both file neighbors`);
+  if (!mapProof.svg || mapProof.svgNoScript === false || !mapProof.root || !mapProof.dep || !mapProof.caller || !mapProof.edge || mapProof.interactiveNodes) {
+    fail(`files.map: rendered graph does not name the fixture files and import edges (${JSON.stringify(mapProof)})`);
   }
-  if (!mapProof.outgoingHasDep) fail('files.map: outgoing does not name the resolved MapDep.sol neighbor with its declaration');
-  if (!mapProof.outgoingExternal) fail('files.map: outgoing does not disclose the unresolved package import');
-  if (!mapProof.outgoingUnresolved) fail('files.map: outgoing does not disclose the unresolved ./MissingMap.sol import');
-  if (!mapProof.incomingHasCaller) fail('files.map: incoming does not name the reverse MapCaller.sol dependent');
-  if (!mapProof.purposeRoot || !mapProof.purposeCaller) fail(`files.map: purpose lines are not the fixtures' verbatim natspec (${JSON.stringify(mapProof)})`);
-  if (!mapProof.coverageHonest) fail(`files.map: coverage does not disclose visible-entries-only/incomplete (${JSON.stringify(mapProof)})`);
   await laneShot(page, 'files-map-root.png', { fullPage: true });
-  const mapScroller = page.locator('[data-testid="file-dependency-map"]');
-  const mapReach = await mapScroller.evaluate((node) => {
-    const max = node.scrollHeight - node.clientHeight;
-    const nodes = node.querySelector('[data-testid="file-dependency-map-nodes"]');
-    const coverage = node.querySelector('[data-testid="file-dependency-map-coverage"]');
-    const box = node.getBoundingClientRect();
-    const inside = (target) => {
-      if (!target || target.getClientRects().length === 0) return false;
-      const rect = target.getBoundingClientRect();
-      return rect.bottom <= box.bottom + 1 && rect.top < box.bottom;
-    };
-    if (max > 8) {
-      node.scrollTop = max;
-      node.dispatchEvent(new Event('scroll', { bubbles: true }));
-    }
-    return { scrollable: max > 8, scrollTop: node.scrollTop, nodes: inside(nodes), coverage: inside(coverage) };
-  });
-  if (!mapReach.nodes || !mapReach.coverage || (mapReach.scrollable && mapReach.scrollTop <= 0)) {
-    fail(`files.map: bottom nodes and coverage are not reachable (${JSON.stringify(mapReach)})`);
-  }
-  const selectedMapOverlay = await page.evaluate(() => (
-    document.querySelector('[data-testid="file-selection-actions"]') != null
-    || document.querySelector('.file-explorer__selection-float:not(.is-hidden)') != null
-  ));
+  await page.getByRole('button', { name: 'View', exact: true }).click();
+  await waitFor(page, () => document.querySelector('.mermaid-viewer:not([hidden]) svg') != null, 'files.map: View did not open the diagram', 10000);
+  const viewerSafe = await page.evaluate(() => document.querySelector('.mermaid-viewer svg')?.querySelector('script, foreignObject') == null);
+  if (!viewerSafe) fail('files.map: viewer SVG carries script/foreignObject');
+  const downloadPromise = page.waitForEvent('download');
+  await page.locator('.mermaid-viewer').getByRole('button', { name: 'Download', exact: true }).click();
+  const download = await downloadPromise;
+  if (download.suggestedFilename() !== 'mermaid-diagram.svg') fail(`files.map: download name is ${download.suggestedFilename()}`);
+  const saved = fs.readFileSync(await download.path(), 'utf8');
+  if (!saved.includes('<svg') || /<script|<foreignObject/i.test(saved)) fail('files.map: downloaded SVG is not a script-free diagram');
+  await page.locator('.mermaid-viewer').getByRole('button', { name: 'Close', exact: true }).click();
+  const selectedMapOverlay = await page.evaluate(() => document.querySelector('[data-testid="file-selection-actions"]') != null);
   if (selectedMapOverlay) fail('files.map: the selected map shows a source selection overlay');
-
-  // Node-list navigation: the resolved neighbor opens through the owner,
-  // exactly like a tree row, and the new file's tab becomes active.
-  const depButton = page.locator(`[data-testid="file-dependency-map-nodes"] button.file-explorer__map-node[data-map-node-path="${solMapDepFile}"]`);
-  await depButton.click();
-  await waitFor(
-    page,
-    (path) => (document.querySelector('button.file-explorer__row--active')?.getAttribute('title') || '') === path
-      && document.querySelector('[data-testid="file-explorer-map-pane"]') == null,
-    'files.map: clicking the MapDep node did not open the exact file through the owner',
-    25000,
-    solMapDepFile,
-  );
-  await waitFor(
-    page,
-    () => document.querySelector('pre.file-explorer__code') != null || document.querySelector('.file-explorer__markdown') != null,
-    'files.map: the opened neighbor shows neither source nor preview content',
-    25000,
-  );
-  await laneShot(page, 'files-map-neighbor-open.png');
-
-  // Stale-response contract: re-open the root, arm the response hold, click
-  // Map, then switch files BEFORE the response lands. The held response
-  // releases onto a DIFFERENT active file, and must paint nothing for it.
+  await page.getByRole('button', { name: 'Close dependency graph' }).click();
   await clickFilesRow(page, solMapRootFile);
   await page.evaluate(() => window.__rpiWarmReconnect.holdNextFileExplorerMap());
-  const staleArmMark = sentFrames.length;
   await mapToggle.click();
-  await waitFor(
-    page,
-    () => window.__rpiWarmReconnect.heldMapCount() > 0,
-    'files.map: the stale leg never dispatched file_explorer_map',
-    15000,
-    staleArmMark,
-  );
+  await waitFor(page, () => window.__rpiWarmReconnect.heldMapCount() > 0, 'files.map: the stale leg never dispatched file_explorer_map', 15000);
+  const heldRootId = await page.evaluate(() => window.__rpiWarmReconnect.heldMapIds()[0] || '');
+  await page.getByRole('button', { name: 'Close dependency graph' }).click();
   await clickFilesRow(page, cleanFile);
-  await page.evaluate(() => window.__rpiWarmReconnect.releaseHeldFileExplorerMap());
-  await waitFor(
-    page,
-    (path) => (document.querySelector('button.file-explorer__row--active')?.getAttribute('title') || '') === path
-      && document.querySelector('[data-testid="file-dependency-map"]') == null,
-    'files.map: the clean file became active but the stale map still painted',
-    15000,
-    cleanFile,
-  );
-  const staleProof = await page.evaluate((rootName) => {
-    const content = document.querySelector('[data-testid="file-explorer-content"]')?.textContent || '';
-    return {
-      mapPaneGone: document.querySelector('[data-testid="file-explorer-map-pane"]') == null,
-      noRootLeak: !content.includes('Root ledger contract for the map fixture') && !content.includes('MapDepVault'),
-      activeRow: (document.querySelector('button.file-explorer__row--active')?.getAttribute('title') || ''),
-    };
-  }, solMapRootFile);
-  if (staleProof.activeRow !== cleanFile) fail(`files.map: the active row after the stale release is ${JSON.stringify(staleProof.activeRow)}, not ${cleanFile}`);
-  if (!staleProof.mapPaneGone || !staleProof.noRootLeak) fail(`files.map: the stale response leaked map content onto ${cleanFile} (${JSON.stringify(staleProof)})`);
-  await laneShot(page, 'files-map-stale-switch.png');
-
-  // Mobile 390x844 evidence: the map surface and its SVG stay usable.
-  await page.setViewportSize({ width: 390, height: 844 });
-  await waitFor(page, () => window.innerWidth === 390 && window.innerHeight === 844, 'files.map mobile viewport', 10000);
+  const releasedRoot = await page.evaluate(() => window.__rpiWarmReconnect.releaseHeldFileExplorerMap());
+  await twoFrames(page);
+  const rootLeak = await page.evaluate((path) => ({
+    active: document.querySelector('button.file-explorer__row--active')?.getAttribute('title') || '',
+    map: document.querySelector('[data-testid="file-dependency-map"]') != null,
+  }), cleanFile);
+  if (rootLeak.active !== cleanFile || rootLeak.map || !releasedRoot.includes(heldRootId)) fail(`files.map: stale root map painted on the clean file (${JSON.stringify(rootLeak)})`);
   await clickFilesRow(page, solMapRootFile);
+  const search = page.locator('[data-testid="file-explorer-search"]');
+  await search.fill('beta');
+  await waitFor(
+    page,
+    () => [...document.querySelectorAll('[data-testid="file-explorer-search-results"] button.file-explorer__row')].some((row) => (row.querySelector('.file-explorer__row-path')?.textContent || '') === 'beta'),
+    'files.map: search did not list directory beta',
+    15000,
+  );
+  await page.locator('[data-testid="file-explorer-search-results"] button.file-explorer__row').filter({ hasText: 'beta' }).first().click();
+  await waitFor(page, () => document.querySelector('[data-testid="file-explorer-search-results"]') == null, 'files.map: selecting beta did not leave search', 10000);
+  await clickFilesRow(page, 'beta');
+  const mapMark = sentFrames.length;
   await mapToggle.click();
-  await waitFor(
-    page,
-    () => document.querySelector('[data-testid="file-dependency-map"]') != null
-      && document.querySelector('[data-testid="file-explorer-map-pane"] svg') != null,
-    'files.map: mobile never rendered the map SVG',
-    30000,
-  );
-  const overflowMobile = await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth);
-  if (!overflowMobile) fail('files.map: mobile map pane overflows horizontally');
-  await laneShot(page, 'files-map-mobile.png', { fullPage: true });
-  await page.setViewportSize({ width: 1360, height: 900 });
-  await waitFor(page, () => window.innerWidth === 1360 && window.innerHeight === 900, 'files.map restore viewport', 10000);
-  // Restore the exact state the fullscreen journey expects: the clean file
-  // active on its Source surface, and the Ask conversation untouched.
+  try {
+    await waitFor(
+      page,
+      () => document.querySelector('[data-testid="file-dependency-map"]')?.getAttribute('data-map-path') === 'beta',
+      'files.map: beta graph did not paint',
+      30000,
+    );
+  } catch (error) {
+    const request = sentFrames.slice(mapMark).map(parseSentFrame).find((frame) => frame?.type === 'file_explorer_map') || null;
+    const response = request ? receivedFrames.map(parseSentFrame).find((frame) => frame?.type === 'response' && frame.id === request.id) : null;
+    const data = response?.data || {};
+    error.mapRequest = request ? { id: request.id || '', path: request.path || '', sessionId: request.sessionId || '' } : null;
+    error.mapResponse = response ? { id: response.id || '', success: response.success === true, path: data.path || '', nodeCount: Array.isArray(data.nodes) ? data.nodes.length : 0, error: data.error || response.error || '' } : null;
+    error.mapHold = await page.evaluate(() => ({ armed: window.__rpiWarmReconnect?.state?.arm?.fileExplorerMap === true, held: window.__rpiWarmReconnect?.heldMapCount?.() ?? null })).catch(() => null);
+    throw error;
+  }
+  const betaRequest = sentFrames.slice(mapMark).map(parseSentFrame).find((frame) => frame?.type === 'file_explorer_map');
+  if (!betaRequest || betaRequest.path !== 'beta') fail(`files.map: request path is not beta (${JSON.stringify(betaRequest)})`);
+  const betaProof = await page.evaluate(() => {
+    const host = document.querySelector('[data-testid="file-dependency-map"]');
+    const relations = document.querySelector('[data-testid="file-dependency-map-relations"]')?.textContent || '';
+    const nodes = [...(host?.querySelectorAll('svg .node text, svg .nodeLabel') || [])].map((node) => (node.textContent || '').trim()).filter(Boolean);
+    return { path: host?.getAttribute('data-map-path') || '', nodes, relations };
+  });
+  const labels = [...betaProof.nodes].sort();
+  if (betaProof.path !== 'beta' || labels.join('|') !== 'beta.ts|lib.ts') {
+    fail(`files.map: painted node labels are not exactly beta.ts and lib.ts (${JSON.stringify(betaProof.nodes)})`);
+  }
+  if (!betaProof.relations.includes('beta.ts \u2192 lib.ts via import') || !betaProof.relations.includes('beta.ts purpose') || !betaProof.relations.includes('Beta ledger owned by the directory graph.')) {
+    fail(`files.map: relations omit the exact import or source purpose (${JSON.stringify(betaProof.relations)})`);
+  }
+  await laneShot(page, 'files-map-beta-desktop.png', { fullPage: false });
+  const rootDirectory = sentFrames.slice(rootMapMark).map(parseSentFrame).find((frame) => frame?.type === 'file_explorer_map')?.path;
+  if (typeof rootDirectory !== 'string' || rootDirectory === 'beta') fail(`files.map: root directory request was not captured (${JSON.stringify(rootDirectory)})`);
+  await page.getByRole('button', { name: 'Close dependency graph' }).click();
+  await clickFilesRow(page, solMapRootFile);
+  await page.evaluate(() => window.__rpiWarmReconnect.holdNextFileExplorerMap());
+  await mapToggle.click();
+  await waitFor(page, () => window.__rpiWarmReconnect.heldMapCount() > 0, 'files.map: old root response was not held', 15000);
+  const heldMapId = await page.evaluate(() => window.__rpiWarmReconnect.heldMapIds()[0] || '');
+  await page.getByRole('button', { name: 'Close dependency graph' }).click();
+  await page.locator('[data-testid="file-explorer-search"]').fill('beta');
+  await page.locator('[data-testid="file-explorer-search-results"] button.file-explorer__row').filter({ hasText: 'beta' }).first().click();
+  await mapToggle.click();
+  await waitFor(page, () => {
+    const host = document.querySelector('[data-testid="file-dependency-map"]');
+    return host?.getAttribute('data-map-path') === 'beta' && host.querySelector('svg')?.getBoundingClientRect().width > 0;
+  }, 'files.map: fresh beta graph did not settle before the old release', 30000);
+  const before = await page.evaluate(() => document.querySelector('[data-testid="file-dependency-map"]')?.textContent || '');
+  if (!before.includes('beta.ts') || !before.includes('lib.ts')) fail('files.map: settled beta graph is empty');
+  const released = await page.evaluate(() => window.__rpiWarmReconnect.releaseHeldFileExplorerMap());
+  await waitFor(page, (text) => (document.querySelector('[data-testid="file-dependency-map"]')?.textContent || '') === text, 'files.map: held root response changed the settled beta graph', 10000, before);
+  if (!heldMapId || !released.includes(heldMapId)) fail(`files.map: held ${rootDirectory} response was not released`);
+  await revealSessionRail(page, 'map workspace switch');
+  const other = await createFreshSessionViaManage(page, waitFor, 'map workspace switch', { closePanel: true, timeoutMs: 20000 });
+  await openFileExplorer(page);
+  await clickFilesRow(page, 'beta');
+  await mapToggle.click();
+  await waitFor(page, () => document.querySelector('[data-testid="file-dependency-map"]')?.getAttribute('data-map-path') === 'beta', 'files.map: second workspace beta graph missing', 30000);
+  await revealSessionRail(page, 'map original owner');
+  await page.locator(`.session-sidebar__switch[data-session-id="${other.beforeSessionId}"]`).click();
+  await waitFor(page, (id) => document.getElementById('session-lifecycle')?.dataset.displayedSessionId === id, 'files.map: original workspace did not return', 20000, other.beforeSessionId);
+  const returned = await displayedExplorerSession(page);
+  if (returned !== other.beforeSessionId) fail(`files.map: original owner did not return (${returned})`);
+  const mapWasWide = await page.evaluate(() => window.innerWidth > 720);
+  await page.setViewportSize({ width: 390, height: 844 });
+  if (mapWasWide) {
+    await waitFor(page, () => window.matchMedia('(max-width: 720px)').matches && document.querySelector('.app-layout')?.classList.contains('app-layout--drawer-open') !== true, 'files.map mobile sessions drawer did not settle closed');
+  }
+  await openFileExplorer(page);
+  await clickFilesRow(page, 'beta');
+  await page.getByRole('button', { name: 'Graph' }).click();
+  await waitFor(page, () => {
+    const svg = document.querySelector('[data-testid="file-explorer-map-pane"] svg');
+    const box = svg?.getBoundingClientRect();
+    return box && box.width > 0 && box.right <= window.innerWidth + 1 && document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1;
+  }, 'files.map: mobile beta SVG is not visible inside the viewport', 30000);
+  await waitFor(page, () => document.querySelector('[data-testid="file-dependency-map"]')?.getAttribute('data-map-path') === 'beta', 'files.map: mobile beta graph missing', 30000);
+  await laneShot(page, 'files-map-beta-mobile.png', { fullPage: false });
+  await page.getByRole('button', { name: 'Close dependency graph' }).click();
+  await page.setViewportSize({ width: 1280, height: 900 });
   await clickFilesRow(page, cleanFile);
-  await waitFor(
-    page,
-    (path) => (document.querySelector('button.file-explorer__row--active')?.getAttribute('title') || '') === path
-      && document.querySelector('[data-testid="file-explorer-map-pane"]') == null,
-    'files.map: clean-file restore before fullscreen failed',
-    25000,
-    cleanFile,
-  );
 }
 async function sendFileQuestion(page, question, label) {
   const input = page.locator('textarea.file-conversation__input');
@@ -3292,7 +3655,7 @@ function settledFileFixtureReply(want) {
     user: true,
     assistant: assistantText,
     fixture: true,
-    path: dock.querySelector('.file-conversation__path')?.textContent || '',
+    path: document.querySelector('button.file-explorer__row--active')?.getAttribute('title') || '',
     streaming: false,
     conversationId,
   };
@@ -3335,7 +3698,7 @@ async function runFileAskJourney(page, sentFrames) {
   await sendFileQuestion(page, question, 'desktop plain');
   await waitFor(
     page,
-    (want) => document.querySelector('section.file-conversation .file-conversation__path')?.textContent === want,
+    askBoundTo,
     `files.ask: ${solFile} dock did not bind after send`,
     25000,
     solFile
@@ -3369,13 +3732,17 @@ async function runFileAskJourney(page, sentFrames) {
   await laneShot(page, 'files-ask-desktop.png', { fullPage: true });
   await assertLongSourceRoundTrip(page, 'files.ask Ask to Source', async () => {
     await clickVisibleAsk(page, 'notes source scroll');
-    await waitFor(page, () => document.querySelector('section.file-conversation') != null, 'files.ask: Ask did not open on the long source', 15000);
+    await waitFor(page, askBoundTo, 'files.ask: Ask did not stay bound to the long source', 15000, markdownFile);
   }, async () => {
-    await page.getByRole('radio', { name: 'Source', exact: true }).click();
-    await waitFor(page, () => document.querySelector('pre.file-explorer__code') != null && document.querySelector('section.file-conversation') == null, 'files.ask: Source did not replace Ask', 15000);
+    await page.getByRole('button', { name: 'Source', exact: true }).click();
+    await waitFor(page, (file) => {
+      const dock = document.querySelector('section.file-conversation');
+      const active = document.querySelector('button.file-explorer__row--active')?.getAttribute('title') || '';
+      return dock?.getAttribute('aria-label') === 'File conversation' && (dock.getAttribute('data-session-id') || '') !== '' && active === file && document.querySelector('pre.file-explorer__code') != null;
+    }, 'files.ask: Source left the selected file conversation', 15000, markdownFile);
   });
   await clickFilesRow(page, solFile);
-  await waitFor(page, () => document.querySelector('section.file-conversation') != null, 'files.ask: Token Ask did not return before the selected range', 15000);
+  await waitFor(page, askBoundTo, 'files.ask: Token conversation did not return before the selected range', 15000, solFile);
 
   const rangeStart = 4;
   const rangeEnd = 7;
@@ -3433,9 +3800,14 @@ async function runFileAskJourney(page, sentFrames) {
   await clickFilesRow(page, cleanFile);
   await waitFor(
     page,
-    () => document.querySelector('section.file-conversation') === null
-      && document.querySelector('pre.file-explorer__code') !== null,
-    `files.ask: switching to ${cleanFile} did not leave the first conversation dock`
+    (file) => {
+      const dock = document.querySelector('section.file-conversation');
+      const active = document.querySelector('button.file-explorer__row--active')?.getAttribute('title') || '';
+      return dock?.getAttribute('aria-label') === 'File conversation' && (dock.getAttribute('data-session-id') || '') !== '' && active === file && (dock.getAttribute('data-conversation-id') || '') === '' && document.querySelector('pre.file-explorer__code') != null;
+    },
+    `files.ask: switching to ${cleanFile} kept the first conversation`,
+    15000,
+    cleanFile
   );
   const secondMark = sentFrames.length;
   await clickVisibleAsk(page, 'second file');
@@ -3443,7 +3815,7 @@ async function runFileAskJourney(page, sentFrames) {
   await sendFileQuestion(page, secondQuestion, 'second file');
   await waitFor(
     page,
-    (want) => document.querySelector('section.file-conversation .file-conversation__path')?.textContent === want,
+    askBoundTo,
     `files.ask: second dock did not bind ${cleanFile}`,
     25000,
     cleanFile
@@ -3482,9 +3854,11 @@ async function runFileAskJourney(page, sentFrames) {
   await clickFilesRow(page, solFile);
   await waitFor(
     page,
-    (want) => document.querySelector('section.file-conversation .file-conversation__path')?.textContent === want.path
-      && Array.from(document.querySelectorAll('.side-chat__entry--user')).some((entry) => (entry.textContent || '').trimStart().startsWith(want.question))
-      && !Array.from(document.querySelectorAll('.side-chat__entry--user')).some((entry) => (entry.textContent || '').includes(want.second)),
+    (want) => {
+      const dock = document.querySelector('section.file-conversation');
+      const active = document.querySelector('button.file-explorer__row--active')?.getAttribute('title') || '';
+      return dock?.getAttribute('aria-label') === 'File conversation' && active === want.path && Array.from(document.querySelectorAll('.side-chat__entry--user')).some((entry) => (entry.textContent || '').trimStart().startsWith(want.question)) && !Array.from(document.querySelectorAll('.side-chat__entry--user')).some((entry) => (entry.textContent || '').includes(want.second));
+    },
     'files.ask: returning to the first file lost its retained history',
     20000,
     { path: solFile, question, second: secondQuestion }
@@ -3527,9 +3901,11 @@ async function runFileAskJourney(page, sentFrames) {
   await openFileExplorer(page);
   await waitFor(
     page,
-    (want) => document.querySelector('section.file-conversation')?.getAttribute('data-conversation-id') === want.id
-      && document.querySelector('.file-conversation__path')?.textContent === want.path
-      && Array.from(document.querySelectorAll('.side-chat__entry--user')).some((entry) => (entry.textContent || '').trimStart().startsWith(want.question)),
+    (want) => {
+      const dock = document.querySelector('section.file-conversation');
+      const active = document.querySelector('button.file-explorer__row--active')?.getAttribute('title') || '';
+      return dock?.getAttribute('aria-label') === 'File conversation' && active === want.path && dock?.getAttribute('data-conversation-id') === want.id && Array.from(document.querySelectorAll('.side-chat__entry--user')).some((entry) => (entry.textContent || '').trimStart().startsWith(want.question));
+    },
     'files.ask: reopening Files restored the wrong owner conversation',
     20000,
     { id: conversationId, path: solFile, question }
@@ -3560,151 +3936,282 @@ async function runFileAskJourney(page, sentFrames) {
 }
 
 
-function sameHeaderGeometry(before, after) {
-  if (!before?.header || !after?.header) return false;
-  return before.header.x === after.header.x
-    && before.header.y === after.header.y
-    && before.header.width === after.header.width
-    && before.header.height === after.header.height
-    && before.header.display === after.header.display
-    && before.headerHeight === after.headerHeight;
-}
 
-async function assertFilesFullscreenLeg(page, label, { askId }) {
-  await waitFor(page, () => {
-    const sample = window.__filesFullscreenSample();
-    const header = sample.header;
-    return header != null && header.display !== 'none' && header.height > 0
-      && sample.explorerTop === header.height;
-  }, `${label}: ordinary explorer top did not settle on the live header bottom`);
-  const before = await page.evaluate(() => window.__filesFullscreenSample());
-  await page.evaluate((sample) => { window.__filesFullscreenBefore = sample; }, before);
-  if (before.expandedClass) fail(`${label}: Files started already expanded`);
-  if (!before.header || before.header.display === 'none' || before.header.height < 1) {
-    fail(`${label}: global header was not visible before expand (${JSON.stringify(before.header)})`);
-  }
-  if (before.explorerTop !== before.header.height) {
-    fail(`${label}: ordinary explorer top ${before.explorerTop} is not the header bottom ${before.header?.height}`);
-  }
-  const expand = page.getByRole('button', { name: 'Expand file explorer to the full app area' });
-  await expand.click();
+async function assertParentChildBlame(page, sentFrames, owner) {
+  if (!/^[0-9a-f]{40}$/.test(childCommit)) fail(`parent blame: child commit missing (${JSON.stringify(childCommit)})`);
+  await page.setViewportSize({ width: 1280, height: 900 });
+  if ((await page.locator('section.file-explorer').count()) === 0) await openFileExplorer(page);
+  await clickFilesDir(page, 'psy-node');
+  await clickFilesRow(page, 'psy-node/child.rs');
+  const source = page.getByRole('button', { name: 'Source', exact: true });
+  if (await source.count()) await source.click();
   await waitFor(
     page,
-    () => {
-      const sample = window.__filesFullscreenSample();
-      const headerHidden = sample.header == null || sample.header.display === 'none' || sample.header.height === 0;
-      return sample.expandedClass && headerHidden && sample.explorerTop === 0
-        && sample.headerHeight === '0px'
-        && sample.expandLabel === 'Restore file explorer'
-        && sample.expandReachable && sample.closeReachable;
-    },
-    `${label}: expanded Files did not hide the global header at top 0 with Restore and Close reachable`,
+    (want) => document.querySelector('#file-explorer-line-1 .file-explorer__line-text')?.textContent === want,
+    'parent blame: child.rs source line 1 did not render',
+    25000,
+    '/// Child ledger owned by the parent-cwd session.',
   );
-  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
-  const expanded = await page.evaluate(() => window.__filesFullscreenSample());
-  if (expanded.explorerTop !== 0 || expanded.headerHeight !== '0px') {
-    fail(`${label}: fullscreen geometry drifted after paint (${JSON.stringify(expanded)})`);
-  }
-  if (askId && expanded.askId !== askId) fail(`${label}: fullscreen dropped Ask conversation ${askId} (got ${expanded.askId})`);
-  await laneShot(page, `files-fullscreen-${label.replace(/\s+/g, '-')}.png`, { fullPage: true });
-  await page.getByRole('button', { name: 'Restore file explorer' }).click();
-  await waitFor(
-    page,
-    () => {
-      const sample = window.__filesFullscreenSample();
-      return !sample.expandedClass
-        && sample.expandLabel === 'Expand file explorer to the full app area'
-        && sample.header != null
-        && sample.header.display !== 'none'
-        && sample.header.height > 0
-        && sample.explorerTop === sample.header.height;
-    },
-    `${label}: restore did not bring the global header back before the explorer`,
-  );
-  const restored = await page.evaluate(() => window.__filesFullscreenSample());
-  if (!sameHeaderGeometry(before, restored)) {
-    fail(`${label}: restored header geometry ${JSON.stringify(restored.header)}/${restored.headerHeight} != ${JSON.stringify(before.header)}/${before.headerHeight}`);
-  }
-  if (askId && restored.askId !== askId) fail(`${label}: restore dropped Ask conversation ${askId}`);
-  await page.getByRole('button', { name: 'Expand file explorer to the full app area' }).click();
-  await waitFor(
-    page,
-    () => window.__filesFullscreenSample().explorerTop === 0 && window.__filesFullscreenSample().headerHeight === '0px',
-    `${label}: second expand did not return the explorer to top 0`,
-  );
-  await page.locator('#file-explorer-drawer-close-btn').click();
-  await waitFor(
-    page,
-    () => {
-      const header = document.querySelector('header');
-      const box = header?.getBoundingClientRect();
-      return document.querySelector('section.file-explorer') == null
-        && !document.querySelector('.app-layout')?.classList.contains('app-layout--files-expanded')
-        && header != null
-        && getComputedStyle(header).display !== 'none'
-        && box != null
-        && Math.round(box.height) === window.__filesFullscreenBefore.header.height
-        && getComputedStyle(document.documentElement).getPropertyValue('--app-header-height').trim() === window.__filesFullscreenBefore.headerHeight;
-    },
-    `${label}: fullscreen close did not restore the original global header`,
-  );
-}
-
-async function runFilesFullscreenJourney(page) {
-  await page.evaluate(() => {
-    window.__filesFullscreenSample = () => {
-      const header = document.querySelector('header');
-      const explorer = document.querySelector('section.file-explorer');
-      const expand = document.getElementById('file-explorer-expand-btn');
-      const close = document.getElementById('file-explorer-drawer-close-btn');
-      const rect = (node) => {
-        if (!node || node.getClientRects().length === 0) return null;
-        const box = node.getBoundingClientRect();
-        const style = getComputedStyle(node);
-        if (style.display === 'none' || style.visibility === 'hidden') return { x: Math.round(box.x), y: Math.round(box.y), width: Math.round(box.width), height: 0, display: style.display };
-        return { x: Math.round(box.x), y: Math.round(box.y), width: Math.round(box.width), height: Math.round(box.height), display: style.display };
-      };
-      const explorerBox = explorer ? explorer.getBoundingClientRect() : null;
-      return {
-        expandedClass: document.querySelector('.app-layout')?.classList.contains('app-layout--files-expanded') === true,
-        headerHeight: getComputedStyle(document.documentElement).getPropertyValue('--app-header-height').trim(),
-        header: rect(header),
-        explorerTop: explorerBox && explorer.getClientRects().length > 0 ? Math.round(explorerBox.top) : null,
-        expandLabel: expand?.getAttribute('aria-label') || '',
-        expandReachable: !!(expand && expand.getClientRects().length > 0 && expand.getBoundingClientRect().width >= 1),
-        closeReachable: !!(close && close.getClientRects().length > 0 && close.getBoundingClientRect().width >= 1),
-        askId: document.querySelector('section.file-conversation')?.getAttribute('data-conversation-id') || '',
-      };
+  await selectSourceLines(page, 1, 1, 'parent child blame');
+  const mark = sentFrames.length;
+  await page.getByRole('button', { name: 'Blame', exact: true }).click();
+  await waitFor(page, () => document.querySelector('[data-testid="file-selection-blame-list"] [data-line="1"]') != null, 'parent blame: child row missing', 15000);
+  const frame = sentFrames.slice(mark).map(parseSentFrame).find((item) => item?.type === 'file_explorer_blame');
+  if (!frame || frame.path !== 'psy-node/child.rs' || frame.sessionId !== owner) fail(`parent blame request is not the child path (${JSON.stringify(frame)})`);
+  const row = await page.evaluate(() => {
+    const line = document.querySelector('[data-testid="file-selection-blame-list"] [data-line="1"]');
+    return {
+      commit: line?.querySelector('span.file-selection-actions__commit')?.getAttribute('title') || '',
+      author: line?.querySelector('span.file-selection-actions__author')?.textContent || '',
+      source: line?.querySelector('span.file-selection-actions__text')?.textContent || '',
     };
   });
+  if (row.commit !== childCommit || row.author !== 'Web E2E' || row.source !== '/// Child ledger owned by the parent-cwd session.') {
+    fail(`parent blame row is not the synthetic child commit (${JSON.stringify(row)})`);
+  }
+  await laneShot(page, 'files-selection-parent-child-blame.png', { fullPage: false });
+  await assertSelectionDismiss(page, 'parent child blame');
+  await hideFileExplorer(page, 'parent child blame');
+}
+function keepNonGitShot(name) {
+  const dir = process.env.RPI_FAILURE_EVIDENCE_DIR;
+  if (!dir) throw new Error(`files.nongit: RPI_FAILURE_EVIDENCE_DIR is not set; cannot retain ${name}`);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.copyFileSync(path.join(stagingDir, name), path.join(dir, name));
+}
+
+async function runNonGitExplorerJourney(page, owner) {
+  const label = 'files.nongit';
+  if (!owner) fail(`${label}: parent non-repo session id is empty`);
+  const residue = page.locator('#toasts .toast--error');
+  const residueTexts = await residue.allTextContents();
+  if (residueTexts.some((text) => !text.includes('code review refresh targets a closed review'))) {
+    fail(`${label}: unexpected error toast before the journey (${JSON.stringify(residueTexts)})`);
+  }
+  while (await residue.count()) {
+    const before = await residue.count();
+    await residue.first().click();
+    await waitFor(page, (beforeArg) => document.querySelectorAll('#toasts .toast--error').length < beforeArg, `${label}: error toast refused to dismiss`, 5000, before);
+  }
+  await waitFor(page, () => document.querySelectorAll('#toasts .toast').length === 0, `${label}: toasts did not clear after dismissal`);
+  await page.setViewportSize({ width: 1360, height: 900 });
+  await waitFor(page, () => window.innerWidth === 1360 && window.innerHeight === 900, `${label}: desktop viewport`, 10000);
+  if ((await page.locator('section.file-explorer').count()) === 0) await openFileExplorer(page);
+  await expandFilesTree(page);
+  await clickFilesDir(page, 'elsewhere');
+  await clickFilesRow(page, 'elsewhere/rewards.rs');
+  const source = page.getByRole('button', { name: 'Source', exact: true });
+  if (await source.count()) await source.click();
+  await waitFor(page, () => document.querySelector('pre.file-explorer__code')?.getClientRects().length > 0, `${label}: real source did not open`);
+  const surface = await page.evaluate(() => ({
+    body: document.querySelector('section.file-explorer')?.textContent || '',
+    code: document.querySelector('pre.file-explorer__code')?.textContent || '',
+    rows: document.querySelectorAll('button.file-explorer__row').length,
+  }));
+  if (!surface.code.includes('OUTSIDE-CHILD-REWARDS')) fail(`${label}: real non-git file body did not render (${JSON.stringify(surface.code.slice(0, 80))})`);
+  if (surface.rows < 1) fail(`${label}: no tree rows rendered for the non-git workspace`);
+  if (surface.body.includes('Not a git repository')) fail(`${label}: retired non-git prose rendered`);
+  await laneShot(page, 'files-nongit-desktop.png', { fullPage: false });
+  keepNonGitShot('files-nongit-desktop.png');
+  await page.setViewportSize({ width: 390, height: 844 });
+  await waitFor(page, () => window.innerWidth === 390 && window.innerHeight === 844, `${label}: mobile viewport`, 10000);
+  await waitFor(page, () => {
+    const files = document.querySelector('section.file-explorer[aria-label="File explorer"]');
+    return files !== null && document.querySelector('.app-layout')?.classList.contains('app-layout--drawer-open') !== true;
+  }, `${label}: Files open must close the sessions drawer`, 10000);
+  await expandFilesTree(page);
+  const treeCoversSource = () => page.evaluate(() => {
+    const code = document.querySelector('pre.file-explorer__code');
+    return code == null || code.getClientRects().length === 0
+      || (code.getBoundingClientRect().width < 40);
+  });
+  if (await treeCoversSource()) {
+    await page.locator('#file-explorer-tree-toggle').click();
+    await waitFor(page, () => {
+      const code = document.querySelector('pre.file-explorer__code');
+      return code != null && code.getClientRects().length > 0 && code.getBoundingClientRect().width >= 40;
+    }, `${label}: source pane did not return after tree collapse`, 10000);
+  }
+  const mobile = await page.evaluate(() => {
+    const code = document.querySelector('pre.file-explorer__code');
+    const rect = code?.getBoundingClientRect();
+    return {
+      body: document.querySelector('section.file-explorer')?.textContent || '',
+      sourceVisible: code != null && code.getClientRects().length > 0 && (rect?.width ?? 0) >= 40,
+      sourceText: code?.textContent || '',
+    };
+  });
+  if (mobile.body.includes('Not a git repository')) fail(`${label}: mobile retired non-git prose rendered`);
+  if (!mobile.sourceVisible || !mobile.sourceText.includes('OUTSIDE-CHILD-REWARDS')) {
+    fail(`${label}: mobile visible source missing the real file body (${JSON.stringify({ sourceVisible: mobile.sourceVisible, code: mobile.sourceText.slice(0, 80) })})`);
+  }
+  await laneShot(page, 'files-nongit-mobile.png', { fullPage: false });
+  keepNonGitShot('files-nongit-mobile.png');
+  await page.setViewportSize({ width: 1360, height: 900 });
+  await waitFor(page, () => window.innerWidth === 1360 && window.innerHeight === 900, `${label}: desktop viewport restore`, 10000);
+  await hideFileExplorer(page, label);
+}
+
+
+function treePctNow() {
+  const raw = getComputedStyle(document.querySelector('[data-testid="file-explorer-layout"]')).getPropertyValue('--file-explorer-tree-pct');
+  return Number.parseFloat(raw);
+}
+
+async function assertFilesMaxLayout(page, label) {
+  const expand = await page.locator('#file-explorer-expand-btn, button.file-explorer__expand-btn').count();
+  if (expand !== 0) fail(`${label}: expand control is still mounted`);
+  const box = await page.evaluate(() => {
+    const header = document.querySelector('header')?.getBoundingClientRect();
+    const footerNode = document.querySelector('footer:has(#composer-row), footer:has(#prompt-input)');
+    const footerStyle = footerNode ? getComputedStyle(footerNode) : null;
+    const explorer = document.querySelector('section.file-explorer')?.getBoundingClientRect();
+    const visible = (rect) => rect && rect.width > 0 && rect.height > 0;
+    const round = (rect) => rect ? { x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height) } : null;
+    const styleOf = (selector) => {
+      const node = document.querySelector(selector);
+      if (!node) return null;
+      const style = getComputedStyle(node);
+      return { position: style.position, top: style.top, bottom: style.bottom, height: style.height, maxHeight: style.maxHeight, margin: style.margin };
+    };
+    const root = getComputedStyle(document.documentElement);
+    return {
+      header: visible(header) && header.top >= -1 && header.bottom > 0,
+      footer: !!footerStyle && footerStyle.display === 'none' && root.getPropertyValue('--app-footer-height').trim() === '0px',
+      left: explorer ? Math.round(explorer.left) : null,
+      right: explorer ? Math.round(window.innerWidth - explorer.right) : null,
+      top: explorer && header ? Math.round(explorer.top - header.bottom) : null,
+      bottom: explorer ? Math.round(window.innerHeight - explorer.bottom) : null,
+      width: explorer ? Math.round(explorer.width) : 0,
+      rects: { header: round(header), footer: round(footerNode?.getBoundingClientRect() ?? null), explorer: round(explorer) },
+      styles: { header: styleOf('header'), footer: styleOf('footer:has(#composer-row), footer:has(#prompt-input)'), explorer: styleOf('section.file-explorer') },
+      vars: { header: root.getPropertyValue('--app-header-height').trim(), footer: root.getPropertyValue('--app-footer-height').trim() },
+    };
+  });
+  if (!box.header || !box.footer) fail(`${label}: header hidden or composer footer VISIBLE — Files-open must hide the whole footer at 0px (${JSON.stringify(box)})`);
+  if (box.left !== 0 || box.right !== 0 || Math.abs(box.top) > 1 || Math.abs(box.bottom) > 1 || Math.abs(box.width - (await page.evaluate(() => window.innerWidth))) > 2) {
+    fail(`${label}: explorer is not the full app body (${JSON.stringify(box)})`);
+  }
+}
+
+
+async function runFilesFullscreenJourney(page) {
   const legs = [
-    { width: 1360, height: 900, label: 'desktop' },
+    { width: 1280, height: 900, label: 'desktop' },
     { width: 390, height: 844, label: 'mobile' },
   ];
   for (const leg of legs) {
-    await page.setViewportSize({ width: leg.width, height: leg.height });
-    await waitFor(
-      page,
-      (size) => window.innerWidth === size.width && window.innerHeight === size.height,
-      `${leg.label} fullscreen viewport did not become ${leg.width}x${leg.height}`,
-      10000,
-      leg,
-    );
+    await page.setViewportSize(leg);
+    await waitFor(page, (size) => window.innerWidth === size.width && window.innerHeight === size.height, `${leg.label} layout viewport`, 10000, leg);
     if ((await page.locator('section.file-explorer').count()) === 0) await openFileExplorer(page);
-    await waitFor(
-      page,
-      () => document.getElementById('file-explorer-expand-btn') != null,
-      `${leg.label}: App Files expand control is missing`,
-    );
-    const askId = await page.evaluate(() => document.querySelector('section.file-conversation')?.getAttribute('data-conversation-id') || '');
-    await assertFilesFullscreenLeg(page, leg.label, { askId });
+    const draft = `layout-draft-${leg.label}`;
+    await page.locator('textarea.file-conversation__input').fill(draft);
+    const tab = await page.evaluate(() => document.querySelector('button.file-explorer__row--active')?.getAttribute('title') || '');
+    await waitFor(page, () => {
+      const header = document.querySelector('header')?.getBoundingClientRect();
+      const footer = document.querySelector('footer:has(#composer-row), footer:has(#prompt-input)')?.getBoundingClientRect();
+      const root = getComputedStyle(document.documentElement);
+      return header && footer && Math.abs(header.height - Number.parseFloat(root.getPropertyValue('--app-header-height'))) <= 1 && Math.abs(footer.height - Number.parseFloat(root.getPropertyValue('--app-footer-height'))) <= 1;
+    }, `${leg.label}: app chrome variables did not match the live rectangles`, 1000);
+    await assertFilesMaxLayout(page, leg.label);
+    if (leg.label === 'desktop') {
+      const owner = await displayedExplorerSession(page);
+      await revealSessionRail(page, 'fresh tree default');
+      const freshSession = await createFreshSessionViaManage(page, waitFor, 'fresh tree default', { closePanel: true, timeoutMs: 20000 });
+      await openFileExplorer(page);
+      if ((await page.evaluate(treePctNow)) !== 29) fail('fresh owner tree percent is not 29');
+      await page.locator(FILES_DRAWER_CLOSE).click();
+      await openFileExplorer(page);
+      if ((await page.evaluate(treePctNow)) !== 29) fail('fresh owner lost the default 29 across reopen');
+      await revealSessionRail(page, 'layout original owner');
+      await page.locator(`.session-sidebar__switch[data-session-id="${owner}"]`).click();
+      await waitFor(page, (id) => document.getElementById('session-lifecycle')?.dataset.displayedSessionId === id, 'layout owner did not return', 20000, owner);
+      await openFileExplorer(page);
+      const divider = page.locator('[data-testid="file-explorer-divider"]');
+      await divider.focus();
+      await page.keyboard.press('Home');
+      for (let step = 0; step < 4; step += 1) await page.keyboard.press('ArrowRight');
+      if ((await page.evaluate(treePctNow)) !== 30) fail('desktop: custom tree percent is not 30');
+      if (freshSession.sessionId === owner) fail('fresh tree session did not change owner');
+      await page.locator(FILES_DRAWER_CLOSE).click();
+      await openFileExplorer(page);
+      if ((await page.evaluate(treePctNow)) !== 30) fail('desktop: reopen lost custom tree percent 30');
+    }
+    await page.locator(FILES_DRAWER_CLOSE).click();
     await openFileExplorer(page);
+    const restored = await page.evaluate((want) => ({
+      tab: document.querySelector('button.file-explorer__row--active')?.getAttribute('title') || '',
+      draft: document.querySelector('textarea.file-conversation__input')?.value || '',
+    }), tab);
+    if (restored.tab !== tab || restored.draft !== draft) fail(`${leg.label}: close/reopen lost tab or draft (${JSON.stringify(restored)})`);
+    const surfaces = await page.evaluate(() => {
+      const source = document.querySelector('[data-testid="file-explorer-content"]');
+      const ask = document.querySelector('section.file-conversation');
+      const body = document.querySelector('[data-testid="file-explorer-layout"]');
+      const sourceBox = source?.getBoundingClientRect();
+      const askBox = ask?.getBoundingClientRect();
+      const bodyBox = body?.getBoundingClientRect();
+      const style = body ? getComputedStyle(body) : null;
+      const pad = style ? Number.parseFloat(style.paddingTop) + Number.parseFloat(style.paddingBottom) + Number.parseFloat(style.borderTopWidth) + Number.parseFloat(style.borderBottomWidth) : 0;
+      const contentTop = bodyBox ? bodyBox.top + Number.parseFloat(style.paddingTop) + Number.parseFloat(style.borderTopWidth) : 0;
+      const contentBottom = bodyBox ? bodyBox.bottom - Number.parseFloat(style.paddingBottom) - Number.parseFloat(style.borderBottomWidth) : 0;
+      const inside = (box) => box && box.width > 0 && box.height > 0 && box.left >= -1 && box.right <= window.innerWidth + 1 && box.bottom <= window.innerHeight + 1;
+      const input = document.querySelector('textarea.file-conversation__input');
+      const send = document.querySelector('section.file-conversation .file-conversation__action--send');
+      const inputBox = input?.getBoundingClientRect();
+      const sendBox = send?.getBoundingClientRect();
+      const point = inputBox ? document.elementFromPoint(inputBox.left + inputBox.width / 2, inputBox.top + inputBox.height / 2) : null;
+      return {
+        source: inside(sourceBox) && source.querySelector('pre.file-explorer__code, .file-explorer__markdown') != null,
+        ask: inside(askBox),
+        askFills: askBox && Math.abs(askBox.top - contentTop) <= 1 && Math.abs(askBox.bottom - contentBottom) <= 1 && askBox.height >= bodyBox.height - pad - 1,
+        askTarget: inputBox && inputBox.width >= 44 && inputBox.height >= 44 && point?.closest('textarea.file-conversation__input') != null && sendBox && sendBox.width >= 44 && sendBox.height >= 44,
+        overflow: document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1,
+      };
+    });
+    if (leg.label === 'desktop' && (!surfaces.source || !surfaces.askFills)) {
+      const error = new Error(`desktop: Ask does not fill the body beside a visible source (${JSON.stringify(surfaces)})`);
+      error.layoutGeometry = await page.evaluate(() => {
+        const nodes = {
+          body: document.querySelector('[data-testid="file-explorer-layout"]'),
+          source: document.querySelector('pre.file-explorer__code, .file-explorer__markdown'),
+          ask: document.querySelector('section.file-conversation'),
+        };
+        const measure = (node) => {
+          if (!node) return null;
+          const rect = node.getBoundingClientRect();
+          const style = getComputedStyle(node);
+          const chain = [];
+          for (let current = node; current && chain.length < 4; current = current.parentElement) {
+            chain.push(`${current.tagName}.${String(current.className || '').split(' ').filter(Boolean).slice(0, 3).join('.')}`);
+          }
+          return {
+            chain,
+            rect: { x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height) },
+            flex: style.flexBasis,
+            height: style.height,
+            minHeight: style.minHeight,
+            maxHeight: style.maxHeight,
+            padding: style.padding,
+          };
+        };
+        return {
+          body: measure(nodes.body),
+          source: measure(nodes.source),
+          ask: measure(nodes.ask),
+          scrollWidth: document.documentElement.scrollWidth,
+          clientWidth: document.documentElement.clientWidth,
+          layout: nodes.body?.getAttribute('data-layout') || '',
+          tree: nodes.body ? getComputedStyle(nodes.body).getPropertyValue('--file-explorer-tree-pct').trim() : '',
+        };
+      });
+      throw error;
+    }
+    if (leg.label === 'mobile' && (!surfaces.source || !surfaces.ask || !surfaces.askTarget || !surfaces.overflow)) fail(`mobile: source and Ask are not both reachable (${JSON.stringify(surfaces)})`);
+    await laneShot(page, `files-layout-${leg.label}.png`, { fullPage: false });
   }
-  const chatHasExpand = await page.evaluate(() => !!document.querySelector('[id$="expand-btn"][aria-label="Expand file explorer to the full app area"]') && !!document.querySelector('#chat-file-explorer-toggle-btn'));
-  if (chatHasExpand) fail('Chat embed must not expose Files fullscreen');
   await page.setViewportSize({ width: 1360, height: 900 });
-  await waitFor(page, () => window.innerWidth === 1360 && window.innerHeight === 900, 'desktop viewport did not restore after files.fullscreen');
-  await hideFileExplorer(page, 'fullscreen restore before mobile');
+  await hideFileExplorer(page, 'layout restore before mobile');
 }
 
 
@@ -3945,20 +4452,23 @@ async function main() {
         },
         releaseHeldFileExplorerMap() {
           const socket = current;
-          if (!socket) return 0;
-          let released = 0;
+          if (!socket) return [];
+          const released = [];
           for (const frame of heldFileExplorerMap.values()) {
             if (!frame) continue;
             releasing.add(frame.id);
             socket.dispatchEvent(new MessageEvent('message', { data: JSON.stringify(frame) }));
             releasing.delete(frame.id);
-            released += 1;
+            released.push(frame.id);
           }
           heldFileExplorerMap.clear();
           return released;
         },
         heldMapCount() {
           return Array.from(heldFileExplorerMap.values()).filter((frame) => frame !== null).length;
+        },
+        heldMapIds() {
+          return Array.from(heldFileExplorerMap.keys());
         },
         heldCount() {
           return [
@@ -4001,7 +4511,7 @@ async function main() {
       console.error(`web-commands-review: page error: ${message}`);
     });
     page.on('console', (message) => {
-      if (message.type() === 'error' && !isKnownConsoleNoise(message.text())) consoleErrors.push(message.text());
+      if (message.type() === 'error' && !isKnownConsoleNoise(message)) consoleErrors.push(message.text());
     });
 
     // Capture outgoing WS frames so the /compact dispatch can be observed
@@ -4105,7 +4615,15 @@ async function main() {
     // Pre-open baseline for the close-restore contract asserted after the
     // geometry checks below (scroll, composer rect, focus = prompt-input).
     const crLayoutBeforeDesktop = await crAppLayout(page);
-    await page.press('#prompt-input', 'Enter');
+    // The inline completion popup owns the SELECTING Enter and never
+    // dispatches: /review is settled by that Enter, and the helper presses
+    // the INDEPENDENT dispatch Enter that actually opens the panel.
+    await selectCompletionThenSubmit(page, {
+      token: '/review',
+      label: 'desktop /review open',
+      sentFrames,
+      dispatchType: 'code_review_open',
+    });
     await waitFor(page, () => document.getElementById('code-review-panel') !== null, 'code-review panel did not open on Enter');
     // Comparison label: backend comparisonLabel "HEAD → working tree".
     await waitFor(
@@ -4166,15 +4684,23 @@ async function main() {
       fail(`code-review deletion line did not render the removed "beta" line (deletions=${JSON.stringify(deletionTexts)})`);
     }
 
-    // ---- Outer shell full-viewport geometry (desktop 1360x900) ----
-    // The shared drawer base styles .code-review-panel like an ordinary
-    // bottom drawer (width:400px, max-width:94vw, 90vh height); the shell
-    // override must fully reset sizing so inset:0 stretches it across the
-    // viewport. A 400px rail, 94vw gutter, bottom-drawer top offset,
-    // top-header inset, or 90vh height each fail by name inside
-    // assertCrShellGeometry.
-    const crGeomDesktop = await crShellGeometry(page);
-    assertCrShellGeometry(crGeomDesktop, 'desktop');
+    // Files-flush shell at 1440, 390, iPad portrait 820, and landscape 1180.
+    // Restore 1360 before close so the close-restore rect stays comparable.
+    for (const leg of [
+      { width: 1440, height: 900, label: 'review-shell-1440' },
+      { width: 390, height: 844, label: 'review-shell-390' },
+      { width: 820, height: 1180, label: 'review-shell-820' },
+      { width: 1180, height: 820, label: 'review-shell-1180' },
+    ]) {
+      await page.setViewportSize({ width: leg.width, height: leg.height });
+      await waitFor(page, (size) => window.innerWidth === size.width && window.innerHeight === size.height, `${leg.label} viewport`, 10000, leg);
+      if (leg.width <= 720) {
+        await waitFor(page, () => document.querySelector('.app-layout')?.classList.contains('app-layout--drawer-open') !== true, `${leg.label} sessions drawer did not settle closed`);
+      }
+      assertCrShellGeometry(await crShellGeometry(page), leg.label);
+    }
+    await page.setViewportSize({ width: 1360, height: 900 });
+    await waitFor(page, () => window.innerWidth === 1360 && window.innerHeight === 900, 'desktop viewport restored after review shell');
     await laneShot(page, 'code-review-panel-geometry-desktop.png');
 
     // Close unmounts the panel AND restores the prior app layout
@@ -4187,7 +4713,12 @@ async function main() {
     await laneShot(page, 'code-review-panel-close-restore-desktop.png');
     await openPicker(page);
     await chooseCommand(page, 'review');
-    await page.press('#prompt-input', 'Enter');
+    await selectCompletionThenSubmit(page, {
+      token: '/review',
+      label: 'desktop /review reopen after close-restore',
+      sentFrames,
+      dispatchType: 'code_review_open',
+    });
     await waitFor(page, () => document.getElementById('code-review-panel') !== null, 'desktop reopen after the geometry close-restore cycle failed');
     await waitFor(
       page,
@@ -4345,7 +4876,12 @@ async function main() {
       () => (document.getElementById('prompt-input')?.value.trim() || '').startsWith('/review'),
       'thread reload: /review draft missing'
     );
-    await page.press('#prompt-input', 'Enter');
+    await selectCompletionThenSubmit(page, {
+      token: '/review',
+      label: 'thread reload /review reopen',
+      sentFrames,
+      dispatchType: 'code_review_open',
+    });
     await waitFor(page, () => document.getElementById('code-review-panel') !== null, 'thread reload: panel did not reopen');
     await waitFor(
       page,
@@ -5067,6 +5603,13 @@ async function main() {
       () => document.querySelector('.code-review__comment-input') !== null,
       'composer did not appear after explicit hunk selection'
     );
+    const composerHit = await page.evaluate(() => {
+      const c = document.querySelector('.code-review__composer textarea');
+      const r = c?.getBoundingClientRect() || null;
+      const hit = r && document.elementFromPoint(r.x + r.width / 2, r.y + Math.min(r.height / 2, Math.max(r.height - 1, 1)));
+      return { h: r ? Math.round(r.height) : null, hitInside: !!hit && (hit === c || c.contains(hit)) };
+    });
+    if (!composerHit.h || composerHit.h < 44 || !composerHit.hitInside) fail(`selected-hunk composer must be its own >=44px hit target under the hidden footer: ${JSON.stringify(composerHit)}`);
 
     // ---- Enter submits; Shift+Enter and IME-composing Enter do not ----
     // The composer keybinding is "Enter to submit · Shift+Enter for a newline"
@@ -5581,7 +6124,12 @@ async function main() {
     // Reopen a fresh panel so the live-textarea Close/Refresh gate starts
     // with no leftover draft and later lane steps are not polluted.
     await page.fill('#prompt-input', '/review');
-    await page.press('#prompt-input', 'Enter');
+    await selectCompletionThenSubmit(page, {
+      token: '/review',
+      label: 'live-textarea draft gate /review reopen',
+      sentFrames,
+      dispatchType: 'code_review_open',
+    });
     await waitFor(
       page,
       () => document.getElementById('code-review-panel') !== null,
@@ -5859,16 +6407,321 @@ async function main() {
       fail(`Close primary duplicated code_review_close over the ≥3.6s observation window (before=${closeFramesBeforeLive.length} after=${closeFramesAfterWindow.length})`);
     }
     await laneShot(page, 'code-review-closed.png', { fullPage: true });
-    await runFileExplorerAcceptance(page, sentFrames, receivedFrames);
+    if (!parentCwd || !childCommit) fail('parent non-repo fixture env is missing');
+    const parentSession = await createFreshSessionViaManage(page, waitFor, 'parent non-repo session', {
+      closePanel: true,
+      timeoutMs: 20000,
+      explicitCwd: parentCwd,
+    });
+    const parentSid = parentSession.sessionId;
+    await openManageSession(page, waitFor, 'parent non-repo cwd');
+    await waitFor(
+      page,
+      (wanted) => document.querySelector('[data-testid="session-cwd-value"]')?.getAttribute('title') === wanted,
+      'parent non-repo session cwd did not load',
+      20000,
+      parentCwd,
+    );
+    await closeManageSession(page, waitFor, 'parent non-repo cwd');
+    await assertParentChildBlame(page, sentFrames, parentSid);
+    await runNonGitExplorerJourney(page, parentSid);
+    recordFiles('files.nongit');
+    const parentOpenMark = sentFrames.length;
+    await page.fill('#prompt-input', '/review psy-node');
+    await page.press('#prompt-input', 'Enter');
+    const parentOpenDeadline = Date.now() + 20000;
+    let parentOpen = null;
+    let parentOpenResponse = null;
+    while (Date.now() < parentOpenDeadline) {
+      parentOpen = sentFrames.slice(parentOpenMark).map(parseSentFrame)
+        .find((frame) => frame?.type === 'code_review_open' && frame.sessionId === parentSid && frame.repo === 'psy-node') || null;
+      parentOpenResponse = parentOpen
+        ? receivedFrames.map((raw) => { try { return JSON.parse(raw); } catch { return null; } })
+          .find((frame) => frame?.type === 'response' && frame.id === parentOpen.id) || null
+        : null;
+      if (parentOpen && parentOpenResponse) break;
+      await page.waitForTimeout(50);
+    }
+    if (!parentOpen || !parentOpenResponse || parentOpenResponse.success !== true
+      || parentOpenResponse.data?.error != null || parentOpenResponse.data?.repo !== 'psy-node') {
+      fail(`parent /review psy-node Enter did not return a null child snapshot error (${JSON.stringify({ parentOpen, parentOpenResponse })})`);
+    }
+    await waitFor(page, () => document.getElementById('code-review-panel') !== null, 'parent review response did not commit the panel', 20000);
+    await waitFor(page, () => [...document.querySelectorAll('.code-review__file')].some((row) => row.getAttribute('data-file-path') === 'changed.txt'), 'parent review did not list changed.txt', 20000);
+    await page.evaluate(() => [...document.querySelectorAll('.code-review__file')].find((row) => row.getAttribute('data-file-path') === 'changed.txt')?.click());
+    await waitFor(page, () => (document.querySelector('.code-review__diff-path')?.textContent || '').includes('changed.txt'), 'parent review did not render changed.txt', 20000);
+    const parentDiff = await page.evaluate(() => document.querySelector('.code-review__diff')?.textContent || '');
+    if (!parentDiff.includes('child changed again')) fail('parent review diff is not the owned child fixture');
+    await laneShot(page, 'code-review-parent-child-desktop.png', { fullPage: false });
+    const reviewCite = 'see `rewards.rs`';
+    await page.locator('.code-review__hunk-header').first().click();
+    await waitFor(page, () => document.querySelector('.code-review__comment-input') !== null, 'review citation composer did not open', 20000);
+    await page.fill('.code-review__comment-input', reviewCite);
+    await page.press('.code-review__comment-input', 'Enter');
+    await waitFor(
+      page,
+      () => [...document.querySelectorAll('.code-review__comment--user[data-review-scope="child"][data-review-repo="psy-node"] code.md-code-path')]
+        .some((node) => node.getAttribute('data-md-path') === 'rewards.rs' && (node.textContent || '') === 'rewards.rs'),
+      'review user comment did not stamp the missing child basename',
+      20000,
+    );
+    const reviewCiteBefore = sentFrames.length;
+    await page.locator('.code-review__comment--user[data-review-scope="child"][data-review-repo="psy-node"] code.md-code-path[data-md-path="rewards.rs"]').last().click();
+    await waitFor(page, () => [...document.querySelectorAll('.toast--error')].some((toast) => (toast.textContent || '').includes('File not found: rewards.rs')), 'missing review citation did not name rewards.rs', 20000);
+    const reviewCiteSent = sentFrames.slice(reviewCiteBefore).map(parseSentFrame);
+    const reviewReads = reviewCiteSent.filter((frame) => frame?.type === 'file_explorer_read');
+    const reviewSearches = reviewCiteSent.filter((frame) => frame?.type === 'file_explorer_search');
+    const reviewStates = reviewCiteSent.filter((frame) => frame?.type === 'get_state');
+    const reviewSearchValue = await page.evaluate(() => document.querySelector('[data-testid="file-explorer-search"]')?.value || '');
+    const reviewDrawerOpen = await page.evaluate(() => document.querySelector('.file-explorer') !== null);
+    if (reviewReads.length !== 1
+      || reviewReads[0]?.path !== 'psy-node/rewards.rs'
+      || reviewReads[0]?.sessionId !== parentSid
+      || reviewSearches.length !== 0
+      || reviewStates.length !== 0
+      || reviewSearchValue === 'rewards.rs'
+      || reviewDrawerOpen) {
+      fail(`missing review basename opened a workspace search (${JSON.stringify({ reviewReads, reviewSearches, reviewStates, reviewSearchValue, reviewDrawerOpen })})`);
+    }
+    await page.evaluate(() => document.querySelectorAll('#toasts .toast').forEach((toast) => toast.click()));
+    const parentRefreshMark = sentFrames.length;
+    await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+    const parentRefreshDeadline = Date.now() + 20000;
+    let parentRefresh = null;
+    let parentRefreshResponse = null;
+    while (Date.now() < parentRefreshDeadline) {
+      parentRefresh = sentFrames.slice(parentRefreshMark).map(parseSentFrame)
+        .find((frame) => frame?.type === 'code_review_refresh' && frame.sessionId === parentSid) || null;
+      parentRefreshResponse = parentRefresh
+        ? receivedFrames.map((raw) => { try { return JSON.parse(raw); } catch { return null; } })
+          .find((frame) => frame?.type === 'response' && frame.id === parentRefresh.id) || null
+        : null;
+      if (parentRefresh && parentRefreshResponse) break;
+      await page.waitForTimeout(50);
+    }
+    if (!parentRefresh || !parentRefreshResponse || parentRefreshResponse.success !== true
+      || parentRefreshResponse.data?.error != null || parentRefreshResponse.data?.repo !== 'psy-node') {
+      fail(`parent review refresh did not return a null child snapshot error (${JSON.stringify({ parentRefresh, parentRefreshResponse })})`);
+    }
+    await waitFor(page, () => [...document.querySelectorAll('.code-review__file')].some((row) => row.getAttribute('data-file-path') === 'changed.txt'), 'parent refresh response did not keep changed.txt', 20000);
+    await page.setViewportSize({ width: 390, height: 844 });
+    await waitFor(page, () => window.innerWidth === 390 && window.innerHeight === 844, 'parent review mobile viewport');
+    await waitFor(page, () => [...document.querySelectorAll('.code-review__file')].some((row) => row.getAttribute('data-file-path') === 'changed.txt'), 'parent review mobile file list lost changed.txt', 20000);
+    await laneShot(page, 'code-review-parent-child-mobile.png', { fullPage: false });
     await page.setViewportSize({ width: 1360, height: 900 });
-    if (await page.locator('#rail-reopen-btn').isVisible()) await page.click('#rail-reopen-btn');
-    await waitFor(page, () => document.getElementById('sidebar-manage-btn')?.getClientRects().length > 0, 'desktop sidebar did not restore after Files mobile journey');
+    await page.click('button.code-review__close');
+    await waitFor(page, () => document.getElementById('code-review-panel') === null, 'parent review panel did not close');
+    await page.evaluate(() => {
+      document.querySelectorAll('#toasts .toast').forEach((toast) => toast.click());
+    });
+    await page.setViewportSize({ width: 1360, height: 900 });
+    await waitFor(page, () => window.innerWidth === 1360 && window.innerHeight === 900, 'ancestor review desktop viewport');
+    if (!await page.evaluate(() => document.querySelector('.app-layout')?.classList.contains('app-layout--drawer-open') === true)) {
+      await openSessionsDrawer(page);
+    }
+    await waitFor(page, () => {
+      const button = document.getElementById('sidebar-manage-btn');
+      return button !== null && button.getClientRects().length > 0;
+    }, 'ancestor review sidebar manage control did not become visible', 20000);
+    const nestedSession = await createFreshSessionViaManage(page, waitFor, 'ancestor review session', {
+      closePanel: true,
+      timeoutMs: 20000,
+      explicitCwd: `${parentCwd}/psy-node/session-nested`,
+    });
+    const nestedSid = nestedSession.sessionId;
+    const ancestorOpenMark = sentFrames.length;
+    await page.fill('#prompt-input', '/review');
+    await selectCompletionThenSubmit(page, {
+      token: '/review',
+      label: 'ancestor review /review open',
+      sentFrames,
+      dispatchType: 'code_review_open',
+    });
+    const ancestorDeadline = Date.now() + 20000;
+    let ancestorOpen = null;
+    let ancestorResponse = null;
+    while (Date.now() < ancestorDeadline) {
+      ancestorOpen = sentFrames.slice(ancestorOpenMark).map(parseSentFrame)
+        .find((frame) => frame?.type === 'code_review_open' && frame.sessionId === nestedSid && frame.repo === undefined) || null;
+      ancestorResponse = ancestorOpen
+        ? receivedFrames.map((raw) => { try { return JSON.parse(raw); } catch { return null; } })
+          .find((frame) => frame?.type === 'response' && frame.id === ancestorOpen.id) || null
+        : null;
+      if (ancestorOpen && ancestorResponse) break;
+      await page.waitForTimeout(50);
+    }
+    if (!ancestorResponse || ancestorResponse.success !== true
+      || JSON.stringify(ancestorResponse.data?.repo) !== JSON.stringify({ unavailable: true })) {
+      fail(`nested /review did not project an unavailable ancestor (${JSON.stringify(ancestorResponse?.data?.repo)})`);
+    }
+    await waitFor(page, () => [...document.querySelectorAll('.code-review__file')].some((row) => row.getAttribute('data-file-path') === 'changed.txt'), 'ancestor review lost changed.txt', 20000);
+    await page.evaluate(() => [...document.querySelectorAll('.code-review__file')].find((row) => row.getAttribute('data-file-path') === 'changed.txt')?.click());
+    await waitFor(page, () => (document.querySelector('.code-review__diff')?.textContent || '').includes('child changed again'), 'ancestor diff is not the child root', 20000);
+    await page.locator('.code-review__hunk-header').first().click();
+    await waitFor(page, () => document.querySelector('.code-review__comment-input') !== null, 'ancestor citation composer did not open', 20000);
+    await page.fill('.code-review__comment-input', 'see `changed.txt`');
+    await page.press('.code-review__comment-input', 'Enter');
+    await waitFor(
+      page,
+      () => document.querySelector('.code-review__comment--user[data-review-scope="unavailable"] code.md-code-path[data-md-path="changed.txt"]') !== null,
+      'ancestor user citation did not stamp unavailable',
+      20000,
+    );
+    const ancestorCiteBefore = sentFrames.length;
+    await page.locator('.code-review__comment--user[data-review-scope="unavailable"] code.md-code-path[data-md-path="changed.txt"]').click();
+    await page.waitForTimeout(300);
+    const ancestorSent = sentFrames.slice(ancestorCiteBefore).map(parseSentFrame);
+    const ancestorFileRpc = ancestorSent.filter((frame) => frame?.type === 'file_explorer_read' || frame?.type === 'file_explorer_search' || frame?.type === 'get_state');
+    const ancestorDrawer = await page.evaluate(() => document.querySelector('.file-explorer') !== null);
+    if (ancestorFileRpc.length !== 0 || ancestorDrawer) {
+      fail(`unavailable ancestor citation issued file RPC (${JSON.stringify({ ancestorFileRpc, ancestorDrawer })})`);
+    }
+    await laneShot(page, 'code-review-ancestor-unavailable-desktop.png', { fullPage: false });
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.locator('.code-review__tab', { hasText: 'Thread' }).click();
+    await waitFor(page, () => {
+      const citation = document.querySelector('.code-review__comment--user[data-review-scope="unavailable"] code.md-code-path[data-md-path="changed.txt"]');
+      const box = citation?.getBoundingClientRect();
+      return box != null && box.width > 0 && box.height > 0 && box.bottom > 0 && box.top < window.innerHeight;
+    }, 'ancestor citation is not visible on the mobile thread', 20000);
+    const ancestorMobileBefore = sentFrames.length;
+    await page.locator('.code-review__comment--user[data-review-scope="unavailable"] code.md-code-path[data-md-path="changed.txt"]').click();
+    await page.waitForTimeout(300);
+    const ancestorMobileSent = sentFrames.slice(ancestorMobileBefore).map(parseSentFrame);
+    const ancestorMobileRpc = ancestorMobileSent.filter((frame) => frame?.type === 'file_explorer_read' || frame?.type === 'file_explorer_search' || frame?.type === 'get_state');
+    const ancestorMobileSurface = await page.evaluate(() => ({
+      explorer: document.querySelector('.file-explorer') !== null,
+      path: window.location.pathname,
+    }));
+    if (ancestorMobileRpc.length !== 0 || ancestorMobileSurface.explorer || ancestorMobileSurface.path !== '/web') {
+      fail(`mobile unavailable ancestor citation issued file RPC (${JSON.stringify({ ancestorMobileRpc, ancestorMobileSurface })})`);
+    }
+    await laneShot(page, 'code-review-ancestor-unavailable-mobile.png', { fullPage: false });
+    await page.setViewportSize({ width: 1360, height: 900 });
+    await page.click('button.code-review__close');
+    await page.locator('.code-review__confirm-actions button', { hasText: 'Close panel' }).click();
+    await waitFor(page, () => document.getElementById('code-review-panel') === null, 'ancestor review panel did not close');
+    await revealSessionRail(page, 'return to parent review session');
+    // Selected-only sidebar: the closed parent row is hidden from the
+    // default view but search restores catalog matches — query the exact
+    // session id (matchSessionSearch matches ids), switch, then clear.
+    await page.fill('#session-sidebar-search', parentSid);
+    await waitFor(
+      page,
+      (want) => {
+        const row = Array.from(document.querySelectorAll('.session-sidebar__switch')).find(
+          (button) => button.dataset.sessionId === want,
+        );
+        return row !== undefined && row.disabled !== true;
+      },
+      'return to parent review: sidebar row never became clickable',
+      20000,
+      parentSid,
+    );
+    const clicked = await page.evaluate((want) => {
+      const row = Array.from(document.querySelectorAll('.session-sidebar__switch')).find(
+        (button) => button.dataset.sessionId === want,
+      );
+      if (!row) return false;
+      row.click();
+      return true;
+    }, parentSid);
+    if (!clicked) fail('return to parent review: sidebar row missing');
+    await waitFor(page, (target) => document.querySelector('.session-sidebar__row--active .session-sidebar__switch')?.dataset.sessionId === target, 'did not return to the parent review session', 20000, parentSid);
+    await page.fill('#session-sidebar-search', '');
+    await waitFor(page, () => document.querySelectorAll('#toasts .toast').length === 0, 'queued toasts did not clear before the bad commit');
+    const badCommit = 'dddddddddddddddddddddddddddddddddddddddd';
+    await page.evaluate(() => {
+      window.__reviewErrorToasts = [];
+      const record = (node) => {
+        if (!(node instanceof Element)) return;
+        for (const toast of [node, ...node.querySelectorAll('.toast--error')]) {
+          if (!toast.matches?.('.toast--error')) continue;
+          const message = toast.querySelector('.toast__message')?.textContent || toast.textContent || '';
+          window.__reviewErrorToasts.push(message);
+        }
+      };
+      new MutationObserver((records) => {
+        for (const recordSet of records) for (const node of recordSet.addedNodes) record(node);
+      }).observe(document.body, { childList: true, subtree: true });
+    });
+    await page.fill('#prompt-input', `/show ${badCommit}`);
+    await page.press('#prompt-input', 'Enter');
+    await waitFor(
+      page,
+      (token) => (window.__reviewErrorToasts || []).filter((message) => message.includes(token)).length >= 1,
+      'parent /show bad commit produced no error toast',
+      20000,
+      badCommit,
+    );
+    await page.waitForTimeout(800);
+    const badCommitToasts = await page.evaluate((token) => [...new Set((window.__reviewErrorToasts || []).filter((message) => message.includes(token)))], badCommit);
+    if (badCommitToasts.length !== 1) {
+      fail(`parent /show ${badCommit} must surface exactly one error toast (got ${JSON.stringify(badCommitToasts)})`);
+    }
+    const panelAfterBadCommit = await page.evaluate(() => document.getElementById('code-review-panel') !== null);
+    if (panelAfterBadCommit) fail(`parent /show ${badCommit} mounted the code-review panel`);
+    await page.fill('#prompt-input', '');
+
+    const parentShowMark = sentFrames.length;
+    await page.fill('#prompt-input', `/show ${childCommit}`);
+    await page.press('#prompt-input', 'Enter');
+    const parentShowDeadline = Date.now() + 20000;
+    let childShow = null;
+    let childShowResponse = null;
+    while (Date.now() < parentShowDeadline) {
+      childShow = sentFrames.slice(parentShowMark).map(parseSentFrame)
+        .find((frame) => frame?.type === 'code_review_open' && frame.sessionId === parentSid && frame.commit === childCommit) || null;
+      childShowResponse = childShow
+        ? receivedFrames.map((raw) => { try { return JSON.parse(raw); } catch { return null; } })
+          .find((frame) => frame?.type === 'response' && frame.id === childShow.id) || null
+        : null;
+      if (childShow && childShowResponse) break;
+      await page.waitForTimeout(50);
+    }
+    if (!childShow || !childShowResponse || childShowResponse.success !== true
+      || childShowResponse.data?.error != null || childShowResponse.data?.repo !== 'psy-node') {
+      fail(`parent /show did not return a null child snapshot error (${JSON.stringify({ childShow, childShowResponse })})`);
+    }
+    await waitFor(page, () => document.getElementById('code-review-panel') !== null
+      && [...document.querySelectorAll('.code-review__file')].some((row) => row.getAttribute('data-file-path') === 'base.txt'),
+      'parent /show response did not commit the child base.txt panel', 20000);
+    await page.click('button.code-review__close');
+    await waitFor(page, () => document.getElementById('code-review-panel') === null, 'parent /show panel did not close');
+    await revealSessionRail(page, 'parent non-repo: return to the repo session');
+    await page.fill('#session-sidebar-search', parentSession.beforeSessionId);
+    await waitFor(
+      page,
+      (want) => {
+        const row = Array.from(document.querySelectorAll('.session-sidebar__switch')).find(
+          (button) => button.dataset.sessionId === want,
+        );
+        return row !== undefined && row.disabled !== true;
+      },
+      'parent non-repo: repo sidebar row never became clickable',
+      20000,
+      parentSession.beforeSessionId,
+    );
+    const clickedBack = await page.evaluate((want) => {
+      const row = Array.from(document.querySelectorAll('.session-sidebar__switch')).find(
+        (button) => button.dataset.sessionId === want,
+      );
+      if (!row) return false;
+      row.click();
+      return true;
+    }, parentSession.beforeSessionId);
+    if (!clickedBack) fail('parent non-repo: repo sidebar row missing');
+    await waitFor(page, (target) => document.querySelector('.session-sidebar__row--active .session-sidebar__switch')?.dataset.sessionId === target, 'parent non-repo: did not return to the repo session', 20000, parentSession.beforeSessionId);
+    await page.fill('#session-sidebar-search', '');
+    await page.setViewportSize({ width: 1360, height: 900 });
+    await runFileExplorerAcceptance(page, sentFrames, receivedFrames);
 
     // ---- Session switch closes the owning review workspace ----
     // Create target session B while code review is closed, then switch back
     // to A. The actual A -> B cutover below clicks B's persistent sidebar row
     // while the review panel is still mounted, so only switch_session can
     // trigger the stamped code_review_close cleanup.
+    await revealSessionRail(page, 'code-review target setup: reopen Sessions rail');
     const { beforeSessionId: sidA, sessionId: sidB } = await createFreshSessionViaManage(
       page,
       waitFor,
@@ -5958,7 +6811,12 @@ async function main() {
       () => (document.getElementById('prompt-input')?.value.trim() || '').startsWith('/review'),
       'choosing /review in the target session did not insert the draft'
     );
-    await page.press('#prompt-input', 'Enter');
+    await selectCompletionThenSubmit(page, {
+      token: '/review',
+      label: 'target-session /review open',
+      sentFrames,
+      dispatchType: 'code_review_open',
+    });
     await waitFor(
       page,
       () => document.getElementById('code-review-panel') !== null,
@@ -6047,7 +6905,15 @@ async function main() {
     await page.evaluate(() => window.__rpiWarmReconnect.holdNextCommitList());
     const lateCommitMark = sentFrames.length;
     await page.fill('#prompt-input', '/show');
-    await page.press('#prompt-input', 'Enter');
+    // Bare /show is staged through the inline popup too: the selecting Enter
+    // settles the token, the dispatch Enter opens the chooser and requests
+    // the commit list.
+    await selectCompletionThenSubmit(page, {
+      token: '/show',
+      label: 'commit picker: bare /show on A',
+      sentFrames,
+      dispatchType: 'code_review_commits',
+    });
     await waitFor(
       page,
       () => document.querySelector('[aria-label="Recent commits"]') !== null,
@@ -6088,7 +6954,12 @@ async function main() {
     const currentCommitMark = sentFrames.length;
     ownershipTrace.startSentIndex = currentCommitMark;
     await page.fill('#prompt-input', '/show');
-    await page.press('#prompt-input', 'Enter');
+    await selectCompletionThenSubmit(page, {
+      token: '/show',
+      label: 'commit picker: current-session /show',
+      sentFrames,
+      dispatchType: 'code_review_commits',
+    });
     await waitFor(
       page,
       (hash) => document.querySelector(`[role="option"][data-commit="${hash}"]`) !== null,
@@ -6319,6 +7190,11 @@ async function main() {
     // close button (required E2E selector) removes the panel.
     const mobileContext = await browser.newContext({ viewport: { width: 390, height: 844 } });
     const mobilePage = await mobileContext.newPage();
+    // The mobile page's own outgoing frames feed the same wire proof (page-scoped observer).
+    const mobileSentFrames = [];
+    mobilePage.on('websocket', (socket) => {
+      socket.on('framesent', (frame) => { if (typeof frame.payload === 'string') mobileSentFrames.push(frame.payload); });
+    });
     diagMobilePage = mobilePage;
     // The MOBILE page owns its browser-error evidence: its own pageerror +
     // console.error handlers, its own arrays, consumed by the lane-final
@@ -6332,7 +7208,7 @@ async function main() {
       console.error(`web-commands-review: mobile page error: ${message}`);
     });
     mobilePage.on('console', (message) => {
-      if (message.type() === 'error' && !isKnownConsoleNoise(message.text())) mobileConsoleErrors.push(message.text());
+      if (message.type() === 'error' && !isKnownConsoleNoise(message)) mobileConsoleErrors.push(message.text());
     });
     if (token) {
       await mobilePage.addInitScript(
@@ -6369,7 +7245,15 @@ async function main() {
       () => (document.getElementById('prompt-input')?.value.trim() || '').startsWith('/review'),
       'choosing /review on mobile did not insert the draft'
     );
-    await mobilePage.press('#prompt-input', 'Enter');
+    // The mobile page's own socket is not in the desktop frame log, so the
+    // selection step is proven by the product surface: the panel must stay
+    // unmounted and the draft must settle before the dispatch Enter.
+    await selectCompletionThenSubmit(mobilePage, {
+      token: '/review',
+      label: 'mobile /review open',
+      sentFrames: mobileSentFrames,
+      dispatchType: 'code_review_open',
+    });
     await waitFor(
       mobilePage,
       () => document.getElementById('code-review-panel') !== null,
@@ -6468,8 +7352,8 @@ async function main() {
     );
     assertSolidityReviewDiff(await reviewSolidityProof(mobilePage), 'mobile solidity review');
     await laneShot(mobilePage, 'code-review-sol-diff-mobile.png');
-    // ---- Outer shell full-viewport geometry (mobile 390x844) ----
-    // Same full-viewport contract as desktop: the shared drawer base's
+    // ---- Outer shell header-to-footer geometry (mobile 390x844) ----
+    // Same header/footer contract as desktop: the shared drawer base's
     // max-width/height caps must never inset or shrink the shell here.
     await assertCrMobileShellGeometry(mobilePage, 'mobile');
     await laneShot(mobilePage, 'code-review-panel-geometry-mobile.png');
@@ -6574,7 +7458,13 @@ async function main() {
       25000,
       skillName
     );
-    await page.press('#prompt-input', 'Enter');
+    await selectCompletionThenSubmit(page, {
+      token: `/skill ${skillName}`,
+      option: skillName,
+      label: `/skill ${skillName} summary dispatch`,
+      sentFrames,
+      dispatchType: 'skill',
+    });
     // The /skill response renders as a dedicated transcript summary bubble
     // (div.msg.msg--summary, label "skill", text in .msg--summary__text).
     // Assert THAT bubble carries the frontmatter values — not just any page
@@ -6606,7 +7496,12 @@ async function main() {
       'choosing /compact did not insert /compact into the composer'
     );
     const compactBefore = sentFrames.length;
-    await page.press('#prompt-input', 'Enter');
+    await selectCompletionThenSubmit(page, {
+      token: '/compact',
+      label: '/compact dispatch',
+      sentFrames,
+      dispatchType: 'compact',
+    });
     let sawCompact = false;
     const deadline = Date.now() + 15000;
     while (Date.now() < deadline) {
@@ -6736,7 +7631,12 @@ async function main() {
     // deterministic error boundary surfaces (bubble + toast).
     await page.fill('#prompt-input', '/compact');
     const bareBefore = sentFrames.length;
-    await page.press('#prompt-input', 'Enter');
+    await selectCompletionThenSubmit(page, {
+      token: '/compact',
+      label: 'bare /compact dispatch',
+      sentFrames,
+      dispatchType: 'compact',
+    });
     let bareFrame = null;
     const bareDeadline = Date.now() + 15000;
     while (Date.now() < bareDeadline) {
@@ -6827,6 +7727,25 @@ async function main() {
     // composer so the user can correct the command).
     const skillRpcBefore = sentFrames.filter((p) => { try { return JSON.parse(p).type === 'skill'; } catch { return false; } }).length;
     await page.fill('#prompt-input', '/skill');
+    // Bare /skill lists every skill candidate, so the inline popup would own
+    // the Enter and settle a candidate instead of submitting the bare token.
+    // Dismiss it explicitly with the popup's own Escape (closeInline), then
+    // the single Enter dispatches the bare command and surfaces the usage
+    // error exactly as before.
+    await waitFor(
+      page,
+      () => document.querySelector('.command-picker__popover') !== null,
+      'bare /skill: the inline completion popup did not open',
+      25000
+    );
+    await page.press('#prompt-input', 'Escape');
+    await waitFor(
+      page,
+      () => document.querySelector('.command-picker__popover') === null
+        && (document.getElementById('prompt-input')?.value || '') === '/skill',
+      'bare /skill: Escape did not dismiss the inline completion popup with the draft intact',
+      15000
+    );
     await page.press('#prompt-input', 'Enter');
     await waitFor(
       page,
@@ -6910,8 +7829,8 @@ async function main() {
     const revBefore = sentFrames.length;
     await page.press('#prompt-input', 'Enter');
     await waitFor(page, () => document.getElementById('code-review-panel') !== null, 'code-review panel did not open for /review HEAD~1 HEAD');
-    // The revision-args open uses the same outer shell: it must still be a
-    // full-viewport overlay, never a drawer-sized right rail.
+    // The revision-args open uses the same outer shell: header-to-footer,
+    // never a drawer-sized right rail and never a full-viewport cover.
     assertCrShellGeometry(await crShellGeometry(page), 'two-revision');
     let revFrame = null;
     const revDeadline = Date.now() + 15000;
@@ -6968,7 +7887,6 @@ async function main() {
       '/review invalid-ref-xyz HEAD did not toast the invalid revision before opening a panel',
       15000
     );
-    await page.waitForTimeout(800);
     const panelAfterBadRef = await page.evaluate(() => document.getElementById('code-review-panel') !== null);
     if (panelAfterBadRef) fail('/review invalid-ref-xyz HEAD opened the panel — invalid revisions must toast first');
     const badRefValue = await page.evaluate(() => document.getElementById('prompt-input')?.value || '');
@@ -6997,6 +7915,17 @@ async function main() {
       fail(`/review a b c must preserve the draft after the usage error (value=${JSON.stringify(arityValue)})`);
     }
     await laneShot(page, 'code-review-arity-error.png', { fullPage: true });
+    // The two expected error toasts above are the evidence in their own
+    // shots; DISMISS them with real clicks (an action-less toast dismisses
+    // on click, App ToastList) so the clean origin-master geometry captures
+    // are not covered by stale errors. A toast that refuses to dismiss is a
+    // typed failure — never a sleep and never a skipped assertion.
+    const errorToasts = page.locator('#toasts .toast--error');
+    while (await errorToasts.count()) {
+      const before = await errorToasts.count();
+      await errorToasts.first().click();
+      await waitFor(page, (beforeArg) => document.querySelectorAll('#toasts .toast--error').length < beforeArg, 'error toast refused to dismiss', 5000, before);
+    }
 
     // ------------------------------------------------------------------
     // /review origin/master: the EXACT literal single-ref user path.
@@ -7110,6 +8039,10 @@ async function main() {
     await waitFor(page, () => window.innerWidth === 1360 && window.innerHeight === 900, 'desktop viewport did not restore 1360x900 before command-copy');
     await waitFor(page, () => document.getElementById('send-btn')?.hasAttribute('disabled') !== true, 'WS not connected before command-copy');
 
+    // Clipboard writeText needs a FOCUSED document and the closed mobile context was a separate window.
+    await page.bringToFront();
+    await waitFor(page, () => document.hasFocus(), 'command-copy: desktop page did not take document focus before the clipboard journeys', 10000);
+
     const COPY_SECRET = 'supersecret';
     const COPY_MULTILINE = `# line one\nexport token = ${COPY_SECRET}\nprintf 'command-copy-ok'\n`;
     const COPY_REDACTED = `# line one\nexport token=[REDACTED]\nprintf 'command-copy-ok'\n`;
@@ -7147,6 +8080,7 @@ async function main() {
     await assertCommandCopyButton(page, '.tool-card__command-copy', {
       expectedClipboard: TOOL_COPY_PAYLOAD,
       secret: COPY_SECRET,
+      frames: receivedFrames,
     });
 
     const activeSid = await page.evaluate(() => document.querySelector('.session-sidebar__row--active .session-sidebar__switch')?.dataset.sessionId || '');
@@ -7171,6 +8105,7 @@ async function main() {
         expectedClipboard: COPY_REDACTED,
         secret: COPY_SECRET,
         keyboard: true,
+        frames: receivedFrames,
       });
 
       const failBtn = page.locator('.bash-copy').last();
@@ -7274,7 +8209,12 @@ async function main() {
       () => (document.getElementById('prompt-input')?.value.trim() || '').startsWith('/review'),
       'review ownership: choosing /review in the third session did not insert the draft',
     );
-    await page.press('#prompt-input', 'Enter');
+    await selectCompletionThenSubmit(page, {
+      token: '/review',
+      label: 'review ownership: third session /review open',
+      sentFrames,
+      dispatchType: 'code_review_open',
+    });
     await waitFor(
       page,
       () => document.getElementById('code-review-panel') !== null,
@@ -7529,9 +8469,8 @@ async function main() {
       closedOwnerProbe.close();
     }
     await laneShot(page, 'review-ownership-third-session.png', { fullPage: true });
-    // The desktop shell is a full-viewport overlay: close the restored panel so
-    // the deferred-probe phase starts from a closed panel (and a reachable
-    // composer).
+    // Close the restored panel so the deferred-probe phase starts from a
+    // closed panel and a reachable composer.
     await page.click('.code-review__title');
     await page.keyboard.press('Escape');
     await waitFor(
@@ -7723,7 +8662,12 @@ async function main() {
     if (unmountDraft.trim() !== '/review') {
       fail(`pending unmount: the composer draft was lost before submit (value=${JSON.stringify(unmountDraft)})`);
     }
-    await page.press('#prompt-input', 'Enter');
+    await selectCompletionThenSubmit(page, {
+      token: '/review',
+      label: 'pending unmount /review open',
+      sentFrames,
+      dispatchType: 'code_review_open',
+    });
     const unmountPanelDeadline = Date.now() + 20000;
     let unmountPanelOpen = false;
     while (Date.now() < unmountPanelDeadline) {
@@ -7950,7 +8894,7 @@ async function main() {
         if (ownershipTrace.startSentIndex !== null) {
           fs.writeFileSync(path.join(failureDir, 'failure-review-ownership-wire.json'), JSON.stringify(ownershipTrace, null, 2));
         }
-        const context = { message, stack, laneNonce, pages: [] };
+        const context = { message, stack, laneNonce, mapRequest: err?.mapRequest || null, mapResponse: err?.mapResponse || null, mapHold: err?.mapHold || null, rowBlocker: err?.rowBlocker || null, layoutGeometry: err?.layoutGeometry || null, pages: [] };
         for (const [label, p] of [['desktop', diagMainPage], ['mobile', diagMobilePage]]) {
           if (!p) continue;
           const entry = { label };
@@ -7977,9 +8921,30 @@ async function main() {
                 innerHeight: window.innerHeight,
                 activeElement: document.activeElement ? (document.activeElement.id || document.activeElement.tagName) : null,
                 fileExplorerToggle: probe('#file-explorer-toggle-btn'),
-                sidebarToggle: probe('#sidebar-toggle-btn'),
+                featureMenuBtn: probe('#feature-menu-btn'),
                 railReopen: probe('#rail-reopen-btn'),
                 fileExplorerSection: probe('section.file-explorer'),
+                map: {
+                  hostPath: document.querySelector('[data-testid="file-dependency-map"]')?.getAttribute('data-map-path') || '',
+                  svgCount: document.querySelectorAll('[data-testid="file-explorer-map-pane"] svg').length,
+                  nodeCount: document.querySelectorAll('[data-testid="file-dependency-map"] svg .node, [data-testid="file-dependency-map"] svg .nodeLabel').length,
+                  foreignObject: document.querySelector('[data-testid="file-explorer-map-pane"] svg foreignObject') != null,
+                  dialog: document.querySelector('[data-testid="file-explorer-map-dialog"]') != null,
+                  active: document.querySelector('button.file-explorer__row--active')?.getAttribute('title') || '',
+                },
+                filesOpenClass: document.querySelector('.app-layout')?.classList.contains('app-layout--files-open') === true,
+                footer: (() => {
+                  const f = document.querySelector('footer:has(#composer-row), footer:has(#prompt-input)');
+                  if (!f) return null;
+                  const rect = f.getBoundingClientRect();
+                  return { x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height), display: getComputedStyle(f).display };
+                })(),
+                transcriptHit: (() => {
+                  const transcript = document.getElementById('transcript');
+                  const tbox = transcript?.getBoundingClientRect();
+                  const el = tbox && tbox.width > 0 ? document.elementFromPoint(tbox.right - 10, tbox.top + Math.min(120, tbox.height / 2)) : null;
+                  return el ? { tag: el.tagName, id: el.id || '', classes: typeof el.className === 'string' ? el.className : '' } : null;
+                })(),
               };
             });
           } catch (e) { entry.domError = String((e && e.message) || e); }

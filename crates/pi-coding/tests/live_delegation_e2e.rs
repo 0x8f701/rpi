@@ -153,7 +153,7 @@ fn session_with_reply(
     registration.set_responses(vec![FauxResponse::text(reply)]);
     let session = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model,
+            model: Some(model),
             cwd: cwd.to_path_buf(),
             system_prompt: String::new(),
             thinking_level: pi_agent::ThinkingLevel::Off,

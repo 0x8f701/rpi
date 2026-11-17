@@ -4,6 +4,9 @@ export interface ContentBlock {
   type: string;
   text?: string;
   thinking?: string;
+  /** Image block payload (assistant transcript images). */
+  data?: string;
+  mimeType?: string;
 }
 
 export type ToolCardStatus = 'running' | 'done' | 'cancelled' | 'error';
@@ -94,6 +97,20 @@ function appendBlock(blocks: ContentBlock[], type: 'text' | 'thinking', delta: s
   return [...blocks, type === 'text' ? { type: 'text', text: delta } : { type: 'thinking', thinking: delta }];
 }
 
+/** Bounded preview of an orphan tool result's body. */
+const ORPHAN_RESULT_PREVIEW_CHARS = 800;
+
+/** Read-only notice text for a tool result whose call is not in the loaded
+ *  history: names the tool and keeps the redacted output visible instead of
+ *  presenting a running card or dropping the row. */
+function orphanToolResultText(message: Record<string, unknown>, result: string): string {
+  const toolName = typeof message.toolName === 'string' && message.toolName !== '' ? message.toolName : 'tool';
+  const preview = result.length > ORPHAN_RESULT_PREVIEW_CHARS
+    ? `${result.slice(0, ORPHAN_RESULT_PREVIEW_CHARS)}…`
+    : result;
+  return `${toolName} result without its call in the loaded history (read-only): ${preview}`;
+}
+
 export function messagesToItems(messages: unknown): TranscriptItem[] {
   const list = Array.isArray(messages) ? messages : [];
   const out: TranscriptItem[] = [];
@@ -121,7 +138,10 @@ export function messagesToItems(messages: unknown): TranscriptItem[] {
             pending.set(toolCallId, out.length);
             out.push({
               kind: 'tool',
-              id: nextId('tc'),
+              // Stable identity: a rebuilt history (each agent_history poll,
+              // each get_messages reload) must not remount every card's fold
+              // and copy state, so a real toolCallId names the card.
+              id: toolCallId !== '' ? `tool-call:${toolCallId}` : nextId('tc'),
               toolCallId,
               toolName: typeof block.name === 'string' && block.name ? block.name : 'tool',
               args: redactSecrets(JSON.stringify(block.arguments ?? {})),
@@ -149,6 +169,15 @@ export function messagesToItems(messages: unknown): TranscriptItem[] {
             status: message.isError === true ? 'error' : 'done',
           };
           pending.delete(toolCallId);
+        } else {
+          // A result whose call fell outside the loaded window (suffix
+          // truncation keeps results after their call was dropped) is shown
+          // read-only, never silently dropped.
+          out.push({
+            kind: 'notice',
+            id: stableId ?? nextId('n'),
+            text: orphanToolResultText(message, result),
+          });
         }
         break;
       }

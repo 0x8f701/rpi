@@ -335,7 +335,7 @@ async fn persona_runtime_configured(
             cwd
         });
     let options = SessionOptions {
-        model: model.clone(),
+        model: Some(model.clone()),
         cwd: cwd.clone(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,
@@ -382,7 +382,7 @@ async fn persona_runtime_configured(
     );
     config.skills = config_ext.extra_skills;
     config.default_agent = "worker".to_owned();
-    config.parent_model = model;
+    config.parent_model = Some(model);
     config.idle_ttl = None;
     config.max_retained_jobs = max_retained_jobs;
     config.retained_job_ttl = Duration::from_secs(24 * 60 * 60);
@@ -838,7 +838,7 @@ async fn persona_spawn_requires_durable_binding() {
     let definition = persona_definition(&persona_root, "mentor");
     let model = test_model();
     let parent = Session::new(SessionOptions {
-        model: model.clone(),
+        model: Some(model.clone()),
         cwd: root.path().to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,
@@ -861,7 +861,7 @@ async fn persona_spawn_requires_durable_binding() {
         root.path().join("artifacts"),
     );
     config.default_agent = "mentor".to_owned();
-    config.parent_model = model;
+    config.parent_model = Some(model);
     config.idle_ttl = None;
     let snapshot = parent.child_session_options_snapshot();
     let runtime = OrchestrationRuntime::new(

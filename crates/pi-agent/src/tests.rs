@@ -93,7 +93,7 @@ fn scripted(messages: Vec<AssistantMessage>) -> StreamFn {
 fn options(stream_fn: StreamFn, tools: Vec<AgentTool>) -> AgentOptions {
     AgentOptions {
         initial_state: AgentState {
-            model: model(),
+            model: Some(model()),
             tools,
             ..AgentState::default()
         },
@@ -260,7 +260,7 @@ async fn tool_context_receives_the_active_turn_model() {
         assistant(vec![ContentBlock::text("done")], StopReason::Stop),
     ]);
     let mut opts = options(stream, vec![tool]);
-    opts.initial_state.model = active.clone();
+    opts.initial_state.model = Some(active.clone());
     let agent = Agent::new(opts);
     agent.prompt("go").await.unwrap();
     assert_eq!(*seen.lock(), Some(active));
@@ -300,7 +300,7 @@ async fn tool_context_receives_prepare_next_turn_model_updates() {
         assistant(vec![ContentBlock::text("done")], StopReason::Stop),
     ]);
     let mut opts = options(stream, vec![tool]);
-    opts.initial_state.model = initial;
+    opts.initial_state.model = Some(initial);
     opts.prepare_next_turn = Some(Arc::new(move |_| {
         Some(AgentLoopTurnUpdate {
             model: Some(updated.clone()),
@@ -310,6 +310,95 @@ async fn tool_context_receives_prepare_next_turn_model_updates() {
     let agent = Agent::new(opts);
     agent.prompt("go").await.unwrap();
     assert_eq!(*seen.lock(), ["initial-model", "updated-model"]);
+}
+
+#[tokio::test]
+async fn prompt_without_a_model_is_rejected_before_any_turn() {
+    let agent = Agent::new(AgentOptions::default());
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let observed = events.clone();
+    let subscription = agent
+        .subscribe_simple(move |event| {
+            let observed = observed.clone();
+            async move {
+                observed.lock().push(event.event_type());
+                Ok(())
+            }
+        })
+        .await;
+    let error = agent.prompt("go").await.unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<crate::ModelNotConfigured>(),
+        Some(&crate::ModelNotConfigured),
+        "unexpected error: {error:#}"
+    );
+    let state = agent.state().await;
+    assert!(state.model.is_none());
+    assert!(!state.is_streaming, "rejection must not claim a run");
+    assert!(state.messages.is_empty(), "rejection must not write history");
+    assert!(state.error_message.is_none());
+    let published = events.lock().clone();
+    assert!(
+        published.is_empty(),
+        "rejection must publish no agent events: {published:?}"
+    );
+    assert!(agent.current_run_generation_for_test().await.is_none());
+    drop(subscription);
+}
+
+#[tokio::test]
+async fn continue_without_a_model_is_rejected_before_any_turn() {
+    let agent = Agent::new(AgentOptions::default());
+    agent
+        .steer(Message::User(pi_ai::UserMessage {
+            content: vec![ContentBlock::text("queued")],
+            timestamp: pi_ai::now_millis(),
+        }))
+        .await;
+    let error = agent.continue_run().await.unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<crate::ModelNotConfigured>(),
+        Some(&crate::ModelNotConfigured),
+        "unexpected error: {error:#}"
+    );
+    let state = agent.state().await;
+    assert!(state.model.is_none());
+    assert!(!state.is_streaming);
+    assert!(state.messages.is_empty());
+    assert!(agent.current_run_generation_for_test().await.is_none());
+    drop(state);
+    let (steering, follow_up) = agent.queued_messages().await;
+    assert_eq!(steering.len(), 1, "rejection must not consume steering");
+    assert!(follow_up.is_empty());
+}
+
+#[tokio::test]
+async fn set_model_configures_the_agent_for_subsequent_runs() {
+    let agent = Agent::new(AgentOptions {
+        stream_fn: scripted(vec![assistant(
+            vec![ContentBlock::text("done")],
+            StopReason::Stop,
+        )]),
+        ..AgentOptions::default()
+    });
+    assert!(agent.state().await.model.is_none());
+    assert!(
+        agent
+            .prompt("go")
+            .await
+            .unwrap_err()
+            .downcast_ref::<crate::ModelNotConfigured>()
+            .is_some()
+    );
+    agent.set_model(model()).await;
+    agent.prompt("go").await.unwrap();
+    agent.wait_for_idle().await;
+    let state = agent.state().await;
+    assert_eq!(
+        state.model.as_ref().map(|configured| configured.id.as_str()),
+        Some("scripted")
+    );
+    assert_eq!(state.messages.len(), 2);
 }
 
 #[tokio::test]
@@ -600,6 +689,112 @@ async fn drain_steering_leaves_follow_up_and_remove_at_is_indexed() {
     let (steering, follow_up) = agent.queued_messages().await;
     assert!(steering.is_empty(), "steering drained");
     assert_eq!(follow_up, [Message::user_text("later", 3)]);
+}
+
+/// Transformed steering must not replay after a post-commit listener failure.
+#[tokio::test]
+async fn transformed_steering_committed_then_listener_failure_is_not_replayed() {
+    use crate::TransformMessageFn;
+
+    let agent = Agent::new(options(scripted(Vec::new()), vec![]));
+
+    let transform: TransformMessageFn = Arc::new(|mut message: AgentMessage, _signal| {
+        Box::pin(async move {
+            if let Message::User(user) = &mut message {
+                for block in &mut user.content {
+                    if let ContentBlock::Text { text, .. } = block {
+                        text.push_str(" [transformed]");
+                    }
+                }
+            }
+            Ok(message)
+        })
+    });
+    agent.set_transform_message(Some(transform));
+
+    let failed = Arc::new(AtomicBool::new(false));
+    let _subscription = agent
+        .subscribe(move |event: AgentEvent, _signal| {
+            let failed = failed.clone();
+            async move {
+                if let AgentEvent::MessageEnd { message } = &event {
+                    if let Message::User(user) = message {
+                        if user.timestamp == 100 && !failed.swap(true, Ordering::SeqCst) {
+                            return Err(anyhow!("listener failed once"));
+                        }
+                    }
+                }
+                Ok(())
+            }
+        })
+        .await;
+
+    agent.set_steering_mode(QueueMode::All).await;
+    agent.steer(Message::user_text("steer me", 100)).await;
+    agent.steer(Message::user_text("steer me", 101)).await;
+    let first = agent.prompt("start").await;
+    assert!(
+        first.is_err(),
+        "run 1 must surface the listener failure: {:?}",
+        first.err().map(|error| error.to_string())
+    );
+    let (steering, follow_up) = agent.queued_messages().await;
+    assert_eq!(
+        steering,
+        [Message::user_text("steer me", 101)],
+        "restore must requeue only the undrained tail, not the committed ts-100 message"
+    );
+    assert!(follow_up.is_empty());
+
+    agent.prompt("again").await.expect("run 2 completes");
+
+    let state = agent.state().await;
+    let count_with_timestamp = |state: &AgentState, timestamp: i64| {
+        state
+            .messages
+            .iter()
+            .filter(|message| {
+                matches!(message, Message::User(user) if user.timestamp == timestamp)
+            })
+            .count()
+    };
+    assert_eq!(
+        count_with_timestamp(&state, 100),
+        1,
+        "the committed (transformed) steered message was replayed: restore must \
+         drop messages whose transformed MessageEnd already reached state, not \
+         compare the original against the committed payload"
+    );
+    assert_eq!(
+        count_with_timestamp(&state, 101),
+        1,
+        "the legitimate identical twin must be delivered exactly once"
+    );
+    assert_eq!(
+        agent.pending_message_count().await,
+        0,
+        "both queued messages must be settled after run 2"
+    );
+    let replayed = state
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::User(user) if user.timestamp == 100 => Some(user),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(replayed.len(), 1);
+    assert_eq!(
+        replayed[0]
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>(),
+        "steer me [transformed]"
+    );
 }
 
 #[tokio::test]

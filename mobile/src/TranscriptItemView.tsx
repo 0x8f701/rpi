@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Clipboard, Text, TouchableOpacity, View } from 'react-native';
+import { Clipboard, Image, Text, TouchableOpacity, View } from 'react-native';
+import { isImageMime } from './attachments';
 import { MarkdownBody } from './MarkdownBody';
 import { normalizeThinkingNewlines } from './markdown';
 import { redactSecrets } from './redact';
@@ -136,6 +137,17 @@ function AssistantBlocks(props: { blocks: ContentBlock[]; palette: Palette }): R
       {props.blocks.map((block, index) => {
         if (block.type === 'thinking' && block.thinking) {
           return <ThinkingFold key={index} thinking={block.thinking} palette={props.palette} />;
+        }
+        if (block.type === 'image' && block.data !== undefined && block.mimeType !== undefined
+          && isImageMime(block.mimeType)) {
+          return (
+            <Image
+              key={index}
+              source={{ uri: `data:${block.mimeType};base64,${block.data}` }}
+              style={styles.transcriptImage}
+              resizeMode="contain"
+            />
+          );
         }
         if (block.type === 'text' && block.text) {
           return <MarkdownBody key={index} text={block.text} palette={props.palette} />;

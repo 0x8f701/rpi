@@ -594,7 +594,11 @@ pub async fn stream_simple_openai_completions(
 ) -> AssistantMessageEventStream {
     let reasoning_effort = options
         .reasoning
-        .map(|level| clamp_thinking_level(&model, thinking_level_name(level)).to_owned());
+        .map(|level| clamp_thinking_level(&model, thinking_level_name(level)).to_owned())
+        .or_else(|| {
+            let clamped = clamp_thinking_level(&model, "off");
+            (clamped != "off").then(|| clamped.to_owned())
+        });
     let mut stream = options.stream;
     let max_tokens = stream.max_tokens.unwrap_or(model.max_tokens);
     stream.max_tokens = Some(clamp_max_tokens_to_context(&model, &context, max_tokens));
@@ -1815,6 +1819,174 @@ mod tests {
                 .to_ascii_lowercase()
                 .contains("authorization: bearer sk-test"),
             "{request}"
+        );
+    }
+
+    /// Reasoning model whose explicit map drops off/minimal/medium/xhigh.
+    /// Clamp of an absent Simple level must land on low, the lowest remaining tier.
+    fn always_thinking_low_floor_model(base_url: &str) -> Model {
+        Model {
+            id: "always-thinking".into(),
+            name: "Always Thinking".into(),
+            api: API_OPENAI_COMPLETIONS.into(),
+            provider: "openai".into(),
+            base_url: base_url.into(),
+            reasoning: true,
+            thinking_level_map: Some(HashMap::from([
+                ("off".into(), None),
+                ("minimal".into(), None),
+                ("medium".into(), None),
+                ("xhigh".into(), None),
+                ("low".into(), Some("low".into())),
+                ("high".into(), Some("high".into())),
+                ("max".into(), Some("max".into())),
+            ])),
+            ..Model::default()
+        }
+    }
+
+    fn simple_reasoning(level: Option<ThinkingLevel>) -> SimpleStreamOptions {
+        SimpleStreamOptions {
+            stream: StreamOptions {
+                api_key: Some("sk-test".into()),
+                http_executor: Some(crate::http::test_http_executor()),
+                ..StreamOptions::default()
+            },
+            reasoning: level,
+            thinking_budgets: None,
+            responses_stateful_chain: false,
+        }
+    }
+
+    async fn captured_simple_chat_body(model: Model, reasoning: Option<ThinkingLevel>) -> Value {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let address = listener.local_addr().expect("mock address");
+        let request = Arc::new(Mutex::new(String::new()));
+        let captured = request.clone();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept mock request");
+            let mut bytes = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let count = socket.read(&mut buffer).await.expect("read mock request");
+                if count == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buffer[..count]);
+                if let Some(split) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&bytes[..split]);
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if bytes.len() >= split + 4 + length {
+                        break;
+                    }
+                }
+            }
+            *captured.lock().await = String::from_utf8(bytes).expect("utf8 request");
+            let body = concat!(
+                "data: {\"id\":\"chat-1\",\"model\":\"mock\",\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\n",
+                "data: [DONE]\n\n"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write mock response");
+        });
+        let mut model = model;
+        model.base_url = format!("http://{address}");
+        let events = stream_simple_openai_completions(
+            model,
+            Context::default(),
+            simple_reasoning(reasoning),
+        )
+        .await;
+        while events.next().await.is_some() {}
+        let result = events.result().await.expect("final result");
+        assert_eq!(
+            result.stop_reason,
+            StopReason::Stop,
+            "mock stream failed: {:?}",
+            result.error_message
+        );
+        let raw = request.lock().await.clone();
+        assert!(
+            raw.starts_with("POST /chat/completions "),
+            "Simple entry must hit chat completions: {raw}"
+        );
+        let body = raw
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .unwrap_or_else(|| panic!("no body in {raw}"));
+        serde_json::from_str(body).unwrap_or_else(|error| panic!("json body {error}: {body}"))
+    }
+
+    #[tokio::test]
+    async fn simple_none_on_always_thinking_model_wires_reasoning_effort_low() {
+        let body = captured_simple_chat_body(always_thinking_low_floor_model(""), None).await;
+        assert_eq!(
+            body["reasoning_effort"],
+            json!("low"),
+            "absent reasoning must clamp to the lowest allowed tier, not off/minimal/medium/xhigh/omit: {body}"
+        );
+        for banned in ["off", "none", "minimal", "medium", "xhigh"] {
+            assert_ne!(
+                body["reasoning_effort"].as_str(),
+                Some(banned),
+                "typed map forbids {banned}: {body}"
+            );
+        }
+        assert!(
+            body.get("reasoning").is_none(),
+            "completions wire is reasoning_effort, not nested reasoning: {body}"
+        );
+        assert!(body.get("thinking").is_none(), "{body}");
+        assert!(body.get("enable_thinking").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn simple_none_omits_reasoning_effort_when_off_is_allowed() {
+        let model = Model {
+            id: "reasoning-model".into(),
+            name: "Reasoning".into(),
+            api: API_OPENAI_COMPLETIONS.into(),
+            provider: "openai".into(),
+            reasoning: true,
+            ..Model::default()
+        };
+        let body = captured_simple_chat_body(model, None).await;
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "off remains available, so Simple None must keep the existing omit wire: {body}"
+        );
+        assert!(body.get("reasoning").is_none(), "{body}");
+        assert!(body.get("thinking").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn simple_high_on_always_thinking_model_keeps_reasoning_effort_high() {
+        let body = captured_simple_chat_body(
+            always_thinking_low_floor_model(""),
+            Some(ThinkingLevel::High),
+        )
+        .await;
+        assert_eq!(
+            body["reasoning_effort"],
+            json!("high"),
+            "an explicit allowed level must stay on that level: {body}"
         );
     }
 

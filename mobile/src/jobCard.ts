@@ -1,4 +1,4 @@
-export type JobStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+export type JobStatus = 'queued' | 'running' | 'cancelling' | 'completed' | 'failed' | 'cancelled';
 export type SubagentJobFilter = 'running' | 'completed';
 
 export const SUBAGENT_FILTER_LABEL: Record<SubagentJobFilter, string> = {
@@ -6,8 +6,42 @@ export const SUBAGENT_FILTER_LABEL: Record<SubagentJobFilter, string> = {
   completed: 'Completed',
 };
 
+/**
+ * Live execution phases. `cancelling` has committed cancellation intent but
+ * the runner still owns abort/drain/cleanup, so it stays active: elapsed,
+ * history polling, and the Running filter. It is not an alias of `running`.
+ * Terminal statuses are history.
+ */
+export function isLiveJobStatus(status: JobStatus): boolean {
+  return status === 'queued' || status === 'running' || status === 'cancelling';
+}
+
+/** Activity attachment rank. Cancelling outranks running; settled is zero. */
+export function jobStatusRank(status: JobStatus): number {
+  switch (status) {
+    case 'cancelling':
+      return 3;
+    case 'running':
+      return 2;
+    case 'queued':
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+/** Display label. Only `cancelling` is titled; other statuses stay wire tokens. */
+export function jobStatusLabel(status: JobStatus): string {
+  return status === 'cancelling' ? 'Cancelling' : status;
+}
+
+/**
+ * Bucket a job status into the panel filter it belongs to. queued, running,
+ * and cancelling are in flight (a just-spawned or draining job must stay
+ * visible under Running); everything else is settled history under Completed.
+ */
 export function subagentJobBucket(status: JobStatus): SubagentJobFilter {
-  return status === 'queued' || status === 'running' ? 'running' : 'completed';
+  return isLiveJobStatus(status) ? 'running' : 'completed';
 }
 
 export interface JobWire {
@@ -25,6 +59,7 @@ export interface JobWire {
 const JOB_STATUSES: Record<string, JobStatus> = {
   queued: 'queued',
   running: 'running',
+  cancelling: 'cancelling',
   completed: 'completed',
   failed: 'failed',
   cancelled: 'cancelled',
@@ -52,7 +87,7 @@ export function formatDuration(milliseconds: number): string {
 }
 
 export function elapsedMs(job: JobWire, now: number): number | null {
-  if (job.status === 'queued' || job.status === 'running') {
+  if (isLiveJobStatus(job.status)) {
     if (now === 0) return null;
     const start = job.startedAt ?? job.createdAt;
     return Math.max(0, now - start);

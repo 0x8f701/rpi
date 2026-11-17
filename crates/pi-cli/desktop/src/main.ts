@@ -476,7 +476,7 @@ async function confirmExternalOpen(window: BrowserWindow | null, url: string): P
   const response = await showMessage(window, {
     type: 'question',
     title: 'Open external link',
-    message: `Open ${host === '' ? 'this link' : host} outside rpi desktop?`,
+    message: `Open ${host === '' ? 'this link' : host} outside rpi?`,
     detail: `Destination: ${url}\n\nOnly continue if you recognise this address. A page can request this link without your intent.`,
     buttons: ['Open in browser', 'Cancel'],
     defaultId: 1,
@@ -530,6 +530,9 @@ function createWindow(load = true): BrowserWindow {
     },
   });
   if (bounds.maximized) window.maximize();
+  // The runner page's document title must not rename the native frame: the
+  // window keeps the app name in task switchers and title bars.
+  window.on('page-title-updated', (event) => event.preventDefault());
   window.on('close', () => {
     const normal = window.getNormalBounds();
     try {
@@ -656,8 +659,8 @@ function buildMenu(): void {
             click: () => {
               void showMessage(mainWindow, {
                 type: 'info',
-                title: 'About rpi desktop',
-                message: `rpi desktop ${app.getVersion()}`,
+                title: 'About rpi',
+                message: `rpi ${app.getVersion()}`,
                 detail: `Runner: ${config.runnerUrl}\nRoute: /${config.route}\nElectron: ${process.versions.electron}`,
                 buttons: ['Close'],
               });

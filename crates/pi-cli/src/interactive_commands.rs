@@ -2564,7 +2564,7 @@ mod tests {
     fn disabled_session(model: pi_ai::Model, cwd: &std::path::Path) -> pi_coding::Session {
         let session = pi_coding::Session::new_with_additional_tools_filtered_and_discovery(
             pi_coding::SessionOptions {
-                model,
+                model: Some(model),
                 cwd: cwd.to_path_buf(),
                 system_prompt: String::new(),
                 thinking_level: pi_agent::ThinkingLevel::Off,
@@ -3785,7 +3785,7 @@ mod tests {
         }
 
         let (model, faux) = faux_model("persona-test");
-        let session = disabled_session(model, cwd);
+        let session = disabled_session(model.clone(), cwd);
         let session_dir = cwd.join("parent-sessions");
         std::fs::create_dir_all(&session_dir).expect("parent session directory");
         let recorder = pi_coding::start_session_in(
@@ -3809,6 +3809,9 @@ mod tests {
             &artifacts,
         );
         config.idle_ttl = None;
+        // Explicit registered fixture parent: children resolve a real model,
+        // never the production `Model::default()`.
+        config.parent_model = Some(model);
         let factory: pi_coding::ChildSessionFactory =
             std::sync::Arc::new(|_| Box::pin(std::future::pending()));
         let runtime =

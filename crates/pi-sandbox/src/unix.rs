@@ -466,21 +466,19 @@ pub(crate) fn fork_sandbox_child(
             .ok_or_else(|| invalid_protocol(ChildProtocolError::InvalidDescriptor));
     }
 
-    let stage = match prepare_wrapper_child(
+    match prepare_wrapper_child(
         wrapper,
         request_fd,
         status_fd,
         wrapper_error_fd,
         pty_slave_fd,
     ) {
-        Ok(()) => WrapperStage::ExecuteWrapper,
-        Err(stage) => stage,
-    };
-    if stage != WrapperStage::ExecuteWrapper {
-        write_wrapper_failure(SANDBOX_WRAPPER_ERROR_FD, stage);
-        unsafe { libc::_exit(WRAPPER_FAILURE_EXIT_CODE) };
+        Ok(()) => exec_prepared_wrapper(wrapper),
+        Err((stage, report_fd)) => {
+            write_wrapper_failure(report_fd, stage);
+            unsafe { libc::_exit(WRAPPER_FAILURE_EXIT_CODE) };
+        }
     }
-    exec_prepared_wrapper(wrapper)
 }
 
 fn prepare_wrapper_child(
@@ -489,31 +487,62 @@ fn prepare_wrapper_child(
     status_fd: RawFd,
     wrapper_error_fd: RawFd,
     pty_slave_fd: Option<RawFd>,
-) -> Result<(), WrapperStage> {
-    reset_child_signals().map_err(|_| WrapperStage::MapControl)?;
+) -> Result<(), (WrapperStage, RawFd)> {
+    // `wrapper_error_fd` can be 3, 4, or 5, which the remap overwrites before
+    // installing fd 6. This copy is not a remap target. `close_complement`
+    // closes it, so later failures must use fd 6.
+    let stable = unsafe {
+        libc::fcntl(
+            wrapper_error_fd,
+            libc::F_DUPFD_CLOEXEC,
+            MINIMUM_TRANSPORT_FD,
+        )
+    };
+    if stable < 0 {
+        return Err((WrapperStage::MapControl, wrapper_error_fd));
+    }
+    if reset_child_signals().is_err() {
+        return Err((WrapperStage::MapControl, stable));
+    }
     match pty_slave_fd {
-        Some(slave) => prepare_pty_process(slave).map_err(|_| WrapperStage::MapStdio)?,
+        Some(slave) => {
+            if prepare_pty_process(slave).is_err() {
+                return Err((WrapperStage::MapStdio, stable));
+            }
+        }
         None => {
             if unsafe { libc::setpgid(0, 0) } < 0 {
-                return Err(WrapperStage::MapStdio);
+                return Err((WrapperStage::MapStdio, stable));
             }
-            map_spawn_stdio(&wrapper.stdio).map_err(|_| WrapperStage::MapStdio)?;
+            if map_spawn_stdio(&wrapper.stdio).is_err() {
+                return Err((WrapperStage::MapStdio, stable));
+            }
         }
     }
-    map_descriptors_cycle_safe(&[
+    if map_descriptors_cycle_safe(&[
         (request_fd, SANDBOX_CHILD_REQUEST_FD),
         (status_fd, SANDBOX_CHILD_STATUS_FD),
         (wrapper.current_executable.as_raw_fd(), SANDBOX_SELF_EXE_FD),
         (wrapper_error_fd, SANDBOX_WRAPPER_ERROR_FD),
     ])
-    .map_err(|_| WrapperStage::MapControl)?;
-    for fd in wrapper.descriptor_plan.wrapper_keep_fds() {
-        clear_cloexec(*fd).map_err(|_| WrapperStage::MapControl)?;
+    .is_err()
+    {
+        return Err((WrapperStage::MapControl, stable));
     }
-    set_cloexec(SANDBOX_WRAPPER_ERROR_FD).map_err(|_| WrapperStage::MapControl)?;
-    close_complement(wrapper.descriptor_plan.complement_close_ranges())
-        .map_err(|_| WrapperStage::CloseDescriptors)?;
-    revalidate_wrapper_descriptors(wrapper).map_err(|_| WrapperStage::CloseDescriptors)?;
+    for fd in wrapper.descriptor_plan.wrapper_keep_fds() {
+        if clear_cloexec(*fd).is_err() {
+            return Err((WrapperStage::MapControl, SANDBOX_WRAPPER_ERROR_FD));
+        }
+    }
+    if set_cloexec(SANDBOX_WRAPPER_ERROR_FD).is_err() {
+        return Err((WrapperStage::MapControl, SANDBOX_WRAPPER_ERROR_FD));
+    }
+    if close_complement(wrapper.descriptor_plan.complement_close_ranges()).is_err() {
+        return Err((WrapperStage::CloseDescriptors, SANDBOX_WRAPPER_ERROR_FD));
+    }
+    if revalidate_wrapper_descriptors(wrapper).is_err() {
+        return Err((WrapperStage::CloseDescriptors, SANDBOX_WRAPPER_ERROR_FD));
+    }
     Ok(())
 }
 
@@ -1779,5 +1808,147 @@ mod tests {
             let is_closed = ranges.iter().any(|(start, end)| *start <= fd && fd <= *end);
             assert_ne!(keep.contains(&fd), is_closed);
         }
+    }
+
+    #[test]
+    fn pre_remap_stdio_failure_is_reported_on_the_original_error_pipe() {
+        let mut report = atomic_cloexec_pipe().expect("report pipe");
+        report.read = owned_at_least(report.read, FIRST_UNRESERVED_FD);
+        report.write = owned_at_least(report.write, FIRST_UNRESERVED_FD);
+        let forked = unsafe { libc::fork() };
+        assert!(forked >= 0, "fork isolated fd table");
+        if forked == 0 {
+            drop(report.read);
+            isolated_pre_remap_stdio_failure(report.write);
+        }
+        drop(report.write);
+        let mut bytes = [0_u8; 20];
+        let read_fd = report.read.as_raw_fd();
+        let flags = unsafe { libc::fcntl(read_fd, libc::F_GETFL) };
+        assert!(flags >= 0 && unsafe { libc::fcntl(read_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == 0);
+        let mut poll_fd = libc::pollfd {
+            fd: read_fd,
+            events: libc::POLLIN | libc::POLLHUP,
+            revents: 0,
+        };
+        let polled = unsafe { libc::poll(&mut poll_fd, 1, 3_000) };
+        let read = if polled > 0 {
+            unsafe { libc::read(read_fd, bytes.as_mut_ptr().cast(), bytes.len()) }
+        } else {
+            unsafe { libc::kill(forked, libc::SIGKILL); }
+            0
+        };
+        let mut status_code = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(forked, &mut status_code, 0) },
+            forked,
+            "isolated child must be reaped"
+        );
+        assert_eq!(read, 20, "isolated child report missing or timed out");
+        let inner_exit = i32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let frame_len = i32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        assert_eq!(inner_exit, 125, "wrapper child must fail closed");
+        assert_eq!(
+            frame_len, WRAPPER_ERROR_FRAME_BYTES as i32,
+            "pre-remap MapStdio failure must arrive on the original error pipe, not as EOF"
+        );
+        let frame = WrapperErrorFrame::decode(bytes[8..].try_into().unwrap()).expect("frame");
+        assert_eq!(frame.stage, WrapperStage::MapStdio);
+        assert_eq!(frame.errno, libc::EBADF);
+    }
+
+    fn owned_at_least(fd: OwnedFd, minimum: RawFd) -> OwnedFd {
+        let moved = duplicate_cloexec(fd.as_raw_fd(), minimum).expect("move owned fd");
+        drop(fd);
+        unsafe { OwnedFd::from_raw_fd(moved) }
+    }
+
+    fn isolated_pre_remap_stdio_failure(report: OwnedFd) -> ! {
+        // This process owns the inherited fd table. Closing fd 6 here cannot
+        // touch the parent suite; the placeholder keeps later setup off fd 6.
+        let seed: OwnedFd = File::open("/dev/null").expect("hold fd 6").into();
+        let hold_fd6 = if seed.as_raw_fd() == SANDBOX_WRAPPER_ERROR_FD {
+            seed
+        } else {
+            let installed = unsafe { libc::dup2(seed.as_raw_fd(), SANDBOX_WRAPPER_ERROR_FD) };
+            assert_eq!(installed, SANDBOX_WRAPPER_ERROR_FD);
+            drop(seed);
+            unsafe { OwnedFd::from_raw_fd(SANDBOX_WRAPPER_ERROR_FD) }
+        };
+        let executable: OwnedFd = File::open("/dev/null").expect("executable").into();
+        let current: OwnedFd = File::open("/dev/null").expect("current").into();
+        let identity = crate::launcher::ExecutableIdentity::for_test(1, 2);
+        let wrapper = PreparedWrapper::new(
+            executable,
+            identity,
+            vec![CString::new("true").expect("argv")],
+            Vec::new(),
+            SpawnStdioParts::Inherit,
+            Vec::new(),
+            current,
+            identity,
+            identity,
+            Vec::new().into_boxed_slice(),
+            NonZeroU64::new(1024).expect("limit"),
+        )
+        .expect("wrapper");
+        let request = atomic_cloexec_pipe().expect("request");
+        let status = atomic_cloexec_pipe().expect("status");
+        let error_pipe = atomic_cloexec_pipe().expect("error pipe");
+        drop(hold_fd6);
+        assert_ne!(error_pipe.write.as_raw_fd(), SANDBOX_WRAPPER_ERROR_FD);
+        let pid = fork_sandbox_child(
+            &wrapper,
+            request.read.as_raw_fd(),
+            status.write.as_raw_fd(),
+            error_pipe.write.as_raw_fd(),
+            Some(-1),
+        )
+        .expect("fork wrapper child");
+        drop(request);
+        drop(status);
+        drop(error_pipe.write);
+        let read_fd = error_pipe.read.as_raw_fd();
+        let flags = unsafe { libc::fcntl(read_fd, libc::F_GETFL) };
+        assert_eq!(unsafe { libc::fcntl(read_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) }, 0);
+        let mut poll_fd = libc::pollfd {
+            fd: read_fd,
+            events: libc::POLLIN | libc::POLLHUP,
+            revents: 0,
+        };
+        let polled = unsafe { libc::poll(&mut poll_fd, 1, 2_000) };
+        let mut frame = [0_u8; WRAPPER_ERROR_FRAME_BYTES];
+        let frame_len = if polled > 0 {
+            unsafe { libc::read(read_fd, frame.as_mut_ptr().cast(), frame.len()) }
+        } else {
+            0
+        };
+        let mut status_code = 0;
+        let mut waited = 0;
+        for _ in 0..20 {
+            waited = unsafe {
+                libc::waitpid(pid.get() as libc::pid_t, &mut status_code, libc::WNOHANG)
+            };
+            if waited != 0 {
+                break;
+            }
+            unsafe { libc::poll(std::ptr::null_mut(), 0, 10) };
+        }
+        if waited == 0 {
+            unsafe { libc::kill(pid.get() as libc::pid_t, libc::SIGKILL) };
+            unsafe { libc::waitpid(pid.get() as libc::pid_t, &mut status_code, 0) };
+        }
+        let inner_exit = if libc::WIFEXITED(status_code) {
+            libc::WEXITSTATUS(status_code)
+        } else {
+            -1
+        };
+        let mut out = [0_u8; 20];
+        out[0..4].copy_from_slice(&inner_exit.to_le_bytes());
+        out[4..8].copy_from_slice(&(frame_len as i32).to_le_bytes());
+        out[8..].copy_from_slice(&frame);
+        let _ = write_all_raw(report.as_raw_fd(), &out);
+        drop(report);
+        unsafe { libc::_exit(0) };
     }
 }

@@ -122,7 +122,7 @@ async fn hermetic_parent(
     let workspace = WorkspaceRoots::new(&cwd, additional_roots).expect("parent workspace");
     let parent = Session::new_with_todo_additional_tools_filtered_discovery_workspace_and_uri(
         SessionOptions {
-            model: parent_model.clone(),
+            model: Some(parent_model.clone()),
             cwd,
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -238,7 +238,7 @@ async fn reliability_fixture(
     agents.extend(scenarios.iter().map(|(definition, _)| definition.clone()));
     let mut config =
         OrchestrationConfig::new(AgentCatalog::from_agents(agents), root.join("artifacts"));
-    config.parent_model = parent_model.clone();
+    config.parent_model = Some(parent_model.clone());
     let runtime = OrchestrationRuntime::new(
         config,
         OrchestrationRuntime::child_factory_from_session(&parent),

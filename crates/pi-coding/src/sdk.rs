@@ -247,7 +247,7 @@ impl AgentSessionBuilder {
         let additional_tools = self.additional_tools;
 
         let mut options = SessionOptions {
-            model: self.model,
+            model: Some(self.model),
             cwd: self.cwd,
             system_prompt: self.system_prompt,
             thinking_level: self.thinking_level,
@@ -287,17 +287,19 @@ impl AgentSessionBuilder {
             if self.prefer_saved_model
                 && let (Some(provider), Some(model_id)) =
                     (context.provider.as_deref(), context.model_id.as_deref())
-                && (options.model.provider != provider || options.model.id != model_id)
+                && options.model.as_ref().is_some_and(|model| {
+                    model.provider != provider || model.id != model_id
+                })
             {
                 let restored =
                     restore_recorded_model(provider, model_id, options.auth_resolver.clone()).await;
                 if let Some((model, api_key)) = restored {
-                    options.model = model;
+                    options.model = Some(model);
                     options.api_key = api_key;
-                } else {
+                } else if let Some(current) = options.model.as_ref() {
                     model_fallback_message = Some(format!(
                         "Could not restore model {provider}/{model_id}. Using {}/{}",
-                        options.model.provider, options.model.id
+                        current.provider, current.id
                     ));
                 }
             }

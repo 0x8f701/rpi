@@ -6,6 +6,7 @@
 import fs from 'node:fs';
 
 import { chromium } from 'playwright';
+import { openSessionsDrawer } from './lib/feature-menu.mjs';
 
 const url = process.env.RPI_URL;
 const token = process.env.RPI_TOKEN || '';
@@ -1135,14 +1136,14 @@ async function main() {
     await page.setViewportSize({ width: 390, height: 844 });
     // The crossing itself must collapse the inherited-open desktop rail into
     // the closed mobile drawer (breakpoint-owned visibility default), so the
-    // FIRST hamburger press below OPENS instead of closing a leaked-open
-    // drawer.
+    // FIRST feature-menu Sessions open below OPENS instead of closing a
+    // leaked-open drawer.
     await waitFor(
       page,
       () => document.querySelector('.app-layout')?.classList.contains('app-layout--drawer-open') === false,
       'desktop-open rail never collapsed on the desktop→mobile crossing'
     );
-    await page.click('#sidebar-toggle-btn');
+    await openSessionsDrawer(page);
     await waitFor(
       page,
       () => document.querySelector('.app-layout')?.classList.contains('app-layout--drawer-open') === true,
@@ -1171,9 +1172,9 @@ async function main() {
     await assertDemandHeadTailJourney(page, SESSION_C, 'mobile C demand head/tail window walk');
     // Every mobile pick closes the drawer (App onSwitchComplete contract),
     // so each subsequent fast-switch row click re-opens it with exactly ONE
-    // hamburger press — never a double-press workaround.
+    // feature-menu Sessions open — never a double-open workaround.
     const openMobileDrawer = async (label) => {
-      await page.click('#sidebar-toggle-btn');
+      await openSessionsDrawer(page);
       await waitFor(
         page,
         () => document.querySelector('.app-layout')?.classList.contains('app-layout--drawer-open') === true,

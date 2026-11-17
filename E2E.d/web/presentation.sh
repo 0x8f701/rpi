@@ -70,6 +70,18 @@ main() {
   }
 }
 EOF
+    mkdir -p "$root/home/.rpi/agents"
+    cat >"$root/home/.rpi/agents/writer.md" <<'EOF'
+---
+name: writer
+description: Write assigned content
+tools:
+  - read
+  - write
+  - hub
+---
+You are the writer agent for deterministic web e2e coverage.
+EOF
 
     # Seed workspace: git repo + deterministic media fixtures + foreign sessions.
     require_cmd git

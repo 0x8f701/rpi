@@ -33,6 +33,7 @@
 import { chromium } from 'playwright';
 import fs from 'node:fs';
 import path from 'node:path';
+import { openSessionsDrawer } from './lib/feature-menu.mjs';
 
 const url = process.env.RPI_URL;
 const token = process.env.RPI_TOKEN || '';
@@ -286,6 +287,19 @@ async function main() {
     await page.goto(url, { waitUntil: 'domcontentloaded' });
 
     // SMD1 — boot: all four rows listed, A active (resumed primary).
+    // Committed default active-path collapse hides the foreign Codex provider; real-click it open for SMD1.
+    const codexHead = page.locator('button.session-sidebar__group-head[data-group-kind="provider"][data-provider="Codex"]');
+    await codexHead.waitFor({ state: 'visible', timeout: 30000 });
+    if (await codexHead.getAttribute('aria-expanded') === 'false') {
+      await codexHead.click();
+    }
+    // Probe-proven: the Codex provider nests a collapsed workspace project subgroup; real-click it open too.
+    for (;;) {
+      const codexSub = page.locator('button.session-sidebar__group-head[data-group-kind="project"][data-subgroup-kind="project"][data-provider="Codex"][aria-expanded="false"]').first();
+      if (await codexSub.count() === 0) break;
+      await codexSub.click();
+      await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    }
     await waitFor(
       page,
       (sids) => {
@@ -565,6 +579,13 @@ async function main() {
 
     // Destination row regrouped under the target project; source group lost
     // the row; active retained with zero switch_session frames.
+    // The move regroups C under the collapsed non-active beta project; real-click it open for the regroup assertions.
+    const betaHead = page.locator('.session-sidebar__group-head[data-group-kind="project"]')
+      .filter({ hasText: TARGET_PROJECT });
+    await betaHead.waitFor({ state: 'visible', timeout: 30000 });
+    if (await betaHead.getAttribute('aria-expanded') === 'false') {
+      await betaHead.click();
+    }
     await waitFor(
       page,
       ({ source, target, moved }) => {
@@ -628,20 +649,27 @@ async function main() {
     // active row (C) stays disabled; the idle-LOADED A row is eligible
     // (its loaded state is asserted explicitly below, never assumed).
     await page.setViewportSize({ width: 390, height: 667 });
-    // Drawer pre-state: only click the hamburger from a CLOSED drawer, then
-    // assert the closed→open transition; an already-open pre-state skips
-    // the click but must still end open.
+    // Drawer pre-state: only open through the feature menu from a CLOSED
+    // drawer, then assert the closed→open transition; an already-open
+    // pre-state skips the open but must still end open.
     const drawerWasOpen = await page.evaluate(
       () => document.querySelector('.app-layout')?.classList.contains('app-layout--drawer-open') === true,
     );
     if (!drawerWasOpen) {
-      await page.click('#sidebar-toggle-btn');
+      await openSessionsDrawer(page);
       await waitFor(
         page,
         () => document.querySelector('.app-layout')?.classList.contains('app-layout--drawer-open') === true,
-        'SMD7: hamburger click never opened the drawer (closed→open)',
+        'SMD7: feature-menu Sessions open never opened the drawer (closed→open)',
         10000,
       );
+    }
+    // C's activation made the source project subgroup non-active-collapsed; real-click it open for the A-row eligibility checks.
+    const sourceHead = page.locator('.session-sidebar__group-head[data-group-kind="project"]')
+      .filter({ hasText: SOURCE_PROJECT });
+    await sourceHead.waitFor({ state: 'visible', timeout: 30000 });
+    if (await sourceHead.getAttribute('aria-expanded') === 'false') {
+      await sourceHead.click();
     }
     state = await sidebarState(page);
     if (requireRow(state, SID_A, 'SMD7 idle A').loaded !== true) {

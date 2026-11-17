@@ -113,7 +113,7 @@ fn parent_session() -> Session {
         .boxed()
     });
     let session = Session::new(SessionOptions {
-        model: model(),
+        model: Some(model()),
         cwd: std::env::current_dir().expect("cwd"),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,
@@ -159,7 +159,7 @@ fn child_factory(contexts: Arc<Mutex<Vec<Context>>>) -> ChildSessionFactory {
             });
             Ok(recorded_session(
                 Session::new(SessionOptions {
-                    model: request.model,
+                    model: Some(request.model),
                     cwd: std::env::current_dir().expect("cwd"),
                     system_prompt: request.system_prompt,
                     thinking_level: request.thinking_level.unwrap_or(ThinkingLevel::Off),
@@ -186,7 +186,7 @@ async fn spawned_workflow_workers_stay_out_of_definition_discovery() {
     let mut config =
         OrchestrationConfig::new(AgentCatalog::from_agents(definitions.clone()), root.path());
     config.default_agent = "researcher".to_owned();
-    config.parent_model = model();
+    config.parent_model = Some(model());
     let contexts = Arc::new(Mutex::new(Vec::new()));
     let runtime =
         OrchestrationRuntime::new(config, child_factory(contexts.clone())).expect("runtime");

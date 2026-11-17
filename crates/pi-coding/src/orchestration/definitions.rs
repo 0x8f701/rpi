@@ -555,10 +555,15 @@ pub fn unknown_tools_warning(name: &str, unknown: &[String]) -> String {
     )
 }
 
-pub fn agent_model_error(name: &str, error: &anyhow::Error) -> anyhow::Error {
-    anyhow!(
-        "agent `{name}` is unavailable because its model configuration is invalid: {error}; choose a valid model with /agents or settings.agents.{name}.model"
-    )
+/// Wrap a resolution failure with the actionable operator message while keeping
+/// the typed cause in the error chain. Callers downcast
+/// [`pi_agent::ModelNotConfigured`] to distinguish "no model configured yet"
+/// from a genuinely invalid model configuration.
+pub fn agent_model_error(name: &str, error: anyhow::Error) -> anyhow::Error {
+    let detail = format!("{error:#}");
+    error.context(format!(
+        "agent `{name}` is unavailable because its model configuration is invalid: {detail}; choose a valid model with /agents or settings.agents.{name}.model"
+    ))
 }
 
 /// Whether `name` may be spawned given effective settings. Missing entries default to enabled.
@@ -573,13 +578,12 @@ pub fn enabled_agent_definitions<'a>(
     agent_settings: &std::collections::BTreeMap<String, AgentRuntimeSettings>,
 ) -> Vec<&'a AgentDefinition> {
     let available = available_models();
-    let parent_model = Model::default();
     agents
         .iter()
         .filter(|agent| {
             let settings = agent_settings.get(&agent.name);
             settings.map_or(true, AgentRuntimeSettings::is_enabled)
-                && agent_compatibility_error(agent, settings, &parent_model, &available).is_none()
+                && agent_compatibility_error(agent, settings, None, &available).is_none()
         })
         .collect()
 }
@@ -588,16 +592,29 @@ pub fn enabled_agent_definitions<'a>(
 /// declared tools never make an agent unavailable: they are silently ignored
 /// (with a deduped warning via [`unknown_tools_warning`]), so this check only
 /// covers model resolution.
+///
+/// A missing parent model is not a definition defect: a definition whose model
+/// resolves only from the parent stays compatible and simply awaits a parent
+/// model. Explicit invalid model configuration always reports an error.
 #[must_use]
 pub fn agent_compatibility_error(
     definition: &AgentDefinition,
     settings: Option<&AgentRuntimeSettings>,
-    parent_model: &Model,
+    parent_model: Option<&Model>,
     available: &[Model],
 ) -> Option<anyhow::Error> {
-    resolve_agent_model(definition, settings, parent_model, available)
-        .err()
-        .map(|error| agent_model_error(&definition.name, &error))
+    match resolve_agent_model(definition, settings, parent_model, available) {
+        Ok(_) => None,
+        Err(error)
+            if parent_model.is_none()
+                && error
+                    .downcast_ref::<pi_agent::ModelNotConfigured>()
+                    .is_some() =>
+        {
+            None
+        }
+        Err(error) => Some(agent_model_error(&definition.name, error)),
+    }
 }
 
 /// Resolve the model a child session should use.
@@ -605,15 +622,17 @@ pub fn agent_compatibility_error(
 /// Precedence:
 /// 1. settings override (`settings.agents.<name>.model`)
 /// 2. first matching entry in `definition.model`
-/// 3. parent session model
+/// 3. parent session model, when one is configured
 ///
 /// An explicit settings override is an operator request, not a fallback hint, so
 /// an invalid override is rejected instead of silently using the definition or
-/// parent model.
+/// parent model. With no override, no matching definition model, and no parent
+/// model, resolution fails with the typed [`pi_agent::ModelNotConfigured`] —
+/// never a defaulted placeholder model.
 pub fn resolve_agent_model(
     definition: &AgentDefinition,
     agent_settings: Option<&AgentRuntimeSettings>,
-    parent_model: &Model,
+    parent_model: Option<&Model>,
     available: &[Model],
 ) -> Result<ResolvedAgentModel> {
     if let Some(pattern) = agent_settings.and_then(AgentRuntimeSettings::model_override) {
@@ -692,6 +711,9 @@ pub fn resolve_agent_model(
         }
     }
 
+    let Some(parent_model) = parent_model else {
+        return Err(anyhow::Error::new(pi_agent::ModelNotConfigured));
+    };
     let selector = model_id(parent_model);
     Ok(ResolvedAgentModel {
         model: parent_model.clone(),
@@ -710,7 +732,7 @@ pub fn resolve_agent_model(
 pub fn resolve_agent_model_from_settings(
     definition: &AgentDefinition,
     settings: &Settings,
-    parent_model: &Model,
+    parent_model: Option<&Model>,
     available: &[Model],
 ) -> Result<ResolvedAgentModel> {
     resolve_agent_model(
@@ -751,13 +773,19 @@ fn split_agent_model_thinking_suffix(pattern: &str) -> (&str, Option<ThinkingLev
     (model, Some(thinking_level))
 }
 
-fn match_model_pattern(pattern: &str, available: &[Model], parent_model: &Model) -> Result<Model> {
+fn match_model_pattern(
+    pattern: &str,
+    available: &[Model],
+    parent_model: Option<&Model>,
+) -> Result<Model> {
     if let Some(model) = find_matching_model(pattern, available)? {
         return Ok(model);
     }
     // Keep parent when the pattern literally names the parent even if the catalog
     // is empty or filtered (tests and offline child factories).
-    if model_matches_pattern(parent_model, pattern) {
+    if let Some(parent_model) = parent_model
+        && model_matches_pattern(parent_model, pattern)
+    {
         return Ok(parent_model.clone());
     }
     // When a catalog was supplied, do not invent models for unmatched patterns —
@@ -1752,7 +1780,7 @@ mod model_resolution_tests {
             model: Some("cliproxy/gpt-5.6-sol:max".to_owned()),
             tools: None,
         };
-        let resolved = resolve_agent_model(&definition, Some(&settings), &parent, &available)
+        let resolved = resolve_agent_model(&definition, Some(&settings), Some(&parent), &available)
             .expect("valid model with max suffix must resolve");
         assert_eq!(resolved.model.provider, "cliproxy");
         assert_eq!(resolved.model.id, "gpt-5.6-sol");
@@ -1780,7 +1808,7 @@ mod model_resolution_tests {
             ]),
         );
         let resolved =
-            resolve_agent_model(&definition, None, &parent, &available).expect("ordered sequence");
+            resolve_agent_model(&definition, None, Some(&parent), &available).expect("ordered sequence");
         assert_eq!(resolved.selected_index, 0);
         assert_eq!(resolved.sequence.len(), 3);
         assert_eq!(resolved.sequence[0].selector, "anthropic/claude-sonnet-4-5");
@@ -1810,7 +1838,7 @@ mod model_resolution_tests {
             model: Some("anthropic/claude-sonnet-4-5".to_owned()),
             tools: None,
         };
-        let resolved = resolve_agent_model(&definition, Some(&settings), &parent, &available)
+        let resolved = resolve_agent_model(&definition, Some(&settings), Some(&parent), &available)
             .expect("settings override must resolve");
         assert_eq!(resolved.source, AgentModelSource::SettingsOverride);
         assert_eq!(resolved.model.provider, "anthropic");
@@ -1836,7 +1864,7 @@ mod model_resolution_tests {
                 "openai/gpt-4.1",
             ]),
         );
-        let resolved = resolve_agent_model(&definition, None, &parent, &available)
+        let resolved = resolve_agent_model(&definition, None, Some(&parent), &available)
             .expect("definition fallback must resolve");
         assert_eq!(resolved.source, AgentModelSource::DefinitionFallback);
         assert_eq!(resolved.model.provider, "anthropic");
@@ -1851,7 +1879,7 @@ mod model_resolution_tests {
         let parent = model("openai", "gpt-4.1");
         let available = vec![model("anthropic", "claude-sonnet-4-5")];
         let definition = def("task", Some(vec!["missing/one", "missing/two"]));
-        let resolved = resolve_agent_model(&definition, None, &parent, &available)
+        let resolved = resolve_agent_model(&definition, None, Some(&parent), &available)
             .expect("parent fallback must resolve");
         assert_eq!(resolved.source, AgentModelSource::Parent);
         assert_eq!(resolved.model.id, "gpt-4.1");
@@ -1895,7 +1923,7 @@ mod model_resolution_tests {
             model: Some("openai".to_owned()),
             tools: None,
         };
-        let error = resolve_agent_model(&definition, Some(&settings), &parent, &available)
+        let error = resolve_agent_model(&definition, Some(&settings), Some(&parent), &available)
             .expect_err("provider-only multi-match must fail");
         let message = error.to_string();
         assert!(message.contains("ambiguous"), "{message}");
@@ -1910,7 +1938,7 @@ mod model_resolution_tests {
             model("anthropic", "shared-id"),
         ];
         let definition = def("reviewer", Some(vec!["shared-id"]));
-        let error = resolve_agent_model(&definition, None, &parent, &available)
+        let error = resolve_agent_model(&definition, None, Some(&parent), &available)
             .expect_err("bare id multi-match must fail");
         let message = error.to_string();
         assert!(message.contains("ambiguous"), "{message}");
@@ -1927,7 +1955,7 @@ mod model_resolution_tests {
             model: Some("openai/gpt-4.1-mini".to_owned()),
             tools: None,
         };
-        let resolved = resolve_agent_model(&definition, Some(&settings), &parent, &available)
+        let resolved = resolve_agent_model(&definition, Some(&settings), Some(&parent), &available)
             .expect("exact provider/id must resolve");
         assert_eq!(resolved.model.id, "gpt-4.1-mini");
     }
@@ -1959,7 +1987,7 @@ mod model_resolution_tests {
             model: Some("totally-missing/model".to_owned()),
             tools: None,
         };
-        let error = resolve_agent_model(&definition, Some(&settings), &parent, &available)
+        let error = resolve_agent_model(&definition, Some(&settings), Some(&parent), &available)
             .expect_err("invalid settings override must not fall through");
         let message = error.to_string();
         assert!(
@@ -1967,6 +1995,44 @@ mod model_resolution_tests {
             "{message}"
         );
         assert!(message.contains("totally-missing/model"), "{message}");
+    }
+
+    #[test]
+    fn absent_parent_without_override_is_typed_model_not_configured() {
+        let available = vec![model("anthropic", "claude-sonnet-4-5")];
+        let definition = def("task", None);
+        let error = resolve_agent_model(&definition, None, None, &available)
+            .expect_err("no override, no definition model, no parent must fail");
+        assert!(
+            error
+                .downcast_ref::<pi_agent::ModelNotConfigured>()
+                .is_some(),
+            "expected typed ModelNotConfigured, got {error:#}"
+        );
+    }
+
+    #[test]
+    fn definition_or_override_resolves_without_parent() {
+        let available = vec![
+            model("anthropic", "claude-sonnet-4-5"),
+            model("openai", "gpt-4.1"),
+        ];
+        let definition = def("reviewer", Some(vec!["anthropic/claude-sonnet-4-5"]));
+        let resolved = resolve_agent_model(&definition, None, None, &available)
+            .expect("definition model must resolve without a parent");
+        assert_eq!(resolved.source, AgentModelSource::DefinitionFallback);
+        assert_eq!(resolved.model.id, "claude-sonnet-4-5");
+
+        let settings = AgentRuntimeSettings {
+            enabled: Some(true),
+            model: Some("openai/gpt-4.1".to_owned()),
+            tools: None,
+        };
+        let parentless = def("coordinate", None);
+        let resolved = resolve_agent_model(&parentless, Some(&settings), None, &available)
+            .expect("settings override must resolve without a parent");
+        assert_eq!(resolved.source, AgentModelSource::SettingsOverride);
+        assert_eq!(resolved.model.id, "gpt-4.1");
     }
 }
 
@@ -2263,7 +2329,7 @@ mod child_tool_validation_tests {
             "only the truly unknown tool is unsupported: {unsupported:?}"
         );
         let error =
-            agent_compatibility_error(&definition, None, &Model::default(), &available_models());
+            agent_compatibility_error(&definition, None, None, &available_models());
         assert!(
             error.is_none(),
             "unknown tools must not make the definition incompatible: {error:?}"
@@ -2317,7 +2383,7 @@ mod child_tool_validation_tests {
             "only the ghost/unknown names are unsupported: {unsupported:?}"
         );
         let error =
-            agent_compatibility_error(&definition, None, &Model::default(), &available_models());
+            agent_compatibility_error(&definition, None, None, &available_models());
         assert!(
             error.is_none(),
             "a qa-style definition with ghost tools must stay available: {error:?}"

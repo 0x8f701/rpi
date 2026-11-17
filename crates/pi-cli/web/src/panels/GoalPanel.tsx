@@ -201,6 +201,10 @@ export function GoalPanel({ state, journal, sendCommand, onChanged, onClose }: G
         </button>
       </div>
 
+      {/* Sole scroll surface: the head above stays a fixed flex item, so no
+          journal row can ever paint through a strip above it. */}
+      <div className="goal-panel__body">
+
       {error !== '' && <div className="goal-panel__error">{safeText(error)}</div>}
 
       {!goal && (
@@ -365,12 +369,18 @@ export function GoalPanel({ state, journal, sendCommand, onChanged, onClose }: G
                 </span>
                 <span className="goal-journal__kind">{formatKind(entry.kind)}</span>
                 {entry.goal && entry.goal.objective && (
-                  <span className="goal-journal__objective">{safeText(entry.goal.objective)}</span>
+                  <details className="goal-journal__objective">
+                    <summary>
+                      {safeText(entry.goal.objective.length > 120 ? `${entry.goal.objective.slice(0, 119)}\u2026` : entry.goal.objective)}
+                    </summary>
+                    <div className="goal-journal__objective-full">{safeText(entry.goal.objective)}</div>
+                  </details>
                 )}
               </li>
             ))}
           </ul>
         )}
+      </div>
       </div>
     </section>
   );

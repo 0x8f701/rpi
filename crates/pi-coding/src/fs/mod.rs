@@ -18,10 +18,12 @@ pub(crate) use capability::{
     CapabilityEntryAuthority, CapabilityExecutableSource, CapabilityFile, CapabilityFs,
     CapabilityReadDir, CapabilityRevisionRoots, CapabilityRootLease, CapabilityRootPurpose,
     CapabilitySpawnSource, CapabilityWorkingDirectorySource, CapabilityWritableFile, EntryKind,
-    FileIdentity, FileMode, FsMetadata, ManagedCapabilityFile, ManagedLinkIdentity, Replacement,
+    FileIdentity, FileMode, ManagedCapabilityFile, ManagedLinkIdentity, Replacement,
     ReplacementTarget, RootCreation, StreamCopyBuffer, StreamingReplacement, is_link_blocked,
 };
-pub use capability::{FsError, FsOperation, SessionFileIdentity};
+#[cfg(test)]
+pub(crate) use capability::{EnumeratedChildOpenFaultGuard, arm_enumerated_child_open_fault};
+pub use capability::{FsError, FsMetadata, FsOperation, SessionFileIdentity};
 pub(crate) use policy::{
     FsAuthority, PolicyDirEntry, PolicyDirectory, PolicyFile, PolicyFs, PolicyOpenedEntry,
     PolicyReadDir, PolicyReplacement, PolicyScratch, PolicyScratchRoot, PolicyWritableFile,

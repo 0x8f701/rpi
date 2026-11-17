@@ -4,13 +4,10 @@ import hashlib
 import io
 import os
 import tarfile
-import zipfile
 from pathlib import Path
 
 TARGETS = (
-    "aarch64-apple-darwin",
     "aarch64-unknown-linux-gnu",
-    "x86_64-apple-darwin",
     "x86_64-unknown-linux-gnu",
 )
 
@@ -39,13 +36,6 @@ def main() -> None:
             license_info.mode = 0o644
             bundle.addfile(license_info, io.BytesIO(license_bytes))
         archives.append(archive)
-    windows = output / f"rpi-{args.version}-x86_64-pc-windows-msvc.zip"
-    with zipfile.ZipFile(windows, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
-        info = zipfile.ZipInfo("rpi.exe")
-        info.external_attr = 0o755 << 16
-        bundle.writestr(info, binary)
-        bundle.writestr("LICENSE", license_bytes)
-    archives.append(windows)
     with (output / "SHA256SUMS").open("w", encoding="utf-8") as manifest:
         for archive in sorted(archives):
             digest = hashlib.sha256(archive.read_bytes()).hexdigest()

@@ -262,7 +262,7 @@ async fn handle_slash(
                             println!("No steering prompts to send");
                         }
                     } else {
-                        match application.send_queued_steering_now().await {
+                        match application.send_queued_steering_now(None).await {
                             Ok(result) => {
                                 if result.combined {
                                     println!("Sent {} steering prompts together", result.sent);
@@ -540,9 +540,18 @@ async fn handle_slash(
                 &|operand| crate::code_review::review_operand_is_directory(application, operand),
             ) {
                 Ok(target) => {
-                    match crate::code_review::review_repository_root(
+                    let revision = match &target.scope {
+                        crate::code_review::ReviewScope::Commit { commit, .. } => {
+                            Some(commit.as_str())
+                        }
+                        crate::code_review::ReviewScope::WorkingTree
+                        | crate::code_review::ReviewScope::BaseToWorkingTree { .. }
+                        | crate::code_review::ReviewScope::Revisions { .. } => None,
+                    };
+                    match crate::code_review::resolve_review_repository_root(
                         application,
                         target.repo.as_deref(),
+                        revision,
                     ) {
                         Ok(cwd) => {
                             let snapshot = crate::code_review::load_review_snapshot_for(
@@ -566,14 +575,23 @@ async fn handle_slash(
                     println!("The /show picker is a full-screen TUI page; pass a ref here.");
                 }
                 Ok(crate::interactive_commands::CommitInspectInvocation::Commit { reference }) => {
-                    let snapshot = crate::code_review::load_review_snapshot_for(
-                        session.cwd(),
-                        crate::code_review::ReviewScope::Commit {
-                            commit: reference,
-                            label: String::new(),
-                        },
-                    );
-                    print_review_snapshot(&snapshot);
+                    match crate::code_review::resolve_review_repository_root(
+                        application,
+                        None,
+                        Some(reference.as_str()),
+                    ) {
+                        Ok(cwd) => {
+                            let snapshot = crate::code_review::load_review_snapshot_for(
+                                &cwd,
+                                crate::code_review::ReviewScope::Commit {
+                                    commit: reference,
+                                    label: String::new(),
+                                },
+                            );
+                            print_review_snapshot(&snapshot);
+                        }
+                        Err(error) => error_line(&error.to_string()),
+                    }
                 }
                 Err(error) => error_line(&error),
             }
@@ -1147,7 +1165,7 @@ mod tests {
         });
         let session = Session::new_with_additional_tools_filtered_and_discovery(
             SessionOptions {
-                model,
+                model: Some(model),
                 cwd: cwd.to_path_buf(),
                 system_prompt: String::new(),
                 thinking_level: ThinkingLevel::Off,

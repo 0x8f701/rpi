@@ -114,7 +114,7 @@ impl SessionSpawner for WireSpawner {
 async fn isolated_session(model: pi_ai::Model, cwd: &Path) -> (Session, TempDir) {
     let session = Session::new_with_todo_and_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model,
+            model: Some(model),
             cwd: cwd.to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,

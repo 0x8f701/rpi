@@ -113,7 +113,7 @@ fn scripted(messages: Vec<AssistantMessage>) -> StreamFn {
 fn options(stream_fn: StreamFn, tools: Vec<AgentTool>) -> AgentOptions {
     AgentOptions {
         initial_state: AgentState {
-            model: model(),
+            model: Some(model()),
             tools,
             ..AgentState::default()
         },

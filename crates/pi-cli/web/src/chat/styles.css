@@ -59,6 +59,21 @@
   display: none;
 }
 
+.chat-app .chat-context .file-explorer__body > .file-conversation {
+  flex: 1 1 auto;
+  width: 100%;
+  max-width: none;
+  min-width: 0;
+  height: auto;
+  min-height: 160px;
+}
+
+.chat-app .chat-context .file-explorer__body--tree-collapsed > .file-explorer__content-viewport {
+  flex: 1 1 auto;
+  min-height: 160px;
+  height: auto;
+}
+
 
 
 .chat-context__owned-pane {
@@ -70,6 +85,7 @@
   overflow: hidden;
 }
 .chat-app {
+  --chat-gutter-x: 16px;
   min-height: 100%;
   max-width: 100vw;
   overflow-x: hidden;
@@ -79,6 +95,18 @@
   padding: 20px 24px 24px;
   background: var(--bg);
   color: var(--fg);
+}
+
+@media (max-width: 768px) {
+  .chat-app {
+    --chat-gutter-x: 12px;
+  }
+}
+
+@media (max-width: 480px) {
+  .chat-app {
+    --chat-gutter-x: 10px;
+  }
 }
 
 .chat-app--projects {
@@ -107,52 +135,6 @@
   z-index: 30;
   min-height: 44px;
 }
-
-.chat-workspace-bar__menu {
-  position: relative;
-  flex: none;
-}
-
-.chat-workspace-menu {
-  position: absolute;
-  top: 100%;
-  right: 0;
-  z-index: 31;
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 6px;
-  min-width: min(280px, calc(100vw - 16px));
-  padding: 8px;
-  border: 1px solid var(--border);
-  border-top: none;
-  background: var(--bg-panel);
-}
-
-.chat-workspace-menu > :last-child:nth-child(odd) {
-  grid-column: 1 / -1;
-}
-
-.chat-workspace-menu a.panel-toggle {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 100%;
-  min-width: 0;
-  min-height: 44px;
-  text-decoration: none;
-  box-sizing: border-box;
-  border: 1px solid var(--border);
-  background: var(--bg);
-  font: inherit;
-  cursor: pointer;
-}
-
-.chat-workspace-menu a.panel-toggle:hover {
-  background: var(--bg-hover);
-  border-color: var(--border-strong);
-  color: var(--fg);
-}
-
 
 .chat-panel h2,
 .chat-project-header h1,
@@ -857,7 +839,7 @@ a.chat-button:hover {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 2px 2px 8px;
+  padding: 2px 9px 8px;
   min-width: 0;
   background: var(--bg);
   border: none;
@@ -1120,7 +1102,7 @@ a.chat-button:hover {
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   gap: 10px 16px;
-  padding: 8px 12px;
+  padding: 8px var(--chat-gutter-x);
   border-bottom: 1px solid var(--border-strong);
   box-sizing: border-box;
   flex: none;
@@ -1603,7 +1585,7 @@ a.chat-button:hover {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  padding: 18px;
+  padding: 18px var(--chat-gutter-x);
   overflow-anchor: none;
 }
 
@@ -1665,6 +1647,21 @@ a.chat-button:hover {
 
 .chat-session-message {
   padding: 8px 12px;
+}
+
+/* Global `.msg--assistant` (loaded after this chat bundle) owns the shared
+ * reply-action band and would otherwise force width:100%, padding-inline:0
+ * and display:flex onto this article. Restore the chat measure/padding for
+ * assistant rows only; the shared min-heights remain in charge via
+ * `.msg--assistant:has(...)`, so no new marker or min-height is needed. */
+.chat-session-message--assistant.msg--assistant {
+  width: min(100%, 840px);
+  padding: 8px 12px 8px 26px;
+  display: block;
+}
+
+@media (pointer: coarse), (hover: none), (max-width: 720px) {
+  .chat-session-message--assistant.msg--assistant { padding-left: 50px; }
 }
 
 .chat-session-tool,
@@ -1823,7 +1820,7 @@ a.chat-button:hover {
   flex-direction: column;
   align-items: stretch;
   gap: 6px;
-  padding: 6px 14px;
+  padding: 6px var(--chat-gutter-x);
   border-top: 1px solid var(--border-strong);
   position: sticky;
   bottom: 0;
@@ -1956,7 +1953,7 @@ a.chat-button:hover {
 }
 
 .chat-session__feedback {
-  padding: 0 16px 14px;
+  padding: 0 var(--chat-gutter-x) 14px;
 }
 
 .chat-session-toast {
@@ -2015,7 +2012,7 @@ a.chat-button:hover {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  padding: 16px;
+  padding: 16px var(--chat-gutter-x);
   border-left: 1px solid var(--border-strong);
   overflow: hidden;
 }
@@ -2163,7 +2160,7 @@ a.chat-button:hover {
     max-height: 100dvh;
   }
   .chat-runner-header {
-    padding: 8px 12px;
+    padding: 8px var(--chat-gutter-x);
     min-height: 60px;
     align-items: center;
   }

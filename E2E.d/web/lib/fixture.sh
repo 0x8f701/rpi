@@ -228,6 +228,9 @@ EOF
 #                              the tokenless policy (loopback accepts browsers;
 #                              the page auto-connects with an empty token).
 #                              Default (0) keeps the tokened fixture.
+#   RPI_WS_TRANSPORT_TIMING    explicit 1 enables server enqueue timing;
+#                              any other value (including unset) is 0. No
+#                              other caller environment is forwarded.
 
 web_spawn_rpi() {
     web_prepare_dist "$WORK_ROOT/web-dist"
@@ -265,6 +268,7 @@ web_spawn_rpi() {
             HOME="$root/home" USERPROFILE="$root/home" \
             PATH="${PATH:-/usr/bin:/bin}" LANG="${LANG:-C.UTF-8}" LC_ALL="${LC_ALL:-C.UTF-8}" \
             RPI_HOME="$root/home/.rpi" \
+            RPI_WS_TRANSPORT_TIMING="$([ "${RPI_WS_TRANSPORT_TIMING:-}" = "1" ] && printf 1 || printf 0)" \
             RPI_OFFLINE=1 RPI_SKIP_VERSION_CHECK=1 \
             RPI_WEB_DEV_DIR="${RPI_WEB_DEV_DIR:-}" \
             "$RPI_BIN" --offline "${extra_args[@]}" \
@@ -382,6 +386,8 @@ web_run_playwright() {
         mkdir -p "$work/lib"
         cp "$WEB_FIXTURE_DIR/session-lifecycle.mjs" "$work/lib/session-lifecycle.mjs"
     fi
+    mkdir -p "$work/lib" && cp "$WEB_FIXTURE_DIR/feature-menu.mjs" "$work/lib/feature-menu.mjs" || return 1
+    cp "$WEB_FIXTURE_DIR/slash-completion.mjs" "$work/lib/slash-completion.mjs" || return 1
     # Hard-coverage mode: preload the V8 coverage hook (node --import) and
     # point it at the per-run payload dir. Gated on RPI_COVERAGE_DIR, so
     # normal lanes are unaffected.

@@ -16,6 +16,7 @@
 //        any non-empty assistant text satisfies the assertion)
 
 import { chromium } from 'playwright';
+import { clickFeature } from './lib/feature-menu.mjs';
 
 const url = process.env.RPI_URL;
 const token = process.env.RPI_TOKEN || '';
@@ -60,7 +61,7 @@ async function main() {
     );
 
     // ---------- Side chat ----------
-    await page.click('#sidechat-toggle-btn');
+    await clickFeature(page, '#sidechat-toggle-btn');
     await waitFor(page, () => document.querySelector('.side-chat') !== null, 'side chat panel did not open');
 
     // 1. Default tab exists.

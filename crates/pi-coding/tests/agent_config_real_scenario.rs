@@ -102,7 +102,7 @@ async fn real_enable_model_thinking_and_agent_settings_persist() {
 
     let session = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model: reasoning.clone(),
+            model: Some(reasoning.clone()),
             cwd,
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,

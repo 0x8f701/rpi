@@ -89,6 +89,21 @@ const detailWire = (revision = 7) => ({
   check('supervisor is not duplicated in agent roster', parseTodoChildDetailSnapshot({
     ...detailWire(), agents: [{ ...detailWire().supervisor }],
   }) === null);
+  check('detail accepts a cancelling child job', parseTodoChildDetailSnapshot({
+    ...detailWire(),
+    jobs: [{ ...detailWire().jobs[0], status: 'cancelling' }],
+  })?.jobs[0]?.status === 'cancelling');
+  check('child lifecycle rejects job cancelling', parseTodoChildDetailSnapshot({
+    ...detailWire(), status: 'cancelling',
+  }) === null);
+  check('child task status rejects job cancelling', parseTodoChildDetailSnapshot({
+    ...detailWire(),
+    tasks: [{ ...detailWire().tasks[0], status: 'cancelling' }],
+  }) === null);
+  check('child receipt status rejects job cancelling', parseTodoChildDetailSnapshot({
+    ...detailWire(),
+    receipts: [{ ...detailWire().receipts[0], status: 'cancelling' }],
+  }) === null);
 }
 
 {

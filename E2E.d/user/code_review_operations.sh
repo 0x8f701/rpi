@@ -90,8 +90,23 @@ release_gate() { # kind
         -d '{}' >"$evidence/release-$1.txt"
 }
 
+release_gate_to() { # kind path
+    curl -s --max-time 5 -X POST "http://127.0.0.1:${mock_port}/__release-$1" \
+        -d '{}' >"$2"
+}
+
+advance_summary_generation() {
+    curl -s --max-time 5 -X POST "http://127.0.0.1:${mock_port}/__tldr-generation" \
+        -d '{}' >"$evidence/tldr-generation.txt"
+}
+
+
 log_count() { # fixed-string -> occurrences in the mock log
     awk -v pattern="$1" 'index($0, pattern) {count++} END {print count + 0}' "$evidence/mock-server.log"
+}
+
+log_count_end() { # classification that must end the log line
+    awk -v pattern="$1" '$0 ~ ("(^| )" pattern "$") {count++} END {print count + 0}' "$evidence/mock-server.log"
 }
 
 require_mock_count() { # fixed-string expected
@@ -100,16 +115,23 @@ require_mock_count() { # fixed-string expected
     [ "$got" -eq "$2" ] || fail "user.$SCENARIO: mock log expected $2 of ${1@Q}, got $got (see $evidence/mock-server.log)"
 }
 
-wait_log() { # needle minimum-logged-count
-    local needle="$1" want="$2" deadline
-    deadline=$((SECONDS + 10))
+require_mock_count_end() { # end-anchored classification expected
+    local got
+    got="$(log_count_end "$1")"
+    [ "$got" -eq "$2" ] || fail "user.$SCENARIO: mock log expected $2 lines ending ${1@Q}, got $got (see $evidence/mock-server.log)"
+}
+
+wait_log() { # needle minimum-logged-count [timeout]
+    local needle="$1" want="$2" timeout="${3:-10}" deadline
+    deadline=$((SECONDS + timeout))
     while ((SECONDS < deadline)); do
         if [ "$(log_count "$needle")" -ge "$want" ]; then
             return 0
         fi
         sleep 0.25
     done
-    fail "user.$SCENARIO: mock log never reached $want of ${needle@Q} (see $evidence/mock-server.log)"
+    capture_to "$evidence/wait-log-timeout.txt"
+    fail "user.$SCENARIO: mock log never reached $want of ${needle@Q} within ${timeout}s (see $evidence/mock-server.log and $evidence/wait-log-timeout.txt)"
 }
 
 assert_mock_counts() {
@@ -118,6 +140,12 @@ assert_mock_counts() {
     require_mock_count 'kind=highlight' 4
     require_mock_count 'kind=manual' 1
     require_mock_count 'kind=unrouted' 0
+    require_mock_count 'kind=tldr' 6
+    require_mock_count 'tldr contract=purpose-json' 6
+    require_mock_count_end 'tldr contract=old-protocol' 0
+    require_mock_count_end 'tldr contract=old-protocol-absent' 6
+    require_mock_count 'tldr generation=1' 1
+    require_mock_count 'tldr generation=2' 5
     require_mock_count 'strict=ok' 2
     require_mock_count 'findings-schema=ok' 4
     require_mock_count 'auto-schema=absent' 1
@@ -130,6 +158,103 @@ assert_mock_counts() {
     require_mock_count 'release=highlight held=true' 3
     require_mock_count 'release=auto held=true' 1
     require_mock_count 'held=false' 0
+}
+
+assert_large_summary_proof() { # expected-patches.json
+    python3 - "$evidence/mock-server.log" "$evidence/rpi-stderr.log" "$1" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+def fail(message):
+    raise SystemExit(f"large-summary proof: {message}")
+
+mock = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace").splitlines()
+stderr = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8", errors="replace").splitlines()
+expected = json.loads(pathlib.Path(sys.argv[3]).read_text(encoding="utf-8"))["patches"]
+GEN = re.compile(r"tldr generation=(\d+) batch=(\d+)$")
+BYTES = re.compile(r"tldr prompt_bytes=(\d+) prompt_digest=([0-9a-f]{64})$")
+LARGE = re.compile(r"tldr-large file=(\S+) sha256=([0-9a-f]{64}) bytes=(\d+) head=1 middle=1 tail=1$")
+COVER = re.compile(r"tldr-large coverage=complete files=(\d+)$")
+START = re.compile(r"summary_batch category=start batch=(\d+)/(\d+) designated_keys=(\d+) estimated_input_bytes=(\d+)$")
+
+requests, current, coverage = [], None, []
+for raw in mock:
+    line = raw.strip()
+    match = GEN.search(line)
+    if match:
+        current = {"generation": int(match.group(1)), "batch": int(match.group(2)),
+                   "bytes": None, "digest": None, "large": {}}
+        requests.append(current)
+        continue
+    match = BYTES.search(line)
+    if match:
+        if current is None:
+            fail("prompt bytes without a request header")
+        current["bytes"], current["digest"] = int(match.group(1)), match.group(2)
+        continue
+    match = LARGE.search(line)
+    if match:
+        if current is None:
+            fail("large record without a request header")
+        path = match.group(1)
+        if path in current["large"]:
+            fail(f"{path} repeated within one batch")
+        current["large"][path] = (match.group(2), int(match.group(3)))
+        continue
+    match = COVER.search(line)
+    if match:
+        coverage.append(int(match.group(1)))
+
+starts = []
+for raw in stderr:
+    match = START.search(raw.strip())
+    if match:
+        starts.append((int(match.group(2)), int(match.group(4))))
+
+if len(requests) != 6:
+    fail(f"expected 6 TLDR requests, saw {len(requests)}")
+if [request["generation"] for request in requests] != [1, 2, 2, 2, 2, 2]:
+    fail("generation sequence")
+if [request["batch"] for request in requests] != [1, 1, 2, 3, 4, 5]:
+    fail("batch sequence")
+if any(request["bytes"] is None or not request["digest"] for request in requests):
+    fail("missing prompt byte/digest trace")
+if len(starts) != len(requests):
+    fail(f"stderr starts {len(starts)} != requests {len(requests)}")
+if any(denominator != 5 for denominator, _ in starts):
+    fail("batch denominator is not 5")
+if [size for _, size in starts] != [request["bytes"] for request in requests]:
+    fail("stderr estimated_input_bytes differ from received prompt bytes")
+
+large = [request for request in requests if request["large"]]
+if len(large) != 2:
+    fail(f"expected 2 large batches, saw {len(large)}")
+if any(len(request["large"]) != 1 for request in large):
+    fail("a large batch carried more than one record")
+seen = {}
+for request in large:
+    for path, (digest, size) in request["large"].items():
+        entry = expected.get(path)
+        if entry is None:
+            fail(f"unexpected large path {path}")
+        if digest != entry["sha256"] or size != entry["bytes"]:
+            fail(f"{path} digest/bytes differ from the git-derived expectation")
+        if size >= 2 * 1024 * 1024:
+            fail(f"{path} patch body is not below 2 MiB")
+        seen[path] = request
+if sorted(seen) != sorted(expected):
+    fail(f"expected files seen {sorted(seen)} != {sorted(expected)}")
+if large[0]["digest"] == large[1]["digest"]:
+    fail("large prompts have the same digest")
+if sum(request["bytes"] for request in large) <= 2 * 1024 * 1024:
+    fail("large prompt bytes do not exceed 2 MiB combined")
+if any(request["bytes"] >= 2 * 1024 * 1024 for request in large):
+    fail("a large prompt reached the 2 MiB cap")
+if coverage != [len(expected)]:
+    fail(f"coverage marker {coverage} != [{len(expected)}]")
+PY
 }
 
 seed_review_fixture() { # root
@@ -183,6 +308,202 @@ PY
         *" M z_big.md"*) ;;
         *) fail "fixture: z_big.md not modified vs review-base: ${status:-<empty>}" ;;
     esac
+    seed_summary_fixture "$root" "$workspace"
+    case "$("${gitenv[@]}" git -C "$workspace" status --porcelain=v1)" in
+        *" M src/lib.rs"*|*"MM src/lib.rs"*) ;;
+        *) fail "fixture: src/lib.rs lost its unstaged edit" ;;
+    esac
+}
+
+seed_summary_fixture() { # parent workspace
+    local parent="$1" workspace="$2"
+    local gitenv=(env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$parent/absent-global-gitconfig")
+    local ahead head_oid origin_oid both_staged both_unstaged origin big="$workspace/big"
+    # Summary ground truth. The primary stays one commit ahead of a local
+    # bare origin. both.rs is MM. kept.txt is deleted. old-name.txt ->
+    # new-name.txt is a rename. pixel.png is a committed binary change.
+    # loose.txt is untracked. bare/ has no origin. clean/ matches its own
+    # local bare origin.
+    mkdir -p "$parent" "$workspace" "$workspace/bare" "$workspace/clean"
+    if ! "${gitenv[@]}" git -C "$workspace" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        "${gitenv[@]}" git -C "$workspace" init -q
+        "${gitenv[@]}" git -C "$workspace" config user.email tui-e2e@example.com
+        "${gitenv[@]}" git -C "$workspace" config user.name "TUI E2E"
+        "${gitenv[@]}" git -C "$workspace" config commit.gpgsign false
+        printf 'summary root\n' >"$workspace/README.md"
+        "${gitenv[@]}" git -C "$workspace" add -A
+        "${gitenv[@]}" git -C "$workspace" commit -q -m "summary root"
+        "${gitenv[@]}" git -C "$workspace" branch -M review-base
+    fi
+    printf 'both staged\nboth base\n' >"$workspace/both.rs"
+    printf 'kept base\n' >"$workspace/kept.txt"
+    printf 'rename base\n' >"$workspace/old-name.txt"
+    printf 'ahead base\n' >"$workspace/ahead.txt"
+    printf 'shared base\n' >"$workspace/bare/shared.txt"
+    printf 'clean base\n' >"$workspace/clean/clean.txt"
+    python3 -c 'import pathlib,sys; pathlib.Path(sys.argv[1]).write_bytes(bytes([0,1,2,3]))' "$workspace/pixel.png"
+    "${gitenv[@]}" git -C "$workspace" add -- both.rs kept.txt old-name.txt ahead.txt pixel.png
+    "${gitenv[@]}" git -C "$workspace" commit -q -m "summary base"
+    origin="$parent/origin.git"
+    "${gitenv[@]}" git init -q --bare "$origin"
+    "${gitenv[@]}" git -C "$workspace" config protocol.file.allow always
+    "${gitenv[@]}" git -C "$workspace" remote add origin "$origin"
+    "${gitenv[@]}" git -C "$workspace" push -q origin review-base
+    printf 'ahead only\n' >>"$workspace/ahead.txt"
+    python3 -c 'import pathlib,sys; pathlib.Path(sys.argv[1]).write_bytes(bytes([0,1,2,255]))' "$workspace/pixel.png"
+    "${gitenv[@]}" git -C "$workspace" add -- ahead.txt pixel.png
+    "${gitenv[@]}" git -C "$workspace" commit -q -m "summary ahead"
+    printf 'both staged\nboth index\n' >"$workspace/both.rs"
+    "${gitenv[@]}" git -C "$workspace" add -- both.rs
+    printf 'both staged\nboth work\nboth extra\n' >"$workspace/both.rs"
+    printf 'added work\n' >"$workspace/added.txt"
+    "${gitenv[@]}" git -C "$workspace" add -- added.txt
+    "${gitenv[@]}" git -C "$workspace" rm -q -- kept.txt
+    "${gitenv[@]}" git -C "$workspace" mv -- old-name.txt new-name.txt
+    python3 -c 'import pathlib,sys; pathlib.Path(sys.argv[1]).write_bytes(bytes([9,8,7,6]))' "$workspace/pixel.png"
+    "${gitenv[@]}" git -C "$workspace" add -- pixel.png
+    printf 'loose work\n' >"$workspace/loose.txt"
+    "${gitenv[@]}" git -C "$workspace/bare" init -q
+    "${gitenv[@]}" git -C "$workspace/bare" config user.email tui-e2e@example.com
+    "${gitenv[@]}" git -C "$workspace/bare" config user.name "TUI E2E"
+    "${gitenv[@]}" git -C "$workspace/bare" config commit.gpgsign false
+    "${gitenv[@]}" git -C "$workspace/bare" add -- shared.txt
+    "${gitenv[@]}" git -C "$workspace/bare" commit -q -m "bare base"
+    "${gitenv[@]}" git -C "$workspace/clean" init -q
+    "${gitenv[@]}" git -C "$workspace/clean" config user.email tui-e2e@example.com
+    "${gitenv[@]}" git -C "$workspace/clean" config user.name "TUI E2E"
+    "${gitenv[@]}" git -C "$workspace/clean" config commit.gpgsign false
+    "${gitenv[@]}" git -C "$workspace/clean" config protocol.file.allow always
+    "${gitenv[@]}" git -C "$workspace/clean" add -- clean.txt
+    "${gitenv[@]}" git -C "$workspace/clean" commit -q -m "clean base"
+    "${gitenv[@]}" git -C "$workspace/clean" branch -M review-base
+    "${gitenv[@]}" git init -q --bare "$parent/clean-origin.git"
+    "${gitenv[@]}" git -C "$workspace/clean" remote add origin "$parent/clean-origin.git"
+    "${gitenv[@]}" git -C "$workspace/clean" push -q origin review-base
+    # Two individually legal unstaged patches whose combined summary budget
+    # exceeds 2 MiB. The nested repository is discovered by summary collection
+    # but excluded from the review snapshot, so the review fixture counts stay
+    # untouched. Expected per-file digests come from real git output normalized
+    # exactly like the collector's hunk bodies, never from the mock.
+    mkdir -p "$big"
+    "${gitenv[@]}" git -C "$big" init -q
+    "${gitenv[@]}" git -C "$big" config user.email tui-e2e@example.com
+    "${gitenv[@]}" git -C "$big" config user.name "TUI E2E"
+    "${gitenv[@]}" git -C "$big" config commit.gpgsign false
+    printf 'base\n' >"$big/left.txt"
+    printf 'base\n' >"$big/right.txt"
+    "${gitenv[@]}" git -C "$big" add -- left.txt right.txt
+    "${gitenv[@]}" git -C "$big" commit -q -m "big base"
+    python3 - "$big/left.txt" "$big/right.txt" <<'PY'
+import pathlib
+import sys
+LINES = 18_500
+def body(tag):
+    rows = []
+    for index in range(LINES):
+        if index == 0:
+            row = f"{tag}-HEAD-MARKER"
+        elif index == LINES // 2:
+            row = f"{tag}-MIDDLE-MARKER"
+        elif index == LINES - 1:
+            row = f"{tag}-TAIL-MARKER"
+        else:
+            row = f"{tag}-{index:05d} " + "x" * 48
+        rows.append(row + "\n")
+    return "".join(rows)
+pathlib.Path(sys.argv[1]).write_text(body("LEFT"), encoding="utf-8")
+pathlib.Path(sys.argv[2]).write_text(body("RIGHT"), encoding="utf-8")
+PY
+    "${gitenv[@]}" git -C "$big" --literal-pathspecs diff --no-ext-diff \
+        --no-textconv --no-color --find-renames -- left.txt >"$parent/big-left.diff"
+    "${gitenv[@]}" git -C "$big" --literal-pathspecs diff --no-ext-diff \
+        --no-textconv --no-color --find-renames -- right.txt >"$parent/big-right.diff"
+    python3 - "$parent/big-left.diff" "$parent/big-right.diff" \
+        "$parent/summary-big-expected.json" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+def patch_body(path):
+    lines = pathlib.Path(path).read_text(encoding="utf-8").splitlines(keepends=True)
+    starts = [index for index, line in enumerate(lines) if line.startswith("@@ ")]
+    if not starts:
+        raise SystemExit(f"{path}: diff has no hunk header")
+    if any(line.startswith("\\ No newline") for line in lines):
+        raise SystemExit(f"{path}: unexpected no-newline marker")
+    body = "".join(lines[starts[0]:])
+    return body[:-1] if body.endswith("\n") else body
+def expected(path, tag):
+    body = patch_body(path)
+    markers = [f"+{tag}-{part}-MARKER" for part in ("HEAD", "MIDDLE", "TAIL")]
+    at = [body.find(marker) for marker in markers]
+    if min(at) < 0 or at != sorted(at) or len(set(at)) != 3:
+        raise SystemExit(f"{path}: head/middle/tail markers missing or out of order")
+    if not body.endswith(markers[2]):
+        raise SystemExit(f"{path}: patch does not end at the tail marker")
+    data = body.encode("utf-8")
+    if not 0 < len(data) < 2 * 1024 * 1024:
+        raise SystemExit(f"{path}: patch body is {len(data)} bytes")
+    return {"token": tag + "TOK", "sha256": hashlib.sha256(data).hexdigest(),
+            "bytes": len(data), "markers": [marker[1:] for marker in markers]}
+patches = {"left.txt": expected(sys.argv[1], "LEFT"),
+           "right.txt": expected(sys.argv[2], "RIGHT")}
+total = sum(item["bytes"] for item in patches.values())
+if total <= 2 * 1024 * 1024:
+    raise SystemExit(f"summary patches total {total} bytes, not above the 2 MiB cap")
+pathlib.Path(sys.argv[3]).write_text(
+    json.dumps({"patches": patches, "total_bytes": total}, indent=2) + "\n",
+    encoding="utf-8")
+PY
+    [ -s "$parent/summary-big-expected.json" ] || fail "fixture: large summary expectation missing"
+    ahead="$("${gitenv[@]}" git -C "$workspace" rev-list --count origin/review-base..HEAD)"
+    [ "$ahead" = 1 ] || fail "fixture: primary is not exactly one commit ahead (${ahead:-empty})"
+    head_oid="$("${gitenv[@]}" git -C "$workspace" rev-parse HEAD)"
+    origin_oid="$("${gitenv[@]}" git -C "$workspace" rev-parse origin/review-base)"
+    [ "$head_oid" != "$origin_oid" ] || fail "fixture: primary HEAD matches origin"
+    case "$("${gitenv[@]}" git -C "$workspace" status --porcelain=v1)" in
+        *"MM both.rs"*) ;;
+        *) fail "fixture: both.rs is not MM" ;;
+    esac
+    case "$("${gitenv[@]}" git -C "$workspace" status --porcelain=v1)" in
+        *"A  added.txt"*) ;;
+        *) fail "fixture: added.txt is not staged added" ;;
+    esac
+    case "$("${gitenv[@]}" git -C "$workspace" status --porcelain=v1)" in
+        *"D  kept.txt"*) ;;
+        *) fail "fixture: kept.txt is not staged deleted" ;;
+    esac
+    case "$("${gitenv[@]}" git -C "$workspace" status --porcelain=v1)" in
+        *"R  old-name.txt -> new-name.txt"*) ;;
+        *) fail "fixture: rename endpoints missing" ;;
+    esac
+    case "$("${gitenv[@]}" git -C "$workspace" status --porcelain=v1)" in
+        *"M  pixel.png"*) ;;
+        *) fail "fixture: pixel.png is not a staged modification" ;;
+    esac
+    case "$("${gitenv[@]}" git -C "$workspace" status --porcelain=v1)" in
+        *"?? loose.txt"*) ;;
+        *) fail "fixture: loose.txt is not untracked" ;;
+    esac
+    [ -z "$("${gitenv[@]}" git -C "$workspace/bare" status --porcelain=v1)" ] || fail "fixture: bare is not clean"
+    [ -z "$("${gitenv[@]}" git -C "$workspace/bare" remote)" ] || fail "fixture: bare has an origin"
+    [ -z "$("${gitenv[@]}" git -C "$workspace/clean" status --porcelain=v1)" ] || fail "fixture: clean is not clean"
+    [ "$("${gitenv[@]}" git -C "$workspace/clean" rev-list --count origin/review-base..HEAD)" = 0 ] || fail "fixture: clean is ahead"
+    both_staged="$("${gitenv[@]}" git -C "$workspace" diff --cached --numstat -- both.rs)"
+    both_unstaged="$("${gitenv[@]}" git -C "$workspace" diff --numstat -- both.rs)"
+    python3 - "$parent/summary-numstat.txt" "$both_staged" "$both_unstaged" <<'PY'
+import pathlib, sys
+path, staged, unstaged = sys.argv[1:]
+def needle(row, label):
+    added, deleted, *_rest = row.split()
+    if not added.isdigit() or not deleted.isdigit():
+        raise SystemExit(f'{label} numstat is not text: {row}')
+    return f'M both.rs +{added}/-{deleted}'
+staged_needle, unstaged_needle = needle(staged, 'staged'), needle(unstaged, 'unstaged')
+if staged_needle == unstaged_needle:
+    raise SystemExit('both.rs layers have the same numstat')
+pathlib.Path(path).write_text(staged_needle + '\n' + unstaged_needle + '\n', encoding='utf-8')
+PY
 }
 
 write_ops_mock() { # root
@@ -191,6 +512,7 @@ write_ops_mock() { # root
 """Strict code-review-ops provider mock: content-routed SSE with release gates."""
 import json
 import re
+import hashlib
 import select
 import socket
 import sys
@@ -198,22 +520,178 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT_FILE = sys.argv[1]
+EXPECTED_PATH = sys.argv[2] if len(sys.argv) > 2 else ""
+EXPECTED = None
+LARGE_SEEN = {}
 GATE_LOCK = threading.Lock()
 GATES = {}
+RELEASE_DONE = {}
 SERIAL = 0
 ZH_TAG = "Respond in the language tagged `zh-CN`."
 AUTO_REPLY_ERROR = "ok"
 HIGHLIGHT_SEEN = 0
 TLDR_LATE = False
-TLDR_OVERVIEW = "Pinned lib.rs and z_big.md change the review base."
-TLDR_GOOD = (
-    TLDR_OVERVIEW + "\n\n"
-    "## Details\n\n"
-    "- `src/lib.rs` keeps `" + "EARLY-HUNK-FLAG-0012" + "` and `" + "DEEP-HUNK-MARK-0240" + "`.\n"
-    "- `z_big.md` grows past the review window.\n\n"
-    "```mermaid\nflowchart LR\n  lib_rs --> z_big\n```\n"
-)
-TLDR_STALE = "STALE-LATE-SNAPSHOT must never paint.\n\nRejected after Stop.\n"
+SUMMARY_MARKER = "Summarize repository changes using the required purpose JSON.\n"
+DESIGNATED_KEYS = "\nDesignated purpose keys JSON:\n"
+SUMMARY_FACTS = "\nRepository facts JSON:\n"
+STALE_PURPOSE = "STALE-LATE-SNAPSHOT"
+DESIGNATED_CONTRACT = "This batch designates exactly these keys."
+OLD_ALL_KEYS = "Include every repository, commit, committed file, staged file, unstaged file, and untracked file from the facts exactly once."
+KIND_ORDER = ("commit", "committed_file", "staged", "unstaged", "untracked")
+TLDR_GENERATION = 0
+TLDR_SEEN = 0
+PURPOSE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["repositories", "changes"],
+    "properties": {
+        "repositories": {"type": "array", "items": {"type": "object", "additionalProperties": False, "required": ["repo", "purpose"], "properties": {"repo": {"type": "string", "minLength": 1}, "purpose": {"type": "string", "minLength": 1}}}},
+        "changes": {"type": "array", "items": {"type": "object", "additionalProperties": False, "required": ["repo", "kind", "id", "purpose"], "properties": {"repo": {"type": "string", "minLength": 1}, "kind": {"type": "string", "enum": ["commit", "committed_file", "staged", "unstaged", "untracked"]}, "id": {"type": "string", "minLength": 1}, "purpose": {"type": "string", "minLength": 1}}}},
+    },
+}
+
+def purpose_for(record):
+    patch = record.get("patch") or ""
+    lines = record.get("lines") or {}
+    stats = f"+{lines.get('insertions', 0)}/-{lines.get('deletions', 0)}" if lines.get("kind") == "text" else lines.get("kind", "unknown")
+    previous = f"{record['previous_path']} -> " if record.get("previous_path") else ""
+    marker = "work" if "both work" in patch else "index" if "both index" in patch else "ahead" if "ahead only" in patch else ""
+    return f"{record.get('status')} {previous}{record.get('path')} {stats} {marker}".strip()
+
+def origin_purpose(repository):
+    origin = repository.get("origin") or {}
+    outcome = origin.get("outcome", "unknown")
+    return f"{repository['label']} {outcome} ahead {origin.get('ahead', 0)}"
+
+def change_purpose(kind, record):
+    return record["subject"] if kind == "commit" else purpose_for(record)
+
+def designated_document(facts):
+    changes = []
+    for repository in facts["repositories"]:
+        for commit in repository.get("commits") or []:
+            changes.append({"repo": repository["label"], "kind": "commit", "id": commit["oid"]})
+            for record in commit.get("files") or []:
+                changes.append({"repo": repository["label"], "kind": "committed_file", "id": f"{commit['oid']}:{record['path']}"})
+        for kind in ("staged", "unstaged", "untracked"):
+            for record in repository.get(kind) or []:
+                changes.append({"repo": repository["label"], "kind": kind, "id": record["path"]})
+    changes.sort(key=lambda item: (item["repo"], KIND_ORDER.index(item["kind"]), item["id"]))
+    return {"repositories": [repository["label"] for repository in facts["repositories"]], "changes": changes}
+
+def locate_change(repository, item):
+    if item["kind"] == "commit":
+        return next((record for record in repository.get("commits") or [] if record["oid"] == item["id"]), None)
+    if item["kind"] == "committed_file":
+        oid, path = item["id"].split(":", 1)
+        for commit in repository.get("commits") or []:
+            if commit["oid"] != oid:
+                continue
+            return next((record for record in commit.get("files") or [] if record["path"] == path), None)
+        return None
+    return next((record for record in repository.get(item["kind"]) or [] if record["path"] == item["id"]), None)
+
+def expected_patches():
+    global EXPECTED
+    if EXPECTED is None:
+        if not EXPECTED_PATH:
+            raise ValueError("large summary expectation path is not configured")
+        with open(EXPECTED_PATH, encoding="utf-8") as handle:
+            EXPECTED = json.load(handle)["patches"]
+    return EXPECTED
+
+def verify_large(record):
+    patches = expected_patches()
+    expected = patches.get(record.get("path"))
+    if expected is None:
+        return None
+    patch = record.get("patch") or ""
+    data = patch.encode("utf-8")
+    digest = hashlib.sha256(data).hexdigest()
+    if len(data) != expected["bytes"] or digest != expected["sha256"]:
+        raise ValueError(f"large patch bytes/digest mismatch path={record.get('path')}")
+    at = [patch.find("+" + marker) for marker in expected["markers"]]
+    if min(at) < 0 or at != sorted(at) or len(set(at)) != 3:
+        raise ValueError(f"large patch head/middle/tail order mismatch path={record.get('path')}")
+    if not patch.endswith("+" + expected["markers"][2]):
+        raise ValueError(f"large patch tail mismatch path={record.get('path')}")
+    with GATE_LOCK:
+        if record["path"] in LARGE_SEEN:
+            raise ValueError(f"large patch duplicated across batches path={record.get('path')}")
+        LARGE_SEEN[record["path"]] = digest
+        complete = len(LARGE_SEEN) == len(patches)
+        log(f"tldr-large file={record['path']} sha256={digest} bytes={len(data)} head=1 middle=1 tail=1")
+        if complete:
+            log(f"tldr-large coverage=complete files={len(LARGE_SEEN)}")
+    return expected["token"]
+
+def purpose_document(text, purpose_override=None):
+    if not text.startswith(SUMMARY_MARKER) or DESIGNATED_KEYS not in text or SUMMARY_FACTS not in text:
+        raise ValueError("summary prompt shape")
+    keys_at = text.index(DESIGNATED_KEYS)
+    facts_at = text.index(SUMMARY_FACTS)
+    if not (len(SUMMARY_MARKER) < keys_at < facts_at):
+        raise ValueError("summary section order")
+    contract = text[len(SUMMARY_MARKER):keys_at]
+    if OLD_ALL_KEYS in contract:
+        raise ValueError("old all-keys protocol")
+    language_at = contract.rfind("Write every purpose in the language tagged `")
+    if language_at >= 0 and ("\n" in contract[language_at:] or not contract[language_at:].endswith(".")):
+        raise ValueError("language line is not the last contract line before Designated purpose keys")
+
+    designated = json.loads(text[keys_at + len(DESIGNATED_KEYS):facts_at].strip())
+    facts = json.loads(text[facts_at + len(SUMMARY_FACTS):].strip())
+    if not isinstance(designated.get("repositories"), list) or not isinstance(designated.get("changes"), list):
+        raise ValueError("designated keys shape")
+    if any(not isinstance(label, str) or not label for label in designated["repositories"]):
+        raise ValueError("designated repositories are not labels")
+    for item in designated["changes"]:
+        if set(item) != {"repo", "kind", "id"} or not all(
+            isinstance(item[key], str) and item[key] for key in ("repo", "kind", "id")
+        ):
+            raise ValueError("designated change is not repo kind id")
+    labels = {repository["label"]: repository for repository in facts["repositories"]}
+    if len(labels) != 1 or len(facts["repositories"]) != 1:
+        raise ValueError("summary facts are not one repository")
+    full = designated_document(facts)
+    if designated["repositories"] not in ([], full["repositories"]):
+        raise ValueError("designated repository key is neither absent nor the repository")
+    designated_keys = [tuple(item[key] for key in ("repo", "kind", "id")) for item in designated["changes"]]
+    full_keys = [tuple(item[key] for key in ("repo", "kind", "id")) for item in full["changes"]]
+    if len(designated_keys) != len(set(designated_keys)) or sorted(designated_keys) != sorted(full_keys):
+        raise ValueError("designated changes are not exactly the facts keys")
+    large_tokens = {}
+    for repository in facts["repositories"]:
+        for record in repository.get("unstaged") or []:
+            token = verify_large(record)
+            if token is not None:
+                large_tokens[record["path"]] = token
+    full_ids = {(item["repo"], item["kind"], item["id"]) for item in full["changes"]}
+    seen = set()
+    purposes = []
+    changes = []
+    def purpose(value):
+        return purpose_override or value
+    for label in designated["repositories"]:
+        if label not in labels:
+            raise ValueError(f"designated repository missing from facts {label}")
+        purposes.append({"repo": label, "purpose": purpose(origin_purpose(labels[label]))})
+    for item in designated["changes"]:
+        if set(item) != {"repo", "kind", "id"}:
+            raise ValueError("designated change is not repo kind id")
+        identity = (item["repo"], item["kind"], item["id"])
+        if identity not in full_ids or identity in seen:
+            raise ValueError(f"designated change is not an owned fact key {item['kind']} {item['id']}")
+        seen.add(identity)
+        matched = locate_change(labels[item["repo"]], item)
+        if matched is None:
+            raise ValueError(f"designated key missing from facts {item['kind']} {item['id']}")
+        value = change_purpose(item["kind"], matched)
+        token = large_tokens.get(matched.get("path"))
+        if token:
+            value = f"{value} {token}"
+        changes.append({"repo": item["repo"], "kind": item["kind"], "id": item["id"], "purpose": purpose(value)})
+    return json.dumps({"repositories": purposes, "changes": changes}, separators=(",", ":"))
 MANUAL_REPLY = "MANUAL-REPLY-OPS-BODY 人工复核：改动合理。\n"
 COMMENT_SENTINEL = "OPS-COMMENT-SENTINEL-01"
 IDENTITY_KEYS = ("snapshotId", "path", "oldStart", "oldCount", "newStart", "newCount", "contentHash")
@@ -226,17 +704,84 @@ def log(line):
 
 def register_gate(kind):
     gate = threading.Event()
+    record = threading.Event()
+    record.delivered = False
+    record.outcome = None
     with GATE_LOCK:
-        GATES[kind] = gate
-    return gate
+        if kind == "tldr":
+            GATES.setdefault(kind, []).append((gate, record))
+        else:
+            GATES[kind] = gate
+            RELEASE_DONE[kind] = record
+    return gate, record
 
 
 def pop_gate(kind):
     with GATE_LOCK:
-        gate = GATES.pop(kind, None)
+        queued = GATES.get(kind)
+        if isinstance(queued, list):
+            item = queued.pop(0) if queued else None
+            gate = item[0] if item is not None else None
+            if not queued:
+                GATES.pop(kind, None)
+        else:
+            gate = GATES.pop(kind, None)
     if gate is not None:
         gate.set()
     return gate is not None
+
+def begin_release(kind):
+    with GATE_LOCK:
+        queued = GATES.get(kind)
+        if isinstance(queued, list):
+            if not queued:
+                return None
+            gate, record = queued.pop(0)
+            if not queued:
+                GATES.pop(kind, None)
+        else:
+            gate = GATES.pop(kind, None)
+            record = RELEASE_DONE.get(kind)
+            if gate is None or record is None:
+                return None
+        gate.set()
+    return record
+
+def finish_release(record, delivered, outcome):
+    if record is not None and not record.is_set():
+        record.delivered = delivered
+        record.outcome = outcome
+        record.set()
+
+def note_tldr_request():
+    global TLDR_GENERATION, TLDR_SEEN
+    with GATE_LOCK:
+        if TLDR_GENERATION == 0:
+            TLDR_GENERATION = 1
+            TLDR_SEEN = 0
+        TLDR_SEEN += 1
+        generation = TLDR_GENERATION
+        seen = TLDR_SEEN
+    log(f"tldr generation={generation} batch={seen}")
+
+def advance_tldr_generation():
+    global TLDR_GENERATION, TLDR_SEEN, TLDR_LATE
+    with GATE_LOCK:
+        TLDR_GENERATION += 1
+        TLDR_SEEN = 0
+        if TLDR_LATE != TLDR_GENERATION:
+            TLDR_LATE = False
+
+def arm_tldr_late():
+    global TLDR_LATE
+    with GATE_LOCK:
+        TLDR_LATE = TLDR_GENERATION or 1
+
+def take_tldr_late(generation):
+    global TLDR_LATE
+    with GATE_LOCK:
+        late = TLDR_LATE == generation
+    return late
 
 
 def sse(payload):
@@ -269,12 +814,13 @@ def peer_closed(handler):
         return False
     try:
         return handler.connection.recv(1, socket.MSG_PEEK) == b""
-    except OSError:
+    except (BrokenPipeError, ConnectionResetError):
         return True
 
 
 def stream_held(handler, kind, final_text, model=None):
-    gate = register_gate(kind)
+    gate, record = register_gate(kind)
+    log(f"{kind} gate=entered")
     tag = f"ops-{kind}"
     handler.send_response(200)
     handler.send_header("content-type", "text/event-stream")
@@ -285,31 +831,62 @@ def stream_held(handler, kind, final_text, model=None):
         for _ in range(1800):
             if peer_closed(handler):
                 log(f"{kind} peer-closed before release")
+                finish_release(record, False, "peer_closed")
                 return
             if gate.wait(timeout=0.25):
                 break
         else:
             log(f"{kind} hold expired")
+            finish_release(record, False, "expired")
             return
-        handler.wfile.write(sse(delta(tag, final_text, finish="stop", model=model)).encode())
-        handler.wfile.write(b"data: [DONE]\n\n")
-        handler.wfile.flush()
+        delivered = False
+        try:
+            if not peer_closed(handler):
+                handler.wfile.write(sse(delta(tag, final_text, finish="stop", model=model)).encode())
+                handler.wfile.write(b"data: [DONE]\n\n")
+                handler.wfile.flush()
+                delivered = True
+        except (BrokenPipeError, ConnectionResetError):
+            delivered = False
         log(f"{kind} released")
-    except OSError:
+        finish_release(record, delivered, "delivered" if delivered else "peer_closed")
+    except (BrokenPipeError, ConnectionResetError):
         log(f"{kind} aborted by client")
+        finish_release(record, False, "peer_closed")
+    except OSError as error:
+        log(f"{kind} unexpected socket error={type(error).__name__}: {error}")
+        finish_release(record, False, "unexpected_error")
+        raise
+
+def message_text(message):
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        chunks = []
+        for block in content:
+            if isinstance(block, dict) and isinstance(block.get("text"), str):
+                chunks.append(block["text"])
+        if chunks:
+            return "\n".join(chunks)
+    return None
 
 
 def full_text(body):
     chunks = []
     for message in body.get("messages", []):
-        content = message.get("content")
-        if isinstance(content, str):
-            chunks.append(content)
-        elif isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict) and isinstance(block.get("text"), str):
-                    chunks.append(block["text"])
+        text = message_text(message)
+        if text is not None:
+            chunks.append(text)
     return "\n".join(chunks)
+
+
+def last_user_text(body):
+    for message in reversed(body.get("messages", [])):
+        if message.get("role") == "user":
+            text = message_text(message)
+            return "" if text is None else text
+    return ""
 
 
 def prompt_identities(prompt):
@@ -457,12 +1034,39 @@ class Handler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("content-length", "0"))
             raw = self.rfile.read(length)
+            if self.path == "/__tldr-generation":
+                advance_tldr_generation()
+                log("tldr-generation=advanced")
+                body = b'{"generation": true}\n'
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if self.path == "/__tldr-late":
+                arm_tldr_late()
+                log("tldr-late=armed")
+                body = b'{"late": true}\n'
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if self.path.startswith("/__release-"):
                 gate_map = {"triage": "triage", "highlight": "highlight", "auto": "auto", "tldr": "tldr"}
                 kind = gate_map[self.path.rsplit("-", 1)[-1]]
-                held = pop_gate(kind)
-                log(f"release={kind} held={str(held).lower()}")
-                body = b'{"released": %s}\n' % (b"true" if held else b"false")
+                done = begin_release(kind)
+                delivered = False
+                outcome = None
+                if done is not None:
+                    done.wait(5)
+                    delivered = done.delivered
+                    outcome = done.outcome
+                held = done is not None
+                log(f"release={kind} held={str(held).lower()} delivered={str(delivered).lower()} outcome={outcome}")
+                body = ('{"released":%s,"delivered":%s,"outcome":%s}\n' % ("true" if held else "false", "true" if delivered else "false", json.dumps(outcome))).encode()
                 self.send_response(200)
                 self.send_header("content-type", "application/json")
                 self.send_header("content-length", str(len(body)))
@@ -471,6 +1075,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             body = json.loads(raw)
             text = full_text(body)
+            current = last_user_text(body)
             if COMMENT_SENTINEL in text and "User comment:" in text:
                 kind = "manual"
             elif "Classify every hunk" in text:
@@ -478,14 +1083,14 @@ class Handler(BaseHTTPRequestHandler):
             elif "Requested hunks:" in text and "Hunk identity:" in text:
                 identities = prompt_identities(text)
                 kind = "auto" if len(identities) == 1 else "highlight"
-            elif text.startswith("Write one Markdown document about only the supplied current diff."):
+            elif current.startswith(SUMMARY_MARKER) and SUMMARY_FACTS in current:
                 kind = "tldr"
             else:
                 kind = "unrouted"
             with GATE_LOCK:
                 type(self).bump_serial()
             log(f"request#{SERIAL} kind={kind} prompt_len={len(text)}")
-            self.route(kind, body, text)
+            self.route(kind, body, current if kind == "tldr" else text)
         except (BrokenPipeError, ConnectionResetError):
             log("client aborted mid-request")
         except Exception as error:
@@ -553,18 +1158,28 @@ class Handler(BaseHTTPRequestHandler):
                 target["findings"][0]["summary"] = "STALE-RANGE"
             stream_held(self, kind, json.dumps(document))
         elif kind == "tldr":
-            schema_absent = body.get("response_format") is None and "tools" not in body
-            log("tldr-schema=absent" if body.get("response_format") is None else "tldr-schema=present")
+            note_tldr_request()
+            prompt_data = text.encode("utf-8")
+            log(f"tldr prompt_bytes={len(prompt_data)} prompt_digest={hashlib.sha256(prompt_data).hexdigest()}")
+            response_format = body.get("response_format") or {}
+            schema = response_format.get("json_schema") or {}
+            purpose_schema = response_format.get("type") == "json_schema" and schema.get("name") == "review_purpose" and schema.get("strict") is True and schema.get("schema") == PURPOSE_SCHEMA
+            log("tldr-schema=review_purpose" if purpose_schema else "tldr-schema=rejected")
             log("tldr-tools=absent" if not body.get("tools") else "tldr-tools=present")
-            if ZH_TAG not in text or not schema_absent:
-                log("tldr lang=missing")
+            if OLD_ALL_KEYS in text or "Write one Markdown document" in text:
+                log("tldr contract=old-protocol")
+            else:
+                log("tldr contract=old-protocol-absent")
+            if not purpose_schema or body.get("tools") or "comparisonLabel:" in text or "Write one Markdown document" in text or OLD_ALL_KEYS in text or DESIGNATED_KEYS not in text:
+                log("tldr contract=rejected")
                 stream_text(self, tag, "TLDR contract missing")
                 return
-            log("tldr lang=zh-CN")
-            if "comparisonLabel:" not in text or "src/lib.rs" not in text:
-                stream_text(self, tag, "TLDR scope missing")
-                return
-            stream_held(self, kind, TLDR_STALE if TLDR_LATE else TLDR_GOOD)
+            log("tldr contract=purpose-json")
+            if take_tldr_late(TLDR_GENERATION):
+                log("tldr-late=consumed")
+                stream_held(self, kind, purpose_document(text, STALE_PURPOSE))
+            else:
+                stream_held(self, kind, purpose_document(text))
         elif kind == "manual":
             stream_text(self, tag, MANUAL_REPLY, model="ops-switch-model")
         else:
@@ -584,9 +1199,9 @@ if __name__ == "__main__":
 PY
 }
 
-start_ops_mock() { # root -> prints port
-    local root="$1" port_file="$root/mock-port.txt" deadline port
-    python3 "$root/ops_mock_server.py" "$port_file" >"$evidence/mock-server.log" 2>&1 &
+start_ops_mock() { # root [expected-patches]
+    local root="$1" expected="${2:-}" port_file="$root/mock-port.txt" deadline port
+    python3 "$root/ops_mock_server.py" "$port_file" "$expected" >"$evidence/mock-server.log" 2>&1 &
     register_pid $!
     deadline=$((SECONDS + 15))
     while [ ! -s "$port_file" ] && [ "$SECONDS" -lt "$deadline" ]; do sleep 0.2; done
@@ -609,7 +1224,7 @@ main() {
     register_tmux_session "$session"
     seed_review_fixture "$root"
     write_ops_mock "$root"
-    port="$(start_ops_mock "$root")"
+    port="$(start_ops_mock "$root" "$root/summary/summary-big-expected.json")"
     mock_port="$port"
 
     mkdir -p "$root/home/.pi/agent"
@@ -636,6 +1251,11 @@ main() {
 }
 EOF
 
+    rpi_pane_command() { # done-sentinel
+        local done="$1" stderr="2>>$(printf '%q' "$evidence/rpi-stderr.log")"
+        printf '%s' "env HOME=$(printf '%q' "$root/home") USERPROFILE=$(printf '%q' "$root/home") PI_CODING_AGENT_DIR=$(printf '%q' "$root/home/.pi/agent") RPI_OFFLINE=1 RPI_SKIP_VERSION_CHECK=1 TERM=xterm-256color $(printf '%q' "$RPI_BIN") --offline --model $(printf '%q' "$PROVIDER/$MODEL_ID") --api-key ops-mock-key ${stderr}; printf '%s\n' $(printf '%q' "$done")"
+    }
+
     # tmux 3.4 default window-size=latest ignores new-session -x/-y for the
     # live window (this server: latest, observed 40x17 from the newest client;
     # -x/-y only sets session default-size). resize-window pins this window to
@@ -647,11 +1267,7 @@ EOF
     size="$(tmux display-message -p -t "$session":0 '#{window_width}x#{window_height}')"
     [ "$size" = "140x42" ] || fail "user.$SCENARIO: pane is ${size}, expected 140x42"
     tmux respawn-pane -k -c "$root/workspace" -t "$session":0 \
-        "env HOME='$root/home' USERPROFILE='$root/home' \
-PI_CODING_AGENT_DIR='$root/home/.pi/agent' \
-RPI_OFFLINE=1 RPI_SKIP_VERSION_CHECK=1 \
-TERM=xterm-256color \
-'$RPI_BIN' --offline --model $PROVIDER/$MODEL_ID --api-key ops-mock-key; printf '===TUI-DONE-code-review-operations===\n'"
+        "$(rpi_pane_command '===TUI-DONE-code-review-operations===')"
 
     wait_for "$PROVIDER/$MODEL_ID" 30
     capture_to "$evidence/00-boot.txt"
@@ -661,14 +1277,16 @@ TERM=xterm-256color \
     tmux send-keys -t "$session":0 -l '/review review-base'
     wait_for '/review review-base' 10
     tmux send-keys -t "$session":0 Enter
-    wait_all 45 'Code review · review-base → working tree · 2 files' \
+    wait_all 45 'Code review · review-base → working tree · 8 files' \
         'focus:tree · A Auto · H Highlight' \
-        'lib.rs' 'z_big.md' '@@' "$EARLY_MARKER"
+        'lib.rs' 'z_big.md' '@@' "$EARLY_MARKER" \
+        'added.txt' 'both.rs' 'kept.txt' 'loose.txt' 'new-name.txt' 'pixel.png'
     capture_to "$evidence/01-open.txt"
     assert_file_contains "$evidence/01-open.txt" \
-        'Code review · review-base → working tree · 2 files' \
+        'Code review · review-base → working tree · 8 files' \
         'focus:tree · A Auto · H Highlight' \
-        'lib.rs' 'z_big.md' '@@' "$EARLY_MARKER"
+        'lib.rs' 'z_big.md' '@@' "$EARLY_MARKER" \
+        'added.txt' 'both.rs' 'kept.txt' 'loose.txt' 'new-name.txt' 'pixel.png'
     assert_file_lacks "$evidence/01-open.txt" "$DEEP_MARKER" '· on demand' '■ Stop'
 
     tmux send-keys -t "$session":0 Left
@@ -690,13 +1308,17 @@ TERM=xterm-256color \
     capture_to "$evidence/03b-refocused.txt"
     assert_file_contains "$evidence/03b-refocused.txt" 'lib.rs' "$EARLY_MARKER" 'z_big.md'
 
-    tmux send-keys -t "$session":0 Down
+    for _ in 1 2 3 4 5 6 7; do
+        tmux send-keys -t "$session":0 Down
+    done
     wait_for '· on demand' 10
     capture_to "$evidence/04-on-demand.txt"
     assert_file_contains "$evidence/04-on-demand.txt" 'z_big.md' '· on demand'
     assert_file_lacks "$evidence/04-on-demand.txt" "$DEEP_MARKER"
 
-    tmux send-keys -t "$session":0 Up
+    for _ in 1 2 3 4 5 6 7; do
+        tmux send-keys -t "$session":0 Up
+    done
     wait_for "$EARLY_MARKER" 10
     capture_to "$evidence/05-before-jump.txt"
     assert_file_contains "$evidence/05-before-jump.txt" 'lib.rs' "$EARLY_MARKER"
@@ -899,6 +1521,122 @@ TERM=xterm-256color \
         fail "user.$SCENARIO: TUI did not exit after /quit (see $evidence/21-quit.txt)"
     fi
 
+    local summary_parent="$root/summary" summary_workspace="$root/summary/workspace" staged_needle unstaged_needle before_scroll after_scroll
+    seed_summary_fixture "$summary_parent" "$summary_workspace"
+    tmux respawn-pane -k -c "$summary_workspace" -t "$session":0 \
+        "$(rpi_pane_command '===TUI-DONE-code-review-summary===')"
+    wait_for "$PROVIDER/$MODEL_ID" 30
+    tmux send-keys -t "$session":0 Escape
+    sleep 0.3
+    tmux send-keys -t "$session":0 -l '/review HEAD'
+    wait_for '/review HEAD' 10
+    tmux send-keys -t "$session":0 Enter
+    wait_for 'Code review · HEAD → working tree' 30
+    curl -s --max-time 5 -X POST "http://127.0.0.1:${mock_port}/__tldr-late" -d '{}' >"$evidence/tldr-late.txt"
+    tmux send-keys -t "$session":0 s
+    wait_for 'Summary' 20
+    wait_for '■ Stop' 20
+    wait_log 'kind=tldr' 1 45
+    wait_log 'tldr generation=1' 1 45
+    wait_log 'tldr-late=consumed' 1
+    wait_log 'tldr gate=entered' 1
+    tmux send-keys -t "$session":0 s
+    wait_for 'TLDR stopped' 15
+    advance_summary_generation
+    stopped=0
+    while [ "$(log_count 'tldr gate=entered')" -gt "$stopped" ]; do
+        stopped=$((stopped + 1))
+        release_gate_to tldr "$evidence/release-tldr-$stopped.txt"
+        grep -q '"delivered":false' "$evidence/release-tldr-$stopped.txt" || fail "user.$SCENARIO: stopped summary batch was delivered (see $evidence/release-tldr-$stopped.txt)"
+        grep -q '"outcome":"peer_closed"' "$evidence/release-tldr-$stopped.txt" || fail "user.$SCENARIO: stopped summary batch was not peer_closed (see $evidence/release-tldr-$stopped.txt)"
+    done
+    [ "$stopped" -ge 1 ] || fail "user.$SCENARIO: first summary stop closed no live request"
+    assert_never_appears summary-stop 4 'STALE-LATE-SNAPSHOT'
+    tmux send-keys -t "$session":0 s
+    wait_for 'Summary' 20
+    wait_for '■ Stop' 20
+    for expected_batch in 1 2 3 4 5; do
+        wait_log "tldr generation=2 batch=$expected_batch" 1 45
+        release_gate_to tldr "$evidence/release-tldr-good-$expected_batch.txt"
+        grep -q '"delivered":true' "$evidence/release-tldr-good-$expected_batch.txt" || fail "user.$SCENARIO: summary batch $expected_batch was not delivered (see $evidence/release-tldr-good-$expected_batch.txt)"
+        grep -q '"outcome":"delivered"' "$evidence/release-tldr-good-$expected_batch.txt" || fail "user.$SCENARIO: summary batch $expected_batch outcome was not delivered (see $evidence/release-tldr-good-$expected_batch.txt)"
+    done
+    wait_for 'Purpose: root0 compared ahead 1' 20
+    wait_gone 'Summary running' 20 summary-settled
+    capture_to "$evidence/19a-summary-settled.txt"
+    assert_file_lacks "$evidence/19a-summary-settled.txt" 'Summary running' '■ Stop'
+    # Normal reading flow: PageUp returns the overlay to its top; the first
+    # captured frame must actually show the first purpose, proving the top
+    # rather than assuming the key count. Each PageDown then keeps its frame
+    # until the capture changes (same 5s deadline as wait_for) or every purpose
+    # has been seen. A stuck overlay still fails; a repeated frame at the
+    # bottom never does because the clean purpose ended the scan already.
+    : >"$evidence/19b-summary.txt"
+    for _ in $(seq 1 8); do
+        tmux send-keys -t "$session":0 PageUp
+    done
+    sleep 0.3
+    summary_frame="$(pane_capture)"
+    case "$summary_frame" in
+        *"Purpose: root0 compared ahead 1"*) ;;
+        *) fail "user.$SCENARIO: PageUp did not reach the summary top (see $evidence/19b-summary.txt)" ;;
+    esac
+    for summary_page in $(seq 1 20); do
+        printf '%s\n' "$summary_frame" >>"$evidence/19b-summary.txt"
+        printf '\n--- summary frame %s ---\n' "$summary_page" >>"$evidence/19b-summary.txt"
+        case "$summary_frame" in
+            *"Purpose: root0/clean compared ahead 0"*) break ;;
+        esac
+        [ "$summary_page" -lt 20 ] || fail "user.$SCENARIO: summary did not reach root0/clean within 20 frames (see $evidence/19b-summary.txt)"
+        summary_previous="$summary_frame"
+        tmux send-keys -t "$session":0 PageDown
+        summary_deadline=$((SECONDS + 5))
+        while [ "$summary_frame" = "$summary_previous" ] && [ "$SECONDS" -lt "$summary_deadline" ]; do
+            sleep 0.2
+            summary_frame="$(pane_capture)"
+        done
+        [ "$summary_frame" != "$summary_previous" ] || fail "user.$SCENARIO: summary overlay did not change within 5s before root0/clean (see $evidence/19b-summary.txt)"
+    done
+    case "$summary_frame" in
+        *"Purpose: root0/clean compared ahead 0"*) ;;
+        *) fail "user.$SCENARIO: summary did not reach root0/clean within 20 frames (see $evidence/19b-summary.txt)" ;;
+    esac
+    printf '%s\n' "$summary_frame" >"$evidence/19c-summary-scrolled.txt"
+    assert_file_contains "$evidence/19b-summary.txt" \
+        'Purpose: root0 compared ahead 1' \
+        'Purpose: root0/bare no_origin ahead 0' \
+        'Purpose: root0/big no_origin ahead 0' \
+        'origin: no origin' \
+        'Purpose: root0/clean compared ahead 0' \
+        'Purpose: modified left.txt +18500/-1 LEFTTOK' \
+        'Purpose: modified right.txt +18500/-1 RIGHTTOK' \
+        'ahead 1' 'pixel.png' 'binary' 'loose.txt' \
+        'A added.txt' 'D kept.txt' 'R old-name.txt -> new-name.txt +0/-0' \
+        '5 staged, 1 unstaged, 1 untracked, 1 commits'
+    staged_needle="$(sed -n '1p' "$summary_parent/summary-numstat.txt")"
+    unstaged_needle="$(sed -n '2p' "$summary_parent/summary-numstat.txt")"
+    assert_file_contains "$evidence/19b-summary.txt" "$staged_needle" "$unstaged_needle"
+    if [ "$staged_needle" = "$unstaged_needle" ]; then
+        [ "$(grep -F -o -e "$staged_needle" "$evidence/19b-summary.txt" | wc -l)" -ge 2 ] || fail "user.$SCENARIO: both.rs staged and unstaged counts collapsed"
+    fi
+    assert_file_lacks "$evidence/19b-summary.txt" 'Write one Markdown document' 'STALE-LATE-SNAPSHOT' 'exceeded 2097152' '##' 'LEFT-HEAD-MARKER' 'RIGHT-TAIL-MARKER'
+    tmux send-keys -t "$session":0 x
+    wait_gone 'Purpose: root0 compared ahead 1' 10 summary-hidden
+    capture_to "$evidence/19d-summary-hidden.txt"
+    assert_file_lacks "$evidence/19d-summary-hidden.txt" 'Purpose: root0 compared ahead 1'
+    tmux send-keys -t "$session":0 q
+    wait_gone 'HEAD → working tree' 15 summary-closed
+    capture_to "$evidence/20b-summary-closed.txt"
+    assert_file_lacks "$evidence/20b-summary-closed.txt" 'HEAD → working tree' 'focus:tree' 'focus:diff'
+    tmux send-keys -t "$session":0 -l '/quit'
+    wait_for '/quit' 10
+    tmux send-keys -t "$session":0 Enter
+    if ! tmux_wait_for "$session" 20 '===TUI-DONE-code-review-summary===' >"$evidence/22-summary-quit.txt"; then
+        fail "user.$SCENARIO: summary TUI did not exit after /quit (see $evidence/22-summary-quit.txt)"
+    fi
+
+
+    assert_large_summary_proof "$summary_parent/summary-big-expected.json"
     assert_mock_counts
     printf 'user.%s passed\nevidence=%s\n' "$SCENARIO" "$evidence"
 }

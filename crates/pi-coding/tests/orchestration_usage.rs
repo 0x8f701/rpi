@@ -73,7 +73,7 @@ async fn completed_child_usage_is_preserved_in_result_and_job_snapshot() {
         let stream_fn = stream_fn.clone();
         Box::pin(async move {
             Session::new(SessionOptions {
-                model,
+                model: Some(model),
                 cwd: std::env::current_dir().expect("cwd"),
                 system_prompt: request.system_prompt,
                 thinking_level: ThinkingLevel::Off,

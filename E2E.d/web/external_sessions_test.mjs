@@ -26,8 +26,10 @@
 //       X11.3 search reveals the bootstrapOnly row under a search-forced-open
 //            Agent sessions subgroup; clearing hides it again
 //       X11.4 switching to the bootstrapOnly row keeps it active; after
-//            search clear, Agent sessions returns to default-collapsed
-//            (row hidden). Expanding the subgroup shows the still-active row.
+//            search clear the ACTIVE Agent sessions subgroup stays expanded
+//            (committed default active-path semantics: only the active
+//            session's ancestors stay open). A real collapse click hides the
+//            still-active row; re-expanding shows it active again.
 //   X3  X3.1 foreign Codex source bytes unchanged after import
 //       X3.2 foreign Codex source mtime unchanged after import
 //   X4  X4.1 exactly one import_*.jsonl under the native sessions tree
@@ -94,6 +96,7 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { createFreshSessionViaManage } from './lib/session-lifecycle.mjs';
+import { clickFeature, openSessionsDrawer } from './lib/feature-menu.mjs';
 
 const url = process.env.RPI_URL;
 const token = process.env.RPI_TOKEN || '';
@@ -228,6 +231,19 @@ function stageWrite(name, data) {
 
 function cleanupStaging() {
   fs.rmSync(stagingDir, { recursive: true, force: true });
+}
+
+// Failure-scene preservation: fail() removes the WHOLE shared staging set, so
+// any DOM/catalog dump left there would be destroyed exactly when it matters.
+// Diagnostic dumps therefore go to the evidence ROOT (beside rpi.stderr),
+// which survives cleanupStaging() and is never published into the lane-set
+// run dir.
+function preserveScene(name, payload) {
+  try {
+    fs.writeFileSync(path.join(evidence, name), `${JSON.stringify(payload, null, 2)}\n`);
+  } catch (error) {
+    throw new Error(`scene dump ${name} failed: ${error.message}`, { cause: error });
+  }
 }
 
 // Phase fragment commit: the phase manifest is written INTO the shared
@@ -593,7 +609,7 @@ async function panelSessionFileTitle(page) {
 async function openSessionPanel(page, id) {
   const open = await page.evaluate(() => document.getElementById('session-panel') !== null);
   if (!open) {
-    await page.click('#session-toggle-btn');
+    await clickFeature(page, '#session-toggle-btn');
   }
   await waitFor(page, () => document.getElementById('session-panel') !== null, `${id}: session panel did not open`);
 }
@@ -678,6 +694,32 @@ async function clickSidebarSession(page, sessionId) {
   }
 }
 
+// Under the committed default active-path collapse (SessionSidebar.tsx
+// collapsedSidebarGroupKeys) only the active session's ancestors render
+// rows. Expand one provider and its project subgroups with REAL user clicks
+// (never force/evaluate clicks, never search) so non-active rows render
+// before assertions or interactions. Idempotent: expanded heads are never
+// clicked, and only [data-subgroup-kind="project"] heads are touched, so
+// Agent-sessions subgroups keep their own default/expected state.
+async function expandProviderRows(page, provider) {
+  const head = page.locator(`button.session-sidebar__group-head[data-group-kind="provider"][data-provider="${provider}"]`);
+  if (await head.count() !== 1) fail(`expandProviderRows: provider head not found for ${provider}`);
+  await head.waitFor({ state: 'visible', timeout: 30000 });
+  if (await head.getAttribute('aria-expanded') !== 'true') {
+    await head.click();
+    await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  }
+  for (;;) {
+    const sub = page.locator(
+      `button.session-sidebar__group-head[data-group-kind="project"]`
+      + `[data-subgroup-kind="project"][data-provider="${provider}"][aria-expanded="false"]`,
+    ).first();
+    if (await sub.count() === 0) break;
+    await sub.click();
+    await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  }
+}
+
 async function activeTranscript(page) {
   return page.evaluate(() => document.getElementById('transcript')?.textContent || '');
 }
@@ -711,6 +753,38 @@ async function runDefaultPhase(page, meta) {
   await stageShot(page, 'external-x0-boot.png');
 
   /* ---------------- X1: default discovery + grouping ---------------- */
+  // Pre-assertion capture, fixture identifiers only: the typed catalog and
+  // the DOM group expanded state must prove the foreign imports actually
+  // loaded BEFORE any expansion click. Under the committed default
+  // active-path collapse only the active session's ancestors render rows, so
+  // collapsed foreign groups are expected; a foreign-empty catalog is a
+  // discovery failure and is REPORTED below instead of being masked by
+  // expansion clicks. The dump lands in the evidence root, which survives
+  // the failure-path staging cleanup.
+  const foreignIds = [...meta.piIds, meta.ompId, meta.codexId, meta.grokId];
+  const domPreExpand = await sidebarSnapshot(page);
+  const catalogList = await httpRpc(page, { type: 'session_list', scope: 'all_projects' });
+  const catalogRows = Array.isArray(catalogList.sessions) ? catalogList.sessions : [];
+  preserveScene('external-x1-pre-expand-scene.json', {
+    fixtureForeignIds: foreignIds,
+    fixtureNativeId: meta.nativeId,
+    catalogRowCount: catalogRows.length,
+    catalogFixtureIds: catalogRows
+      .map((row) => row.sessionId || '')
+      .filter((id) => foreignIds.includes(id) || id === meta.nativeId),
+    providerGroupsPreExpand: domPreExpand.providerGroups,
+    domRowIdsPreExpand: domPreExpand.rows.map((row) => row.sessionId),
+  });
+  const missingCatalogIds = foreignIds.filter((id) => !catalogRows.some((row) => row.sessionId === id));
+  if (missingCatalogIds.length > 0) {
+    fail(`X1.1: typed catalog is missing fixture foreign ids ${JSON.stringify(missingCatalogIds)} (${catalogRows.length} catalog rows) — foreign imports did not load; assertion left unchanged`);
+  }
+  // Real user clicks (never force/evaluate clicks, never search): expand the
+  // foreign providers and their project subgroups so their fixture rows
+  // render. The default active-path semantics stay untouched.
+  for (const provider of ['Pi', 'OMP', 'Codex', 'Grok']) {
+    await expandProviderRows(page, provider);
+  }
   await waitFor(
     page,
     (ids) => {
@@ -766,37 +840,69 @@ async function runDefaultPhase(page, meta) {
       || !meta.piIds.every((id) => piRowIds.includes(id))) {
     fail(`X1.2: expanded Pi count/actionable-row divergence (${JSON.stringify({ piGroup, actionablePiRows })})`);
   }
+  for (const viewport of [{ width: 1280, height: 800 }, { width: 390, height: 844 }]) {
+    await page.setViewportSize(viewport);
+    if (viewport.width === 390) {
+      await page.waitForFunction(() => !document.querySelector('.app-layout')?.classList.contains('app-layout--drawer-open'), null, { timeout: 3000 });
+    }
+    if (!await page.evaluate(() => document.querySelector('.app-layout')?.classList.contains('app-layout--drawer-open'))) {
+      await openSessionsDrawer(page);
+    }
+    await page.locator('#session-sidebar-search').waitFor({ state: 'visible', timeout: 3000 });
+    await page.waitForFunction(() => document.querySelector('.app-layout')?.classList.contains('app-layout--drawer-open'), null, { timeout: 3000 });
+    const ownership = await page.evaluate(() => {
+      let parentProvider = null;
+      let checkedRows = 0;
+      const mismatches = [];
+      for (const item of document.querySelectorAll('.session-sidebar__list > li')) {
+        const head = item.querySelector('button.session-sidebar__group-head[data-group-kind="provider"]');
+        if (head) parentProvider = head.dataset.provider;
+        const button = item.querySelector('.session-sidebar__switch');
+        if (!button) continue;
+        checkedRows += 1;
+        const source = button.dataset.sessionSource?.trim().toLowerCase();
+        const provider = ['rpi', 'native', 'primary'].includes(source) ? 'rpi' : source === 'grok/hyper' ? 'grok' : source;
+        if (provider !== parentProvider?.toLowerCase()) mismatches.push({ parentProvider, source });
+      }
+      return { checkedRows, mismatches };
+    });
+    await stageShot(page, `external-x1-parent-${viewport.width}-before.png`);
+    if (ownership.checkedRows < requiredProviders.length || ownership.mismatches.length > 0) {
+      fail(`X1.2: ${viewport.width}px visual parent ownership mismatch: ${JSON.stringify(ownership)}`);
+    }
+    for (const provider of requiredProviders) {
+      const head = page.locator(`button.session-sidebar__group-head[data-group-kind="provider"][data-provider="${provider}"]`);
+      if (await head.count() !== 1 || await head.getAttribute('aria-expanded') !== 'true') {
+        fail(`X1.2: ${viewport.width}px ${provider} provider must start expanded`);
+      }
+      const before = await sidebarSnapshot(page);
+      const sources = provider === 'rpi' ? ['rpi', 'native', 'primary'] : provider === 'Grok' ? ['grok', 'grok/hyper'] : [provider.toLowerCase()];
+      const owned = before.rows.filter(row => sources.includes(row.source));
+      const others = before.rows.filter(row => !sources.includes(row.source));
+      if (owned.length === 0 || others.length === 0) fail(`X1.2: ${provider} collapse requires nonzero owned and control rows`);
+      await head.click();
+      await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+      const after = await sidebarSnapshot(page);
+      const descendants = page.locator(`button.session-sidebar__group-head[data-group-kind="project"][data-provider="${provider}"]`);
+      if (await head.getAttribute('aria-expanded') !== 'false' || after.rows.some(row => sources.includes(row.source)) || await descendants.count() !== 0) {
+        fail(`X1.2: ${viewport.width}px collapsing ${provider} did not hide all descendants`);
+      }
+      const retained = after.rows.map(row => [row.source, row.sessionId]);
+      if (JSON.stringify(retained) !== JSON.stringify(others.map(row => [row.source, row.sessionId]))) {
+        fail(`X1.2: ${viewport.width}px collapsing ${provider} changed another provider's rows`);
+      }
+      await head.click();
+      await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+      const restored = await sidebarSnapshot(page);
+      if (await head.getAttribute('aria-expanded') !== 'true'
+          || JSON.stringify(restored.rows.map(row => [row.source, row.sessionId])) !== JSON.stringify(before.rows.map(row => [row.source, row.sessionId]))) {
+        fail(`X1.2: ${viewport.width}px expanding ${provider} did not restore the exact tree row order`);
+      }
+    }
+    await stageShot(page, `external-x1-parent-${viewport.width}-after.png`);
+  }
+  await page.setViewportSize({ width: 1280, height: 800 });
   record('X1.2');
-
-  // Exact provider collapse: clicking the OMP provider header must hide every
-  // OMP descendant subgroup and row, then restore the same row on expand.
-  const ompProviderHead = page.locator('.session-sidebar__group-head[data-group-kind="provider"][data-provider="OMP"]');
-  if (await ompProviderHead.count() !== 1) fail(`X1.2: expected one exact OMP provider header, got ${await ompProviderHead.count()}`);
-  await ompProviderHead.click();
-  await waitFor(
-    page,
-    (ompId) => {
-      const head = document.querySelector('.session-sidebar__group-head[data-group-kind="provider"][data-provider="OMP"]');
-      const row = document.querySelector(`.session-sidebar__switch[data-session-id="${ompId}"]`);
-      const descendants = document.querySelectorAll('.session-sidebar__group-head[data-provider="OMP"][data-group-kind="project"]');
-      return head?.getAttribute('aria-expanded') === 'false' && row === null && descendants.length === 0;
-    },
-    'X1.2: collapsed exact OMP provider did not hide all descendants',
-    30000,
-    meta.ompId,
-  );
-  await ompProviderHead.click();
-  await waitFor(
-    page,
-    (ompId) => {
-      const head = document.querySelector('.session-sidebar__group-head[data-group-kind="provider"][data-provider="OMP"]');
-      return head?.getAttribute('aria-expanded') === 'true'
-        && document.querySelector(`.session-sidebar__switch[data-session-id="${ompId}"]`) !== null;
-    },
-    'X1.2: expanding exact OMP provider did not restore its row',
-    30000,
-    meta.ompId,
-  );
   await stageShot(page, 'external-x1-discovery.png');
 
   /* ---- Search exercise: provider/title/id filtering + active visibility ---- */
@@ -932,10 +1038,12 @@ async function runDefaultPhase(page, meta) {
     );
     record('X11.3');
 
-    /* X11.4: switch while search reveals the row; after clear, Agent
-     * sessions default-collapses and hides descendants — including the
-     * active row (SessionSidebar.tsx:452-462; sessionSidebar.test.ts:2717-2746).
-     * Expanding the subgroup shows the still-active bootstrap row. */
+    /* X11.4: switch while search reveals the row; after clear, the ACTIVE
+     * session's Agent sessions subgroup stays expanded under the committed
+     * default active-path semantics (collapsedSidebarGroupKeys keeps active
+     * ancestors open; sessionSidebar.test.ts covers the non-active
+     * default-collapse case). A real collapse click hides the still-active
+     * bootstrap row; re-expanding shows it active again. */
     await page.fill('#session-sidebar-search', meta.bootstrapId);
     await waitFor(
       page,
@@ -952,10 +1060,18 @@ async function runDefaultPhase(page, meta) {
       (sid) => {
         const expanded = document.querySelector('.session-sidebar__group-head[data-subgroup-kind="agent"]')
           ?.getAttribute('aria-expanded');
-        return expanded === 'false'
-          && document.querySelector(`.session-sidebar__switch[data-session-id="${sid}"]`) === null;
+        return expanded === 'true'
+          && document.querySelector(`.session-sidebar__switch[data-session-id="${sid}"]`) !== null;
       },
-      'X11: Agent sessions did not return to default-collapsed after clearing search',
+      'X11: active Agent sessions subgroup did not stay open with the still-active bootstrapOnly row after clearing search',
+      30000,
+      meta.bootstrapId,
+    );
+    await page.click('.session-sidebar__group-head[data-subgroup-kind="agent"]');
+    await waitFor(
+      page,
+      (sid) => document.querySelector(`.session-sidebar__switch[data-session-id="${sid}"]`) === null,
+      'X11: collapsing Agent sessions did not hide the still-active bootstrapOnly row',
       30000,
       meta.bootstrapId,
     );
@@ -993,6 +1109,9 @@ async function runDefaultPhase(page, meta) {
     foreignId: meta.codexId,
     priorId: await page.evaluate(() => document.querySelector('.session-sidebar__row--active .session-sidebar__switch')?.dataset.sessionId || ''),
   });
+  // The X11.4 bootstrap switch re-collapsed every non-active group; expand
+  // the Codex provider with real clicks before the foreign row click.
+  await expandProviderRows(page, 'Codex');
   await clickSidebarSession(page, meta.codexId);
   await waitFor(
     page,
@@ -1122,6 +1241,9 @@ async function runDefaultPhase(page, meta) {
   }
   record('X4.1');
 
+  // The X2.1 import switch re-collapsed every non-active group; expand the
+  // Codex provider with real clicks so the imported badge row renders.
+  await expandProviderRows(page, 'Codex');
   await waitFor(
     page,
     (args) => {
@@ -1161,6 +1283,9 @@ async function runDefaultPhase(page, meta) {
     importedNativeId
   );
 
+  // The New-session switch re-collapsed every non-active group; expand the
+  // Codex provider with real clicks so the imported foreign row renders.
+  await expandProviderRows(page, 'Codex');
   await waitFor(
     page,
     (foreignId) => document.querySelector(`.session-sidebar__switch[data-session-id="${foreignId}"][data-session-source="codex"] .session-sidebar__imported`) !== null,
@@ -1240,6 +1365,9 @@ async function runDefaultPhase(page, meta) {
   }
   const ompImportsBefore = listImportFiles(nativeSessionsRoot);
 
+  // The Codex import switch re-collapsed every non-active group; expand the
+  // OMP provider with real clicks before the X7.1 foreign leaf-row click.
+  await expandProviderRows(page, 'OMP');
   await clickSidebarSession(page, meta.ompId);
 
   await waitFor(
@@ -1339,6 +1467,9 @@ async function runDefaultPhase(page, meta) {
   );
   const piBefore = fileFingerprint(meta.piPath);
   const piImportsBefore = listImportFiles(nativeSessionsRoot);
+  // The OMP import switch re-collapsed every non-active group; expand the Pi
+  // provider with real clicks before the X9.1 foreign row click.
+  await expandProviderRows(page, 'Pi');
   await clickSidebarSession(page, meta.piId);
   await waitFor(
     page,
@@ -1394,8 +1525,14 @@ async function runDefaultPhase(page, meta) {
   if (piNewImports.length !== 1) {
     fail(`X9.3: expected one Pi import file, got ${piNewImports.join(', ')}`);
   }
+  // The Pi import switch re-collapsed the native seed's project subgroup;
+  // expand rpi with real clicks before the A-to-B-to-A native row click.
+  await expandProviderRows(page, 'rpi');
   await clickSidebarSession(page, meta.nativeId);
   await waitRowActive(page, meta.nativeId, 'X9.3');
+  // The nativeId switch re-collapsed the imported copy's project subgroup;
+  // expand rpi again with real clicks for the A-to-B-to-A return click.
+  await expandProviderRows(page, 'rpi');
   await clickSidebarSession(page, piActiveId);
   await waitRowActive(page, piActiveId, 'X9.3');
   if (listImportFiles(nativeSessionsRoot).length !== piImportsAfter.length) {
@@ -1405,6 +1542,9 @@ async function runDefaultPhase(page, meta) {
   await stageShot(page, 'external-x9-pi-import.png');
 
   /* ---------------- X10: selected-row HTML export ------------------------- */
+  // X9.3's last switch re-collapsed the non-active project subgroup holding
+  // the native seed row; expand rpi with real clicks before the X10.1 click.
+  await expandProviderRows(page, 'rpi');
   await clickSidebarSession(page, meta.nativeId);
   await waitRowActive(page, meta.nativeId, 'X10.1');
   const nativeExport = await exportSessionRow(page, meta.nativeId, 'native-ext-seed', 'X10.1');
@@ -1414,6 +1554,11 @@ async function runDefaultPhase(page, meta) {
   record('X10.1');
   await stageShot(page, 'external-x10-native-export.png');
 
+  // The X10.1 active switch retired explicit expansion intent and
+  // re-collapsed every non-active group (committed default active-path
+  // semantics); expand the Pi provider again with real clicks so the
+  // exportable foreign Pi row renders for the checks below.
+  await expandProviderRows(page, 'Pi');
   const piExportImportsBefore = listImportFiles(nativeSessionsRoot).length;
   const piExportSourceBefore = fileFingerprint(meta.piPath);
   const importedPiRowCount = await page.locator(

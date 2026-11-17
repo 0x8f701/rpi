@@ -34,6 +34,7 @@ import {
   parseCodeReviewAutoReviewAck,
   parseCodeReviewHighlightAck,
   reviewErrorNotices,
+  reviewRepositoryUnavailable,
   threadLatestUserIsAuto,
   FILE_STATUS_LETTERS,
   fileStatusLetter,
@@ -50,12 +51,12 @@ import {
   initialAutoReviewButtonState,
   hunkKey,
   hunkKeyFor,
-  normalizeCodeReviewSnapshot,
+  parseCodeReviewSnapshot,
+  INVALID_CODE_REVIEW_SNAPSHOT_REPO,
   normalizeFileDiffPage,
   normalizeThreads,
   overlayReviewLifecycle,
   codeReviewOpenCommand,
-  codeReviewOpenSnapshotError,
   normalizeCodeReviewCommits,
   buildCodeReviewCommitsPayload,
   filterCommitRows,
@@ -64,7 +65,6 @@ import {
   isValidGitHash,
   CODE_REVIEW_COMMITS_MAX_LIMIT,
   CODE_REVIEW_COMMIT_LABEL_HEX,
-  classifyReviewProbe,
   isNoOpenCodeReviewError,
   reviewModelOptionValue,
   buildCodeReviewSetModelPayload,
@@ -121,6 +121,7 @@ import {
   parseCodeReviewTldrAck,
   tldrButtonView,
   tldrMarkdownForSnapshot,
+  tldrTimestampForSnapshot,
   CODE_REVIEW_FILES_WIDTH_DEFAULT,
   CODE_REVIEW_FILES_WIDTH_MAX,
   CODE_REVIEW_FILES_WIDTH_MIN,
@@ -150,6 +151,29 @@ function check(name, cond, detail) {
   ran += 1;
   if (!cond) failures.push(`${name}${detail ? `: ${detail}` : ''}`);
 }
+
+/** Central fixture projection over the typed parse boundary. Fixtures that
+ *  are not about repo authority stamp the explicit session-cwd null. */
+const fixtureParse = (data) =>
+  parseCodeReviewSnapshot(
+    data !== null && typeof data === 'object' && !Array.isArray(data)
+      ? { repo: null, ...data }
+      : data,
+  );
+
+/** Success-path fixtures read a typed snapshot; an unexpected structural
+ *  rejection aborts instead of returning a repaired empty snapshot. */
+const fixtureSnapshot = (data) => {
+  const parsed = fixtureParse(data);
+  if (!parsed.ok) throw new Error(`fixture rejected: ${parsed.error}`);
+  return parsed.snapshot;
+};
+
+/** Typed rejection text, or null on success (negative assertions only). */
+const fixtureError = (data) => {
+  const parsed = fixtureParse(data);
+  return parsed.ok ? null : parsed.error;
+};
 // ---- transport failures toast; review business failures stay inline ----
 check('transport close is not rendered inline', !shouldRenderReviewError(new Error('connection closed (code 1006)')));
 check('bounded review timeout remains inline', shouldRenderReviewError(new Error('code_review_open timed out after 600s (no response from server)')));
@@ -372,20 +396,91 @@ check('RPC business failure remains inline', shouldRenderReviewError(Object.assi
   }
 }
 
-// ---- bad shapes never throw; error snapshot returned ----
+// ---- bad shapes reject through the typed boundary; error snapshot is never used ----
 {
-  const nullSnap = normalizeCodeReviewSnapshot(null);
-  check('null -> empty with error', !!nullSnap.error && nullSnap.files.length === 0);
-  const strSnap = normalizeCodeReviewSnapshot('nope');
-  check('string -> empty with error', !!strSnap.error);
-  const arrSnap = normalizeCodeReviewSnapshot([]);
-  check('array -> empty with error', !!arrSnap.error);
+  for (const [label, data] of [
+    ['null', null],
+    ['string', 'nope'],
+    ['array', []],
+  ] as const) {
+    const parsed = fixtureParse(data);
+    check(`${label} -> typed rejection`, !parsed.ok && parsed.reviewId === null, parsed.ok ? 'accepted' : parsed.error);
+  }
   check('empty helper defaults', emptyCodeReviewSnapshot().snapshotId === '');
   check('empty helper with error', emptyCodeReviewSnapshot('x').error === 'x');
   check('empty helper untracked defaults to 0', emptyCodeReviewSnapshot().untrackedNotShown === 0);
   check('empty helper internalBusy defaults false', emptyCodeReviewSnapshot().internalBusy === false);
   check('empty helper isStreaming defaults false', emptyCodeReviewSnapshot().isStreaming === false);
-  check('null snapshot internalBusy fails closed', nullSnap.internalBusy === false);
+}
+
+// ---- repo authority is required wire data (no open-arguments fallback) ----
+{
+  const base = { snapshotId: 'snap-repo', files: [], threads: [] };
+  const nullRepo = parseCodeReviewSnapshot({ ...base, repo: null });
+  check('explicit null repo means the session cwd', nullRepo.ok && nullRepo.snapshot.repo === null && nullRepo.snapshot.error === null);
+  const missing = parseCodeReviewSnapshot(base);
+  check(
+    'missing repo rejects the snapshot',
+    !missing.ok && missing.error === INVALID_CODE_REVIEW_SNAPSHOT_REPO && missing.reviewId === null,
+    missing.ok ? 'accepted' : missing.error,
+  );
+  const identityReject = parseCodeReviewSnapshot({ ...base, repo: '', reviewId: 'rev-raw' });
+  check(
+    'rejection carries the validated raw review id for owner cleanup',
+    !identityReject.ok && identityReject.reviewId === 'rev-raw',
+    identityReject.ok ? 'accepted' : String(identityReject.reviewId),
+  );
+  const badIdentity = parseCodeReviewSnapshot({ ...base, repo: '', reviewId: ' rev-raw ' });
+  check(
+    'malformed identity never reaches cleanup',
+    !badIdentity.ok && badIdentity.reviewId === null,
+    badIdentity.ok ? 'accepted' : String(badIdentity.reviewId),
+  );
+  for (const malformed of ['', 7, true, {}, [], undefined]) {
+    const rejected = parseCodeReviewSnapshot({ ...base, repo: malformed });
+    check(
+      `malformed repo ${String(JSON.stringify(malformed))} rejects the snapshot`,
+      !rejected.ok && rejected.error === INVALID_CODE_REVIEW_SNAPSHOT_REPO,
+      rejected.ok ? 'accepted' : rejected.error,
+    );
+  }
+  for (const malformed of [
+    '/abs/repo',
+    'C:/repo',
+    'C:\\repo',
+    '..',
+    '../repo',
+    'repo/../other',
+    'repo//other',
+    'repo/',
+    './repo',
+    ' repo',
+    'repo ',
+    'repo\\other',
+    'repo\u0000other',
+  ]) {
+    const rejected = parseCodeReviewSnapshot({ ...base, repo: malformed });
+    check(
+      `non-addressable repo ${JSON.stringify(malformed)} rejects the snapshot`,
+      !rejected.ok && rejected.error === INVALID_CODE_REVIEW_SNAPSHOT_REPO,
+      rejected.ok ? 'accepted' : rejected.error,
+    );
+  }
+  const nested = parseCodeReviewSnapshot({ ...base, repo: 'nested/repo' });
+  check('non-empty session-relative repo is preserved', nested.ok && nested.snapshot.repo === 'nested/repo' && nested.snapshot.error === null);
+  check('empty helper repo defaults to the session cwd', emptyCodeReviewSnapshot().repo === null);
+  const unavailable = parseCodeReviewSnapshot({ ...base, repo: { unavailable: true } });
+  check(
+    'exact unavailable repo is preserved',
+    unavailable.ok && reviewRepositoryUnavailable(unavailable.snapshot.repo),
+  );
+  for (const malformed of [{ unavailable: false }, { unavailable: true, repo: 'child' }, { unavailable: 'true' }]) {
+    const rejected = parseCodeReviewSnapshot({ ...base, repo: malformed });
+    check(
+      `inexact unavailable repo ${JSON.stringify(malformed)} rejects the snapshot`,
+      !rejected.ok && rejected.error === INVALID_CODE_REVIEW_SNAPSHOT_REPO,
+    );
+  }
 }
 
 // ---- untracked-not-shown note: path-free empty-state copy ----
@@ -409,7 +504,7 @@ check('RPC business failure remains inline', shouldRenderReviewError(Object.assi
     emptyComparisonMessage(2) ===
       'No tracked changes — 2 untracked files are not part of the review',
   );
-  const wire = normalizeCodeReviewSnapshot({
+  const wire = fixtureSnapshot({
     comparisonLabel: 'HEAD → working tree',
     snapshotId: 'snap-u',
     files: [],
@@ -421,13 +516,14 @@ check('RPC business failure remains inline', shouldRenderReviewError(Object.assi
     emptyComparisonMessage(wire.untrackedNotShown) ===
       'No tracked changes — 3 untracked files are not part of the review',
   );
-  const missing = normalizeCodeReviewSnapshot({ snapshotId: 'snap-clean', files: [] });
+  const missing = fixtureSnapshot({ snapshotId: 'snap-clean', files: [] });
   check('missing wire count -> 0', missing.untrackedNotShown === 0);
 }
 // ---- happy path: full snapshot coerces and preserves ----
 {
   const wire = {
     comparisonLabel: 'HEAD → working tree',
+    repo: 'psy-node',
     snapshotId: 'snap-1',
     truncated: true,
     error: null,
@@ -496,8 +592,9 @@ check('RPC business failure remains inline', shouldRenderReviewError(Object.assi
     isStreaming: true,
     activeCount: 1,
   };
-  const snap = normalizeCodeReviewSnapshot(wire);
+  const snap = fixtureSnapshot(wire);
   check('label preserved', snap.comparisonLabel === 'HEAD → working tree');
+  check('repo authority preserved', snap.repo === 'psy-node');
   check('snapshotId preserved', snap.snapshotId === 'snap-1');
   check('truncated preserved', snap.truncated === true);
   check('error null preserved', snap.error === null);
@@ -524,7 +621,7 @@ check('RPC business failure remains inline', shouldRenderReviewError(Object.assi
   check('omitted thread isCancellable fails closed', snap.threads[0].isCancellable === false);
   check('omitted snapshot internalBusy fails closed', snap.internalBusy === false);
   check('omitted review model identity is null', snap.reviewModelProvider === null && snap.reviewModelId === null && snap.reviewModelLabel === null);
-  const identitySnap = normalizeCodeReviewSnapshot({
+  const identitySnap = fixtureSnapshot({
     ...wire,
     reviewModelProvider: 'user-steering',
     reviewModelId: 'mock',
@@ -579,7 +676,7 @@ check('RPC business failure remains inline', shouldRenderReviewError(Object.assi
     activeCount: -3,
     internalBusy: 1,
   };
-  const snap = normalizeCodeReviewSnapshot(wire);
+  const snap = fixtureSnapshot(wire);
   check('non-string label -> empty', snap.comparisonLabel === '');
   check('non-string snapshotId -> empty', snap.snapshotId === '');
   check('non-string error -> null', snap.error === null);
@@ -606,7 +703,7 @@ check('RPC business failure remains inline', shouldRenderReviewError(Object.assi
 }
 
 {
-  const snap = normalizeCodeReviewSnapshot({
+  const snap = fixtureSnapshot({
     threads: [
       {
         identity: {
@@ -651,7 +748,7 @@ check('RPC business failure remains inline', shouldRenderReviewError(Object.assi
     streamingThinking: 'live reasoning',
     ...over,
   });
-  const snap = normalizeCodeReviewSnapshot({ threads: [threadWire({})] });
+  const snap = fixtureSnapshot({ threads: [threadWire({})] });
   const thread = snap.threads[0];
   check('streamingThinking preserved while streaming', thread.streamingThinking === 'live reasoning');
   check('comment thinking preserved', thread.comments[1].thinking === 'reasoning trace');
@@ -660,11 +757,11 @@ check('RPC business failure remains inline', shouldRenderReviewError(Object.assi
   check('user comment has no thinking', !('thinking' in thread.comments[0]));
   check('no placeholder while thinking streams', threadNeedsThinkingPlaceholder(thread) === false);
 
-  const deadAir = normalizeCodeReviewSnapshot({
+  const deadAir = fixtureSnapshot({
     threads: [threadWire({ streamingThinking: '' })],
   }).threads[0];
   check('placeholder fires on dead air', threadNeedsThinkingPlaceholder(deadAir) === true);
-  const garbageThinking = normalizeCodeReviewSnapshot({
+  const garbageThinking = fixtureSnapshot({
     threads: [threadWire({ streamingThinking: 7 })],
   }).threads[0];
   check('non-string streamingThinking coerced to empty', garbageThinking.streamingThinking === '');
@@ -672,11 +769,11 @@ check('RPC business failure remains inline', shouldRenderReviewError(Object.assi
   check(
     'placeholder suppressed once text streams',
     threadNeedsThinkingPlaceholder(
-      normalizeCodeReviewSnapshot({ threads: [threadWire({ streamingText: 'partial' })] }).threads[0],
+      fixtureSnapshot({ threads: [threadWire({ streamingText: 'partial' })] }).threads[0],
     ) === false,
   );
 
-  const settled = normalizeCodeReviewSnapshot({
+  const settled = fixtureSnapshot({
     threads: [threadWire({ isStreaming: false, streamingText: 'residue', streamingThinking: 'residue' })],
   }).threads[0];
   check('terminal status clears streaming buffers', settled.streamingText === '' && settled.streamingThinking === '');
@@ -844,15 +941,20 @@ const commitRowFixture = (over = {}) => ({
     'an explicitly empty commit rides the wire (backend fails clearly) instead of a silent working-tree open',
     emptyCommit.ok === true && emptyCommit.ok && emptyCommit.command.commit === '',
   );
+  const openError = parseCodeReviewSnapshot({
+    error: 'invalid source revision; expected a commit, branch, or tag',
+    comparisonLabel: 'origin/mainnet-beta → working tree',
+    reviewId: 'rev-1',
+    repo: null,
+  });
   check(
     'open snapshot error is the git message, never the ref',
-    codeReviewOpenSnapshotError({
-      error: 'invalid source revision; expected a commit, branch, or tag',
-      comparisonLabel: 'origin/mainnet-beta → working tree',
-      reviewId: 'rev-1',
-    }) === 'invalid source revision; expected a commit, branch, or tag',
+    openError.ok
+      && openError.snapshot.error === 'invalid source revision; expected a commit, branch, or tag'
+      && openError.snapshot.reviewId === 'rev-1',
   );
-  check('open snapshot without error is null', codeReviewOpenSnapshotError({ reviewId: 'rev-ok', files: [] }) === null);
+  const openOk = parseCodeReviewSnapshot({ reviewId: 'rev-ok', files: [], repo: null });
+  check('open snapshot without error is null', openOk.ok && openOk.snapshot.error === null);
 }
 
 // ---- code_review_commits strict normalization + /commit picker decisions ----
@@ -1965,7 +2067,7 @@ const commitRowFixture = (over = {}) => ({
   check('stale page keeps the stream incomplete', stale.hunksComplete === false);
 }
 {
-  const multi = normalizeCodeReviewSnapshot({
+  const multi = fixtureSnapshot({
     comparisonLabel: 'x',
     snapshotId: 's2',
     files: [],
@@ -2039,7 +2141,7 @@ const commitRowFixture = (over = {}) => ({
   check('omitted internalBusy fails closed', multi.internalBusy === false);
   check('internalBusy not inferred from derived live count', reviewHasInternalBusy(multi) === false);
 
-  const wireCount = normalizeCodeReviewSnapshot({
+  const wireCount = fixtureSnapshot({
     threads: [
       {
         identity: {
@@ -2384,40 +2486,27 @@ const commitRowFixture = (over = {}) => ({
   check('transport: new epoch retries exactly once', epochRetryCalls === 1, `got ${epochRetryCalls}`);
 }
 
-// ---- restart re-open decision (classifyReviewProbe) ----
-// A same-process reconnect preserves a live controller; a real process
-// restart whose probe reports no open review reopens once; a transport
-// failure of the probe waits for the next epoch (no inline, no spin).
+// ---- typed no-open matcher (never prose, only the rpcCode) ----
 {
-  const liveSnapshot = { snapshotId: 'snap-7', files: [], threads: [], truncated: false };
-  check(
-    'same-process live snapshot -> preserve',
-    classifyReviewProbe(liveSnapshot, null).kind === 'preserve',
-  );
-  check(
-    'restart with no open review (empty probe) -> reopen',
-    classifyReviewProbe(emptyCodeReviewSnapshot(), null).kind === 'reopen',
-  );
-  check(
-    'restart with null probe data -> reopen',
-    classifyReviewProbe(null, null).kind === 'reopen',
-  );
-  // The backend signals no-open as a typed rpcCode; prose never matches.
   const noReviewProse = Object.assign(new Error('no open code review; call code_review_open first'), { rpc: true });
-  check(
-    'restart: prose no-open without rpcCode -> preserve',
-    classifyReviewProbe(null, noReviewProse).kind === 'preserve',
-  );
   const noReviewTyped = Object.assign(new Error('no open code review; call code_review_open first'), {
     rpc: true,
     rpcCode: 'code_review_not_open',
   });
-  check(
-    'restart: typed no-open rpcCode -> reopen',
-    classifyReviewProbe(null, noReviewTyped).kind === 'reopen',
-  );
   check('typed no-open matcher ignores prose', isNoOpenCodeReviewError(noReviewProse) === false);
   check('typed no-open matcher accepts rpcCode', isNoOpenCodeReviewError(noReviewTyped) === true);
+  check('typed no-open matcher rejects transport close', isNoOpenCodeReviewError(new Error('connection closed (code 1006)')) === false);
+  check('typed no-open matcher rejects send failure', isNoOpenCodeReviewError(new Error('send failed: websocket closed')) === false);
+  const overload = Object.assign(new Error('server busy: too many concurrent commands'), { rpc: true });
+  check('typed no-open matcher rejects slot overload', isNoOpenCodeReviewError(overload) === false);
+  const timeout = new Error('code_review_snapshot timed out after 30s (no response from server)');
+  check('typed no-open matcher rejects business timeout', isNoOpenCodeReviewError(timeout) === false);
+  const genericBusiness = Object.assign(new Error('snapshot unavailable'), { rpc: true });
+  check('typed no-open matcher rejects generic rpc business error', isNoOpenCodeReviewError(genericBusiness) === false);
+}
+
+// ---- model selection payloads ----
+{
   check(
     'identity option value is provider/id',
     reviewModelOptionValue('user-steering', 'mock') === 'user-steering/mock'
@@ -2433,31 +2522,6 @@ const commitRowFixture = (over = {}) => ({
     'auto_review payload omits modelId unless qualified identity is given',
     buildCodeReviewAutoReviewPayload('zh').modelId === undefined
       && buildCodeReviewAutoReviewPayload('zh', 'prov/m-1').modelId === 'prov/m-1',
-  );
-  // Transport failure of the probe never reopens inline nor spins.
-  const transport = new Error('connection closed (code 1006)');
-  check(
-    'probe transport failure -> wait (no reopen, no inline)',
-    classifyReviewProbe(null, transport).kind === 'wait',
-  );
-  check(
-    'probe send-failed transport -> wait',
-    classifyReviewProbe(null, new Error('send failed: websocket closed')).kind === 'wait',
-  );
-  const overload = Object.assign(new Error('server busy: too many concurrent commands'), { rpc: true });
-  check(
-    'probe slot overload -> preserve without reopen',
-    classifyReviewProbe(null, overload).kind === 'preserve',
-  );
-  const timeout = new Error('code_review_snapshot timed out after 30s (no response from server)');
-  check(
-    'probe business timeout -> preserve without reopen',
-    classifyReviewProbe(null, timeout).kind === 'preserve',
-  );
-  const genericBusiness = Object.assign(new Error('snapshot unavailable'), { rpc: true });
-  check(
-    'probe generic business error -> preserve without reopen',
-    classifyReviewProbe(null, genericBusiness).kind === 'preserve',
   );
 }
 
@@ -2530,7 +2594,7 @@ const commitRowFixture = (over = {}) => ({
   };
 
   function snapFor(thread, extras = {}) {
-    return normalizeCodeReviewSnapshot({
+    return fixtureSnapshot({
       snapshotId: 'snap-life',
       reviewId: 'review-a',
       generation: 1,
@@ -2551,7 +2615,7 @@ const commitRowFixture = (over = {}) => ({
   const afterFirst = life;
   const delayedEmpty = applyReviewLifecycle(afterFirst, {
     type: 'snapshot',
-    snapshot: normalizeCodeReviewSnapshot({
+    snapshot: fixtureSnapshot({
       snapshotId: 'snap-life',
       generation: 1,
       revision: afterFirst.revision,
@@ -2755,7 +2819,7 @@ const commitRowFixture = (over = {}) => ({
   check('reconnect terminal snapshot stays terminal', life.threads[key].reply.status === 'completed');
   check('reconnect overlay stays idle', overlayReviewLifecycle(reconnectTerminal, life).activeCount === 0);
 
-  const lifecycleOnlySnapshot = normalizeCodeReviewSnapshot({
+  const lifecycleOnlySnapshot = fixtureSnapshot({
     snapshotId: 'snap-life',
     reviewId: 'review-a',
     generation: 1,
@@ -2831,7 +2895,7 @@ const commitRowFixture = (over = {}) => ({
 
   const pruned = applyReviewLifecycle(life, {
     type: 'snapshot',
-    snapshot: normalizeCodeReviewSnapshot({ snapshotId: 'snap-life', generation: 1, revision: 7, files: [], threads: [] }),
+    snapshot: fixtureSnapshot({ snapshotId: 'snap-life', generation: 1, revision: 7, files: [], threads: [] }),
   });
   check('snapshot prunes missing hunk keys', pruned.threads[key] === undefined);
 
@@ -2844,7 +2908,7 @@ const commitRowFixture = (over = {}) => ({
 
   const refreshZero = applyReviewLifecycle(life, {
     type: 'snapshot',
-    snapshot: normalizeCodeReviewSnapshot({
+    snapshot: fixtureSnapshot({
       snapshotId: 'snap-refresh',
       generation: 3,
       revision: 0,
@@ -2906,7 +2970,7 @@ const commitRowFixture = (over = {}) => ({
 
   const restartEmpty = applyReviewLifecycle(life, {
     type: 'snapshot',
-    snapshot: normalizeCodeReviewSnapshot({
+    snapshot: fixtureSnapshot({
       snapshotId: 'snap-life',
       reviewId: 'review-b',
       generation: 1,
@@ -3400,7 +3464,7 @@ const autoThreadWire = (path, over = {}) => ({
 
 
 {
-  const snap = normalizeCodeReviewSnapshot({
+  const snap = fixtureSnapshot({
     threads: [
       autoThreadWire('a.ts', { autoComment: true }),
       autoThreadWire('b.ts'),
@@ -3411,7 +3475,7 @@ const autoThreadWire = (path, over = {}) => ({
   const manualComment = snap.threads[1].comments[0];
   check('auto flag survives on auto user comments', autoComment.auto === true);
   check('auto flag absent on manual comments', manualComment.auto === undefined);
-  check('comment auto flag absent when wire omits it', normalizeCodeReviewSnapshot({
+  check('comment auto flag absent when wire omits it', fixtureSnapshot({
     threads: [autoThreadWire('a.ts')],
   }).threads[0].comments[0].auto === undefined);
 }
@@ -3422,16 +3486,16 @@ const autoThreadWire = (path, over = {}) => ({
   check('empty snapshot leaves auto counts absent', emptyCodeReviewSnapshot().autoReviewCounts.submitted === null
     && emptyCodeReviewSnapshot().autoReviewCounts.completed === null
     && emptyCodeReviewSnapshot().autoReviewCounts.failed === null);
-  const defaults = normalizeCodeReviewSnapshot({});
+  const defaults = fixtureSnapshot({});
   check('missing wire auto state defaults to idle', defaults.autoReviewState === 'idle');
   check('missing wire auto counts stay absent', defaults.autoReviewCounts.submitted === null && defaults.autoReviewCounts.completed === null && defaults.autoReviewCounts.failed === null);
-  check('explicit zero counts stay distinct from absence', normalizeCodeReviewSnapshot({
+  check('explicit zero counts stay distinct from absence', fixtureSnapshot({
     autoReviewCounts: { submitted: 0, completed: 0, failed: 0 },
   }).autoReviewCounts.submitted === 0);
-  const invalid = normalizeCodeReviewSnapshot({ autoReviewState: 'paused', autoReviewCounts: { submitted: -2, completed: 'x', failed: 0 } });
+  const invalid = fixtureSnapshot({ autoReviewState: 'paused', autoReviewCounts: { submitted: -2, completed: 'x', failed: 0 } });
   check('unknown wire auto state falls back to idle', invalid.autoReviewState === 'idle');
   check('malformed wire auto counts stay absent', invalid.autoReviewCounts.submitted === null && invalid.autoReviewCounts.completed === null && invalid.autoReviewCounts.failed === null);
-  const running = normalizeCodeReviewSnapshot({
+  const running = fixtureSnapshot({
     autoReviewState: 'running',
     autoReviewCounts: { submitted: 5, completed: 2, failed: 1 },
     threads: [autoThreadWire('src/a.rs')],
@@ -3454,23 +3518,24 @@ const autoThreadWire = (path, over = {}) => ({
   const identity = { snapshotId: 'snap-h', path: 'src/a.ts', oldStart: 1, oldCount: 2, newStart: 1, newCount: 2, contentHash: 'hash-a' };
   const finding = { category: 'critical', side: 'new', startLine: 1, endLine: 2, summary: 'bounds check', evidence: 'unchecked index' };
   const result = { identity, findings: [finding] };
-  const normalize = (reviewFindings) => normalizeCodeReviewSnapshot({ reviewFindings });
+  const normalize = (reviewFindings) => fixtureSnapshot({ reviewFindings });
+  const normalizeError = (reviewFindings) => fixtureError({ reviewFindings });
   const snap = normalize([result]);
   check('exact seven-field identity survives', JSON.stringify(snap.reviewFindings?.[0].identity) === JSON.stringify(identity));
   check('precise side range and evidence survive', JSON.stringify(snap.reviewFindings?.[0].findings[0]) === JSON.stringify(finding));
-  check('missing findings remain unreviewed', normalizeCodeReviewSnapshot({}).reviewFindings === null);
+  check('missing findings remain unreviewed', fixtureSnapshot({}).reviewFindings === null);
   check('reviewed clean remains distinct', normalize([{ identity, findings: [] }]).reviewFindings?.[0].findings.length === 0);
   for (const malformed of [null, {}, { ...finding, category: 'clean' }, { ...finding, side: 'both' }, { ...finding, startLine: 0 }, { ...finding, endLine: 3 }, { ...finding, endLine: 0 }, { ...finding, extra: true }, { ...finding, evidence: null }, { ...finding, summary: 'x'.repeat(CODE_REVIEW_MAX_FINDING_SUMMARY_BYTES + 1) }]) {
-    check('malformed finding rejects the whole snapshot', normalize([{ identity, findings: [finding, malformed] }]).error === 'Invalid review findings');
+    check('malformed finding rejects the whole snapshot', normalizeError([{ identity, findings: [finding, malformed] }]) === 'Invalid review findings');
   }
   for (const malformed of ['nope', {}, [null], [result, result], [{ ...result, extra: true }], [{ identity: { ...identity, snapshotId: '' }, findings: [finding] }], [{ identity: { ...identity, newCount: 0 }, findings: [finding] }], [{ identity, findings: [finding, finding] }]]) {
-    check('malformed result rejects rather than truncates', normalize(malformed).error === 'Invalid review findings');
+    check('malformed result rejects rather than truncates', normalizeError(malformed) === 'Invalid review findings');
   }
-  check('summary at UTF-8 cap survives', normalize([{ identity, findings: [{ ...finding, summary: 'é'.repeat(CODE_REVIEW_MAX_FINDING_SUMMARY_BYTES / 2) }] }]).error === null);
-  check('summary over UTF-8 cap rejects', normalize([{ identity, findings: [{ ...finding, summary: 'é'.repeat(CODE_REVIEW_MAX_FINDING_SUMMARY_BYTES / 2 + 1) }] }]).error === 'Invalid review findings');
+  check('summary at UTF-8 cap survives', normalizeError([{ identity, findings: [{ ...finding, summary: 'é'.repeat(CODE_REVIEW_MAX_FINDING_SUMMARY_BYTES / 2) }] }]) === null);
+  check('summary over UTF-8 cap rejects', normalizeError([{ identity, findings: [{ ...finding, summary: 'é'.repeat(CODE_REVIEW_MAX_FINDING_SUMMARY_BYTES / 2 + 1) }] }]) === 'Invalid review findings');
   const twenty = Array.from({ length: 20 }, (_, i) => ({ ...finding, summary: `issue ${i}` }));
   check('twenty findings per hunk survive', normalize([{ identity, findings: twenty }]).reviewFindings?.[0].findings.length === 20);
-  check('twenty-one findings reject', normalize([{ identity, findings: [...twenty, { ...finding, summary: '21' }] }]).error === 'Invalid review findings');
+  check('twenty-one findings reject', normalizeError([{ identity, findings: [...twenty, { ...finding, summary: '21' }] }]) === 'Invalid review findings');
   const byFile = aggregateFindingsByFile(snap.reviewFindings);
   const byDir = aggregateFindingsByDirectory(snap.reviewFindings);
   check('finding count and severity aggregate by file', byFile.get('src/a.ts')?.issues === 1 && byFile.get('src/a.ts')?.category === 'critical');
@@ -3488,12 +3553,25 @@ const autoThreadWire = (path, over = {}) => ({
     check('TLDR malformed ACK generation rejects', !parseCodeReviewTldrAck({ ok: true, state: 'running', tldrGeneration: generation }).ok);
   }
   const wire = { snapshotId: 'snap-t', tldrState: 'done', tldrGeneration: 7, tldrSnapshotId: 'snap-t', tldrError: null, tldrMarkdown: '# Summary' };
-  const snap = normalizeCodeReviewSnapshot(wire);
+  const snap = fixtureSnapshot(wire);
   check('TLDR matching snapshot exposes markdown', tldrMarkdownForSnapshot(snap) === '# Summary');
   check('TLDR stale snapshot hides markdown', tldrMarkdownForSnapshot({ ...snap, snapshotId: 'next' }) === '');
   for (const field of [{ tldrState: 'paused' }, { tldrGeneration: -1 }, { tldrSnapshotId: 9 }, { tldrError: false }, { tldrMarkdown: null }]) {
-    check('malformed TLDR field rejects snapshot', normalizeCodeReviewSnapshot({ ...wire, ...field }).error === 'Invalid TLDR fields');
+    check('malformed TLDR field rejects snapshot', fixtureError({ ...wire, ...field }) === 'Invalid TLDR fields');
   }
+  const stamped = fixtureSnapshot({ ...wire, tldrTimestamp: 1730000000000 });
+  check('TLDR integer timestamp survives parse', stamped.tldrTimestamp === 1730000000000);
+  check('TLDR timestamp accessor binds to markdown', tldrTimestampForSnapshot(stamped) === 1730000000000);
+  check('TLDR stale snapshot hides timestamp', tldrTimestampForSnapshot({ ...stamped, snapshotId: 'next' }) === null);
+  for (const malformed of [undefined, null, '1730000000000', 1730000000000.5, true, Number.NaN, Number.POSITIVE_INFINITY]) {
+    const degraded = fixtureSnapshot({ ...wire, tldrTimestamp: malformed });
+    check(
+      `TLDR non-usable timestamp ${String(malformed)} degrades to null with markdown preserved`,
+      degraded.tldrTimestamp === null && degraded.tldrMarkdown === '# Summary',
+    );
+  }
+  const negative = fixtureSnapshot({ ...wire, tldrTimestamp: -5 });
+  check('TLDR negative integer passes parse (range is the filename authority)', negative.tldrTimestamp === -5);
   check('TLDR pending gate is quiet', tldrButtonView(true, 'idle', false).progress === null);
   check('TLDR running gate identifies summary', tldrButtonView(false, 'running', true).progress === 'Summarizing…');
   check('TLDR failed state permits retry', !tldrButtonView(false, 'failed', true).busy);
@@ -3521,7 +3599,7 @@ check('spinner gate is the frozen 151ms', AUTO_REVIEW_SPINNER_GATE_MS === 151);
   // P0-1: a wire internalBusy=true batch owner (Auto Review triage / Highlight)
   // must survive overlayReviewLifecycle even with zero live/cancellable
   // threads — the overlay may ADD busy, never zero it.
-  const triageSnap = normalizeCodeReviewSnapshot({
+  const triageSnap = fixtureSnapshot({
     snapshotId: 'snap-busy',
     reviewId: 'rev-1',
     generation: 1,
@@ -3546,7 +3624,7 @@ check('spinner gate is the frozen 151ms', AUTO_REVIEW_SPINNER_GATE_MS === 151);
   // Thread ownership may ADD busy on top of a false wire flag: a snapshot
   // whose thread is live projects busy through the reconciled lifecycle
   // owner even though the wire flag was false.
-  const streamSnap = normalizeCodeReviewSnapshot({
+  const streamSnap = fixtureSnapshot({
     snapshotId: 'snap-busy',
     reviewId: 'rev-1',
     generation: 1,
@@ -3596,7 +3674,7 @@ check('spinner gate is the frozen 151ms', AUTO_REVIEW_SPINNER_GATE_MS === 151);
     newCount: 1,
     contentHash: 'h-live',
   };
-  const longSnap = normalizeCodeReviewSnapshot({
+  const longSnap = fixtureSnapshot({
     reviewId: 'rev-live',
     snapshotId: 's-live',
     generation: 1,
@@ -3621,7 +3699,7 @@ check('spinner gate is the frozen 151ms', AUTO_REVIEW_SPINNER_GATE_MS === 151);
     replyId: 'r1',
     text: ' more',
   });
-  const shortSnap = normalizeCodeReviewSnapshot({
+  const shortSnap = fixtureSnapshot({
     reviewId: 'rev-live',
     snapshotId: 's-live',
     generation: 1,
@@ -3656,7 +3734,7 @@ check('spinner gate is the frozen 151ms', AUTO_REVIEW_SPINNER_GATE_MS === 151);
     mergedReply.streamingText === 'hello world more' && mergedReply.streamingThinking === 'think longer',
     `${mergedReply.streamingText}|${mergedReply.streamingThinking}`,
   );
-  const emptySnap = normalizeCodeReviewSnapshot({
+  const emptySnap = fixtureSnapshot({
     reviewId: 'rev-live',
     snapshotId: 's-live',
     generation: 1,
@@ -3688,7 +3766,7 @@ check('spinner gate is the frozen 151ms', AUTO_REVIEW_SPINNER_GATE_MS === 151);
 
 {
   // Strict wire parsing of the new identity + typed-error fields.
-  const snap = normalizeCodeReviewSnapshot({
+  const snap = fixtureSnapshot({
     autoReviewState: 'failed',
     autoReviewError: { message: 'Auto review stopped', code: 'cancelled' },
     autoReviewBatchId: 9,
@@ -3705,27 +3783,27 @@ check('spinner gate is the frozen 151ms', AUTO_REVIEW_SPINNER_GATE_MS === 151);
   );
   check(
     'malformed typed auto error nulls whole',
-    normalizeCodeReviewSnapshot({ autoReviewError: 'plain string' }).autoReviewError === null
-      && normalizeCodeReviewSnapshot({ autoReviewError: { message: 'm' } }).autoReviewError === null
-      && normalizeCodeReviewSnapshot({ autoReviewError: { code: 'cancelled' } }).autoReviewError === null
-      && normalizeCodeReviewSnapshot({ autoReviewError: 7 }).autoReviewError === null,
+    fixtureSnapshot({ autoReviewError: 'plain string' }).autoReviewError === null
+      && fixtureSnapshot({ autoReviewError: { message: 'm' } }).autoReviewError === null
+      && fixtureSnapshot({ autoReviewError: { code: 'cancelled' } }).autoReviewError === null
+      && fixtureSnapshot({ autoReviewError: 7 }).autoReviewError === null,
   );
   check(
     'missing identity fields default to 0',
     emptyCodeReviewSnapshot().autoReviewBatchId === 0
       && emptyCodeReviewSnapshot().highlightGeneration === 0
-      && normalizeCodeReviewSnapshot({}).autoReviewBatchId === 0
-      && normalizeCodeReviewSnapshot({}).highlightGeneration === 0,
+      && fixtureSnapshot({}).autoReviewBatchId === 0
+      && fixtureSnapshot({}).highlightGeneration === 0,
   );
   const identity = { snapshotId: 'snap-1', path: 'src/a.ts', oldStart: 1, oldCount: 1, newStart: 2, newCount: 1, contentHash: 'h' };
   const validFinding = { category: 'critical', side: 'new', startLine: 2, endLine: 2, summary: 'bounds check', evidence: 'unchecked index' };
   for (const token of ['constructor', 'toString', '__proto__']) {
     for (const field of ['category', 'side']) {
-      const rejected = normalizeCodeReviewSnapshot({
+      const rejected = fixtureParse({
         reviewFindings: [{ identity, findings: [validFinding, { ...validFinding, [field]: token }] }],
       });
       check(`prototype-key ${field} ${token} rejects the whole findings snapshot`,
-        rejected.error === 'Invalid review findings' && rejected.reviewFindings === null);
+        !rejected.ok && rejected.error === 'Invalid review findings');
     }
   }
 }
@@ -3828,7 +3906,7 @@ check('spinner gate is the frozen 151ms', AUTO_REVIEW_SPINNER_GATE_MS === 151);
   // Async error toasts: exactly once per identity; cancelled is the only
   // quiet terminal category.
   let report = initialReviewErrorReport();
-  const failedBatch = normalizeCodeReviewSnapshot({
+  const failedBatch = fixtureSnapshot({
     snapshotId: 's1',
     reviewId: 'rev-1',
     generation: 1,
@@ -3854,7 +3932,7 @@ check('spinner gate is the frozen 151ms', AUTO_REVIEW_SPINNER_GATE_MS === 151);
     reviewErrorNotices(failedBatch, report).notices.length === 0,
   );
   // A newer batch id re-arms the toast even with identical copy.
-  const newerBatch = normalizeCodeReviewSnapshot({
+  const newerBatch = fixtureSnapshot({
     ...failedBatch,
     autoReviewBatchId: 5,
   });
@@ -3865,12 +3943,12 @@ check('spinner gate is the frozen 151ms', AUTO_REVIEW_SPINNER_GATE_MS === 151);
   check(
     'a new review identity re-arms auto and highlight error toasts',
     reviewErrorNotices(
-      normalizeCodeReviewSnapshot({ ...failedBatch, reviewId: 'rev-2' }),
+      fixtureSnapshot({ ...failedBatch, reviewId: 'rev-2' }),
       report,
     ).notices.length === 2,
   );
   // User stop: the typed cancelled category is the ONLY quiet terminal.
-  const cancelledBatch = normalizeCodeReviewSnapshot({
+  const cancelledBatch = fixtureSnapshot({
     snapshotId: 's1',
     autoReviewState: 'failed',
     autoReviewError: { message: 'Auto review stopped', code: 'cancelled' },
@@ -3883,7 +3961,7 @@ check('spinner gate is the frozen 151ms', AUTO_REVIEW_SPINNER_GATE_MS === 151);
       && cancelled.notices[0].cancelled === true,
   );
   // snapshot.error is keyed per review identity (not repeated per poll).
-  const errorSnap = normalizeCodeReviewSnapshot({
+  const errorSnap = fixtureSnapshot({
     reviewId: 'rev-2',
     generation: 1,
     revision: 3,
@@ -3901,7 +3979,7 @@ check('spinner gate is the frozen 151ms', AUTO_REVIEW_SPINNER_GATE_MS === 151);
     reviewErrorNotices(errorSnap, first.reported).notices.length === 0,
   );
   const bumped = reviewErrorNotices(
-    normalizeCodeReviewSnapshot({ ...errorSnap, revision: 4 }),
+    fixtureSnapshot({ ...errorSnap, revision: 4 }),
     first.reported,
   );
   check(
@@ -3919,7 +3997,7 @@ check('spinner gate is the frozen 151ms', AUTO_REVIEW_SPINNER_GATE_MS === 151);
     newCount: 1,
     contentHash: 'h',
   };
-  const rejected = normalizeCodeReviewSnapshot({
+  const rejected = fixtureSnapshot({
     reviewId: 'rev-1',
     autoReviewBatchId: 4,
     autoReviewState: 'failed',
@@ -3945,7 +4023,7 @@ check('spinner gate is the frozen 151ms', AUTO_REVIEW_SPINNER_GATE_MS === 151);
       && notices[0].cancelled === false,
     notices.map((notice) => notice.message).join(' | '),
   );
-  const followed = normalizeCodeReviewSnapshot({
+  const followed = fixtureSnapshot({
     reviewId: 'rev-1',
     threads: [{
       identity,

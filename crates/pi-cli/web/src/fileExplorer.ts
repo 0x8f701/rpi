@@ -54,11 +54,12 @@ export const FILE_EXPLORER_MAX_CACHE_BYTES = 8 * 1024 * 1024;
 export const FILE_EXPLORER_MAX_LINES_PER_ENTRY = FILE_EXPLORER_DEFAULT_MAX_LINES;
 
 /** Desktop tree/content split bounds (percent). Owned here so the session
- *  slot's persisted inner tree width and the panel share ONE clamp
- *  authority; FileExplorerPanel re-exports them for its render surface. */
+ *  view store and the panel share ONE clamp authority; FileExplorerPanel
+ *  re-exports them for its render surface. Fresh owners use 29, which is
+ *  round(34 × 0.85); a stored tree percent is clamped but never rewritten. */
 export const FILE_EXPLORER_TREE_PCT_MIN = 22;
 export const FILE_EXPLORER_TREE_PCT_MAX = 55;
-export const FILE_EXPLORER_TREE_PCT_DEFAULT = 34;
+export const FILE_EXPLORER_TREE_PCT_DEFAULT = 29;
 export const FILE_EXPLORER_TREE_PCT_STEP = 2;
 
 /** Clamp a candidate tree percent into the supported desktop range. */
@@ -174,10 +175,22 @@ export interface FileExplorerTab {
   conversationId?: string;
 }
 
+/** Server ambiguity for one citation, bound to this owner slot only.
+ *  `path` is the relative path that was probed; `candidates` is the strict
+ *  parser result. Absent means the citation is not ambiguous. */
+export interface FileExplorerCitationChoices {
+  path: string;
+  candidates: string[];
+}
+
 export interface FileExplorerSessionSlot {
   tabs: FileExplorerTab[];
   activePath: string | null;
   mode: FileExplorerDrawerMode;
+  /** Files tree search for this owner only. Absent means no query. */
+  treeQuery?: string;
+  /** The only store for a `file_ambiguous` probe of this owner. */
+  citationChoices?: FileExplorerCitationChoices;
   /** Drawer view geometry is NOT stored here: it lives in the module
    *  view-geometry external store (fileExplorerViewCache below), keyed by
    *  the same owner key as this slot map, so directory toggles and tree
@@ -230,6 +243,17 @@ export function fileExplorerExpandDirectoryChain(
   const next = { ...expandedDirs };
   for (const item of fileExplorerAncestorPaths(path)) next[item] = true;
   return next;
+}
+
+/** Parent-directory chain to expand so an opened FILE's row can render:
+ *  root `''` first, then each ancestor. Only workspace-relative paths have
+ *  tree rows — an absolute/outside-workspace tab (displayed with the
+ *  symbolic `<workspace>` prefix) yields `[]`, so callers never reveal or
+ *  list a pseudo directory for it. */
+export function fileExplorerRevealDirChain(path: string): string[] {
+  const canonical = fileExplorerCanonicalPath(path);
+  if (!canonical || canonical.startsWith('/') || /^[A-Za-z]:/.test(canonical)) return [];
+  return fileExplorerAncestorPaths(fileExplorerParentDir(canonical));
 }
 
 export function fileExplorerReadCommand(
@@ -710,6 +734,51 @@ export function fileExplorerResolvedRequestPath(requestPath: string, pagePath: s
   return null;
 }
 
+/** A candidate the server already normalized. Any form that canonicalization
+ *  would rewrite is rejected, so the parser never silently repairs a path. */
+function fileExplorerAmbiguousCandidate(value: unknown): string | null {
+  if (typeof value !== 'string' || value === '' || value.length > 512) return null;
+  if (value !== value.trim() || value.includes('\\') || value.includes('//')) return null;
+  if (value.startsWith('/') || /^[A-Za-z]:/.test(value)) return null;
+  const segments = value.split('/');
+  if (segments.some((segment) => segment === '' || segment === '.' || segment === '..')) return null;
+  return fileExplorerCanonicalPath(value) === value ? value : null;
+}
+
+function fileExplorerAmbiguityData(error: unknown): unknown {
+  if (error == null || typeof error !== 'object' || Array.isArray(error)) return undefined;
+  const record = error as { rpcData?: unknown; response?: { data?: unknown } };
+  if ('rpcData' in record) return record.rpcData;
+  const response = record.response;
+  if (response != null && typeof response === 'object' && !Array.isArray(response) && 'data' in response) {
+    return response.data;
+  }
+  return undefined;
+}
+
+/** Strict `file_ambiguous` parse. Input is the rejected command error:
+ *  `rpcData` (App) wins over `response.data` (Chat). Returns the candidate
+ *  list only when it is already a sorted list of two or more safe relative
+ *  paths. Malformed payloads return null; nothing is sorted or dropped. */
+export function parseFileExplorerAmbiguity(error: unknown): string[] | null {
+  const data = fileExplorerAmbiguityData(error);
+  if (data == null || typeof data !== 'object' || Array.isArray(data)) return null;
+  const record = data as { code?: unknown; candidates?: unknown };
+  if (record.code !== 'file_ambiguous' || !Array.isArray(record.candidates) || record.candidates.length < 2) {
+    return null;
+  }
+  const candidates: string[] = [];
+  for (const item of record.candidates) {
+    const candidate = fileExplorerAmbiguousCandidate(item);
+    if (!candidate) return null;
+    const previous = candidates[candidates.length - 1];
+    if (previous !== undefined && previous >= candidate) return null;
+    candidates.push(candidate);
+  }
+  return candidates;
+}
+
+
 /** Loaded logical-line end (exclusive cursor). */
 export function fileExplorerLoadedEnd(state: Pick<FileExplorerPageState, 'startCursor' | 'lines'>): number {
   return state.startCursor + state.lines.length;
@@ -836,6 +905,131 @@ export function fileExplorerReleaseInflight(
   live: Map<string, FileExplorerInflightRequest> = moduleInflight,
 ): void {
   live.delete(identity);
+}
+
+/* ------------------------------------------------------------------ *
+ * Module snapshot singleflight (conversation polling).
+ *
+ * The conversation snapshot poll runs per mounted panel at 500ms while
+ * streaming. With two mounts of the same tab (StrictMode replay, App+Chat)
+ *  each panel used to issue its OWN request, so one tab could occupy two
+ *  global RPC slots forever. The flight table below is MODULE-level: one
+ *  shared request per exact identity, joined by every subscriber.
+ * ------------------------------------------------------------------ */
+
+export interface FileExplorerSnapshotFlight {
+  /** Unified issue sequence: allocated ONCE per flight and shared by every
+   *  subscriber, so a poll response is fenced against newer prompt/stop
+   *  acks exactly like a per-panel request was. */
+  writeSeq: number;
+  /** Shared request promise: settles with the raw RPC payload or error.
+   *  Every subscriber attaches its own guards and applies the result —
+   *  joining a live flight must never SKIP it (a `.has → continue` gate
+   *  would drop the result for every later subscriber). */
+  promise: Promise<unknown>;
+}
+
+const moduleSnapshotFlights = new Map<string, FileExplorerSnapshotFlight>();
+
+/** Canonical flight identity: authority + session + canonical path +
+ *  conversation id + connection generation. A reconnect (new generation)
+ *  has a different identity, so it always starts a NEW request and the old
+ *  flight's release can never touch the new one. */
+export function fileExplorerSnapshotFlightKey(
+  authority: string,
+  sessionId: string,
+  path: string,
+  conversationId: string,
+  connectionEpoch: number,
+): string {
+  return `${authority}\0${sessionId}\0${fileExplorerCanonicalPath(path)}\0${conversationId}\0${connectionEpoch}`;
+}
+
+/** Acquire ONE shared snapshot flight per exact identity (StrictMode
+ *  replay, double mounts, and repeat poll ticks reuse the live promise;
+ *  the write sequence is assigned once in create). Identity release mirrors
+ *  fileExplorerAcquireDirInflight: the finally deletes ONLY its own entry,
+ *  so a late settle of an old flight can never release a newer flight. */
+export function fileExplorerAcquireSnapshotFlight(
+  identity: string,
+  create: () => FileExplorerSnapshotFlight,
+  live: Map<string, FileExplorerSnapshotFlight> = moduleSnapshotFlights,
+): FileExplorerSnapshotFlight {
+  const existing = live.get(identity);
+  if (existing) return existing;
+  const created = create();
+  const entry: FileExplorerSnapshotFlight = {
+    writeSeq: created.writeSeq,
+    promise: created.promise.finally(() => {
+      if (live.get(identity) === entry) live.delete(identity);
+    }),
+  };
+  live.set(identity, entry);
+  return entry;
+}
+
+export function fileExplorerPeekSnapshotFlight(
+  identity: string,
+  live: Map<string, FileExplorerSnapshotFlight> = moduleSnapshotFlights,
+): FileExplorerSnapshotFlight | null {
+  return live.get(identity) ?? null;
+}
+
+/** Test/admin reset of the module snapshot flight table. */
+export function fileExplorerResetSnapshotFlights(
+  live: Map<string, FileExplorerSnapshotFlight> = moduleSnapshotFlights,
+): void {
+  live.clear();
+}
+
+/* ------------------------------------------------------------------ *
+ * Background-poll failure toast latch. A 500ms poll that keeps failing
+ * must not spam a toast per tick: the SAME owner + message collapses
+ * consecutive failure episodes into ONE emission and only a valid,
+ * accepted same-owner success resets it. A different message is a new
+ * failure and always reports. Nothing is swallowed here: the caller keeps
+ * its guards/retirement paths and the last-good snapshot is untouched.
+ * ------------------------------------------------------------------ */
+
+const moduleConversationToastLatches = new Map<string, Set<string>>();
+
+export function fileExplorerConversationErrorLatched(
+  owner: string,
+  message: string,
+  emit: (message: string) => void,
+  latches: Map<string, Set<string>> = moduleConversationToastLatches,
+): void {
+  let seen = latches.get(owner);
+  if (seen === undefined) {
+    seen = new Set();
+    latches.set(owner, seen);
+  }
+  if (seen.has(message)) return;
+  seen.add(message);
+  emit(message);
+}
+/** Per-conversation latch identity: the owner base (authority + session)
+ *  scoped by canonical path + conversation id, so only a valid, accepted
+ *  success of THAT conversation resets its own latch — a sibling
+ *  conversation's health never folds or clears it. */
+export function fileExplorerConversationToastKey(owner: string, path: string, conversationId: string): string {
+  return `${owner}\0${fileExplorerCanonicalPath(path)}\0${conversationId}`;
+}
+
+/** Reset ONE owner's failure-toast latches after a valid, accepted
+ *  same-owner success — the next identical failure reports again. */
+export function fileExplorerConversationToastLatchReset(
+  owner: string,
+  latches: Map<string, Set<string>> = moduleConversationToastLatches,
+): void {
+  latches.delete(owner);
+}
+
+/** Test/admin reset of every conversation toast latch. */
+export function fileExplorerConversationToastLatchesResetAll(
+  latches: Map<string, Set<string>> = moduleConversationToastLatches,
+): void {
+  latches.clear();
 }
 
 /** Host-stamped rpcCode only; unknown or malformed codes are dropped. */
@@ -1840,6 +2034,17 @@ function normalizeConversationEntry(raw: unknown): SideChatEntryWire | null {
     if (record.thinking != null && typeof record.thinking !== 'string') return null;
     entry.thinking = record.thinking ?? null;
   }
+  // Entry-owned wire clock: `null` per schema, or a finite integer epoch-ms
+  // number. An unusable value NEVER drops the reply body — the field is left
+  // absent (undefined) and the filename range stays the sole authority.
+  if ('timestamp' in record) {
+    const timestamp = record.timestamp;
+    if (timestamp === null) {
+      entry.timestamp = null;
+    } else if (typeof timestamp === 'number' && Number.isFinite(timestamp) && Number.isInteger(timestamp)) {
+      entry.timestamp = timestamp;
+    }
+  }
   return entry;
 }
 
@@ -2329,7 +2534,7 @@ export type FileExplorerContentSurface = 'source' | 'preview' | 'ask' | 'map';
 export interface FileExplorerViewState {
   /** Expanded workspace directory paths ('' = root). */
   expandedDirs: Record<string, true>;
-  /** Inner tree/content split percent (22–55, default 34). */
+  /** Inner tree/content split percent (22–55, fresh default 29). */
   treePct: number;
   /** Workspace tree viewport scroll offset, restored after dirs settle. */
   treeScrollTop: number;
@@ -2689,14 +2894,6 @@ export const FILE_EXPLORER_MAP_MAX_PAYLOAD_BYTES = 256 * 1024;
 export const FILE_EXPLORER_MAP_MAX_PATH_CHARS = 4096;
 export const FILE_EXPLORER_MAP_MAX_TEXT_CHARS = 4096;
 
-const MAP_LANGUAGES: Record<string, true> = {
-  rust: true,
-  typescript: true,
-  tsx: true,
-  javascript: true,
-  solidity: true,
-  unsupported: true,
-};
 
 const MAP_PARSE: Record<string, true> = {
   ok: true,
@@ -2712,7 +2909,20 @@ const MAP_EDGE_KINDS: Record<string, true> = {
   sol_import: true,
 };
 
-export type FileExplorerMapLanguage = 'rust' | 'typescript' | 'tsx' | 'javascript' | 'solidity' | 'unsupported';
+export type FileExplorerMapLanguage = 'rust' | 'typescript' | 'tsx' | 'javascript' | 'solidity' | 'go' | 'unsupported';
+
+function normalizeMapLanguage(language: string): FileExplorerMapLanguage | null {
+  switch (language) {
+    case 'rust': return 'rust';
+    case 'type_script': return 'typescript';
+    case 'tsx': return 'tsx';
+    case 'java_script': return 'javascript';
+    case 'solidity': return 'solidity';
+    case 'go': return 'go';
+    case 'unsupported': return 'unsupported';
+    default: return null;
+  }
+}
 export type FileExplorerMapParse = 'ok' | 'incomplete' | 'unsupported';
 export type FileExplorerMapEdgeKind = 'import' | 'export_from' | 'use' | 'mod' | 'sol_import';
 
@@ -2728,10 +2938,15 @@ export interface FileExplorerMapPurpose {
   text: string;
 }
 
+/** Edge target. A `package` endpoint is a resolved package directory (Go
+ *  imports): `dir` is canonically `.` (workspace root) or an already-canonical
+ *  workspace-relative POSIX path — never empty, absolute, drive-prefixed, or
+ *  parent-jumping. A package is never an openable file node. */
 export type FileExplorerMapTarget =
   | { type: 'file'; path: string }
   | { type: 'external'; specifier: string }
-  | { type: 'unresolved'; reason: string };
+  | { type: 'unresolved'; reason: string }
+  | { type: 'package'; dir: string };
 
 export interface FileExplorerMapNode {
   path: string;
@@ -2818,6 +3033,21 @@ function normalizeMapPurpose(raw: unknown): FileExplorerMapPurpose | null {
   return { line, text };
 }
 
+/** Wire `dir` of a `package` target: canonically `.` for the workspace root,
+ *  otherwise an already-canonical workspace-relative POSIX path. Empty,
+ *  absolute, drive, backslash, `.`/`..`/empty segments, surrounding
+ *  whitespace, and any form canonicalization would rewrite reject — the
+ *  parser never silently repairs a package directory. */
+function normalizeMapPackageDir(value: unknown): string | null {
+  if (typeof value !== 'string' || value.length === 0 || value.length > FILE_EXPLORER_MAP_MAX_PATH_CHARS) return null;
+  if (value === '.') return '.';
+  if (value.includes('\\') || value.startsWith('/') || /^[A-Za-z]:/.test(value)) return null;
+  const segments = value.split('/');
+  if (segments.includes('..') || segments.includes('.') || segments.includes('')) return null;
+  if (fileExplorerCanonicalPath(value) !== value) return null;
+  return value;
+}
+
 function normalizeMapTarget(raw: unknown): FileExplorerMapTarget | null {
   const rec = asRecord(raw);
   if (!rec) return null;
@@ -2834,6 +3064,10 @@ function normalizeMapTarget(raw: unknown): FileExplorerMapTarget | null {
     const reason = boundedText(rec.reason, FILE_EXPLORER_MAP_MAX_TEXT_CHARS);
     return reason ? { type: 'unresolved', reason } : null;
   }
+  if (type === 'package') {
+    const dir = normalizeMapPackageDir(rec.dir);
+    return dir ? { type: 'package', dir } : null;
+  }
   return null;
 }
 
@@ -2841,9 +3075,9 @@ function normalizeMapNode(raw: unknown): FileExplorerMapNode | null {
   const rec = asRecord(raw);
   if (!rec) return null;
   const path = boundedText(rec.path, FILE_EXPLORER_MAP_MAX_PATH_CHARS);
-  const language = stringField(rec.language);
+  const language = normalizeMapLanguage(stringField(rec.language));
   const parse = stringField(rec.parse);
-  if (!path || !MAP_LANGUAGES[language] || !MAP_PARSE[parse]) return null;
+  if (!path || language == null || !MAP_PARSE[parse]) return null;
   if (!Array.isArray(rec.declarations)) return null;
   if (!Array.isArray(rec.purpose)) return null;
   const declarations: FileExplorerMapDeclaration[] = [];
@@ -2860,7 +3094,7 @@ function normalizeMapNode(raw: unknown): FileExplorerMapNode | null {
   }
   return {
     path,
-    language: language as FileExplorerMapLanguage,
+    language,
     parse: parse as FileExplorerMapParse,
     declarations,
     purpose,
@@ -2967,8 +3201,16 @@ export function normalizeFileExplorerMap(
     } else if (!seen.has(fileExplorerCanonicalPath(edge.source))) {
       return null;
     }
-    if (!selected && edge.target.type === 'file' && !seen.has(fileExplorerCanonicalPath(edge.target.path))) {
-      return null;
+    if (!selected && edge.target.type === 'file') {
+      const rawTarget = edge.target.path.trim().replace(/\\/g, '/');
+      if (!rawTarget || rawTarget.startsWith('/') || /^[A-Za-z]:/.test(rawTarget) || rawTarget.split('/').includes('..')) return null;
+      const target = fileExplorerCanonicalPath(edge.target.path);
+      // A safe relative file target may reference a file the scan did not
+      // list as a node: the diagram draws it as an unscanned, non-openable
+      // endpoint instead of rejecting the whole payload.
+      if (!target || target.startsWith('/') || target.split('/').includes('..')) {
+        return null;
+      }
     }
     outgoing.push(edge);
   }
@@ -3017,13 +3259,16 @@ export function fileExplorerMapMermaidLabel(text: string): string {
 export interface FileExplorerMapDiagram {
   /** ```mermaid fence body. Opaque ids only; labels are escaped. */
   source: string;
-  /** Opaque flowchart id → canonical file path. External and unresolved
-   *  targets are absent: they are not openable files. */
+  /** Opaque flowchart id → canonical file path. External, unresolved,
+   *  package, and out-of-node file targets are absent: they are not
+   *  openable files. */
   filesById: Record<string, string>;
 }
 
 /** One-hop flowchart. Ids are `n0`… assigned in node order, never derived
- *  from a path, so a hostile path cannot become a click target or HTML. */
+ *  from a path, so a hostile path cannot become a click target or HTML.
+ *  Package targets draw `p` endpoints labeled `package <dir>`: a package is
+ *  not a scanned node and never enters filesById. */
 export function fileExplorerMapDiagram(map: FileExplorerMapResult): FileExplorerMapDiagram {
   const filesById: Record<string, string> = {};
   const idByPath = new Map<string, string>();
@@ -3038,18 +3283,29 @@ export function fileExplorerMapDiagram(map: FileExplorerMapResult): FileExplorer
   });
   let external = 0;
   let unresolved = 0;
+  let outside = 0;
+  let packages = 0;
   const emit = (edge: FileExplorerMapEdge) => {
     const from = idByPath.get(fileExplorerCanonicalPath(edge.source));
     if (!from) return;
     let to: string;
     if (edge.target.type === 'file') {
       const target = idByPath.get(fileExplorerCanonicalPath(edge.target.path));
-      if (!target) return;
-      to = target;
+      if (target) {
+        to = target;
+      } else {
+        to = `x${outside}`;
+        outside += 1;
+        lines.push(`  ${to}["${fileExplorerMapMermaidLabel(edge.target.path)}"]`);
+      }
     } else if (edge.target.type === 'external') {
       to = `e${external}`;
       external += 1;
       lines.push(`  ${to}["${fileExplorerMapMermaidLabel(`external ${edge.target.specifier}`)}"]`);
+    } else if (edge.target.type === 'package') {
+      to = `p${packages}`;
+      packages += 1;
+      lines.push(`  ${to}["${fileExplorerMapMermaidLabel(`package ${edge.target.dir}`)}"]`);
     } else {
       to = `u${unresolved}`;
       unresolved += 1;

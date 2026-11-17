@@ -2,6 +2,7 @@
 // SideChatPanel and FileConversationDock. No tabs, drafts, or RPC.
 import { memo, useEffect, useRef } from 'react';
 import { MarkdownBody } from '../MarkdownBody';
+import { ReplyActions } from '../ReplyActions';
 import { ToolCard } from '../App';
 import { hydrateMermaid, renderStreamingMarkdown, thinkingSummaryHtml } from '../markdown';
 import {
@@ -277,6 +278,8 @@ export function ConversationEntryView({
   onLayoutChange,
   sessionId,
   cwd,
+  onReplyActionError,
+  liveStreaming = false,
 }: {
   entry: SideChatEntryWire;
   pathContext: string;
@@ -285,14 +288,37 @@ export function ConversationEntryView({
   onLayoutChange?: () => void;
   sessionId?: string;
   cwd?: string;
+  /** Central toast sink from the owning panel. Present → settled assistant
+   *  body text gets the shared copy/save strip (never the thinking/tool/user/
+   *  system rows); absent → no action chrome, matching FinalAssistant. */
+  onReplyActionError?: (message: string) => void;
+  /** The owning tab/conversation is streaming. Partial assistant rows stay
+   *  action-free until the owner settles (abort flips the owner streaming
+   *  flag to false without dropping `isPartial`); final rows ignore this. */
+  liveStreaming?: boolean;
 }) {
   const partialAssistant = entry.kind === 'assistant' && entry.isPartial && streaming != null;
+  // Entry-owned wire clock only; schema is null or a finite integer. Null/
+  // missing/invalid stays undefined (the filename range is the sole range
+  // authority) and the save action reports through the caller's toast.
+  // Never Date.now().
+  const timestampMs =
+    typeof entry.timestamp === 'number' && Number.isFinite(entry.timestamp) && Number.isInteger(entry.timestamp)
+      ? entry.timestamp
+      : undefined;
   return (
     <div
-      className={`side-chat__entry side-chat__entry--${entry.role}${entry.isError ? ' side-chat__entry--error' : ''}${entry.isPartial ? ' side-chat__entry--partial' : ''}`}
+      className={`side-chat__entry side-chat__entry--${entry.role}${entry.kind === 'assistant' ? ' msg--assistant' : ''}${entry.isError ? ' side-chat__entry--error' : ''}${entry.isPartial ? ' side-chat__entry--partial' : ''}`}
       data-session-id={sessionId}
       data-workspace-cwd={cwd}
     >
+      {onReplyActionError && entry.kind === 'assistant' && (!entry.isPartial || !liveStreaming) ? (
+        <ReplyActions
+          markdown={entry.text}
+          timestampMs={timestampMs}
+          onError={onReplyActionError}
+        />
+      ) : null}
       {entry.kind === 'thinking' ? (
         <ConversationThinkingFold
           thinking={entry.thinking || entry.text}

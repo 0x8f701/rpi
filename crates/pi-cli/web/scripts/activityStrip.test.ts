@@ -166,6 +166,39 @@ check('Task result projects every authoritative child identity', taskBatch.child
 taskBatch = applyActivityStripEvent(taskBatch, { type: 'job_updated', turnId: 'turn-task-batch', job: { id: 'batch-b', status: 'completed' } }, sid);
 check('Task batch completion settles only matching child identity', taskBatch.children.length === 1 && taskBatch.children[0]?.jobId === 'batch-a');
 
+let cancellingChild = applyActivityStripEvent(emptyActivityStripState(sid), { type: 'turn_started', turnId: 'turn-cancelling' }, sid);
+cancellingChild = applyActivityStripEvent(cancellingChild, { type: 'job_updated', turnId: 'turn-cancelling', job: { id: 'job-cancel', agentId: 'agent-cancel', agent: 'glm', parentId: 'Main', status: 'cancelling' } }, sid);
+check('cancelling Main child stays on the strip', activityStripView(cancellingChild, 'on')?.text === 'Waiting for glm…');
+cancellingChild = applyTaskSpawnDetails(cancellingChild, sid, 'turn-cancelling', [
+  { jobId: 'job-drain', agentId: 'agent-drain', agent: 'gpt', status: 'cancelling' },
+]);
+check('cancelling Task spawn stays live', cancellingChild.children.some((child) => child.jobId === 'job-drain'));
+const beforeTerminal = cancellingChild;
+cancellingChild = applyActivityStripEvent(cancellingChild, { type: 'job_updated', turnId: 'turn-cancelling', job: { id: 'job-cancel', status: 'cancelled' } }, sid);
+check('cancelled settles off the strip', !cancellingChild.children.some((child) => child.jobId === 'job-cancel') && cancellingChild !== beforeTerminal);
+check('sibling cancelling child remains', cancellingChild.children.some((child) => child.jobId === 'job-drain'));
+
+// Stop-tap regression (goal-stop "Saving reply…"): the optimistic idle reset
+// (reconcileActivityStrip(state, sid, false, '')) must NOT orphan the live
+// turn's typed identity. If the reset drops turnId, the real turn_terminal
+// can no longer reach the terminal ledger, the settled-refill ownership
+// check rejects the canonical-id hydration, and the aborted reply is stuck
+// on "Saving reply…" forever.
+let stopPending = applyActivityStripEvent(emptyActivityStripState(sid), { type: 'turn_started', turnId: 'turn-stop' }, sid);
+stopPending = reconcileActivityStrip(stopPending, sid, false, '');
+check('stop-tap idle preserves the pending turn identity for its terminal', stopPending.turnId === 'turn-stop' && stopPending.isStreaming === false);
+check('stop-tap idle still clears every activity visual (idle, no tools/children/thinking)', activityStripView(stopPending, 'on') === null && stopPending.tools.length === 0 && stopPending.children.length === 0 && stopPending.isThinking === false && stopPending.error === '');
+const stopSettled = applyActivityStripEvent(stopPending, { type: 'turn_terminal', turnId: 'turn-stop', status: 'aborted' }, sid);
+check('real terminal after a stop-tap idle lands on the terminal ledger', stopSettled.terminalTurnIds.includes('turn-stop') && stopSettled.turnId === '' && stopSettled.isStreaming === false && activityStripView(stopSettled, 'on') === null);
+// An ALREADY-terminated turn resets exactly as before (no identity resurrection).
+const terminatedTurn = applyActivityStripEvent(
+  applyActivityStripEvent(emptyActivityStripState(sid), { type: 'turn_started', turnId: 'turn-done' }, sid),
+  { type: 'turn_terminal', turnId: 'turn-done', status: 'succeeded' },
+  sid,
+);
+const terminatedReset = reconcileActivityStrip(terminatedTurn, sid, false, '');
+check('terminated turn still resets cleanly on an idle snapshot', terminatedReset.turnId === '' && terminatedReset.terminalTurnIds.includes('turn-done') && activityStripView(terminatedReset, 'on') === null);
+
 console.log(`activityStrip.test: ${assertions} assertions, ${failures.length} failure(s)`);
 if (failures.length > 0) {
   for (const failure of failures) console.error(`FAIL ${failure}`);

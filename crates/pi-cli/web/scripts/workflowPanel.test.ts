@@ -135,6 +135,29 @@ const detailWire = (failure?: unknown) => ({
   check('detail pane omits the failure row when absent', html === '', html);
 }
 
+{
+  const accepted = projectWorkflowDetail({
+    ...detailWire(),
+    status: 'running',
+    jobs: [{
+      jobId: 'job-drain',
+      displayName: 'worker',
+      status: 'cancelling',
+      createdAtMs: 1,
+    }],
+  });
+  check('workflow detail accepts a cancelling job without changing workflow status',
+    accepted?.status === 'running' && accepted.jobs?.[0]?.status === 'cancelling',
+    JSON.stringify(accepted));
+  const rejectedWorkflow = projectWorkflowDetail({ ...detailWire(), status: 'cancelling' });
+  check('workflow status itself rejects cancelling', rejectedWorkflow === null);
+  const rejectedJob = projectWorkflowDetail({
+    ...detailWire(),
+    jobs: [{ jobId: 'job-bad', displayName: 'worker', status: 'planning', createdAtMs: 1 }],
+  });
+  check('workflow job status rejects workflow-only planning', (rejectedJob?.jobs?.length ?? -1) === 0);
+}
+
 console.log(`\nworkflowPanel.test: ${ran} assertions, ${failures.length} failure(s)`);
 if (failures.length) {
   console.error(failures.join('\n'));

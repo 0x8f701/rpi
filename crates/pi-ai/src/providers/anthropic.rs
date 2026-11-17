@@ -258,8 +258,12 @@ fn thinking_level_name(level: ThinkingLevel) -> &'static str {
     }
 }
 
-fn clamp_anthropic_thinking_level(model: &Model, level: ThinkingLevel) -> Option<ThinkingLevel> {
-    match crate::clamp_thinking_level(model, thinking_level_name(level)) {
+fn clamp_anthropic_thinking_level(
+    model: &Model,
+    level: Option<ThinkingLevel>,
+) -> Option<ThinkingLevel> {
+    let requested = level.map(thinking_level_name).unwrap_or("off");
+    match crate::clamp_thinking_level(model, requested) {
         "minimal" => Some(ThinkingLevel::Minimal),
         "low" => Some(ThinkingLevel::Low),
         "medium" => Some(ThinkingLevel::Medium),
@@ -1349,10 +1353,7 @@ pub async fn stream_simple_anthropic(
     };
     aopts.stream.max_tokens = Some(base_max);
 
-    let Some(reasoning) = opts
-        .reasoning
-        .and_then(|level| clamp_anthropic_thinking_level(&model, level))
-    else {
+    let Some(reasoning) = clamp_anthropic_thinking_level(&model, opts.reasoning) else {
         aopts.thinking_enabled = false;
         return stream_anthropic(model, req, aopts).await;
     };
@@ -2971,5 +2972,146 @@ data: {\"type\":\"message_stop\"}\n\
     async fn register_anthropic_exposes_provider() {
         register_anthropic();
         assert!(get_api_provider(API_ANTHROPIC_MESSAGES).is_some());
+    }
+
+    /// Reasoning model whose explicit map drops off/minimal/medium/xhigh.
+    /// Clamp of an absent level must land on low, the lowest remaining tier.
+    fn always_thinking_low_floor_model(adaptive: bool) -> Model {
+        Model {
+            id: "always-thinking".into(),
+            name: "always-thinking".into(),
+            api: API_ANTHROPIC_MESSAGES.into(),
+            provider: "anthropic".into(),
+            reasoning: true,
+            thinking_level_map: Some(HashMap::from([
+                ("off".into(), None),
+                ("minimal".into(), None),
+                ("medium".into(), None),
+                ("xhigh".into(), None),
+                ("low".into(), Some("low".into())),
+                ("high".into(), Some("high".into())),
+                ("max".into(), Some("max".into())),
+            ])),
+            context_window: 128000,
+            max_tokens: 16384,
+            compat: adaptive.then(|| json!({"forceAdaptiveThinking": true})),
+            ..Model::default()
+        }
+    }
+
+    fn simple_reasoning(level: Option<ThinkingLevel>) -> SimpleStreamOptions {
+        SimpleStreamOptions {
+            stream: StreamOptions {
+                api_key: Some("test-key".into()),
+                max_retries: 0,
+                http_executor: Some(crate::http::test_http_executor()),
+                ..StreamOptions::default()
+            },
+            reasoning: level,
+            ..SimpleStreamOptions::default()
+        }
+    }
+
+    async fn captured_simple_thinking_body(
+        mut model: Model,
+        reasoning: Option<ThinkingLevel>,
+    ) -> Value {
+        let (base, captured) = spawn_mock(ANTHROPIC_SSE);
+        model.base_url = base;
+        let stream = stream_simple_anthropic(
+            model,
+            Context {
+                messages: vec![Message::user_text("hi", 1)],
+                ..Context::default()
+            },
+            simple_reasoning(reasoning),
+        )
+        .await;
+        let message = stream.result().await.expect("simple anthropic stream");
+        assert_eq!(
+            message.stop_reason,
+            StopReason::Stop,
+            "mock stream failed: {:?}",
+            message.error_message
+        );
+        captured
+            .lock()
+            .expect("lock")
+            .take()
+            .expect("captured request")
+            .body
+    }
+
+    #[tokio::test]
+    async fn anthropic_simple_none_capability_adaptive_low() {
+        let body =
+            captured_simple_thinking_body(always_thinking_low_floor_model(true), None).await;
+        assert_eq!(
+            body["thinking"],
+            json!({"type":"adaptive","display":"summarized"}),
+            "absent reasoning must clamp to adaptive thinking, not omit/disable: {body}"
+        );
+        assert_eq!(
+            body["output_config"]["effort"],
+            json!("low"),
+            "adaptive clamp floor is low effort: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_simple_none_capability_budget_low() {
+        let body =
+            captured_simple_thinking_body(always_thinking_low_floor_model(false), None).await;
+        assert_eq!(
+            body["thinking"],
+            json!({"type":"enabled","budget_tokens":2048,"display":"summarized"}),
+            "absent reasoning must enable the low token budget (2048), not omit/disable: {body}"
+        );
+        assert!(
+            body.get("output_config").is_none(),
+            "budget path must not send output_config: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_simple_none_capability_off_allowed() {
+        let model = Model {
+            id: "claude-test".into(),
+            name: "Claude Test".into(),
+            api: API_ANTHROPIC_MESSAGES.into(),
+            provider: "anthropic".into(),
+            reasoning: true,
+            max_tokens: 4096,
+            ..Model::default()
+        };
+        let body = captured_simple_thinking_body(model, None).await;
+        assert_eq!(
+            body["thinking"],
+            json!({"type":"disabled"}),
+            "off remains available, so Simple None must keep the disabled wire: {body}"
+        );
+        assert!(
+            body.get("output_config").is_none(),
+            "old off wire has no output_config: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_simple_none_capability_high() {
+        let body = captured_simple_thinking_body(
+            always_thinking_low_floor_model(true),
+            Some(ThinkingLevel::High),
+        )
+        .await;
+        assert_eq!(
+            body["thinking"],
+            json!({"type":"adaptive","display":"summarized"}),
+            "explicit high stays adaptive: {body}"
+        );
+        assert_eq!(
+            body["output_config"]["effort"],
+            json!("high"),
+            "an explicit allowed level must stay on that level: {body}"
+        );
     }
 }

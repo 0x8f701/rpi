@@ -258,7 +258,7 @@ fn controlled_runtime(
                 })
             });
             Session::new(SessionOptions {
-                model: request.model,
+                model: Some(request.model),
                 cwd: std::env::current_dir().expect("cwd"),
                 system_prompt: request.system_prompt,
                 thinking_level: ThinkingLevel::Off,
@@ -281,7 +281,7 @@ fn controlled_runtime(
     config.max_concurrency = max_concurrency;
     config.max_recursion_depth = max_recursion_depth;
     config.idle_ttl = None;
-    config.parent_model = test_model();
+    config.parent_model = Some(test_model());
     ControlledRuntime {
         runtime: OrchestrationRuntime::new(config, factory).expect("runtime"),
         current,
@@ -381,16 +381,17 @@ async fn cancel_queued_job_never_starts_and_settles_cancelled() {
     let first_id = first.id.clone();
     assert_eq!(controlled.peak.load(Ordering::SeqCst), 1);
 
-    // Cancel the queued job before the permit frees. `cancel_jobs` accepts a
-    // job id (the user-facing cancel path); `cancel` is agent-id keyed, so a
-    // bug that only cancels running/active children would leave this queued.
+    // Cancel the queued job before the permit frees. The durable cancel path
+    // accepts a job id, so a bug that only cancels running children would
+    // leave this queued.
     let cancelled = controlled
         .runtime
-        .cancel_jobs(std::slice::from_ref(&queued_id));
+        .cancel_jobs_result(std::slice::from_ref(&queued_id))
+        .expect("cancel queued job");
     assert_eq!(
         cancelled,
         vec![queued_id.clone()],
-        "cancel_jobs must claim the queued job id"
+        "cancel_jobs_result must claim the queued job id"
     );
 
     let queued_terminal =
@@ -649,7 +650,10 @@ async fn settled_job_survives_late_cancel_without_double_settle() {
 
     // A late cancel against the settled job must claim nothing and must not
     // mutate the terminal snapshot or re-publish a terminal event.
-    let claimed = controlled.runtime.cancel(&[job_id.clone()]);
+    let claimed = controlled
+        .runtime
+        .cancel_jobs_result(std::slice::from_ref(&job_id))
+        .expect("late cancel of settled job");
     assert!(
         claimed.is_empty(),
         "cancel of a settled job must claim nothing: {claimed:?}"
@@ -742,7 +746,7 @@ impl ApplicationRuntimeFactory for ResidentRuntimeFactory {
                 target_artifacts,
             );
             config.idle_ttl = None;
-            config.parent_model = test_model();
+            config.parent_model = Some(test_model());
             let orchestration = OrchestrationRuntime::new(config, factory)?;
             let mut candidate =
                 ApplicationRuntimeCandidate::new(session).with_orchestration(orchestration);
@@ -779,7 +783,7 @@ fn recorded_parent(cwd: &Path, session_dir: &Path) -> Session {
     .expect("parent recorder");
     recorder.persist_now().expect("materialize parent header");
     let parent = Session::new(SessionOptions {
-        model: test_model(),
+        model: Some(test_model()),
         cwd: cwd.to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,
@@ -1924,7 +1928,7 @@ async fn real_application_task_tool_end_to_end_smoke() {
             let mut tools = request.orchestration_tools;
             tools.push(child_yield_tool(request.yield_state.clone()));
             Session::new(SessionOptions {
-                model: child_model,
+                model: Some(child_model),
                 cwd: std::env::current_dir().expect("cwd"),
                 system_prompt: request.system_prompt,
                 thinking_level: ThinkingLevel::Off,
@@ -1946,7 +1950,7 @@ async fn real_application_task_tool_end_to_end_smoke() {
         artifacts.path(),
     );
     config.idle_ttl = None;
-    config.parent_model = parent_model;
+    config.parent_model = Some(parent_model);
     let runtime = OrchestrationRuntime::new(config, factory).expect("runtime");
     let application = Application::new(parent).await;
     application
@@ -2049,7 +2053,7 @@ fn real_parent(artifacts: &Path, session_dir: &Path, model: &Model) -> (Session,
     let parent_id = recorder.id();
     let parent_path = recorder.path();
     let parent = Session::new(SessionOptions {
-        model: model.clone(),
+        model: Some(model.clone()),
         cwd: artifacts.to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,

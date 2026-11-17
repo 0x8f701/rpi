@@ -54,6 +54,8 @@
 // recovery on DOM/ws events with deadlines.
 import { chromium } from 'playwright';
 import fs from 'node:fs';
+import { clickFeature } from './lib/feature-menu.mjs';
+import { selectCompletionThenSubmit } from './lib/slash-completion.mjs';
 
 const url = process.env.RPI_URL;
 const token = process.env.RPI_TOKEN || '';
@@ -211,6 +213,11 @@ async function main() {
     page.on('console', (msg) => {
       if (msg.type() === 'error') consoleErrors.push(msg.text());
     });
+    // Outgoing frames: the slash journey proves the selecting Enter stays wire-silent.
+    const sentFrames = [];
+    page.on('websocket', (socket) => {
+      socket.on('framesent', (frame) => { if (typeof frame.payload === 'string') sentFrames.push(frame.payload); });
+    });
 
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
     // A1 bootstrap: the wrapper observed a connection AND the live socket is
@@ -247,7 +254,15 @@ async function main() {
 
     // A2: /review opens and settles with a real diff of the dirty file.
     await page.fill('#prompt-input', '/review');
-    await page.press('#prompt-input', 'Enter');
+    // The inline completion popup owns the SELECTING Enter and never
+    // dispatches; the helper presses the independent dispatch Enter on the
+    // settled /review token and proves the selection step stayed wire-silent.
+    await selectCompletionThenSubmit(page, {
+      token: '/review',
+      label: 'A2: /review',
+      sentFrames,
+      dispatchType: 'code_review_open',
+    });
     await waitFor(
       page,
       () => document.getElementById('code-review-panel') !== null,
@@ -286,12 +301,11 @@ async function main() {
     }
     await page.screenshot({ path: `${evidence}/04-post-cr-getstate.png`, fullPage: true });
 
-    // A4: Side Chat opens via #sidechat-toggle-btn (App.tsx:8327), mounts
+    // A4: Side Chat opens via #sidechat-toggle-btn inside the #feature-menu
+    // portal (App.tsx:8327), mounts
     // #side-chat-panel (SideChatPanel.tsx:675, App.tsx:3825, styles.css:2607),
     // and New is button.side-chat__new (SideChatPanel.tsx:708-718) not an input.
-    await page.evaluate(() => {
-      document.getElementById('sidechat-toggle-btn')?.click();
-    });
+    await clickFeature(page, '#sidechat-toggle-btn');
     await waitFor(
       page,
       () => document.querySelector('#side-chat-panel[aria-label="Side chat"] .side-chat') !== null,

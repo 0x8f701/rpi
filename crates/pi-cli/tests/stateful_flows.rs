@@ -60,7 +60,7 @@ fn faux_model(label: &str, reasoning: bool) -> (Model, FauxProviderRegistration)
 
 fn session_options(model: Model, cwd: &Path, thinking: ThinkingLevel) -> SessionOptions {
     SessionOptions {
-        model,
+        model: Some(model),
         cwd: cwd.to_path_buf(),
         system_prompt: String::new(),
         thinking_level: thinking,
@@ -225,7 +225,7 @@ fn usage_stream_session(cwd: &Path, usage: Usage) -> (Session, FauxProviderRegis
         })
     });
     let mut options = SessionOptions {
-        model,
+        model: Some(model),
         cwd: cwd.to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,
@@ -607,7 +607,7 @@ async fn model_and_thinking_runtime_clamp_and_next_turn_observe_change() {
     });
 
     let session = Session::new(SessionOptions {
-        model: reasoning.clone(),
+        model: Some(reasoning.clone()),
         cwd: cwd.path().to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,

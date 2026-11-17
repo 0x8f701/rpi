@@ -94,7 +94,7 @@ pub struct HandoffTodoCounts {
     pub total: usize,
 }
 
-/// One active (queued or running) orchestration job in the handoff.
+/// One active (queued, running, or cancelling) orchestration job in the handoff.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HandoffJob {
@@ -124,7 +124,7 @@ pub struct HandoffEnvelope {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal: Option<HandoffGoal>,
     pub todo: HandoffTodoCounts,
-    /// Active orchestration jobs (queued or running); settled jobs are omitted.
+    /// Active orchestration jobs (queued, running, or cancelling); settled jobs are omitted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub jobs: Vec<HandoffJob>,
     /// The most recent user asks (newest first), truncated per line.
@@ -516,6 +516,7 @@ fn job_status_name(status: &JobStatus) -> String {
     match status {
         JobStatus::Queued => "queued",
         JobStatus::Running => "running",
+        JobStatus::Cancelling => "cancelling",
         JobStatus::Completed => "completed",
         JobStatus::Failed => "failed",
         JobStatus::Cancelled => "cancelled",
@@ -1108,7 +1109,7 @@ mod tests {
     ) -> Session {
         Session::new_with_additional_tools_filtered_and_discovery(
             SessionOptions {
-                model,
+                model: Some(model),
                 cwd: cwd.to_path_buf(),
                 system_prompt: String::new(),
                 thinking_level: ThinkingLevel::Off,
@@ -1187,6 +1188,8 @@ mod tests {
             created_at: 1,
             started_at: None,
             finished_at: None,
+            cancellation_cause: matches!(status, JobStatus::Cancelling | JobStatus::Cancelled)
+                .then_some(crate::CancellationCause::Task),
             result: None,
             soft_budget_exhausted: false,
         }
@@ -1539,14 +1542,17 @@ mod tests {
         let snapshots = vec![
             job("queued", JobStatus::Queued),
             job("running", JobStatus::Running),
+            job("cancelling", JobStatus::Cancelling),
             job("done", JobStatus::Completed),
             job("failed", JobStatus::Failed),
             job("cancelled", JobStatus::Cancelled),
         ];
         let active = active_handoff_jobs(&snapshots);
-        assert_eq!(active.len(), 2, "only queued and running jobs are active");
+        assert_eq!(active.len(), 3, "queued, running, and cancelling jobs are active");
         assert_eq!(active[0].id, "queued");
         assert_eq!(active[1].id, "running");
+        assert_eq!(active[2].id, "cancelling");
+        assert_eq!(active[2].status, JobStatus::Cancelling);
         // Each active job projects the snapshot identity, agent, and status.
         assert_eq!(active[0].agent, "agent-queued");
         assert_eq!(active[0].status, JobStatus::Queued);

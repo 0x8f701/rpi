@@ -4,12 +4,17 @@ use std::{
     net::{IpAddr, SocketAddr, UdpSocket},
     path::{Path, PathBuf},
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     task::{Context as TaskContext, Poll},
     time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use futures_util::{FutureExt, SinkExt, StreamExt};
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use pi_coding::{Application, TranscriptUnavailable};
@@ -356,8 +361,71 @@ struct OutboundMessage {
     _bytes: tokio::sync::OwnedSemaphorePermit,
 }
 
+static NEXT_WS_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
+
+
+#[derive(Debug)]
+struct OutboundEnqueueFailure {
+    kind: OutboundEnqueueKind,
+    source: Option<anyhow::Error>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutboundEnqueueKind {
+    ByteBudgetTimeout,
+    QueueTimeout,
+    EncoderTimeout,
+    WriterStopped,
+    MessageTooLarge,
+    Serialization,
+    MessageSizeConversion,
+}
+
+impl OutboundEnqueueFailure {
+    fn new(kind: OutboundEnqueueKind, source: Option<anyhow::Error>) -> Self {
+        Self { kind, source }
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self.kind {
+            OutboundEnqueueKind::ByteBudgetTimeout => "byte_budget_timeout",
+            OutboundEnqueueKind::QueueTimeout => "queue_timeout",
+            OutboundEnqueueKind::EncoderTimeout => "encoder_timeout",
+            OutboundEnqueueKind::WriterStopped => "writer_stopped",
+            OutboundEnqueueKind::MessageTooLarge => "message_too_large",
+            OutboundEnqueueKind::Serialization => "serialization",
+            OutboundEnqueueKind::MessageSizeConversion => "message_size_conversion",
+        }
+    }
+}
+
+impl std::fmt::Display for OutboundEnqueueFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self.kind {
+            OutboundEnqueueKind::ByteBudgetTimeout => "control plane outbound byte budget is exhausted",
+            OutboundEnqueueKind::QueueTimeout => "control plane outbound queue is full",
+            OutboundEnqueueKind::EncoderTimeout => "control plane outbound encoder is busy",
+            OutboundEnqueueKind::WriterStopped => "control plane outbound writer stopped",
+            OutboundEnqueueKind::MessageTooLarge => "control plane outbound message exceeds byte budget",
+            OutboundEnqueueKind::Serialization => "serializing control plane message",
+            OutboundEnqueueKind::MessageSizeConversion => "control plane outbound message size",
+        };
+        match &self.source {
+            Some(source) => write!(f, "{label}: {source:#}"),
+            None => f.write_str(label),
+        }
+    }
+}
+
+impl std::error::Error for OutboundEnqueueFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_ref().map(|error| error.as_ref())
+    }
+}
+
 #[derive(Clone)]
 struct OutboundSender {
+    connection_id: u64,
     messages: mpsc::Sender<OutboundMessage>,
     bytes: Arc<Semaphore>,
     /// Serializes at most one JSON frame at a time. The owner keeps this
@@ -372,6 +440,85 @@ fn outbound_message_bytes(message: &Message) -> usize {
 fn outbound_write_timeout(bytes: usize, grace: Duration) -> Duration {
     let extra_secs = u64::try_from(bytes / (1024 * 1024)).unwrap_or(u64::MAX);
     grace.saturating_add(Duration::from_secs(extra_secs))
+}
+
+
+
+struct EnqueueFailureRecord<'a> {
+    connection_id: u64,
+    failure: &'a OutboundEnqueueFailure,
+    trace: &'a EnqueueTrace,
+    available_bytes: usize,
+    queue_remaining: usize,
+    elapsed_ms: u64,
+    timeout_ms: u64,
+}
+
+impl std::fmt::Display for EnqueueFailureRecord<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ws_enqueue_failure level=warn connection_id={} cause={} phase={} message_bytes_known={} message_bytes={} requested_bytes={} available_bytes={} queue_remaining={} elapsed_ms={} timeout_ms={}",
+            self.connection_id,
+            self.failure.as_str(),
+            self.trace.phase,
+            self.trace.message_bytes_known,
+            self.trace.message_bytes,
+            self.trace.requested_bytes,
+            self.available_bytes,
+            self.queue_remaining,
+            self.elapsed_ms,
+            self.timeout_ms,
+        )
+    }
+}
+
+struct EnqueueTrace {
+    phase: &'static str,
+    message_bytes_known: bool,
+    message_bytes: usize,
+    requested_bytes: u32,
+    timeout: Duration,
+    started: tokio::time::Instant,
+}
+
+impl OutboundSender {
+    fn trace(&self, phase: &'static str, timeout: Duration) -> EnqueueTrace {
+        EnqueueTrace {
+            phase,
+            message_bytes_known: false,
+            message_bytes: 0,
+            requested_bytes: 0,
+            timeout,
+            started: tokio::time::Instant::now(),
+        }
+    }
+
+    fn fail(
+        &self,
+        trace: &EnqueueTrace,
+        kind: OutboundEnqueueKind,
+        source: Option<anyhow::Error>,
+    ) -> anyhow::Error {
+        let failure = OutboundEnqueueFailure::new(kind, source);
+        let available_bytes = self.bytes.available_permits();
+        let queue_remaining = self.messages.capacity();
+        let elapsed_ms = u64::try_from(trace.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let timeout_ms = u64::try_from(trace.timeout.as_millis()).unwrap_or(u64::MAX);
+        eprintln!(
+            "{}",
+            EnqueueFailureRecord {
+                connection_id: self.connection_id,
+                failure: &failure,
+                trace,
+                available_bytes,
+                queue_remaining,
+                elapsed_ms,
+                timeout_ms,
+            }
+        );
+        anyhow::Error::new(failure)
+    }
 }
 
 const SUBSCRIPTION_WINDOW_EVENT_CAPACITY: usize = 2048;
@@ -1410,18 +1557,32 @@ where
     // The static web client page is served without authentication: it carries
     // no data itself, and every command/event flows through authenticated or
     // capability-gated WebSockets. A collaboration join link uses the WS path
-    // as its browser document URL; non-upgrade GETs at that exact validated
-    // route receive the same embedded client, which reads the secret fragment
-    // locally before opening the encrypted WebSocket.
-    if raw.method == Method::GET
+    // as its browser document URL; non-upgrade GET (or HEAD) at that exact
+    // validated route receives the same embedded client, which reads the
+    // secret fragment locally before opening the encrypted WebSocket. HEAD
+    // gets the identical GET headers with no body.
+    if matches!(raw.method, Method::GET | Method::HEAD)
         && (raw.path == "/web" || raw.path == "/chat" || collab_room_id(&raw.path).is_some())
     {
-        let if_none_match = raw
+        let accept_encoding = raw
             .headers
-            .get(http::header::IF_NONE_MATCH)
+            .get(http::header::ACCEPT_ENCODING)
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
-        return serve_web_page(&mut stream, if_none_match.as_deref()).await;
+        let if_none_match: Vec<String> = raw
+            .headers
+            .get_all(http::header::IF_NONE_MATCH)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .map(str::to_owned)
+            .collect();
+        return serve_web_page(
+            &mut stream,
+            accept_encoding.as_deref(),
+            &if_none_match,
+            raw.method == Method::HEAD,
+        )
+        .await;
     }
     // Named web assets (e.g. hashed JS/CSS bundles) from the embedded table.
     if raw.method == Method::GET && raw.path.starts_with("/assets/") {
@@ -3540,7 +3701,9 @@ where
     let mut subscriptions = ConnectionSubscriptions::default();
     let (outbound_messages, mut outbound_rx) =
         mpsc::channel::<OutboundMessage>(OUTBOUND_QUEUE_CAPACITY);
+    let connection_id = NEXT_WS_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
     let outbound_tx = OutboundSender {
+        connection_id,
         messages: outbound_messages,
         bytes: Arc::new(Semaphore::new(OUTBOUND_QUEUE_BYTE_BUDGET)),
         encoder: Arc::new(Semaphore::new(1)),
@@ -3571,6 +3734,8 @@ where
     let mut snapshots = JoinSet::<SnapshotTaskResult>::new();
     let mut next_snapshot_generation = 0u64;
     let (writer_control_tx, mut writer_control_rx) = mpsc::channel::<WriterControl>(1);
+    let writer_connection_id = connection_id;
+
     let mut writer = AbortTask::new(tokio::spawn(async move {
         loop {
             let message = tokio::select! {
@@ -3598,6 +3763,9 @@ where
                     None => return Ok(()),
                 },
             };
+            let message_bytes = outbound_message_bytes(&message.message);
+            let send_timeout = outbound_write_timeout(message_bytes, slow_client_grace);
+            let started = tokio::time::Instant::now();
             tokio::select! {
                 biased;
                 control = writer_control_rx.recv() => match control {
@@ -3614,15 +3782,22 @@ where
                     }
                     None => return Ok(()),
                 },
-                send = tokio::time::timeout(
-                    outbound_write_timeout(
-                        outbound_message_bytes(&message.message),
-                        slow_client_grace,
-                    ),
-                    websocket_write.send(message.message),
-                ) => match send {
-                    Ok(result) => result.context("sending control plane WebSocket message")?,
+                send = tokio::time::timeout(send_timeout, websocket_write.send(message.message)) => match send {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        eprintln!(
+                            "ws_writer_failure connection_id={writer_connection_id} phase=writer_send cause=send_error message_bytes={message_bytes} elapsed_ms={} timeout_ms={}",
+                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                            u64::try_from(send_timeout.as_millis()).unwrap_or(u64::MAX),
+                        );
+                        return Err(anyhow::Error::from(error).context("sending control plane WebSocket message"));
+                    }
                     Err(_) => {
+                        eprintln!(
+                            "ws_writer_failure connection_id={writer_connection_id} phase=writer_send cause=writer_timeout message_bytes={message_bytes} elapsed_ms={} timeout_ms={}",
+                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                            u64::try_from(send_timeout.as_millis()).unwrap_or(u64::MAX),
+                        );
                         // The frame was dequeued, but the socket made no
                         // write progress within the slow-client grace: the
                         // peer stopped reading and the kernel Send-Q is
@@ -4013,12 +4188,19 @@ where
                             // Release the outbound path exactly as it does
                             // (the 1008 close frame cannot be delivered on a
                             // socket that just proved non-writable) and take
-                            // the slow-client eviction.
+                            // the slow-client eviction. This path bypasses
+                            // the ws_close block below.
+                            eprintln!(
+                                "ws_close connection_id={connection_id} category=slow_client cause=writer_timeout"
+                            );
                             writer.handle.take();
                             outbound_tx.encoder.close();
                             outbound_tx.bytes.close();
                             return Err(error);
                         }
+                        eprintln!(
+                            "ws_writer_failure connection_id={connection_id} phase=writer_join cause=send_error message_bytes=0 elapsed_ms=0 timeout_ms=0"
+                        );
                         return Err(error);
                     }
                 }
@@ -4342,19 +4524,24 @@ where
 
     let close = match exit {
         WebSocketExit::Graceful(Some(frame)) => {
-            eprintln!("ws_close category={}", graceful_close_category(&frame));
+            eprintln!(
+                "ws_close connection_id={connection_id} category={}",
+                graceful_close_category(&frame)
+            );
             WriterControl::Close(Some(frame))
         }
         WebSocketExit::Graceful(None) => {
-            eprintln!("ws_close category=eof");
+            eprintln!("ws_close connection_id={connection_id} category=eof");
             WriterControl::Close(None)
         }
         WebSocketExit::PeerInitiatedClose => {
-            eprintln!("ws_close category=peer_close");
+            eprintln!("ws_close connection_id={connection_id} category=peer_close");
             WriterControl::FlushPeerClose
         }
         WebSocketExit::SlowClient => {
-            eprintln!("ws_close category=slow_client");
+            eprintln!(
+                "ws_close connection_id={connection_id} category=slow_client cause=outbound_or_forwarder_failure"
+            );
             WriterControl::Close(Some(slow_client_close_frame()))
         }
     };
@@ -4445,19 +4632,42 @@ async fn enqueue_message(
     message: Message,
     slow_client_grace: Duration,
 ) -> Result<()> {
-    let bytes = outbound_message_bytes(&message);
-    if bytes > OUTBOUND_QUEUE_BYTE_BUDGET {
-        bail!("control plane outbound message exceeds byte budget");
+    let message_bytes = outbound_message_bytes(&message);
+    let mut trace = sender.trace("message_size", slow_client_grace);
+    trace.message_bytes_known = true;
+    trace.message_bytes = message_bytes;
+    if message_bytes > OUTBOUND_QUEUE_BYTE_BUDGET {
+        return Err(sender.fail(&trace, OutboundEnqueueKind::MessageTooLarge, None));
     }
-    let bytes = u32::try_from(bytes).context("control plane outbound message size")?;
-    let permit = tokio::time::timeout(
+    let bytes = match u32::try_from(message_bytes) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return Err(sender.fail(
+                &trace,
+                OutboundEnqueueKind::MessageSizeConversion,
+                Some(anyhow!(error).context("control plane outbound message size")),
+            ));
+        }
+    };
+    trace.phase = "byte_reserve";
+    trace.requested_bytes = bytes;
+    let permit = match tokio::time::timeout(
         slow_client_grace,
         sender.bytes.clone().acquire_many_owned(bytes),
     )
     .await
-    .map_err(|_| anyhow!("control plane outbound byte budget is exhausted"))?
-    .map_err(|_| anyhow!("control plane outbound writer stopped"))?;
-    enqueue_reserved(sender, message, permit, slow_client_grace).await
+    {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_error)) => {
+            trace.phase = "byte_reserve";
+            return Err(sender.fail(&trace, OutboundEnqueueKind::WriterStopped, None));
+
+        }
+        Err(_) => {
+            return Err(sender.fail(&trace, OutboundEnqueueKind::ByteBudgetTimeout, None));
+        }
+    };
+    enqueue_reserved(sender, message, permit, slow_client_grace, message_bytes).await
 }
 
 async fn enqueue_reserved(
@@ -4465,15 +4675,24 @@ async fn enqueue_reserved(
     message: Message,
     permit: tokio::sync::OwnedSemaphorePermit,
     slow_client_grace: Duration,
+    message_bytes: usize,
 ) -> Result<()> {
+    let mut trace = sender.trace("queue_send", slow_client_grace);
+    trace.message_bytes_known = true;
+    trace.message_bytes = message_bytes;
+    trace.requested_bytes = u32::try_from(message_bytes).unwrap_or(u32::MAX);
     let outbound = OutboundMessage {
         message,
         _bytes: permit,
     };
-    tokio::time::timeout(slow_client_grace, sender.messages.send(outbound))
-        .await
-        .map_err(|_| anyhow!("control plane outbound queue is full"))?
-        .map_err(|_| anyhow!("control plane outbound writer stopped"))
+    match tokio::time::timeout(slow_client_grace, sender.messages.send(outbound)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            drop(error);
+            Err(sender.fail(&trace, OutboundEnqueueKind::WriterStopped, None))
+        }
+        Err(_) => Err(sender.fail(&trace, OutboundEnqueueKind::QueueTimeout, None)),
+    }
 }
 
 async fn enqueue_json<T: Serialize>(
@@ -4481,24 +4700,34 @@ async fn enqueue_json<T: Serialize>(
     value: &T,
     slow_client_grace: Duration,
 ) -> Result<()> {
+    let reservation_timeout =
+        outbound_write_timeout(OUTBOUND_QUEUE_BYTE_BUDGET, slow_client_grace);
     if sender.messages.is_closed() {
-        bail!("control plane outbound writer stopped");
+        let trace = sender.trace("precheck", reservation_timeout);
+        return Err(sender.fail(&trace, OutboundEnqueueKind::WriterStopped, None));
     }
     // Only one connection task may approach serialization. Reserving the
     // connection's complete byte budget before serde runs means the encoded
     // String, and every already queued String, can never coexist above the
     // budget. Once its exact size is known, only that portion is transferred
     // to OutboundMessage and the unused reservation is released.
-    let reservation_timeout =
-        outbound_write_timeout(OUTBOUND_QUEUE_BYTE_BUDGET, slow_client_grace);
-    let encoder = tokio::time::timeout(
+    let mut trace = sender.trace("encoder_acquire", reservation_timeout);
+    trace.requested_bytes = u32::try_from(OUTBOUND_QUEUE_BYTE_BUDGET).unwrap_or(u32::MAX);
+    let encoder = match tokio::time::timeout(
         reservation_timeout,
         sender.encoder.clone().acquire_owned(),
     )
     .await
-    .map_err(|_| anyhow!("control plane outbound encoder is busy"))?
-    .map_err(|_| anyhow!("control plane outbound writer stopped"))?;
-    let mut reservation = tokio::time::timeout(
+    {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_error)) => {
+            return Err(sender.fail(&trace, OutboundEnqueueKind::WriterStopped, None));
+
+        }
+        Err(_) => return Err(sender.fail(&trace, OutboundEnqueueKind::EncoderTimeout, None)),
+    };
+    trace.phase = "byte_reserve";
+    let mut reservation = match tokio::time::timeout(
         reservation_timeout,
         sender
             .bytes
@@ -4506,18 +4735,41 @@ async fn enqueue_json<T: Serialize>(
             .acquire_many_owned(OUTBOUND_QUEUE_BYTE_BUDGET as u32),
     )
     .await
-    .map_err(|_| anyhow!("control plane outbound byte budget is exhausted"))?
-    .map_err(|_| anyhow!("control plane outbound writer stopped"))?;
-    let text = serde_json::to_string(value).context("serializing control plane message")?;
+    {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_error)) => {
+            return Err(sender.fail(&trace, OutboundEnqueueKind::WriterStopped, None));
+
+        }
+        Err(_) => {
+            return Err(sender.fail(&trace, OutboundEnqueueKind::ByteBudgetTimeout, None));
+        }
+    };
+    let text = match serde_json::to_string(value) {
+        Ok(text) => text,
+        Err(error) => {
+            trace.phase = "serialize";
+            return Err(sender.fail(
+                &trace,
+                OutboundEnqueueKind::Serialization,
+                Some(anyhow!(error).context("serializing control plane message")),
+            ));
+        }
+    };
     let bytes = text.len();
+    trace.message_bytes_known = true;
+    trace.message_bytes = bytes;
+    trace.phase = "message_size";
     if bytes > OUTBOUND_QUEUE_BYTE_BUDGET {
-        bail!("control plane outbound message exceeds byte budget");
+        return Err(sender.fail(&trace, OutboundEnqueueKind::MessageTooLarge, None));
     }
     let permit = reservation
         .split(bytes)
         .expect("encoded frame fits the complete outbound reservation");
     drop(reservation);
-    let result = enqueue_reserved(sender, Message::Text(text.into()), permit, slow_client_grace).await;
+    let result =
+        enqueue_reserved(sender, Message::Text(text.into()), permit, slow_client_grace, bytes)
+            .await;
     drop(encoder);
     result
 }
@@ -4597,42 +4849,104 @@ fn content_length(headers: &HeaderMap) -> Option<usize> {
     Some(first)
 }
 
-async fn serve_web_page<S>(stream: &mut S, if_none_match: Option<&str>) -> Result<()>
+async fn serve_web_page<S>(
+    stream: &mut S,
+    accept_encoding: Option<&str>,
+    if_none_match: &[String],
+    head: bool,
+) -> Result<()>
 where
     S: AsyncWrite + Unpin,
 {
-    let (mime, bytes) = if let Ok(dir) = std::env::var(RPI_WEB_DEV_DIR)
-        && !dir.trim().is_empty()
+    let (mime, bytes) = web_page_document()?;
+    serve_web_document(stream, accept_encoding, if_none_match, head, &mime, &bytes).await
+}
+
+/// Resolves the web document afresh on every request: the `RPI_WEB_DEV_DIR`
+/// override re-reads `index.html` from disk (frontend iteration without
+/// rebuilding the binary), otherwise the embedded copy.
+fn web_page_document() -> Result<(String, Vec<u8>)> {
+    match std::env::var(RPI_WEB_DEV_DIR)
+        .ok()
+        .filter(|dir| !dir.trim().is_empty())
     {
-        let file = pi_coding::read_operator_file(
-            &Path::new(dir.trim()).join("index.html"),
-            64 * 1024 * 1024,
-        )
-        .with_context(|| format!("RPI_WEB_DEV_DIR {dir:?} index.html is unreadable"))?;
-        ("text/html; charset=utf-8".to_owned(), file.bytes)
-    } else {
-        let (mime, bytes) = crate::web::index().context("embedded web client assets are missing")?;
-        (mime.to_owned(), bytes.to_vec())
-    };
+        Some(dir) => web_page_document_from_dir(&dir),
+        None => web_page_embedded_document(),
+    }
+}
+
+/// Reads the override `index.html`. Kept separate from the environment
+/// lookup so tests exercise real file rotation through a temp dir without
+/// mutating process-global state.
+fn web_page_document_from_dir(dir: &str) -> Result<(String, Vec<u8>)> {
+    let file = pi_coding::read_operator_file(
+        &Path::new(dir.trim()).join("index.html"),
+        64 * 1024 * 1024,
+    )
+    .with_context(|| format!("RPI_WEB_DEV_DIR {dir:?} index.html is unreadable"))?;
+    Ok(("text/html; charset=utf-8".to_owned(), file.bytes))
+}
+
+fn web_page_embedded_document() -> Result<(String, Vec<u8>)> {
+    let (mime, bytes) = crate::web::index().context("embedded web client assets are missing")?;
+    Ok((mime.to_owned(), bytes.to_vec()))
+}
+
+/// Negotiates and writes one reply for an already-resolved web document.
+async fn serve_web_document<S>(
+    stream: &mut S,
+    accept_encoding: Option<&str>,
+    if_none_match: &[String],
+    head: bool,
+    mime: &str,
+    bytes: &[u8],
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
     // The web client is a moving bundle: it must always revalidate, but an
     // unchanged 6+ MB document must not re-download on every phone wake. The
-    // ETag turns a warm page load into one small 304 round-trip.
-    let etag = format!("\"{}\"", web_bundle_etag(&bytes));
-    if if_none_match.is_some_and(|candidate| candidate.trim() == etag) {
+    // ETag turns a warm page load into one small 304 round-trip. It is weak
+    // (`W/`) because identity and gzip forms of the same document are not
+    // byte-identical: weak lets the server serve either representation for
+    // one validator. A 304 has no body, so it needs no negotiated encoding.
+    let etag = format!("W/\"{}\"", web_bundle_etag(bytes));
+    if if_none_match_matches(if_none_match.iter().map(String::as_str), &etag) {
         let header = format!(
-            "HTTP/1.1 304 Not Modified\r\netag: {etag}\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n",
+            "HTTP/1.1 304 Not Modified\r\netag: {etag}\r\nvary: accept-encoding\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n",
         );
         stream.write_all(header.as_bytes()).await?;
         stream.shutdown().await?;
         return Ok(());
     }
+    // Gzip only when the client explicitly negotiates it (never for `*`); the
+    // compressed form is memoized per ETag so the one-time compression of the
+    // multi-MB document is paid once per bundle, not per request.
+    let gzip = accepts_gzip(accept_encoding);
+    let gzip_body = if gzip {
+        Some(web_document_gzip(&etag, bytes)?)
+    } else {
+        None
+    };
+    let body: &[u8] = match &gzip_body {
+        Some(compressed) => compressed,
+        None => bytes,
+    };
     let reason = StatusCode::OK.canonical_reason().unwrap_or("OK");
-    let header = format!(
-        "HTTP/1.1 200 {reason}\r\ncontent-type: {mime}\r\ncontent-length: {}\r\netag: {etag}\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n",
-        bytes.len(),
+    let mut header = format!(
+        "HTTP/1.1 200 {reason}\r\ncontent-type: {mime}\r\ncontent-length: {}\r\netag: {etag}\r\nvary: accept-encoding\r\ncache-control: no-cache\r\nconnection: close\r\n",
+        body.len(),
     );
+    if gzip {
+        header.push_str("content-encoding: gzip\r\n");
+    }
+    header.push_str("\r\n");
     stream.write_all(header.as_bytes()).await?;
-    stream.write_all(&bytes).await?;
+    // HEAD advertises the exact GET response (content-length included) but
+    // carries no body.
+    if !head {
+        stream.write_all(body).await?;
+    }
     stream.shutdown().await?;
     Ok(())
 }
@@ -4645,6 +4959,96 @@ fn web_bundle_etag(bytes: &[u8]) -> String {
         hex.push_str(&format!("{byte:02x}"));
     }
     hex
+}
+
+/// Negotiates the `gzip` coding from an `Accept-Encoding` header value.
+/// Only an explicit `gzip` token (case-insensitive, `;q=` values honored,
+/// `q=0` excluded) selects the compressed form. A wildcard `*` is
+/// deliberately not treated as an opt-in: ignoring it can only leave a
+/// client uncompressed, never send a representation it did not ask for.
+fn accepts_gzip(accept_encoding: Option<&str>) -> bool {
+    let Some(value) = accept_encoding else {
+        return false;
+    };
+    for part in value.split(',') {
+        let mut fields = part.split(';');
+        let Some(coding) = fields.next() else {
+            continue;
+        };
+        if !coding.trim().eq_ignore_ascii_case("gzip") {
+            continue;
+        }
+        let mut quality = 1.0_f32;
+        for field in fields {
+            let field = field.trim();
+            let (name, value) = match field.split_once('=') {
+                Some((name, value)) => (name, value),
+                None => continue,
+            };
+            // Parameter NAME is case-insensitive (RFC 9110 §5.6.6); `Q=0`
+            // must exclude gzip just like `q=0`.
+            if name.trim().eq_ignore_ascii_case("q") {
+                quality = value.trim().parse().unwrap_or(1.0);
+            }
+        }
+        if quality > 0.0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether any `If-None-Match` header value matches the server's ETag under
+/// the RFC 9110 §13.1.2 rules: header values are comma-separated lists
+/// (multiple headers accumulate), `*` matches any current representation,
+/// and comparison is WEAK — both sides drop an optional `W/` prefix and the
+/// opaque values compare equal — so a client that cached either encoding
+/// form revalidates with one shared validator.
+fn if_none_match_matches<'a>(values: impl IntoIterator<Item = &'a str>, etag: &str) -> bool {
+    fn weak_opaque(candidate: &str) -> &str {
+        let candidate = candidate.trim();
+        candidate.strip_prefix("W/").unwrap_or(candidate)
+    }
+    let opaque = weak_opaque(etag);
+    values.into_iter().any(|value| {
+        value.split(',').any(|token| {
+            token == "*" || !token.is_empty() && weak_opaque(token) == opaque
+        })
+    })
+}
+
+/// Single-slot memoization of the gzip form of the web document, keyed by the
+/// ETag of the identity bytes. The embedded bundle is immutable for the
+/// process lifetime; the `RPI_WEB_DEV_DIR` override still re-reads
+/// `index.html` on every request (unchanged semantics), and a rebuilt file
+/// simply changes the ETag and recompresses once.
+static WEB_DOCUMENT_GZIP: std::sync::Mutex<Option<(String, Arc<Vec<u8>>)>> =
+    std::sync::Mutex::new(None);
+
+fn web_document_gzip(etag: &str, bytes: &[u8]) -> Result<Arc<Vec<u8>>> {
+    use std::io::Write as _;
+    // The lock is deliberately held ACROSS the compression. Gzipping the
+    // document is pure CPU (no await, no blocking I/O), so a concurrent first
+    // request merely waits out this critical section instead of redundantly
+    // compressing 6+ MB itself; the section runs at most once per bundle
+    // (~300 ms for the current page) and every later request hits the cache.
+    let mut cache = WEB_DOCUMENT_GZIP.lock().unwrap();
+    if let Some((cached_etag, compressed)) = cache.as_ref()
+        && cached_etag == etag
+    {
+        return Ok(Arc::clone(compressed));
+    }
+    let mut encoder = GzEncoder::new(Vec::with_capacity(bytes.len() / 2), Compression::default());
+    encoder
+        .write_all(bytes)
+        .context("gzipping the web document")?;
+    let compressed = Arc::new(
+        encoder
+            .finish()
+            .context("finishing the web document gzip stream")?,
+    );
+    *cache = Some((etag.to_owned(), Arc::clone(&compressed)));
+    Ok(compressed)
 }
 
 /// The web client is a moving bundle: every deploy must reach browsers on the
@@ -5302,7 +5706,7 @@ mod tests {
         let resources = pi_coding::ResourceManager::new(resource_options).expect("resources");
         let session = pi_coding::Session::new_with_additional_tools_filtered_and_discovery(
             pi_coding::SessionOptions {
-                model,
+                model: Some(model),
                 cwd: cwd.clone(),
                 system_prompt: String::new(),
                 thinking_level: pi_agent::ThinkingLevel::Off,
@@ -6463,11 +6867,12 @@ mod tests {
         }
         let wait_pane = Instant::now() + Duration::from_millis(10000);
         let mut last = String::new();
+        let mut marks: Vec<(u32, usize)> = Vec::new();
         loop {
+            marks.clear();
             match crate::modes::tmux::pane_snapshot(&name, Some(500)) {
                 Ok(snap) => {
                     last = snap.content;
-                    let mut marks = Vec::new();
                     for i in 0..100u32 {
                         let mark = format!("MARK{i:03}");
                         if let Some(at) = last.find(&mark) {
@@ -6485,12 +6890,18 @@ mod tests {
                 Err(error) => last = error,
             }
             if Instant::now() >= wait_pane {
-                let sample: Vec<&str> = last
+                let indices: Vec<u32> = marks.iter().map(|(index, _)| *index).collect();
+                let lines: Vec<&str> = last
                     .lines()
                     .filter(|line| line.contains("MARK"))
                     .take(12)
                     .collect();
-                panic!("ordered input missing from pane sample={sample:?}");
+                panic!(
+                    "ordered input missing from pane marks={} first={:?} last={:?} lines={lines:?}",
+                    marks.len(),
+                    indices.first(),
+                    indices.last(),
+                );
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -7904,6 +8315,7 @@ mod tests {
     async fn enqueue_json_admits_get_messages_above_old_24_mib_cap() {
         let (messages, mut rx) = mpsc::channel::<OutboundMessage>(1);
         let sender = OutboundSender {
+            connection_id: 1,
             messages,
             bytes: Arc::new(Semaphore::new(OUTBOUND_QUEUE_BYTE_BUDGET)),
             encoder: Arc::new(Semaphore::new(1)),
@@ -7936,6 +8348,7 @@ mod tests {
         let (messages, _rx) = mpsc::channel::<OutboundMessage>(1);
         let bytes = Arc::new(Semaphore::new(OUTBOUND_QUEUE_BYTE_BUDGET));
         let sender = OutboundSender {
+            connection_id: 2,
             messages,
             bytes: bytes.clone(),
             encoder: Arc::new(Semaphore::new(1)),
@@ -8249,6 +8662,7 @@ mod tests {
                 mpsc::channel::<OutboundMessage>(OUTBOUND_QUEUE_CAPACITY);
             (
                 OutboundSender {
+                    connection_id: 3,
                     messages,
                     bytes: Arc::new(Semaphore::new(OUTBOUND_QUEUE_BYTE_BUDGET)),
                     encoder: Arc::new(Semaphore::new(1)),
@@ -8273,7 +8687,11 @@ mod tests {
         .expect_err("an undrained full queue must exhaust the grace and fail");
         assert!(started.elapsed() >= Duration::from_millis(150));
         assert!(format!("{error:#}").contains("queue is full"), "{error:#}");
-        drop(rx);
+        assert_eq!(
+            error.downcast_ref::<OutboundEnqueueFailure>().map(|failure| failure.kind),
+            Some(OutboundEnqueueKind::QueueTimeout)
+        );
+
 
         let (tx, mut rx) = sender();
         for _ in 0..OUTBOUND_QUEUE_CAPACITY {
@@ -8316,6 +8734,7 @@ mod tests {
     async fn outbound_byte_reservation_is_held_until_writer_consumes_or_drops() {
         let (messages, mut receiver) = mpsc::channel::<OutboundMessage>(2);
         let sender = OutboundSender {
+            connection_id: 4,
             messages,
             bytes: Arc::new(Semaphore::new(4)),
             encoder: Arc::new(Semaphore::new(1)),
@@ -8335,6 +8754,10 @@ mod tests {
         .await
         .expect_err("queued bytes retain their reservation");
         assert!(format!("{blocked:#}").contains("byte budget"));
+        assert_eq!(
+            blocked.downcast_ref::<OutboundEnqueueFailure>().map(|failure| failure.kind),
+            Some(OutboundEnqueueKind::ByteBudgetTimeout)
+        );
 
         drop(receiver.recv().await.expect("queued frame"));
         enqueue_message(
@@ -8367,6 +8790,7 @@ mod tests {
 
         let (messages, receiver) = mpsc::channel::<OutboundMessage>(8);
         let sender = OutboundSender {
+            connection_id: 5,
             messages,
             bytes: Arc::new(Semaphore::new(OUTBOUND_QUEUE_BYTE_BUDGET)),
             encoder: Arc::new(Semaphore::new(1)),
@@ -8415,6 +8839,143 @@ mod tests {
         })
         .await
         .expect("close must promptly preempt encoder and byte waiters");
+    }
+
+    fn assert_enqueue_failure(error: &anyhow::Error, expected: OutboundEnqueueKind) {
+        let failure = error
+            .downcast_ref::<OutboundEnqueueFailure>()
+            .expect("typed enqueue failure");
+        assert_eq!(failure.kind, expected, "{failure:?}");
+
+    }
+
+    #[tokio::test]
+    async fn outbound_failures_are_typed_and_logs_omit_payload() {
+        let (messages, _receiver) = mpsc::channel::<OutboundMessage>(1);
+        let bytes = Arc::new(Semaphore::new(OUTBOUND_QUEUE_BYTE_BUDGET));
+        let sender = OutboundSender {
+            connection_id: 41,
+            messages,
+            bytes: bytes.clone(),
+            encoder: Arc::new(Semaphore::new(1)),
+        };
+        let clone = sender.clone();
+        assert_eq!(clone.connection_id, sender.connection_id);
+        let (other_messages, _other) = mpsc::channel::<OutboundMessage>(1);
+        let other = OutboundSender {
+            connection_id: 42,
+            messages: other_messages,
+            bytes: Arc::new(Semaphore::new(OUTBOUND_QUEUE_BYTE_BUDGET)),
+            encoder: Arc::new(Semaphore::new(1)),
+        };
+        assert_ne!(other.connection_id, sender.connection_id);
+
+        let encoder = sender.encoder.clone().acquire_owned().await.expect("encoder");
+        let grace = Duration::from_millis(30);
+        let reservation_timeout = outbound_write_timeout(OUTBOUND_QUEUE_BYTE_BUDGET, grace);
+        let encoder_error = tokio::time::timeout(
+            reservation_timeout + Duration::from_secs(1),
+            enqueue_json(&sender, &json!({"ok": true}), grace),
+        )
+        .await
+        .expect("encoder wait bounded by the full-budget reservation timeout")
+        .expect_err("held encoder");
+        assert_enqueue_failure(&encoder_error, OutboundEnqueueKind::EncoderTimeout);
+        assert!(bytes.available_permits() == OUTBOUND_QUEUE_BYTE_BUDGET);
+        drop(encoder);
+        let (stopped_messages, stopped_receiver) = mpsc::channel::<OutboundMessage>(1);
+        drop(stopped_receiver);
+        let stopped_sender = OutboundSender {
+            connection_id: sender.connection_id,
+            messages: stopped_messages,
+            bytes: sender.bytes.clone(),
+            encoder: sender.encoder.clone(),
+        };
+        let stopped_precheck = enqueue_json(&stopped_sender, &json!({"ok": true}), Duration::from_secs(1))
+            .await
+            .expect_err("closed message receiver");
+        assert_enqueue_failure(&stopped_precheck, OutboundEnqueueKind::WriterStopped);
+
+        let (messages, receiver) = mpsc::channel::<OutboundMessage>(1);
+        let sender = OutboundSender {
+            connection_id: 43,
+            messages,
+            bytes: Arc::new(Semaphore::new(OUTBOUND_QUEUE_BYTE_BUDGET)),
+            encoder: Arc::new(Semaphore::new(1)),
+        };
+        drop(receiver);
+        let stopped_queue = enqueue_message(
+            &sender,
+            Message::Text("queue-stopped".into()),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("closed receiver");
+        assert_enqueue_failure(&stopped_queue, OutboundEnqueueKind::WriterStopped);
+
+        sender.bytes.close();
+        let stopped_bytes = enqueue_message(&sender, Message::Text("x".into()), Duration::from_secs(1))
+            .await
+            .expect_err("closed byte semaphore");
+        assert_enqueue_failure(&stopped_bytes, OutboundEnqueueKind::WriterStopped);
+
+        let (messages, _receiver) = mpsc::channel::<OutboundMessage>(1);
+        let sender = OutboundSender {
+            connection_id: 44,
+            messages,
+            bytes: Arc::new(Semaphore::new(OUTBOUND_QUEUE_BYTE_BUDGET)),
+            encoder: Arc::new(Semaphore::new(1)),
+        };
+        struct SecretSerializer;
+        impl Serialize for SecretSerializer {
+            fn serialize<S>(&self, _serializer: S) -> std::result::Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                Err(serde::ser::Error::custom("SECRET_SENTINEL_do_not_log"))
+            }
+        }
+        let serialized = enqueue_json(&sender, &SecretSerializer, Duration::from_secs(1))
+            .await
+            .expect_err("custom serializer");
+        let failure = serialized
+            .downcast_ref::<OutboundEnqueueFailure>()
+            .expect("typed serialization failure");
+        let trace = EnqueueTrace {
+            phase: "serialize",
+            message_bytes_known: false,
+            message_bytes: 0,
+            requested_bytes: u32::try_from(OUTBOUND_QUEUE_BYTE_BUDGET).unwrap_or(u32::MAX),
+            timeout: Duration::from_secs(1),
+            started: tokio::time::Instant::now(),
+        };
+        let record = EnqueueFailureRecord {
+            connection_id: sender.connection_id,
+            failure,
+            trace: &trace,
+            available_bytes: sender.bytes.available_permits(),
+            queue_remaining: sender.messages.capacity(),
+            elapsed_ms: 0,
+            timeout_ms: 1000,
+        }
+        .to_string();
+        assert_eq!(failure.kind, OutboundEnqueueKind::Serialization);
+        assert!(serialized.chain().any(|source| source.to_string().contains("SECRET_SENTINEL_do_not_log")));
+        assert!(serialized.source().is_some());
+        assert!(record.contains("cause=serialization"));
+        assert!(record.contains("phase=serialize"));
+        assert!(!record.contains("SECRET_SENTINEL_do_not_log"));
+
+        let oversized = enqueue_message(
+            &sender,
+            Message::Binary(vec![0; OUTBOUND_QUEUE_BYTE_BUDGET + 1].into()),
+            Duration::from_millis(20),
+        )
+        .await
+        .expect_err("oversized frame");
+        assert_enqueue_failure(&oversized, OutboundEnqueueKind::MessageTooLarge);
+
+
     }
 
 
@@ -10508,6 +11069,266 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 204"), "{response}");
         assert!(response.contains("x-file-name"), "{response}");
         state.manager.shutdown().await;
+    }
+
+    #[test]
+    fn accepts_gzip_negotiation_table() {
+        // No header, no compression.
+        assert!(!accepts_gzip(None));
+        assert!(!accepts_gzip(Some("")));
+        // Explicit gzip accepts, case-insensitively and alongside others.
+        assert!(accepts_gzip(Some("gzip")));
+        assert!(accepts_gzip(Some("GZIP")));
+        assert!(accepts_gzip(Some("deflate, gzip")));
+        assert!(accepts_gzip(Some("br, gzip, zstd")));
+        // q-values: nonzero accepts, zero excludes.
+        assert!(accepts_gzip(Some("gzip; q=0.5")));
+        assert!(accepts_gzip(Some("gzip;q=0.001")));
+        assert!(!accepts_gzip(Some("gzip; q=0")));
+        assert!(!accepts_gzip(Some("gzip; q=0.0, deflate")));
+        assert!(!accepts_gzip(Some("deflate, gzip;Q=0")));
+        // Wildcard is deliberately not an opt-in (see accepts_gzip).
+        assert!(!accepts_gzip(Some("*")));
+        assert!(!accepts_gzip(Some("*; q=1.0")));
+    }
+
+    #[tokio::test]
+    async fn serve_web_page_negotiates_gzip_body() {
+        use std::io::Read as _;
+        let (mime, bytes) = crate::web::index().expect("embedded web client assets");
+        let mut sink = std::io::Cursor::new(Vec::new());
+        serve_web_page(&mut sink, Some("gzip"), &[], false)
+            .await
+            .expect("gzip response");
+        let raw = sink.get_ref().clone();
+        let head = String::from_utf8_lossy(&raw).into_owned();
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+        assert!(head.contains(&format!("content-type: {mime}\r\n")));
+        assert!(head.contains("content-encoding: gzip\r\n"), "{head}");
+        assert!(head.contains("vary: accept-encoding\r\n"), "{head}");
+        let compressed_len = header_content_length(&head).expect("content-length header");
+        let body = &raw[raw.len() - compressed_len..];
+        assert_eq!(raw.len() - compressed_len, body_offset(&head));
+        // gzip magic number: a real gzip stream, smaller than the identity.
+        assert_eq!(&body[..2], &[0x1f, 0x8b]);
+        assert!(compressed_len < bytes.len(), "gzip must shrink the bundle");
+        // Round-trip: the served stream decompresses to the exact bundle.
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(body)
+            .read_to_end(&mut decoded)
+            .expect("gzip body decodes");
+        assert_eq!(decoded, bytes);
+
+        // Without the header the identity document is served unchanged.
+        let mut sink = std::io::Cursor::new(Vec::new());
+        serve_web_page(&mut sink, None, &[], false)
+            .await
+            .expect("identity response");
+        let raw = sink.get_ref().clone();
+        let head = String::from_utf8_lossy(&raw).into_owned();
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+        assert!(!head.contains("content-encoding"), "{head}");
+        assert_eq!(header_content_length(&head), Some(bytes.len()));
+        assert_eq!(raw.len() - body_offset(&head), bytes.len());
+        assert_eq!(&raw[raw.len() - bytes.len()..], bytes);
+    }
+
+    #[tokio::test]
+    async fn serve_web_page_etag_match_returns_304() {
+        let (_, bytes) = crate::web::index().expect("embedded web client assets");
+        let etag = format!("W/\"{}\"", web_bundle_etag(bytes));
+        let mut sink = std::io::Cursor::new(Vec::new());
+        serve_web_page(&mut sink, Some("gzip"), &[etag.clone()], false)
+            .await
+            .expect("304 response");
+        let raw = String::from_utf8_lossy(sink.get_ref()).into_owned();
+        assert!(raw.starts_with("HTTP/1.1 304 Not Modified\r\n"), "{raw}");
+        assert!(raw.contains(&format!("etag: {etag}\r\n")), "{raw}");
+        // A 304 is header-only: no content-length and no body.
+        assert!(!raw.contains("content-length"), "{raw}");
+        assert!(raw.ends_with("\r\n\r\n"), "{raw}");
+
+        // A stale or absent validator gets the full document, not a 304.
+        let mut sink = std::io::Cursor::new(Vec::new());
+        serve_web_page(&mut sink, None, &["\"0000000000000000\"".to_owned()], false)
+            .await
+            .expect("mismatched validator falls through");
+        let raw = String::from_utf8_lossy(sink.get_ref()).into_owned();
+        assert!(raw.starts_with("HTTP/1.1 200 OK\r\n"), "{raw}");
+        assert!(raw.contains("content-length"), "{raw}");
+    }
+
+    #[tokio::test]
+    async fn serve_web_page_head_returns_headers_without_body() {
+        // Reference GET: its actual body length is what HEAD must advertise.
+        let mut get_sink = std::io::Cursor::new(Vec::new());
+        serve_web_page(&mut get_sink, None, &[], false)
+            .await
+            .expect("GET response");
+        let get_raw = get_sink.get_ref().clone();
+        let get_head = String::from_utf8_lossy(&get_raw).into_owned();
+        let get_len = header_content_length(&get_head).expect("GET content-length header");
+        assert_eq!(get_raw.len() - body_offset(&get_head), get_len);
+
+        let mut sink = std::io::Cursor::new(Vec::new());
+        serve_web_page(&mut sink, None, &[], true)
+            .await
+            .expect("HEAD response");
+        let raw = String::from_utf8_lossy(sink.get_ref()).into_owned();
+        assert!(raw.starts_with("HTTP/1.1 200 OK\r\n"), "{raw}");
+        let head_len = header_content_length(&raw).expect("HEAD content-length header");
+        assert_eq!(head_len, get_len, "HEAD advertises the GET body length");
+        // Nothing beyond the header terminator: a zero-byte body.
+        assert_eq!(sink.get_ref().len(), body_offset(&raw), "HEAD writes no body");
+    }
+
+    #[tokio::test]
+    async fn serve_web_page_override_swap_rotates_etag_body_and_cache() {
+        use std::io::Read as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let index = dir.path().join("index.html");
+        let doc_dir = dir.path().to_str().expect("temp dir is UTF-8");
+
+        // One request = one fresh document resolution + one reply write,
+        // exactly the per-request shape of serve_web_page.
+        std::fs::write(&index, b"<html>document A</html>").expect("write override A");
+        let (mime, bytes_a) = web_page_document_from_dir(doc_dir).expect("override A document");
+        let mut sink = std::io::Cursor::new(Vec::new());
+        serve_web_document(&mut sink, Some("gzip"), &[], false, &mime, &bytes_a)
+            .await
+            .expect("override A response");
+        let raw_a = sink.get_ref().clone();
+        let head_a = String::from_utf8_lossy(&raw_a).into_owned();
+        // content-length advertises the gzip body, which the buffer carries.
+        assert_eq!(
+            header_content_length(&head_a),
+            Some(raw_a.len() - body_offset(&head_a))
+        );
+        let etag_a = header_etag(&head_a).expect("override A etag header");
+        let mut decoded_a = Vec::new();
+        flate2::read::GzDecoder::new(&raw_a[body_offset(&head_a)..])
+            .read_to_end(&mut decoded_a)
+            .expect("override A gzip body decodes");
+        assert_eq!(decoded_a, b"<html>document A</html>");
+
+        // Replacing the file invalidates everything at once: the stale A
+        // validator must not produce a 304, and the etag, body, and gzip
+        // cache entry must all rotate to B.
+        std::fs::write(&index, b"<html>document B</html>").expect("write override B");
+        let (_, bytes_b) = web_page_document_from_dir(doc_dir).expect("override B document");
+        assert_ne!(bytes_b, bytes_a, "re-read picks up the new file");
+        let mut sink = std::io::Cursor::new(Vec::new());
+        serve_web_document(&mut sink, Some("gzip"), &[etag_a.clone()], false, &mime, &bytes_b)
+            .await
+            .expect("override B response");
+        let raw_b = sink.get_ref().clone();
+        let head_b = String::from_utf8_lossy(&raw_b).into_owned();
+        assert!(head_b.starts_with("HTTP/1.1 200 OK\r\n"), "{head_b}");
+        let etag_b = header_etag(&head_b).expect("override B etag header");
+        assert_ne!(etag_b, etag_a, "rebuilt document gets a fresh etag");
+        let mut decoded_b = Vec::new();
+        flate2::read::GzDecoder::new(&raw_b[body_offset(&head_b)..])
+            .read_to_end(&mut decoded_b)
+            .expect("override B gzip body decodes");
+        assert_eq!(decoded_b, b"<html>document B</html>");
+
+        // The fresh validator revalidates against the new bundle.
+        let mut sink = std::io::Cursor::new(Vec::new());
+        serve_web_document(&mut sink, Some("gzip"), &[etag_b], false, &mime, &bytes_b)
+            .await
+            .expect("override B revalidation");
+        let raw = String::from_utf8_lossy(sink.get_ref()).into_owned();
+        assert!(raw.starts_with("HTTP/1.1 304 Not Modified\r\n"), "{raw}");
+    }
+
+    #[tokio::test]
+    async fn serve_web_page_unreadable_override_propagates_error() {
+        // Prime the gzip cache with a readable override first: a regression
+        // that answered from cached state would 304 or 200 on the stale tag
+        // instead of propagating the read error.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let index = dir.path().join("index.html");
+        let doc_dir = dir.path().to_str().expect("temp dir is UTF-8");
+        std::fs::write(&index, b"<html>document A</html>").expect("write override A");
+        let (mime, bytes_a) = web_page_document_from_dir(doc_dir).expect("override A document");
+        let mut sink = std::io::Cursor::new(Vec::new());
+        serve_web_document(&mut sink, Some("gzip"), &[], false, &mime, &bytes_a)
+            .await
+            .expect("override A response");
+        let head_a = String::from_utf8_lossy(sink.get_ref()).into_owned();
+        let etag_a = header_etag(&head_a).expect("override A etag header");
+
+        // Delete the file. The next request's document resolution — the FIRST
+        // thing serve_web_page does, before any etag comparison — must fail,
+        // so no reply (least of all a 304 reusing the cached etag) can be
+        // written from cached state.
+        std::fs::remove_file(&index).expect("remove override");
+        let resolution = web_page_document_from_dir(doc_dir);
+        assert!(
+            resolution.is_err(),
+            "missing index.html must fail the document resolution"
+        );
+        // Serve the stale bytes under the cached validator at the writer
+        // level to show the cache alone would 304: only the failing
+        // resolution ahead of it prevents that path in production.
+        let mut sink = std::io::Cursor::new(Vec::new());
+        serve_web_document(&mut sink, Some("gzip"), &[etag_a.clone()], false, &mime, &bytes_a)
+            .await
+            .expect("writer still serves when handed a document");
+        let stale = String::from_utf8_lossy(sink.get_ref()).into_owned();
+        assert!(
+            stale.starts_with("HTTP/1.1 304 Not Modified\r\n"),
+            "the guard is the resolution error, not the validator: {stale}"
+        );
+    }
+
+    #[test]
+    fn if_none_match_matching_table() {
+        let etag = "W/\"abc123\"";
+        // Absent or empty list never matches.
+        assert!(!if_none_match_matches([], etag));
+        // Client replays the weak validator verbatim.
+        assert!(if_none_match_matches([etag], etag));
+        // Multiple headers accumulate; any hit is enough.
+        assert!(if_none_match_matches(["\"other\"", etag], etag));
+        // One header value may itself be a comma-separated list.
+        assert!(if_none_match_matches([r#""other", W/"abc123""#], etag));
+        // `*` matches any current representation.
+        assert!(if_none_match_matches(["*"], etag));
+        assert!(if_none_match_matches(["*"], "W/\"anything-else\""));
+        // Weak comparison: the `W/` prefix is not significant on either side.
+        assert!(if_none_match_matches([r#""abc123""#], etag));
+        assert!(if_none_match_matches([r#"W/"abc123""#], r#""abc123""#));
+        // Different opaque values never match, weak or strong.
+        assert!(!if_none_match_matches([r#""abc124""#], etag));
+        assert!(!if_none_match_matches([r#"W/"abc124""#], etag));
+        // Only whitespace separates tokens; a bare token is not a match.
+        assert!(!if_none_match_matches(["   "], etag));
+    }
+
+    /// Extracts the `etag` header value from a response written by
+    /// [`serve_web_page`].
+    #[cfg(test)]
+    fn header_etag(head: &str) -> Option<String> {
+        head.lines()
+            .find_map(|line| line.strip_prefix("etag: "))
+            .map(str::to_owned)
+    }
+
+
+    /// Extracts `content-length` from a response written by [`serve_web_page`].
+    #[cfg(test)]
+    fn header_content_length(head: &str) -> Option<usize> {
+        head.lines()
+            .find_map(|line| line.strip_prefix("content-length: "))
+            .and_then(|value| value.parse().ok())
+    }
+
+    /// Byte offset of the response body inside the buffer: everything up to
+    /// and including the empty line that terminates the header block.
+    #[cfg(test)]
+    fn body_offset(head: &str) -> usize {
+        head.find("\r\n\r\n").expect("header terminator") + 4
     }
 
 }

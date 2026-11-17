@@ -41,6 +41,7 @@ export type RpcErrorCode =
   | 'cwd_changed'
   | 'file_line_too_large'
   | 'file_unavailable'
+  | 'file_ambiguous'
   | 'file_symlink'
   | 'directory_unavailable'
   | 'file_conversation_capacity'
@@ -56,7 +57,8 @@ export type RpcErrorCode =
   | 'file_conversation_selection_out_of_range'
   | 'file_conversation_read_failed'
   | 'code_review_not_open'
-  | 'session_processing';
+  | 'session_processing'
+  | 'model_not_configured';
 
 const RPC_ERROR_CODES: Readonly<Record<RpcErrorCode, true>> = {
   invalid_request: true,
@@ -73,6 +75,7 @@ const RPC_ERROR_CODES: Readonly<Record<RpcErrorCode, true>> = {
   cwd_changed: true,
   file_line_too_large: true,
   file_unavailable: true,
+  file_ambiguous: true,
   file_symlink: true,
   directory_unavailable: true,
   file_conversation_capacity: true,
@@ -89,6 +92,7 @@ const RPC_ERROR_CODES: Readonly<Record<RpcErrorCode, true>> = {
   file_conversation_read_failed: true,
   code_review_not_open: true,
   session_processing: true,
+  model_not_configured: true,
 };
 
 /** Parse the closed machine-readable RPC failure code set. */
@@ -130,6 +134,32 @@ export interface ExactRuntimeEventFrame extends EventFrame {
   sessionId: string;
   runtimeIncarnation: string;
   sequence: number;
+}
+
+/** `SessionEvent::CompactionStart` on the exact-runtime stream. */
+export interface CompactionStartedEvent extends ExactRuntimeEventFrame {
+  type: 'compaction_start';
+  reason?: string;
+}
+
+/** `SessionEvent::CompactionEnd`: published before CompactionActivityGuard
+ *  drops, so it — not a later `get_state` — is the authority that ends THIS
+ *  compaction, including aborted/error/willRetry terminals. */
+export interface CompactionEndedEvent extends ExactRuntimeEventFrame {
+  type: 'compaction_end';
+  reason?: string;
+  aborted?: boolean;
+  willRetry?: boolean;
+  errorMessage?: string;
+  result?: unknown;
+}
+
+export type CompactionEvent = CompactionStartedEvent | CompactionEndedEvent;
+
+/** Narrow a frame that already passed the exact-runtime boundary
+ *  (identity + incarnation + numeric sequence) to a compaction event. */
+export function isCompactionEvent(event: ExactRuntimeEventFrame): event is CompactionEvent {
+  return event.type === 'compaction_start' || event.type === 'compaction_end';
 }
 
 export interface SwitchHandoffDataV1 {

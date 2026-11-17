@@ -99,6 +99,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { clickFeature } from './lib/feature-menu.mjs';
 
 const url = process.env.RPI_URL;
 const token = process.env.RPI_TOKEN || '';
@@ -1276,7 +1277,7 @@ async function main() {
     if (!cancelWorkflowCreated.workflowId) fail('WF5.1: cancel-wf create response missing workflowId');
     await waitLiveWorkflow(sessionA, cancelWorkflowCreated.workflowId, 'WF5.1');
 
-    await page.getByRole('button', { name: 'Open Workflows panel' }).click();
+    await clickFeature(page, '#workflow-toggle-btn');
     await waitFor(page, () => Boolean(document.getElementById('workflow-panel')), 'WF5.1: workflow panel never opened', 10000);
     await waitFor(
       page,

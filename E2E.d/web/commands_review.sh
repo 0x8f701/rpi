@@ -100,12 +100,18 @@
 #     aborts that exact id, a second clean file keeps its own conversation
 #     while the first history stays, and Back plus the Files title close
 #     send no conversation close and restore the same owner
-#     Dependency map on committed MapRoot.sol (files.map): the Map surface
-#     renders an actual SVG with the selected root, the resolved
-#     ./MapDep.sol neighbor, the external forge-std/Test.sol import, the
-#     unresolved ./MissingMap.sol import, and the reverse MapCaller.sol
-#     dependent; the node list opens the exact target through the owner;
-#     a stale file switch paints no map for the wrong file.
+    #     Parent-cwd Blame (files.selection): a fresh session at the non-repo
+    #     parent opens tracked child.rs, selects its source, and Blame returns
+    #     the synthetic child commit with path psy-node/child.rs.
+    #     Dependency map (files.map): MapRoot.sol stays the alpha file. Search
+    #     then the tree selects directory beta; the map request path is beta
+    #     and painted nodes are only beta. The relation list shows the fixture
+    #     import arrow and source purpose. A held alpha response after the
+    #     beta or workspace switch paints nothing.
+    #     Files max layout (files.fullscreen): desktop 1280 and mobile 390 open
+    #     Files over the app body with header and footer visible and no expand
+    #     control. Close/reopen keeps the Ask draft and tab. A custom tree
+    #     width survives reopen; a fresh session is 29, not a home-derived 29.
 #   - files.selection-cache-compaction: retain Ask lines 4–7 while real source
 #     paging reaches cursor 40000; disclosure, prompt, and accepted context agree.
 
@@ -283,6 +289,7 @@ const MANIFEST = 'playwright-assertions.json';
 const LEDGER = 'coverage-assertions.json';
 const EXPECTED_IDS = [
   'files.solidity-preview',
+  'files.nongit',
   'files.boot',
   'files.desktop-open',
   'files.git-tree',
@@ -296,6 +303,7 @@ const EXPECTED_IDS = [
   'files.reopen',
   'files.tablet',
   'files.ask',
+  'files.citations',
   'files.selection',
   'files.map',
   'files.fullscreen',
@@ -749,8 +757,23 @@ contract MapCallerGate {
     MapRootLedger public ledger;
 }
 EOF
-    git -C "$root/workspace" add -- "$DELETED_FILE" "$RENAMED_OLD" "$MARKDOWN_FILE" "$SELECTION_WINDOW_FILE" "$HTML_FILE" "$PREVIEW_MD_FILE" "$CLEAN_FILE" "$SEPOLIA_FILE" "$SOL_FILE" "$SOL_REVIEW_FILE" "$SOL_MAP_ROOT_FILE" "$SOL_MAP_DEP_FILE" "$SOL_MAP_CALLER_FILE"
-    git -C "$root/workspace" -c commit.gpgsign=false commit -q -m "files explorer fixtures" -- "$DELETED_FILE" "$RENAMED_OLD" "$MARKDOWN_FILE" "$SELECTION_WINDOW_FILE" "$HTML_FILE" "$PREVIEW_MD_FILE" "$CLEAN_FILE" "$SEPOLIA_FILE" "$SOL_FILE" "$SOL_REVIEW_FILE" "$SOL_MAP_ROOT_FILE" "$SOL_MAP_DEP_FILE" "$SOL_MAP_CALLER_FILE"
+    mkdir -p "$root/workspace/beta"
+    cat >"$root/workspace/beta/beta.ts" <<'EOF'
+import { betaLib } from "./lib";
+
+/** Beta ledger owned by the directory graph. */
+export function betaLedger(): number {
+    return 1;
+}
+EOF
+    cat >"$root/workspace/beta/lib.ts" <<'EOF'
+/** Beta helper imported by beta.ts. */
+export function betaLib(): number {
+    return 2;
+}
+EOF
+    git -C "$root/workspace" add -- "$DELETED_FILE" "$RENAMED_OLD" "$MARKDOWN_FILE" "$SELECTION_WINDOW_FILE" "$HTML_FILE" "$PREVIEW_MD_FILE" "$CLEAN_FILE" "$SEPOLIA_FILE" "$SOL_FILE" "$SOL_REVIEW_FILE" "$SOL_MAP_ROOT_FILE" "$SOL_MAP_DEP_FILE" "$SOL_MAP_CALLER_FILE" beta/beta.ts beta/lib.ts
+    git -C "$root/workspace" -c commit.gpgsign=false commit -q -m "files explorer fixtures" -- "$DELETED_FILE" "$RENAMED_OLD" "$MARKDOWN_FILE" "$SELECTION_WINDOW_FILE" "$HTML_FILE" "$PREVIEW_MD_FILE" "$CLEAN_FILE" "$SEPOLIA_FILE" "$SOL_FILE" "$SOL_REVIEW_FILE" "$SOL_MAP_ROOT_FILE" "$SOL_MAP_DEP_FILE" "$SOL_MAP_CALLER_FILE" beta/beta.ts beta/lib.ts
     SOL_COMMIT="$(git -C "$root/workspace" log -1 --format=%H -- "$SOL_FILE")"
     SOL_COMMIT_TIME="$(git -C "$root/workspace" log -1 --format=%at -- "$SOL_FILE")"
     # src/ReviewToken.sol's WORKING TREE is the current version (the review
@@ -800,6 +823,41 @@ EOF
     for i in $(seq 1 80); do
         printf 'tree filler %03d\n' "$i" >"$root/workspace/tree-filler-$(printf '%03d' "$i").txt"
     done
+    mkdir -p "$root/workspace/psy-node/bridge" "$root/workspace/psy-node-fix/bridge"
+    printf 'CITE-UNIQUE\n' >"$root/workspace/unique.rs"
+    for name in deposit_logs daemon prove_bridge; do
+      printf 'COPY-A-%s\n' "$name" >"$root/workspace/psy-node/bridge/${name}.rs"
+      printf 'COPY-B-%s\n' "$name" >"$root/workspace/psy-node-fix/bridge/${name}.rs"
+    done
+
+    # Owned non-repo parent. psy-node is a real git child, not a link.
+    # child.rs stays committed so parent-cwd Blame can prove the child path.
+    parent_cwd="$root/review-parent"
+    mkdir -p "$parent_cwd/psy-node"
+    [ ! -e "$parent_cwd/.git" ] || fail "$SCENARIO: review parent is already a git root"
+    printf 'child base\n' >"$parent_cwd/psy-node/base.txt"
+    printf 'child changed\n' >"$parent_cwd/psy-node/changed.txt"
+    cat >"$parent_cwd/psy-node/child.rs" <<'EOF'
+/// Child ledger owned by the parent-cwd session.
+pub fn child_ledger() -> u64 {
+    1
+}
+EOF
+    git -C "$parent_cwd/psy-node" init -q
+    git -C "$parent_cwd/psy-node" config user.email "web-e2e@example.com"
+    git -C "$parent_cwd/psy-node" config user.name "Web E2E"
+    git -C "$parent_cwd/psy-node" add -- base.txt changed.txt child.rs
+    git -C "$parent_cwd/psy-node" -c commit.gpgsign=false commit -q -m "child baseline"
+    printf 'child changed again\n' >"$parent_cwd/psy-node/changed.txt"
+    mkdir -p "$parent_cwd/elsewhere"
+    printf 'OUTSIDE-CHILD-REWARDS\n' >"$parent_cwd/elsewhere/rewards.rs"
+    mkdir -p "$parent_cwd/psy-node/session-nested"
+    printf 'nested cwd\n' >"$parent_cwd/psy-node/session-nested/note.txt"
+    child_commit="$(git -C "$parent_cwd/psy-node" rev-parse HEAD)"
+    git -C "$parent_cwd" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+        && fail "$SCENARIO: review parent resolves as a git work tree"
+    [ ! -L "$parent_cwd/psy-node" ] && [ -d "$parent_cwd/psy-node/.git" ] \
+        || fail "$SCENARIO: psy-node is not a real child repository"
 
     spawn_rpi "$root" "$evidence" "$port"
     url="$(web_wait_for_listener "$evidence")"
@@ -832,6 +890,8 @@ EOF
         RPI_LANE_NONCE="$lane_nonce" \
         RPI_STAGING="$staging" \
         RPI_FAILURE_EVIDENCE_DIR="$evidence" \
+        RPI_PARENT_CWD="$parent_cwd" \
+        RPI_CHILD_COMMIT="$child_commit" \
         INJECT_FAIL="${INJECT_FAIL:-0}" >"$pw_log" 2>&1 || pw_status=$?
     if [ "$pw_status" -eq 0 ]; then
         # Playwright STAGED ONLY — nothing is published yet. The pointer can

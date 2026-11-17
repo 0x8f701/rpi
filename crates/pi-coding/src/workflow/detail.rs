@@ -688,6 +688,7 @@ mod tests {
                 created_at: 3,
                 started_at: Some(4),
                 finished_at: status.is_settled().then_some(5),
+                cancellation_cause: None,
                 result: None,
                 soft_budget_exhausted: false,
             },

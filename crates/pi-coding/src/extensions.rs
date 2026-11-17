@@ -5701,7 +5701,7 @@ mod trust_decision_hook_tests {
         let session =
             crate::Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
                 crate::SessionOptions {
-                    model: faux.model(None).expect("extension test model"),
+                    model: Some(faux.model(None).expect("extension test model")),
                     cwd: workspace.path().to_path_buf(),
                     system_prompt: String::new(),
                     thinking_level: pi_agent::ThinkingLevel::Off,

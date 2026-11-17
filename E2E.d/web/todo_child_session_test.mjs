@@ -23,6 +23,7 @@ import { chromium } from 'playwright';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createFreshSessionViaManage } from './lib/session-lifecycle.mjs';
+import { clickFeature } from './lib/feature-menu.mjs';
 
 const url = process.env.RPI_URL;
 const token = process.env.RPI_TOKEN || '';
@@ -161,13 +162,9 @@ async function switchSession(page, sessionId, label) {
 async function openTodoPanel(page, label) {
   const already = await page.evaluate(() => document.querySelectorAll('#todo-panel').length === 1);
   if (!already) {
-    const clicked = await page.evaluate(() => {
-      const button = document.getElementById('todo-toggle-btn');
-      if (!button) return false;
-      button.click();
-      return true;
-    });
-    if (!clicked) fail(`${label}: Todo module entry missing`);
+    const present = await page.evaluate(() => document.getElementById('todo-toggle-btn') !== null);
+    if (!present) fail(`${label}: Todo module entry missing`);
+    await clickFeature(page, '#todo-toggle-btn');
   }
   await waitFor(
     page,
@@ -815,7 +812,7 @@ async function main() {
     if (!aliasPrompt) fail('/todo-child did not dispatch through the normal prompt path');
     await waitForIdle(page, '/todo-child unknown-command turn did not settle');
 
-    await page.click('#activity-toggle-btn');
+    await clickFeature(page, '#activity-toggle-btn');
     await waitFor(page, () => document.getElementById('activity-panel') !== null, 'Activity panel did not open');
     const activityText = await page.evaluate(() => document.getElementById('activity-panel')?.textContent || '');
     if (!activityText.includes('Activity') || activityText.includes('Todo children')) {
@@ -827,7 +824,7 @@ async function main() {
     await page.click('#activity-close-btn');
     await waitFor(page, () => document.getElementById('activity-panel') === null, 'Activity panel did not close');
 
-    await page.click('#workflow-toggle-btn');
+    await clickFeature(page, '#workflow-toggle-btn');
     await waitFor(page, () => document.getElementById('workflow-panel') !== null, 'Workflow panel did not open');
     if (await page.evaluate(() => document.getElementById('todo-panel') !== null)) {
       fail('Workflow panel left the unified Todo panel mounted');

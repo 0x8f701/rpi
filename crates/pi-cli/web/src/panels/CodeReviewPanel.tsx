@@ -74,6 +74,7 @@ import {
   type ReviewModelState,
   tldrButtonView,
   tldrMarkdownForSnapshot,
+  tldrTimestampForSnapshot,
 } from '../codeReview';
 import {
   clearCodeReviewToastAnchor,
@@ -103,7 +104,6 @@ import {
   applyReviewLifecycle,
   buildCodeReviewAbortPayload,
   buildFileTree,
-  classifyReviewProbe,
   codeReviewOpenCommand,
   emptyCodeReviewSnapshot,
   emptyReviewLifecycle,
@@ -124,7 +124,7 @@ import {
   shouldRenderReviewError,
   initLoadedDiff,
   nextFileDiffLoadState,
-  normalizeCodeReviewSnapshot,
+  parseCodeReviewSnapshot,
   normalizeFileDiffPage,
   diffGapId,
   gapExpandWindow,
@@ -251,6 +251,9 @@ type SpinnerGate = Record<SpinnerSlot, boolean>;
 type MobileTab = 'files' | 'diff' | 'thread';
 type ConfirmAction = { kind: 'close' | 'refresh'; draftCount: number };
 
+type SnapshotFetchOutcome = 'applied' | 'not-open' | 'failed' | 'superseded';
+type SnapshotFlight = { key: string; promise: Promise<SnapshotFetchOutcome> };
+
 /**
  * Fullscreen code-review workspace. Owns open/poll/refresh/comment/abort/close
  * against the backend controller; App only mounts it and passes openArgs +
@@ -375,6 +378,12 @@ export function CodeReviewPanel({
   const previousFocusRef = useRef<HTMLElement | null>(null);
   const settledOnceRef = useRef(false);
   const snapshotRequestSeqRef = useRef(0);
+  const snapshotFlightRef = useRef<{
+    epoch: number;
+    flight: SnapshotFlight | null;
+  }>({ epoch: 0, flight: null });
+  const connectionEpochRef = useRef(connectionEpoch);
+  connectionEpochRef.current = connectionEpoch;
   const batchOwnerLiveRef = useRef(false);
   /** Request seq per path: bumping discards in-flight code_review_file_diff calls. */
   const loadSeqRef = useRef<Record<string, number>>({});
@@ -547,21 +556,12 @@ export function CodeReviewPanel({
     setPreviewSurface(surface === 'preview');
   }, []);
   /**
-   * Normalize + project one code_review_* response into panel state. The
-   * batch/highlight identity fields feed the typed request owners (stale
-   * idle snapshots cannot clear an accepted owner), and the async error
-   * fields own exactly one App toast per snapshot/batch/highlight identity.
+   * Project one already-parsed snapshot into panel state. The batch/highlight
+   * identity fields feed the typed request owners (stale idle snapshots cannot
+   * clear an accepted owner), and the async error fields own exactly one App
+   * toast per snapshot/batch/highlight identity.
    */
-  const applyData = useCallback((data: unknown) => {
-    const next = normalizeCodeReviewSnapshot(data);
-    if (
-      next.error === 'Invalid review findings'
-      || next.error === 'Invalid code-review snapshot response'
-      || next.error === 'Invalid TLDR fields'
-    ) {
-      onToast(`Code review: ${next.error}`, true);
-      return;
-    }
+  const applySnapshot = useCallback((next: CodeReviewSnapshot) => {
     // Out-of-order staleness gate: a snapshot response with an older
     // controller revision (a delayed poll that raced a start/stop) must
     // never regress the projected state — it cannot clear a live Stop or an
@@ -571,7 +571,7 @@ export function CodeReviewPanel({
       lastAppliedRevisionRef.current.reviewId === next.reviewId
       && next.revision < lastAppliedRevisionRef.current.revision
     ) {
-      return;
+      return false;
     }
     lastAppliedRevisionRef.current = { reviewId: next.reviewId, revision: next.revision };
     setAutoReviewButton((prev) =>
@@ -638,32 +638,93 @@ export function CodeReviewPanel({
       gapStoreRef.current = {};
       return {};
     });
-    return overlaid;
+    return true;
   }, [onToast, snapshot.snapshotId]);
 
+  /** The one parse boundary for raw code_review_* responses: structural
+   *  rejection toasts and keeps the authoritative last-good state. */
+  const applyData = useCallback((data: unknown): boolean => {
+    const parsed = parseCodeReviewSnapshot(data);
+    if (!parsed.ok) {
+      onToast(`Code review: ${parsed.error}`, true);
+      return false;
+    }
+    applySnapshot(parsed.snapshot);
+    return true;
+  }, [applySnapshot, onToast]);
 
-  const fetchSnapshot = useCallback(() => {
-    const requestSeq = snapshotRequestSeqRef.current;
+
+  /** One snapshot flight shared by poll/ACK/bootstrap/probe; same key reuses it. */
+  const invalidateSnapshotFlight = useCallback(() => {
+    const state = snapshotFlightRef.current;
+    state.epoch += 1;
+    state.flight = null;
+  }, []);
+
+  /** Drop only the JOIN reference: the next fetch issues a fresh request (a
+   *  hung poll never blocks the next cadence tick) while the hung poll's own
+   *  response stays live and may still apply — invalidating would wrongly
+   *  supersede a terminal error/owner release it carries. */
+  const releaseSnapshotFlight = useCallback(() => {
+    snapshotFlightRef.current.flight = null;
+  }, []);
+
+  const fetchSnapshot = useCallback((): Promise<SnapshotFetchOutcome> => {
+    const state = snapshotFlightRef.current;
+    const connection = connectionEpochRef.current;
+    const epoch = state.epoch;
+    const { reviewId, revision } = lastAppliedRevisionRef.current;
+    const key = `${owningSessionIdRef.current ?? ''}\0${reviewId ?? ''}\0${revision}\0${connection}\0${epoch}`;
+    const inFlight = state.flight;
+    if (inFlight && inFlight.key === key) return inFlight.promise;
+    const flight: SnapshotFlight = {
+      key,
+      promise: Promise.resolve<SnapshotFetchOutcome>('superseded'),
+    };
     // Same owner-targeted during-switch allowance as the bootstrap: a poll that
     // lands inside the panel's own restore window must not be refused (it would
     // latch a background failure and never refresh the restored panel).
-    return sendCommand(reviewCommand({ type: 'code_review_snapshot' }), undefined, { allowDuringSwitch: true })
-      .then((data) => {
-        if (!aliveRef.current || requestSeq !== snapshotRequestSeqRef.current) return;
-        applyData(data);
+    flight.promise = sendCommand(
+      reviewCommand({ type: 'code_review_snapshot' }),
+      undefined,
+      { allowDuringSwitch: true },
+    )
+      .then((data): SnapshotFetchOutcome => {
+        if (!aliveRef.current) return 'superseded';
+        if (snapshotFlightRef.current.epoch !== epoch || connectionEpochRef.current !== connection) {
+          return 'superseded';
+        }
+        const parsed = parseCodeReviewSnapshot(data);
+        if (!parsed.ok) {
+          reportBackgroundFailure(
+            `snapshot-parse\0${parsed.error}`,
+            'Code review snapshot failed',
+            new Error(parsed.error),
+          );
+          return 'failed';
+        }
+        if (!applySnapshot(parsed.snapshot)) return 'superseded';
         backgroundErrorRef.current = null;
+        return 'applied';
       })
-      .catch((err: unknown) => {
-        if (!aliveRef.current || requestSeq !== snapshotRequestSeqRef.current) return;
+      .catch((err: unknown): SnapshotFetchOutcome => {
+        if (!aliveRef.current) return 'superseded';
+        if (snapshotFlightRef.current.epoch !== epoch || connectionEpochRef.current !== connection) {
+          return 'superseded';
+        }
         if (isNoOpenCodeReviewError(err)) {
-          if (!lastAppliedRevisionRef.current.reviewId) return;
-          openReviewRef.current(true);
-          return;
+          if (lastAppliedRevisionRef.current.reviewId) openReviewRef.current(true);
+          return 'not-open';
         }
         reportBackgroundFailure('snapshot-poll', 'Code review snapshot failed', err);
+        return 'failed';
+      })
+      .finally(() => {
+        if (snapshotFlightRef.current.flight === flight) snapshotFlightRef.current.flight = null;
       });
-  }, [applyData, reportBackgroundFailure, reviewCommand, sendCommand]);
-
+    state.flight = flight;
+    return flight.promise;
+  }, [applySnapshot, reportBackgroundFailure, reviewCommand, sendCommand]);
 
   const closeReviewById = useCallback((reviewId: string) => {
     const closeCmd: Record<string, unknown> = { type: 'code_review_close', reviewId };
@@ -714,9 +775,26 @@ export function CodeReviewPanel({
       setBusy('open');
       lifecycleRef.current = emptyReviewLifecycle();
     }
-    const command = snapshotAlreadyOpen
-      ? { type: 'code_review_snapshot' }
-      : validatedOpen.command;
+    invalidateSnapshotFlight();
+    if (snapshotAlreadyOpen) {
+      let handedOff = false;
+      void fetchSnapshot()
+        .then((outcome) => {
+          if (outcome !== 'not-open' || !aliveRef.current) return;
+          if (requestSeq !== snapshotRequestSeqRef.current) return;
+          // Settlement reopen is blocked by this handler's still-set
+          // mutatingRef; a reopen that succeeded bumps requestSeq instead.
+          handedOff = true;
+          mutatingRef.current = false;
+          openReviewRef.current(true);
+        })
+        .finally(() => {
+          if (handedOff) return;
+          if (requestSeq === snapshotRequestSeqRef.current) mutatingRef.current = false;
+          if (aliveRef.current && requestSeq === snapshotRequestSeqRef.current) setBusy(null);
+        });
+      return;
+    }
     // Owner-targeted bootstrap of THIS panel's review. A restored view slot
     // mounts the panel inside a still-pending switch (a warm display activation
     // restores it before the authoritative cut lands), and the pending gate
@@ -727,7 +805,8 @@ export function CodeReviewPanel({
     const applyOpenResult = (data: unknown) => {
       if (requestSeq !== snapshotRequestSeqRef.current) return;
       if (!aliveRef.current) {
-        const reviewId = normalizeCodeReviewSnapshot(data).reviewId;
+        const parsed = parseCodeReviewSnapshot(data);
+        const reviewId = parsed.ok ? parsed.snapshot.reviewId : parsed.reviewId;
         if (reviewId) closeReviewById(reviewId);
         return;
       }
@@ -740,24 +819,10 @@ export function CodeReviewPanel({
         onToast(err instanceof Error ? err.message : String(err), true);
       }
     };
-    sendCommand(reviewCommand(command), undefined, { allowDuringSwitch: true })
+    sendCommand(reviewCommand(validatedOpen.command), undefined, { allowDuringSwitch: true })
       .then(applyOpenResult)
       .catch((err: unknown) => {
         if (!aliveRef.current || requestSeq !== snapshotRequestSeqRef.current) return;
-        if (isNoOpenCodeReviewError(err) && snapshotAlreadyOpen) {
-          const reopened = codeReviewOpenCommand(openArgs);
-          if (!reopened.ok) {
-            reportOpenFailure(new Error(reopened.error));
-            return;
-          }
-          return sendCommand(
-            reviewCommand(reopened.command),
-            undefined,
-            { allowDuringSwitch: true },
-          )
-            .then(applyOpenResult)
-            .catch(reportOpenFailure);
-        }
         if (isNoOpenCodeReviewError(err)) return;
         reportOpenFailure(err);
       })
@@ -766,7 +831,7 @@ export function CodeReviewPanel({
         if (forceOpen) reopenInFlightRef.current = false;
         if (aliveRef.current && requestSeq === snapshotRequestSeqRef.current) setBusy(null);
       });
-  }, [applyData, closeReviewById, onToast, openArgs.commit, openArgs.from, openArgs.to, openArgs.includeWorkingTree, openArgs.repo, openArgs.alreadyOpen, reviewCommand, sendCommand]);
+  }, [applyData, closeReviewById, fetchSnapshot, invalidateSnapshotFlight, onToast, openArgs.commit, openArgs.from, openArgs.to, openArgs.includeWorkingTree, openArgs.repo, openArgs.alreadyOpen, reviewCommand, sendCommand]);
   openReviewRef.current = openReview;
 
   useEffect(() => {
@@ -777,6 +842,7 @@ export function CodeReviewPanel({
     loadModels();
     return () => {
       aliveRef.current = false;
+      invalidateSnapshotFlight();
       for (const slot of SPINNER_SLOTS) {
         const timer = spinnerTimersRef.current[slot];
         if (timer != null) window.clearTimeout(timer);
@@ -823,6 +889,9 @@ export function CodeReviewPanel({
     let timer: number | null = null;
     const tick = () => {
       if (cancelled) return;
+      // Same-key join: an unsettled poll from a previous tick IS this
+      // tick's request (production single-flight) — only its settlement
+      // releases the flight and lets the cadence issue fresh.
       void fetchSnapshot();
       timer = window.setTimeout(tick, snapshotPollDelayMs(batchOwnerLiveRef.current));
     };
@@ -831,7 +900,7 @@ export function CodeReviewPanel({
       cancelled = true;
       if (timer != null) window.clearTimeout(timer);
     };
-  }, [applyData, reportBackgroundFailure, busy, fetchSnapshot, batchOwnerLive, openArgs]);
+  }, [busy, fetchSnapshot, batchOwnerLive, openArgs]);
 
 
   // Re-fetch the model catalog after an authoritative reconnect (a restart
@@ -1118,6 +1187,8 @@ export function CodeReviewPanel({
   const refresh = useCallback(() => {
     if (mutatingRef.current) return;
     mutatingRef.current = true;
+    // New generation: an in-flight poll/ACK snapshot must not apply over it.
+    invalidateSnapshotFlight();
     const requestSeq = ++snapshotRequestSeqRef.current;
     setBusy('refresh');
     sendCommand(reviewCommand({ type: 'code_review_refresh' }))
@@ -1135,7 +1206,7 @@ export function CodeReviewPanel({
         mutatingRef.current = false;
         if (aliveRef.current && requestSeq === snapshotRequestSeqRef.current) setBusy(null);
       });
-  }, [applyData, onToast, reviewCommand, sendCommand]);
+  }, [applyData, invalidateSnapshotFlight, onToast, reviewCommand, sendCommand]);
 
   const abort = useCallback(() => {
     if (!selectedIdentity || !selectedIsCancellable) return;
@@ -1146,6 +1217,8 @@ export function CodeReviewPanel({
     const identity = selectedIdentity;
     if (mutatingRef.current) return;
     mutatingRef.current = true;
+    // New generation: an in-flight poll/ACK snapshot must not apply over it.
+    invalidateSnapshotFlight();
     const requestSeq = ++snapshotRequestSeqRef.current;
     setBusy('abort');
     sendCommand(reviewCommand(buildCodeReviewAbortPayload(identity)))
@@ -1163,7 +1236,7 @@ export function CodeReviewPanel({
         mutatingRef.current = false;
         if (aliveRef.current && requestSeq === snapshotRequestSeqRef.current) setBusy(null);
       });
-  }, [applyData, onToast, reviewCommand, selectedIdentity, selectedIsCancellable, sendCommand]);
+  }, [applyData, invalidateSnapshotFlight, onToast, reviewCommand, selectedIdentity, selectedIsCancellable, sendCommand]);
 
   // Auto Review: submits the code_review_auto_review batch (the backend walks
   // the open snapshot's triaged hunks through the existing per-hunk comment
@@ -1197,6 +1270,12 @@ export function CodeReviewPanel({
         setAutoReviewButton((prev) =>
           applyAutoReviewButtonEvent(prev, { type: 'ack', batchId: ack.batchId }),
         );
+        // A settled operation ACK must not JOIN the pre-ACK poll in flight
+        // (joining would swallow the post-ACK snapshot): drop the join
+        // reference and issue fresh. The pre-ACK poll itself stays live —
+        // its terminal error/owner release must still surface, and a stale
+        // payload is refused by the revision gate on apply.
+        releaseSnapshotFlight();
         void fetchSnapshot();
       })
       .catch((err: unknown) => {
@@ -1206,7 +1285,7 @@ export function CodeReviewPanel({
           onToast(err instanceof Error ? err.message : String(err), true);
         }
       });
-  }, [autoLanguagePicked, autoReviewButton, fetchSnapshot, onToast, reviewCommand, sendCommand, snapshot.reviewId]);
+  }, [autoLanguagePicked, autoReviewButton, fetchSnapshot, onToast, releaseSnapshotFlight, reviewCommand, sendCommand, snapshot.reviewId]);
 
   /**
    * Run one Highlight call. The accepted ACK is strictly
@@ -1232,6 +1311,7 @@ export function CodeReviewPanel({
         setHighlightOwner((prev) =>
           applyHighlightOwnerEvent(prev, { type: 'ack', generation: ack.generation }),
         );
+        releaseSnapshotFlight();
         void fetchSnapshot();
       })
       .catch((err: unknown) => {
@@ -1241,7 +1321,7 @@ export function CodeReviewPanel({
           onToast(`Highlight start failed: ${err instanceof Error ? err.message : String(err)}`, true);
         }
       });
-  }, [fetchSnapshot, highlightOwner, onToast, reviewCommand, sendCommand, snapshot.reviewId]);
+  }, [fetchSnapshot, highlightOwner, onToast, releaseSnapshotFlight, reviewCommand, sendCommand, snapshot.reviewId]);
   const runTldr = useCallback(() => {
     if (highlightOwnerBusy(tldrOwner) || snapshot.tldrState === 'running') return;
     setTldrOpen(true);
@@ -1258,6 +1338,7 @@ export function CodeReviewPanel({
           return;
         }
         setTldrOwner((prev) => applyHighlightOwnerEvent(prev, { type: 'ack', generation: ack.generation }));
+        releaseSnapshotFlight();
         void fetchSnapshot();
       })
       .catch((err: unknown) => {
@@ -1267,12 +1348,13 @@ export function CodeReviewPanel({
           onToast(err instanceof Error ? err.message : String(err), true);
         }
       });
-  }, [autoLanguagePicked, fetchSnapshot, onToast, reviewCommand, sendCommand, snapshot.reviewId, snapshot.tldrState, tldrOwner]);
+  }, [autoLanguagePicked, fetchSnapshot, onToast, releaseSnapshotFlight, reviewCommand, sendCommand, snapshot.reviewId, snapshot.tldrState, tldrOwner]);
   const stopOperation = useCallback(
     (operation: CodeReviewStopOperation) => {
       sendCommand(reviewCommand(buildCodeReviewStopPayload(operation)))
         .then(() => {
           if (!aliveRef.current) return;
+          releaseSnapshotFlight();
           void fetchSnapshot();
         })
         .catch((err: unknown) => {
@@ -1281,7 +1363,7 @@ export function CodeReviewPanel({
           }
         });
     },
-    [fetchSnapshot, onToast, reviewCommand, sendCommand],
+    [fetchSnapshot, onToast, releaseSnapshotFlight, reviewCommand, sendCommand],
   );
 
 
@@ -1673,7 +1755,9 @@ export function CodeReviewPanel({
     )
       .then((data) => {
         if (!aliveRef.current || requestSeq !== snapshotRequestSeqRef.current) return;
-        applyData(data);
+        // A structurally unusable comment projection is not an accepted
+        // comment: keep the draft, attachments, and followed key untouched.
+        if (!applyData(data)) return;
         // Accepted comment ACK: emit a full-hunk-keyed follow event so the
         // dock follows THIS hunk's thread tail while pinned (rejection throws,
         // and a switched hunk never retargets the event).
@@ -2163,14 +2247,8 @@ export function CodeReviewPanel({
     snapshot.snapshotId,
   ]);
 
-  // Reconcile once per authoritative connection epoch (App passes a
-  // monotonically increasing connectionEpoch after a ready reconnect). A
-  // same-process reconnect probes the existing controller and preserves it
-  // when the authoritative snapshot is still live; a real process restart
-  // whose probe reports no open review reopens exactly once from the retained
-  // openArgs. Transport failure of the probe never renders inline nor spins —
-  // the next epoch retries. The eager file-diff stall is also cleared so a
-  // transport-stalled fetch may retry after reconnect.
+  // Reconcile once per authoritative connection epoch; the probe joins the
+  // shared snapshot flight (a racing poll is reused, typed no-open reopens).
   useEffect(() => {
     if (lastEpochRef.current === connectionEpoch) return;
     lastEpochRef.current = connectionEpoch;
@@ -2180,40 +2258,13 @@ export function CodeReviewPanel({
     // A new authoritative epoch clears transport stalls so file-diff fetches
     // may retry (transport errors are never rendered inline here).
     fetchStalledRef.current = {};
-    const requestSeq = ++snapshotRequestSeqRef.current;
-    sendCommand(reviewCommand({ type: 'code_review_snapshot' }))
-      .then((data) => {
-        if (!aliveRef.current || requestSeq !== snapshotRequestSeqRef.current) return;
-        const outcome = classifyReviewProbe(data, null);
-        if (outcome.kind === 'preserve') {
-          applyData(data);
-          // Retry a transport-stalled file-diff fetch for the selected path:
-          // the eager effect does not re-run on an unchanged snapshot id, so
-          // the epoch drives the retry directly (single-flight dedupes).
-          const path = selectedPathRef.current;
-          const loaded = path ? diffCacheRef.current.entries[path] : null;
-          if (path && loaded && !loaded.hunksComplete) {
-            void fetchPagesUntil(path);
-          }
-        } else if (outcome.kind === 'reopen') {
-          openReview(true);
-        }
-        // 'wait' (transport error): suppress; the next epoch retries.
-      })
-      .catch((err: unknown) => {
-        if (!aliveRef.current || requestSeq !== snapshotRequestSeqRef.current) return;
-        const outcome = classifyReviewProbe(null, err);
-        if (outcome.kind === 'reopen' || isNoOpenCodeReviewError(err)) {
-          if (outcome.kind === 'reopen') openReview(true);
-          return;
-        }
-        // 'wait' = transport: suppressed, the next epoch retries, last-good
-        // state kept. 'preserve' keeps the retained snapshot but toasts the
-        // business cause once per epoch (probe business errors are no longer
-        // silent).
-        reportBackgroundFailure(`epoch-probe\0${connectionEpoch}`, 'Code review probe failed', err);
-      });
-  }, [connectionEpoch, applyData, fetchPagesUntil, openReview, reportBackgroundFailure, reviewCommand, sendCommand, openArgs]);
+    void fetchSnapshot().then((outcome) => {
+      if (!aliveRef.current || outcome !== 'applied') return;
+      const path = selectedPathRef.current;
+      const loaded = path ? diffCacheRef.current.entries[path] : null;
+      if (path && loaded && !loaded.hunksComplete) void fetchPagesUntil(path);
+    });
+  }, [connectionEpoch, fetchPagesUntil, fetchSnapshot, openArgs]);
 
   // A file whose initial window was zero (a placeholder with no snapshot
   // lines) gets its first soft-cap window as soon as lines arrive.
@@ -2251,6 +2302,7 @@ export function CodeReviewPanel({
   );
   const tldrBusy = tldrView.busy;
   const tldrPaneMarkdown = tldrMarkdownForSnapshot(snapshot);
+  const tldrPaneTimestampMs = tldrTimestampForSnapshot(snapshot) ?? undefined;
   const stopLiveGeneration = useCallback((): boolean => {
     if (autoBusy) {
       stopOperation('autoReview');
@@ -2832,7 +2884,7 @@ export function CodeReviewPanel({
             isHidden={isNarrow && mobileTab !== 'thread'}
             busy={threadBusy}
             sessionId={sessionId}
-            reviewRepo={openArgs.repo}
+            reviewRepo={snapshot.repo}
             snapshotId={snapshot.snapshotId}
             reviewResults={snapshot.reviewFindings}
             selectedFinding={selectedFinding}
@@ -2857,8 +2909,10 @@ export function CodeReviewPanel({
           <CodeReviewTldrPane
             markdown={tldrPaneMarkdown}
             state={snapshot.tldrState}
+            timestampMs={tldrPaneTimestampMs}
+            onReplyActionError={(message) => onToast(message, true)}
             sessionId={sessionId ?? undefined}
-            reviewRepo={openArgs.repo}
+            reviewRepo={snapshot.repo}
             onStop={() => stopOperation('tldr')}
             onClose={() => setTldrOpen(false)}
           />

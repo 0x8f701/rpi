@@ -113,7 +113,7 @@ async fn bootstrap_runtime(
     std::fs::create_dir_all(&session_dir)?;
     let session = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model,
+            model: Some(model),
             cwd: project.clone(),
             system_prompt: String::new(),
             thinking_level: pi_agent::ThinkingLevel::Off,

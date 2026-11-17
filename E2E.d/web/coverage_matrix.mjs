@@ -226,7 +226,7 @@ export const MATRIX = [
     // The real sessions lane (E2E.d/web/sessions.sh -> sessions_test.mjs).
     // Its evidence file is written by the lane itself at
     // $EVIDENCE_ROOT/web-sessions/coverage-assertions.json; the gate fails if
-    // any of these T0.1-T8.3 contracts did not execute.
+    // any of these T0.1-T9.4 contracts did not execute.
     feature: 'multi-session',
     ids: [
       // IN ACTUAL EXECUTION (record-site) ORDER — identical to the lane's
@@ -240,6 +240,7 @@ export const MATRIX = [
       'T6.1', 'T6.2', 'T6.3', 'T6.4',
       'T8.1', 'T8.2', 'T8.3',
       'T4.1', 'T4.2', 'T4.3',
+      'T9.1', 'T9.2', 'T9.3', 'T9.4',
       'T5.1', 'T5.2', 'T5.3',
       'T7.4', 'T7.1', 'T7.2', 'T7.3',
     ],
@@ -348,9 +349,18 @@ export const MATRIX = [
     // (not the latency parent): exact nested content, unique nearby
     // basename, inert duplicate basename, inert out-of-workspace, the root
     // bare-basename README.md:2 citation stamped (never
-    // data-md-resolved="none") and opened via the session-stamped read; zero
-    // captured browser errors. The lane publishes explicit exact assertion
-    // IDs/counts (FL0.1-FL6.5) in the lane's ACTUAL execution order
+    // data-md-resolved="none") and opened via the session-stamped read; FL6.3
+    // and FL6.6 return file_ambiguous candidates and open neither copy until
+    // the exact choice click; FL6.7 offers both rewards.rs suffix
+    // copies without search or get_state; zero
+    // captured browser errors. FL0.9 (desktop only) additionally probes the
+    // bottom-left CORNER: the open explorer rect must cover the
+    // #sidebar-manage-btn/.session-sidebar__foot centers (geometry, not just
+    // z-order — the reported leak sat BELOW the drawer's bottom edge where
+    // interior probes can never reach), those points must not pierce to the
+    // sidebar foot, and #prompt-input stays hittable.
+    // The lane publishes explicit exact assertion
+    // IDs/counts (FL0.1-FL6.7) in the lane's ACTUAL execution order
     // (FL1.2's mutation-ledger observation window settles before FL1.1's
     // timing gate) alongside the timings — never timings-only.
     // Evidence at the run dir named by
@@ -360,11 +370,14 @@ export const MATRIX = [
     feature: 'files drawer latency',
     ids: [
       'FL0.1',
+      'FL0.2', 'FL0.3',
+      'FL0.4', 'FL0.5', 'FL0.6',
       'FL1.2', 'FL1.1',
       'FL2.1',
       'FL3.1', 'FL3.2',
       'FL4.1', 'FL4.2',
-      'FL6.1', 'FL6.2', 'FL6.3', 'FL6.4', 'FL6.5',
+      'FL6.1', 'FL6.2', 'FL6.3', 'FL6.4', 'FL6.5', 'FL6.6', 'FL6.7',
+      'FL0.7', 'FL0.9', 'FL0.8',
       'FL5.1',
     ],
   },
@@ -372,7 +385,7 @@ export const MATRIX = [
     // The real scroll lane (E2E.d/web/scroll.sh -> scroll_test.mjs). Its
     // evidence file is written by the lane itself at
     // $EVIDENCE_ROOT/web-scroll/coverage-assertions.json; the gate fails if
-    // any documented S0.1-S7.3 contract did not execute.
+    // any documented S0.1-S8.4 contract did not execute.
     feature: 'scroll pinning',
     ids: [
       'S0.1', 'S0.2', 'S0.3',
@@ -383,6 +396,7 @@ export const MATRIX = [
       'S5.1', 'S5.2',
       'S6.1', 'S6.3', 'S6.2',
       'S7.1', 'S7.2', 'S7.3',
+      'S8.1', 'S8.2', 'S8.3', 'S8.4',
     ],
   },
   {
@@ -413,7 +427,7 @@ export const MATRIX = [
     feature: 'mobile navigation',
     ids: [
       'mobile.viewport-no-hscroll',
-      'mobile.sidebar-toggle-visible',
+      'mobile.feature-menu-visible',
       'mobile.drawer-opens',
       'mobile.composer-above-fold',
       'mobile.touch-targets-44',
@@ -541,6 +555,11 @@ export const MATRIX = [
       'pres.hub-wait-timeout',
       'pres.hub-wait-typed-running',
       'pres.hub-wait-typed-irc',
+      'pres.hub-wait-ids-running',
+      'pres.hub-wait-ids-identity',
+      'pres.hub-wait-ids-job-typed',
+      'pres.hub-wait-ids-settles-after-job',
+      'pres.hub-wait-ids-frames',
       'pres.hub-send-card',
       'pres.no-raw-json',
       'pres.no-done-text',
@@ -622,6 +641,7 @@ export const MATRIX = [
       'files.reopen',
       'files.tablet',
       'files.ask',
+      'files.citations',
       'files.selection',
       'files.map',
       'files.fullscreen',

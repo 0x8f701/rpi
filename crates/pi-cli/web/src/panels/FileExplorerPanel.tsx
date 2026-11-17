@@ -71,9 +71,11 @@ import {
   emptyFileExplorerViewState,
   fileExplorerApplyDirState,
   fileExplorerAcquireDirInflight,
+  fileExplorerAcquireSnapshotFlight,
   fileExplorerBeginDirState,
   fileExplorerBuildChangeIndex,
   fileExplorerDirInflightKey,
+  fileExplorerSnapshotFlightKey,
   fileExplorerEmptyDirState,
   fileExplorerFailDirState,
   fileExplorerToggleExpandedDir,
@@ -95,11 +97,14 @@ import {
   fileExplorerSamePath,
   fileExplorerMapCommand,
   fileExplorerParentDir,
-  fileExplorerMapResponseCurrent,
-  type FileExplorerMapRequest,
+  fileExplorerPeekDirInflight,
+  fileExplorerRevealDirChain,
   type FileExplorerMapResult,
   fileExplorerDisplayPath,
   fileExplorerCommandForSession,
+  fileExplorerConversationErrorLatched,
+  fileExplorerConversationToastKey,
+  fileExplorerConversationToastLatchReset,
   fileExplorerDirsForSession,
   fileExplorerCursorForLine,
   fileExplorerInflightKey,
@@ -321,10 +326,10 @@ export interface FileExplorerSelectionAnchor {
 /** Pure geometry for the floating selection bar. Prefers below the
  *  selection when the viewport has room for bar + edge gap, otherwise flips
  *  above; both axes clamp into the viewport inset by `edge`. An optional
- *  popup size anchors the blame overlay to the bar with an edge gap in the
- *  direction that has room (flipping independently), clamped into the same
- *  inset. Not visible when the selection is null or does not intersect the
- *  viewport. */
+ *  popup anchors on the outer side of that bar. Its height is capped to the
+ *  selection-free remainder of the viewport inset, including the bar-to-popup
+ *  gap, so the popup cannot cover the selection or the inset. Not visible
+ *  when the selection is null or does not intersect the viewport. */
 export function fileExplorerSelectionAnchor(
   input: FileExplorerSelectionAnchorInput,
 ): FileExplorerSelectionAnchor {
@@ -360,25 +365,19 @@ export function fileExplorerSelectionAnchor(
     return { visible: true, top, left, placement };
   }
   const barBottom = top + input.bar.height;
-  const spaceBelow = viewportBottom - edge - barBottom;
-  const spaceAbove = top - input.viewport.top - edge;
-  const popupDirection: 'below' | 'above' =
-    popupSize.height <= spaceBelow ? 'below'
-    : popupSize.height <= spaceAbove ? 'above'
-    : spaceBelow >= spaceAbove ? 'below' : 'above';
-  const maxHeight = popupDirection === 'below' ? spaceBelow : spaceAbove;
-  if (maxHeight < edge) {
-    return { visible: true, top, left, placement };
-  }
+  const outerBelow = viewportBottom - edge - (barBottom + edge);
+  const outerAbove = top - edge - (input.viewport.top + edge);
+  const maxHeight = placement === 'below' ? outerBelow : outerAbove;
+  if (maxHeight < edge) return { visible: true, top, left, placement };
   const maxWidth = Math.max(input.viewport.width - 2 * edge, 0);
+  const popupWidth = Math.min(popupSize.width, maxWidth);
   const popupLeftMin = input.viewport.left + edge;
-  const popupLeftMax = viewportRight - edge - Math.min(popupSize.width, maxWidth);
+  const popupLeftMax = viewportRight - edge - popupWidth;
   const popupLeft = popupLeftMax < popupLeftMin
     ? popupLeftMin
     : Math.min(Math.max(left, popupLeftMin), popupLeftMax);
-  const popupTop = popupDirection === 'below'
-    ? barBottom + edge
-    : Math.max(input.viewport.top + edge, top - edge - Math.min(popupSize.height, maxHeight));
+  const popupHeight = Math.min(popupSize.height, maxHeight);
+  const popupTop = placement === 'below' ? barBottom + edge : top - edge - popupHeight;
   return {
     visible: true,
     top,
@@ -432,8 +431,7 @@ export interface FileExplorerPanelProps {
    * Same epoch never auto-retries.
    */
   connectionEpoch: number;
-  /** Unused: overlay layout is App-owned (`app-layout--files-overlay`).
-   *  Kept so ChatApp's existing `overlay={false}` still type-checks. */
+  /** Unused. Kept so ChatApp's existing `overlay={false}` still type-checks. */
   overlay?: boolean;
   /** Chat Files column: exclusive tree OR file, ignoring viewport width. */
   exclusivePanes?: boolean;
@@ -442,12 +440,6 @@ export interface FileExplorerPanelProps {
    *  FILE_EXPLORER_TOGGLE_ID default; Chat passes CHAT_FILE_EXPLORER_TOGGLE_ID,
    *  so each host restores its own toggle). */
   toggleId?: string;
-  /** Full-app expand (user requirement): when true the App-level layout
-   *  class hides the sidebar + transcript + composer and the file tree +
-   *  content viewports fill the entire app area. The SAME-ROW button
-   *  becomes the exit/restore control. Reset is App-owned (panel close). */
-  expanded?: boolean;
-  onToggleExpanded?: () => void;
 }
 
 type DirNode = FileExplorerDirState;
@@ -684,19 +676,16 @@ export function FileExplorerPanel({
   markdownMappingId,
   connectionEpoch,
   toggleId = FILE_EXPLORER_TOGGLE_ID,
-  expanded,
-  onToggleExpanded,
   exclusivePanes = false,
 }: FileExplorerPanelProps) {
   const [changes, setChanges] = useState<FileExplorerChange[]>([]);
   const [repoHeads, setRepoHeads] = useState<Record<string, string>>({});
   const [changesTruncated, setChangesTruncated] = useState(false);
-  const [isRepo, setIsRepo] = useState(true);
   const [changesError, setChangesError] = useState<string | null>(null);
   const [changesLoading, setChangesLoading] = useState(false);
   const [changesGeneration, setChangesGeneration] = useState(0);
-  const [treeQuery, setTreeQuery] = useState('');
-  const treeNeedle = fileExplorerNormalizeTreeQuery(treeQuery);
+  const treeQuery = slot.treeQuery ?? '';
+  const citationChoices = slot.citationChoices ?? null;
   const [searchHits, setSearchHits] = useState<FileExplorerEntry[]>([]);
   const [searchTruncated, setSearchTruncated] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
@@ -724,11 +713,17 @@ export function FileExplorerPanel({
   const resolvedView = viewCache[viewOwnerKey] ?? emptyFileExplorerViewState();
   const expandedDirs = resolvedView.expandedDirs;
   const treePct = resolvedView.treePct;
-  const [treeCollapsed, setTreeCollapsed] = useState(() =>
-    Boolean(slot.activePath)
-    && (exclusivePanes
-      || (typeof window !== 'undefined' && window.matchMedia(FILE_EXPLORER_SPLIT_QUERY).matches)),
-  );
+  const [treeCollapsed, setTreeCollapsed] = useState(() => {
+    const activeDirectory = slot.activePath != null
+      && slot.activePath !== ''
+      && slot.tabs.some((tab) => tab.path === slot.activePath && tab.view === 'dir');
+    if (slot.citationChoices && (slot.activePath == null || activeDirectory)) return false;
+    return (slot.treeQuery ?? '') === ''
+      && Boolean(slot.activePath)
+      && !activeDirectory
+      && (exclusivePanes
+        || (typeof window !== 'undefined' && window.matchMedia(FILE_EXPLORER_SPLIT_QUERY).matches));
+  });
   const patchView = useCallback((patch: Partial<FileExplorerViewState>) => {
     patchFileExplorerViewCache(viewOwnerKey, patch);
   }, [viewOwnerKey]);
@@ -753,9 +748,15 @@ export function FileExplorerPanel({
   const splitDragRef = useRef(false);
   const askDragRef = useRef(false);
   const [askWidth, setAskWidth] = useState(360);
+  const [askFocus, setAskFocus] = useState(false);
   const treeViewportRef = useRef<HTMLDivElement | null>(null);
   const treeScrollRestoredRef = useRef(false);
   const treeReloadGenerationRef = useRef<number | null>(null);
+  /** Owner+path whose accepted file open still owes ONE reveal scroll into
+   *  the tree. Consumed once the row commits and the cached tree scroll is
+   *  restored; an owner/path change replaces it (identity compare), so a
+   *  stale reveal can never scroll a later tree or steal a manual scroll. */
+  const pendingRevealRef = useRef<string | null>(null);
   const markdownRef = useRef<HTMLDivElement | null>(null);
   const codeRef = useRef<HTMLElement | null>(null);
   /** Content identity the cached scroll was last restored for (session,
@@ -772,10 +773,30 @@ export function FileExplorerPanel({
     blamePopupRef.current = node;
   }, []);
   const measureSelectionRef = useRef<(() => void) | null>(null);
-  const activeTab = slot.tabs.find((tab) => tab.path === slot.activePath) ?? slot.tabs[0];
+  const activeTab = slot.activePath == null ? undefined : slot.tabs.find((tab) => tab.path === slot.activePath);
   const activePath = activeTab?.path ?? null;
   const activeView = activeTab?.view ?? 'file';
+  const activeIsDirectory = activeView === 'dir' && activePath != null && activePath !== '';
   const activeLine = activeTab?.line;
+  /** Full labeled path above the content: `fileExplorerDisplayPath` is the
+   *  ONE authority (workspace-relative stays relative; an outside-workspace
+   *  absolute path keeps its symbolic prefix). Never a basename. */
+  const activeDisplayPath = activePath != null ? fileExplorerDisplayPath(activePath, workspaceCwd) : null;
+  /** Citation candidates are a chooser ONLY while this owner has no open
+   *  file. App keeps them in the slot as its zero-RPC reopen authority, so
+   *  an accepted file open hides them from the tree instead of erasing
+   *  them: the tree returns to the real workspace listing (or the user's
+   *  own search) the moment a file is active. */
+  const citationCandidates = citationChoices != null && activePath == null
+    ? citationChoices.candidates
+    : null;
+  const citationChoosing = citationCandidates != null;
+  const treeNeedle = citationChoosing ? '' : fileExplorerNormalizeTreeQuery(treeQuery);
+  /** Accepted-open reveal identity: one reveal per owner+file open, surface
+   *  (file/diff) independent because the tree row is path-addressed. */
+  const revealIdentity = activePath != null && (activeView === 'file' || activeView === 'diff')
+    ? `${viewOwnerKey}\0${activePath}`
+    : null;
   const fileState = sessionId && activeTab
     ? fileExplorerReadCachedPage(pageCache, sessionId, activeTab.path, activeView)
     : null;
@@ -830,8 +851,12 @@ export function FileExplorerPanel({
     return () => mq.removeEventListener('change', onChange);
   }, [exclusivePanes]);
   useEffect(() => {
+    if ((citationChoices && slot.activePath == null) || (treeQuery !== '' && slot.activePath == null) || activeIsDirectory) {
+      setTreeCollapsed(false);
+      return;
+    }
     if (exclusivePanes && slot.activePath) setTreeCollapsed(true);
-  }, [exclusivePanes, slot.activePath]);
+  }, [activeIsDirectory, citationChoices, exclusivePanes, slot.activePath, treeQuery]);
 
 
   const closeDrawer = useCallback(() => {
@@ -896,6 +921,11 @@ export function FileExplorerPanel({
    *  must never treat the backend's not_found for a not-yet-open id as
    *  retirement — the id only retires once no open for it is pending. */
   const pendingOpensRef = useRef(new Set<string>());
+  /** Toast-latch owner for background poll failures: authority + session,
+   *  so two runners (or a mapping id vs a real session) never fold each
+   *  other's errors. Success of THIS owner resets the latch below. */
+  const conversationToastOwnerRef = useRef(`${hostAuthority}\0${sessionId ?? ''}`);
+  conversationToastOwnerRef.current = `${hostAuthority}\0${sessionId ?? ''}`;
   /** Last applied snapshot write sequence per path. Conversation RPCs are
    *  fenced by their issue sequence: an overlapping (older-issued) poll can
    *  never overwrite a newer prompt/stop ack. */
@@ -906,6 +936,16 @@ export function FileExplorerPanel({
     if (writeSeq < (conversationWriteSeqRef.current.get(tabPath) ?? 0)) return false;
     conversationWriteSeqRef.current.set(tabPath, writeSeq);
     setConversationSnapshots((prev) => (prev[tabPath] === snapshot ? prev : { ...prev, [tabPath]: snapshot }));
+    // A valid, ACCEPTED success of THIS conversation resets only ITS OWN
+    // failure-toast latch (authority+session+canonical path+conversation):
+    // a sibling conversation's health never folds or clears it, and the
+    // next identical failure episode reports again. A fenced-out stale
+    // write never resets.
+    fileExplorerConversationToastLatchReset(fileExplorerConversationToastKey(
+      conversationToastOwnerRef.current,
+      tabPath,
+      snapshot.conversationId,
+    ));
     return true;
   }, []);
   /** Poll targets: only tabs of the CURRENT owner carrying a conversation id
@@ -993,8 +1033,20 @@ export function FileExplorerPanel({
         const conversationId = tab.conversationId;
         if (typeof conversationId !== 'string' || conversationId === '') continue;
         if (pendingOpensRef.current.has(`${tab.path}\0${conversationId}`)) continue;
-        const writeSeq = nextFileExplorerRequestGeneration();
-        sendCommand(fileExplorerCommandForSession(sessionId, fileConversationSnapshotCommand(conversationId)))
+        // MODULE singleflight keyed authority+session+canonical path+
+        // conversation+connection generation: one shared request across
+        // every mounted panel of the same tab, so a 500ms/tab poll can
+        // never stack global RPC slots. This subscriber JOINS the live
+        // flight and applies the result itself — skipping on an in-flight
+        // key would drop that tick's result for this mount.
+        const flight = fileExplorerAcquireSnapshotFlight(
+          fileExplorerSnapshotFlightKey(hostAuthority, sessionId, tab.path, conversationId, connectionEpoch),
+          () => ({
+            writeSeq: nextFileExplorerRequestGeneration(),
+            promise: sendCommand(fileExplorerCommandForSession(sessionId, fileConversationSnapshotCommand(conversationId))),
+          }),
+        );
+        flight.promise
           .then((data) => {
             if (cancelled || !currentSession() || !conversationTabOwned(tab.path, conversationId)) return;
             // Exact expected id+path: a stale or malformed response is
@@ -1002,10 +1054,14 @@ export function FileExplorerPanel({
             // nothing is written.
             const snapshot = normalizeFileConversationSnapshot(data, { conversationId, path: tab.path });
             if (!snapshot) {
-              onConversationError('unusable file conversation snapshot response');
+              fileExplorerConversationErrorLatched(
+                fileExplorerConversationToastKey(conversationToastOwnerRef.current, tab.path, conversationId),
+                'unusable file conversation snapshot response',
+                onConversationError,
+              );
               return;
             }
-            writeConversationSnapshot(tab.path, writeSeq, snapshot);
+            writeConversationSnapshot(tab.path, flight.writeSeq, snapshot);
           })
           .catch((error: unknown) => {
             if (cancelled || !currentSession() || !conversationTabOwned(tab.path, conversationId)) return;
@@ -1020,7 +1076,15 @@ export function FileExplorerPanel({
               }
               return;
             }
-            onConversationError(errorMessage(error));
+            // Latched surface: the same owner+message failure episode
+            // toasts once until the next accepted success resets it; a
+            // different error always reports. The failure itself is never
+            // swallowed and the last-good snapshot is untouched.
+            fileExplorerConversationErrorLatched(
+              fileExplorerConversationToastKey(conversationToastOwnerRef.current, tab.path, conversationId),
+              errorMessage(error),
+              onConversationError,
+            );
           });
       }
 
@@ -1031,9 +1095,15 @@ export function FileExplorerPanel({
       cancelled = true;
       window.clearTimeout(timerId);
     };
-  }, [conversationTabOwned, currentSession, onConversationError, polledTabs, retireConversationId, sendCommand, sessionId, writeConversationSnapshot]);
+  }, [connectionEpoch, conversationTabOwned, currentSession, hostAuthority, onConversationError, polledTabs, retireConversationId, sendCommand, sessionId, writeConversationSnapshot]);
 
-  const loadDir = useCallback((path: string) => {
+  /** Fully owned directory refresh. The returned promise resolves only after
+   *  this path's latest generation is written — success, hard error, or
+   *  transport — and it NEVER rejects: every failure is classified into that
+   *  dir's own observable state (its Retry / transport surface), which is
+   *  this panel's single listing-error owner. Serialized callers (the mount
+   *  refresh) await it for ordering; fire-and-forget callers ignore it. */
+  const loadDir = useCallback(async (path: string): Promise<void> => {
     if (!sessionId) return;
     const generation = nextFileExplorerRequestGeneration();
     if (path === '' && !treeScrollRestoredRef.current) {
@@ -1053,7 +1123,7 @@ export function FileExplorerPanel({
         fileExplorerListCommand(path === '' ? undefined : path),
       )),
     );
-    void request
+    return request
       .then((data) => {
         if (!currentSession()) return;
         const parsed = normalizeList(data);
@@ -1147,7 +1217,6 @@ export function FileExplorerPanel({
           setChanges([]);
           setRepoHeads({});
           setChangesTruncated(false);
-          setIsRepo(false);
           setChangesError('unusable changes response');
           setChangesLoading(false);
           return;
@@ -1155,7 +1224,6 @@ export function FileExplorerPanel({
         setChanges(parsed.files);
         setRepoHeads(Object.fromEntries(parsed.repositories.filter((repo) => repo.head != null).map((repo) => [repo.path, repo.head as string])));
         setChangesTruncated(parsed.truncated);
-        setIsRepo(parsed.isRepo);
         setChangesError(null);
         setChangesLoading(false);
       })
@@ -1167,17 +1235,39 @@ export function FileExplorerPanel({
       });
   }, [currentSession, sendCommand, sessionId]);
 
+  // Mount refresh of every expanded directory. The REQUEST SET and per-path
+  // correlation are unchanged (a close/reopen still refetches each expanded
+  // dir exactly once — the documented freshness contract), but dispatch is
+  // SERIALIZED: the host rejects bursts above its concurrent-command window
+  // (`busy_capacity`), and one rejected listing is a hard dir failure that
+  // wipes that dir's last-good entries (the tree then falls back to disabled
+  // change-only rows). Awaiting each shared inflight promise keeps at most
+  // ONE refresh in flight from this effect — no new fixed limit, no retry
+  // masking, and loadDir's own catch still owns every failure.
   useEffect(() => {
     if (!sessionId) return;
     loadChanges();
     const paths = Object.keys(expandedDirs);
     if (!paths.includes('')) paths.unshift('');
-    for (const path of paths) {
-      if (dirs[path]?.transportIncomplete) continue;
-      loadDir(path);
-    }
-    // Same-epoch transport failures remain on their visible Retry surface.
-    // A later authoritative epoch is owned by the retry effect below.
+    let cancelled = false;
+    const refreshSequentially = async (): Promise<void> => {
+      for (const path of paths) {
+        if (cancelled || !currentSession()) return;
+        // Same-epoch transport failures remain on their visible Retry surface.
+        // A later authoritative epoch is owned by the retry effect below.
+        if (dirs[path]?.transportIncomplete) continue;
+        // `loadDir` owns every failure outcome (it writes this path's error /
+        // transport state and its promise never rejects), so awaiting it is
+        // ordering only — no second wait on the raw shared flight and no
+        // swallowed rejection here. A live shared flight is joined by
+        // loadDir's own single-flight, never re-sent.
+        await loadDir(path);
+      }
+    };
+    void refreshSequentially();
+    return () => {
+      cancelled = true;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loadChanges, loadDir, sessionId]);
 
@@ -1307,6 +1397,92 @@ export function FileExplorerPanel({
     treeScrollRestoredRef.current = true;
   }, [dirs, resolvedView.treeScrollTop]);
 
+  // Expand (view store only) so the opened file's row can render. The store
+  // write is synchronous and exclusive to this owner; loading is a separate
+  // idempotent effect below.
+  const revealFileParents = useCallback((path: string) => {
+    const parent = fileExplorerParentDir(path);
+    if (fileExplorerRevealDirChain(path).length === 0) return;
+    updateFileExplorerViewCache(viewOwnerKey, (view) => {
+      const chain = fileExplorerAncestorPaths(parent);
+      if (chain.every((item) => view.expandedDirs[item] === true)) return view;
+      return { ...view, expandedDirs: fileExplorerExpandDirectoryChain(view.expandedDirs, parent) };
+    });
+  }, [viewOwnerKey]);
+
+  // ONE reveal per accepted file identity: expand the parent chain, make the
+  // tree the visible pane on desktop (narrow/exclusive panes stay on the
+  // file and reveal on the next toggle), and stamp the pending scroll. The
+  // identity string is the only dedupe — no mirrored path/tab state. A
+  // viewport/media change must NOT re-run this: compact/desktop pane state is
+  // owned by the user's toggle after the open, so only a NEW identity acts.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (revealIdentity == null || activePath == null) {
+      pendingRevealRef.current = null;
+      return;
+    }
+    revealFileParents(activePath);
+    setTreeCollapsed(isNarrow || exclusivePanes);
+    pendingRevealRef.current = revealIdentity;
+  }, [activePath, revealFileParents, revealIdentity]);
+
+  // Idempotent chain load: a cached dir (loading included) or an in-flight
+  // listing is never re-requested, so dir-cache settles cannot fan out
+  // duplicate listing RPCs.
+  useEffect(() => {
+    if (revealIdentity == null || activePath == null || !sessionId) return;
+    for (const item of fileExplorerRevealDirChain(activePath)) {
+      if (dirs[item]) continue;
+      if (fileExplorerPeekDirInflight(fileExplorerDirInflightKey(sessionId, item))) continue;
+      loadDir(item);
+    }
+  }, [activePath, dirs, loadDir, revealIdentity, sessionId]);
+
+  // Reveal scroll: ONE scroll per accepted open, only inside the tree list,
+  // only after the row chain is both SETTLED and EXPANDED in the committed
+  // view and the cached tree scroll is restored. A collapsed
+  // (narrow/exclusive) tree waits for the toggle so the selected row is
+  // visible when the tree is shown.
+  useEffect(() => {
+    const identity = pendingRevealRef.current;
+    if (identity == null || identity !== revealIdentity) return;
+    if (treeCollapsed || !treeScrollRestoredRef.current) return;
+    if (activePath == null || !sessionId) {
+      pendingRevealRef.current = null;
+      return;
+    }
+    const chain = fileExplorerRevealDirChain(activePath);
+    if (chain.length === 0) {
+      pendingRevealRef.current = null;
+      return;
+    }
+    for (const item of chain) {
+      const state = dirs[item];
+      if (!state || state.loading) return;
+      if (state.error || state.transportIncomplete) {
+        // The chain cannot render rows; drop the marker so a later unrelated
+        // render never scrolls (and never steals a manual scroll).
+        pendingRevealRef.current = null;
+        return;
+      }
+    }
+    // The expansion write and this commit can race: settled dirs are not
+    // enough — every chain dir must already be EXPANDED in the committed
+    // view, otherwise the row is legitimately absent and the marker must
+    // survive to the next render (a warm cached parent settles on the same
+    // commit the expansion lands in).
+    if (!chain.every((item) => expandedDirs[item] === true)) return;
+    const viewport = treeViewportRef.current;
+    const row = viewport?.querySelector<HTMLElement>('.file-explorer__row--active') ?? null;
+    pendingRevealRef.current = null;
+    if (!viewport || !row) return;
+    const box = viewport.getBoundingClientRect();
+    const target = row.getBoundingClientRect();
+    if (target.top < box.top) viewport.scrollTop -= box.top - target.top;
+    else if (target.bottom > box.bottom) viewport.scrollTop += target.bottom - box.bottom;
+  }, [activePath, dirs, expandedDirs, revealIdentity, sessionId, treeCollapsed]);
+
   // Hot path: the store write is SYNCHRONOUS and FIRST — the twisty/child
   // commit renders from this store on the next frame without waiting for
   // the listing, and no App/Chat setState participates. loadDir starts only
@@ -1314,18 +1490,23 @@ export function FileExplorerPanel({
   // settled dir is zero-RPC).
   const revealDirectory = useCallback((path: string) => {
     const chain = fileExplorerAncestorPaths(path);
-    updateFileExplorerViewCache(viewOwnerKey, (view) => ({
-      ...view,
-      expandedDirs: fileExplorerExpandDirectoryChain(view.expandedDirs, path),
-    }));
+    updateFileExplorerViewCache(viewOwnerKey, (view) => {
+      if (chain.every((item) => view.expandedDirs[item] === true)) return view;
+      return { ...view, expandedDirs: fileExplorerExpandDirectoryChain(view.expandedDirs, path) };
+    });
     for (const item of chain) {
       if (!dirs[item]) loadDir(item);
     }
-    setTreeQuery('');
   }, [dirs, loadDir, viewOwnerKey]);
 
+  const chooseDirectory = useCallback((path: string) => {
+    setGraphDirOverride(path);
+    revealDirectory(path);
+    onPatchSlot((current) => ({ ...current, treeQuery: undefined, citationChoices: undefined }));
+  }, [onPatchSlot, revealDirectory]);
+
   useEffect(() => {
-    if (activeView !== 'dir' || !activePath) return;
+    if (activeView !== 'dir' || activePath == null || activePath === '') return;
     revealDirectory(activePath);
   }, [activePath, activeView, revealDirectory]);
 
@@ -1345,9 +1526,11 @@ export function FileExplorerPanel({
     onOpenPath(path, undefined, 'diff');
   };
   const openFile = (path: string) => {
+    setGraphDirOverride(null);
     if (isNarrow) setTreeCollapsed(true);
     onOpenPath(path, undefined, 'file');
   };
+  const openCitationChoice = openFile;
 
   const downloadPath = useCallback((path: string) => {
     if (!sessionId || downloading) return;
@@ -1413,53 +1596,88 @@ export function FileExplorerPanel({
     setBlameResult(null);
   }, [blameScope]);
   const [mapResult, setMapResult] = useState<FileExplorerMapResult | null>(null);
+  const [mapResultScope, setMapResultScope] = useState('');
   const [mapPending, setMapPending] = useState(false);
   const [mapOpen, setMapOpen] = useState(false);
   const mapRequestRef = useRef(0);
   const [graphDirOverride, setGraphDirOverride] = useState<string | null>(null);
   const [reviewDialogDir, setReviewDialogDir] = useState<string | null>(null);
   const [reviewDialogBase, setReviewDialogBase] = useState('');
-  useEffect(() => { setGraphDirOverride(null); }, [activePath]);
-  const graphDirectory = graphDirOverride
-    ?? (activePath != null && activeView === 'file' ? fileExplorerParentDir(activePath) : null);
-  const mapScope = `${viewOwnerKey}\0${graphDirectory ?? ''}\0${graphDirectory == null}\0${activeView}`;
+  const graphTabKey = `${activePath ?? ''}\0${activeView}`;
+  const [graphTabSeen, setGraphTabSeen] = useState(graphTabKey);
+  if (graphTabSeen !== graphTabKey) {
+    setGraphTabSeen(graphTabKey);
+    setGraphDirOverride(activeView === 'dir' && activePath != null ? activePath : null);
+  }
+  const graphWorkspace = `${viewOwnerKey}\0${workspaceCwd ?? ''}`;
+  const [graphWorkspacePrev, setGraphWorkspacePrev] = useState(graphWorkspace);
+  if (graphWorkspacePrev !== graphWorkspace) {
+    setGraphWorkspacePrev(graphWorkspace);
+    setGraphDirOverride(null);
+  }
+  const explicitDir = graphTabSeen === graphTabKey
+    ? graphDirOverride
+    : (activeView === 'dir' && activePath != null ? activePath : null);
+  const activeDir = activeView === 'dir' && activePath != null ? activePath : null;
+  const activeFileDir = activePath != null && activeView === 'file' ? fileExplorerParentDir(activePath) : null;
+  const graphDirectory = graphWorkspacePrev === graphWorkspace
+    ? (explicitDir ?? activeDir ?? activeFileDir)
+    : (activeDir ?? activeFileDir);
+  const mapScope = `${graphWorkspace}\0${graphDirectory ?? ''}\0${graphDirectory == null}\0${activeView}`;
+  const graphLiveRef = useRef({ ownerKey: viewOwnerKey, cwd: workspaceCwd ?? '', path: graphDirectory, view: activeView, generation: 0, scope: mapScope });
+  if (graphLiveRef.current.scope !== mapScope) mapRequestRef.current += 1;
+  graphLiveRef.current = { ownerKey: viewOwnerKey, cwd: workspaceCwd ?? '', path: graphDirectory, view: activeView, generation: mapRequestRef.current, scope: mapScope };
   const requestMap = useCallback(() => {
-    if (!sessionId || graphDirectory == null) return;
+    const live = graphLiveRef.current;
+    if (!sessionId || live.path == null || live.ownerKey !== viewOwnerKey) return;
     const generation = nextFileExplorerRequestGeneration();
     mapRequestRef.current = generation;
-    const ownerKey = viewOwnerKey;
-    const path = graphDirectory;
-    const request: FileExplorerMapRequest = { ownerKey, path, generation };
-    const stillRendered = () => currentSession() && fileExplorerMapResponseCurrent(request, {
-      ownerKey,
-      path,
-      generation: mapRequestRef.current,
-    });
+    graphLiveRef.current = { ...graphLiveRef.current, generation };
+    const request = {
+      ownerKey: live.ownerKey,
+      cwd: live.cwd,
+      path: live.path,
+      view: live.view,
+      generation,
+    };
+    const scopeCurrent = () => {
+      const now = graphLiveRef.current;
+      return currentSession()
+        && now.ownerKey === request.ownerKey
+        && now.cwd === request.cwd
+        && now.path != null
+        && fileExplorerSamePath(now.path, request.path)
+        && now.view === request.view
+        && now.generation === request.generation;
+    };
     setMapPending(true);
     setMapResult(null);
-    sendCommand(fileExplorerCommandForSession(sessionId, fileExplorerMapCommand(path)))
+    setMapResultScope('');
+    sendCommand(fileExplorerCommandForSession(sessionId, fileExplorerMapCommand(request.path)))
       .then((data) => {
-        if (!stillRendered()) return;
-        const parsed = normalizeFileExplorerMap(data, path);
+        if (!scopeCurrent()) return;
+        const parsed = normalizeFileExplorerMap(data, request.path);
         if (!parsed) {
           onConversationError('unusable file map response');
           return;
         }
+        if (!scopeCurrent()) return;
         setMapResult(parsed);
+        setMapResultScope(`${request.ownerKey}\0${request.cwd}\0${request.path}`);
       })
       .catch((error: unknown) => {
-        if (!stillRendered()) return;
+        if (!scopeCurrent()) return;
         onConversationError(errorMessage(error));
       })
       .finally(() => {
-        if (mapRequestRef.current === generation) setMapPending(false);
+        if (graphLiveRef.current.generation === generation) setMapPending(false);
       });
-  }, [currentSession, graphDirectory, onConversationError, sendCommand, sessionId, viewOwnerKey]);
+  }, [currentSession, onConversationError, sendCommand, sessionId, viewOwnerKey]);
   useEffect(() => {
     if (!mapOpen || graphDirectory == null) {
-      mapRequestRef.current += 1;
       setMapPending(false);
       setMapResult(null);
+      setMapResultScope('');
       if (graphDirectory == null) setMapOpen(false);
       return;
     }
@@ -1469,12 +1687,11 @@ export function FileExplorerPanel({
     // Escape triage: report whether a selection/blame existed so the document
     // keydown consumes Escape only for a real dismissal and never closes the
     // drawer in the same keystroke.
-    const hadSelection = askSelectionRef.current != null || selectionBarPin != null;
+    const hadSelection = askSelectionRef.current != null;
     blameRequestRef.current += 1;
     setBlamePending(false);
     setBlameResult(null);
     setAskSelection(null);
-    setSelectionBarPin(null);
     const selection = window.getSelection();
     if (selection?.anchorNode && codeRef.current?.contains(selection.anchorNode)) {
       selection.removeAllRanges();
@@ -1811,11 +2028,28 @@ export function FileExplorerPanel({
       const toggle = fileExplorerKeydownScope(rootRef.current)
         ?.querySelector<HTMLElement>(`#${toggleId}`)
         ?? fileExplorerToggleButton(toggleId);
+      if (event.key === 'Escape' && askFocus) {
+        const target = event.target as { tagName?: string; isContentEditable?: boolean } | null;
+        const tag = typeof target?.tagName === 'string' ? target.tagName.toUpperCase() : '';
+        if (target?.isContentEditable === true || tag === 'TEXTAREA' || tag === 'INPUT' || tag === 'SELECT') {
+          return;
+        }
+        if (dismissSelection() === true) {
+          event.preventDefault();
+          return;
+        }
+        event.preventDefault();
+        setAskFocus(false);
+        const focusButton = fileExplorerKeydownScope(rootRef.current)
+          ?.querySelector<HTMLElement>(`#${fileExplorerControlId(toggleId, 'focus-btn')}`);
+        focusButton?.focus();
+        return;
+      }
       fileExplorerHandleDocumentKeyDown(event, onClose, toggle, dismissSelection);
     };
     document.addEventListener('keydown', onDocKeyDown);
     return () => document.removeEventListener('keydown', onDocKeyDown);
-  }, [dismissSelection, mapOpen, onClose, toggleId]);
+  }, [askFocus, dismissSelection, mapOpen, onClose, toggleId]);
   const root = dirs[''] ?? fileExplorerEmptyDirState();
   const treeLoadingIdentity = fileExplorerTreeLoadingIdentity(
     sessionId,
@@ -1865,7 +2099,13 @@ export function FileExplorerPanel({
   // presentational: its snapshot comes from the bounded local snapshot map
   // (keyed per current tab path) or a placeholder bound to the tab's lazily
   // allocated id until the first poll lands.
-  const askActive = activePath != null && activeTab != null && activeView === 'file';
+  const askActive = activePath != null && activeTab != null && (activeView === 'file' || activeView === 'diff');
+  useEffect(() => {
+    setAskFocus(false);
+  }, [sessionId, activePath]);
+  if (askFocus && !askActive) setAskFocus(false);
+
+
   const askDockSnapshot: FileConversationSnapshot | null = askActive && activePath
     ? conversationSnapshots[activePath] ?? {
         conversationId: typeof activeTab?.conversationId === 'string' ? activeTab.conversationId : '',
@@ -1902,14 +2142,13 @@ export function FileExplorerPanel({
   // resize (ResizeObserver, disconnected on cleanup); hidden — never
   // cleared — when the selected lines are not painted in the visible source.
   const selectionFloatRange = showLines && !showPreview && !diffHunks ? paintedSelection : null;
-  const [selectionBarPin, setSelectionBarPin] = useState<{ top: number; left: number } | null>(null);
   const [selectionAnchor, setSelectionAnchor] = useState<FileExplorerSelectionAnchor>(
     () => ({ visible: false, top: 0, left: 0, placement: 'below' }),
   );
   useEffect(() => {
     const viewportNode = contentViewportRef.current;
     if (!viewportNode) return;
-    if (selectionFloatRange == null || selectionBarPin == null) {
+    if (selectionFloatRange == null) {
       setSelectionAnchor((prev) => (prev.visible ? { ...prev, visible: false } : prev));
       return;
     }
@@ -1991,7 +2230,7 @@ export function FileExplorerPanel({
       measureSelectionRef.current = null;
       observer.disconnect();
     };
-  }, [activePath, contentSurface, selectionBarPin, selectionFloatRange == null, selectionFloatRange?.startLine, selectionFloatRange?.endLine, toggleId, visibleBlame == null]);
+  }, [activePath, contentSurface, selectionFloatRange == null, selectionFloatRange?.startLine, selectionFloatRange?.endLine, toggleId, visibleBlame == null]);
   // The source/preview/diff markup, verbatim. An open file re-parents it
   // beside the Ask dock (desktop 62/38, phone 58/42). Diff view is not split.
   const sourceSurfacePane = (
@@ -2096,15 +2335,10 @@ export function FileExplorerPanel({
             onMouseUp={captureAskSelection}
             onContextMenu={(event) => {
               event.preventDefault();
-              const origin = event.currentTarget.getBoundingClientRect();
               const lineNo = fileExplorerLineDataOfNode(event.target);
               if (lineNo == null) return;
               const range = { startLine: lineNo, endLine: lineNo };
               setAskSelection({ ownerKey: viewOwnerKey, path: activePath ?? '', range });
-              setSelectionBarPin({
-                top: event.clientY - origin.top,
-                left: event.clientX - origin.left,
-              });
             }}
           >
             {fileState.lines.map((text, index) => {
@@ -2148,7 +2382,7 @@ export function FileExplorerPanel({
   return (
     <section
       ref={rootRef}
-      className="panel-drawer file-explorer"
+      className={`panel-drawer file-explorer${askFocus && askActive ? ' file-explorer--ask-focus' : ''}`}
       aria-label="File explorer"
       data-session-id={conversationSessionId ?? sessionId ?? ''}
       data-workspace-cwd={workspaceCwd ?? undefined}
@@ -2183,19 +2417,19 @@ export function FileExplorerPanel({
           >
             <span className="file-explorer__refresh-glyph" aria-hidden="true">⟳</span>
           </button>
+          <button
+            type="button"
+            id={fileExplorerControlId(toggleId, 'focus-btn')}
+            className={`file-explorer__focus-toggle${askFocus ? ' is-active' : ''}`}
+            aria-pressed={askFocus}
+            aria-label={askFocus ? 'Exit fullscreen conversation' : 'Show conversation fullscreen'}
+            title={askFocus ? 'Exit fullscreen conversation' : 'Show conversation fullscreen'}
+            disabled={!askActive}
+            onClick={() => setAskFocus((prev) => !prev)}
+          >
+            ⛶
+          </button>
 
-          {onToggleExpanded != null && (
-            <button
-              type="button"
-              id={fileExplorerControlId(toggleId, 'expand-btn')}
-              className={`file-explorer__expand-btn${expanded ? ' is-active' : ''}`}
-              title={expanded ? 'Shrink file explorer back to the panel' : 'Expand file explorer to the full app area'}
-              aria-label={expanded ? 'Shrink file explorer back to the panel' : 'Expand file explorer to the full app area'}
-              onClick={onToggleExpanded}
-            >
-              <span className="file-explorer__action-glyph" aria-hidden="true">⛶</span>
-            </button>
-          )}
           <button
             type="button"
             id={fileExplorerControlId(toggleId, 'drawer-close-btn')}
@@ -2227,8 +2461,12 @@ export function FileExplorerPanel({
               <input
                 type="search"
                 className="file-explorer__search-input"
-                value={treeQuery}
-                onChange={(event) => setTreeQuery(event.target.value)}
+                value={citationChoosing ? '' : treeQuery}
+                onChange={(event) => onPatchSlot((current) => ({
+                  ...current,
+                  treeQuery: event.target.value,
+                  citationChoices: undefined,
+                }))}
                 placeholder="Search files and folders…"
                 aria-label="Search workspace files and folders"
                 data-testid="file-explorer-search"
@@ -2246,7 +2484,6 @@ export function FileExplorerPanel({
             }}
           >
             {changesError && <div className="file-explorer__error">{safeText(changesError)}</div>}
-            {!changesLoading && !changesError && !isRepo && <div className="file-explorer__muted">Not a git repository.</div>}
             {(root.error || root.transportIncomplete) && !root.loading && root.errorCode !== 'directory_unavailable' && (
               <div className="file-explorer__error">
                 {safeText(root.error ?? 'Connection lost')}
@@ -2255,7 +2492,23 @@ export function FileExplorerPanel({
             )}
             {downloadError && <div className="file-explorer__error">{safeText(downloadError)}</div>}
             {deleteError && <div className="file-explorer__error">{safeText(deleteError)}</div>}
-            {treeNeedle ? (
+            {citationCandidates ? (
+              <SearchResults
+                entries={citationCandidates.map((path) => ({
+                  name: path,
+                  path,
+                  kind: 'file' as const,
+                }))}
+                truncated={false}
+                loading={false}
+                error={null}
+                activePath={activePath}
+                workspaceCwd={workspaceCwd}
+                choice
+                onOpenFile={openCitationChoice}
+                onOpenDir={chooseDirectory}
+              />
+            ) : treeNeedle ? (
               <SearchResults
                 entries={searchHits}
                 truncated={searchTruncated}
@@ -2264,7 +2517,7 @@ export function FileExplorerPanel({
                 activePath={activePath}
                 workspaceCwd={workspaceCwd}
                 onOpenFile={openFile}
-                onOpenDir={revealDirectory}
+                onOpenDir={chooseDirectory}
               />
             ) : (
               <WorkspaceTree
@@ -2315,6 +2568,16 @@ export function FileExplorerPanel({
           role="region"
           hidden={isNarrow && !treeCollapsed}
         >
+          {activeDisplayPath != null && (
+            <div
+              className="file-explorer__content-path"
+              data-testid="file-explorer-content-path"
+              title={safeText(activeDisplayPath)}
+            >
+              <span className="file-explorer__content-path-text">{safeText(activeDisplayPath)}</span>
+            </div>
+          )}
+          {(treeCollapsed || (activeTab && ((activeView === 'file' && headerPreviewKind) || activeView === 'diff'))) && (
           <div className="file-explorer__content-toolbar">
             {treeCollapsed && treeToggle}
             {activeTab && activeView === 'file' && headerPreviewKind && (
@@ -2338,7 +2601,21 @@ export function FileExplorerPanel({
                 </button>
               </div>
             )}
+            {activeTab && activeView === 'diff' && activePath && (
+              <button
+                type="button"
+                className="file-explorer__surface-btn"
+                data-testid="file-explorer-open-file"
+                aria-label="Open file"
+                title="Open file"
+                onClick={() => openFile(activePath)}
+              >
+                <FileTypeIcon tone={fileExplorerTreeTone('file', activePath)} />
+                Open file
+              </button>
+            )}
           </div>
+          )}
           {activeView === 'dir' ? (
             <div className="file-explorer__muted">Directory expanded in the tree.</div>
           ) : (
@@ -2359,7 +2636,7 @@ export function FileExplorerPanel({
             </div>
           )}
           {paneKind === 'empty' && (
-            <div className="file-explorer__muted">Empty file</div>
+            <div className="file-explorer__muted">{activeView === 'diff' ? 'No changes' : 'Empty file'}</div>
           )}
           {sourceSurfacePane}
           {truncationInconsistent && (
@@ -2368,11 +2645,11 @@ export function FileExplorerPanel({
           {!truncationInconsistent && fileState?.truncated && fileState.nextCursor == null && (
             <div className="file-explorer__muted">Truncated.</div>
           )}
-          {selectionFloatRange && selectionBarPin && (
+          {selectionFloatRange && (
             <div
               ref={selectionBarRef}
               className={`file-explorer__selection-float${selectionAnchor.visible ? '' : ' is-hidden'}`}
-              style={{ top: selectionBarPin.top, left: selectionBarPin.left }}
+              style={{ top: selectionAnchor.top, left: selectionAnchor.left }}
               data-placement={selectionAnchor.placement}
             >
               <FileSelectionActions
@@ -2454,7 +2731,7 @@ export function FileExplorerPanel({
             </div>
             <div className="file-explorer__map-pane" data-testid="file-explorer-map-pane">
               {mapPending && <div className="file-explorer__muted">Loading dependency graph…</div>}
-              {!mapPending && mapResult && fileExplorerSamePath(mapResult.path, graphDirectory) && (
+              {!mapPending && mapResult && mapResultScope === `${viewOwnerKey}\0${workspaceCwd ?? ''}\0${graphDirectory}` && fileExplorerSamePath(mapResult.path, graphDirectory) && (
                 <FileDependencyMap
                   map={mapResult}
                   workspaceCwd={workspaceCwd}
@@ -2620,6 +2897,7 @@ function SearchResults({
   workspaceCwd,
   onOpenFile,
   onOpenDir,
+  choice = false,
 }: {
   entries: readonly FileExplorerEntry[];
   truncated: boolean;
@@ -2629,6 +2907,7 @@ function SearchResults({
   workspaceCwd?: string;
   onOpenFile: (path: string) => void;
   onOpenDir: (path: string) => void;
+  choice?: boolean;
 }) {
   if (error) return <div className="file-explorer__error">{safeText(error)}</div>;
   if (!loading && entries.length === 0) {
@@ -2648,6 +2927,7 @@ function SearchResults({
                 onClick={open}
                 title={safeText(fileExplorerDisplayPath(entry.path, workspaceCwd))}
                 data-tone={entry.kind}
+                data-file-ambiguous-choice={choice && entry.kind === 'file' ? entry.path : undefined}
               >
                 <FileTypeIcon tone={entry.kind === 'dir' ? 'dir' : fileExplorerTreeTone(entry.kind, entry.name)} />
                 <span className="file-explorer__row-path">{safeText(entry.path)}</span>

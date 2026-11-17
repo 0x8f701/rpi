@@ -281,7 +281,7 @@ describe('command wire rows', () => {
     expect(parseRunnerCommand({ type: 'fork', entryId: 'e1', sessionPath: 7 })).toBeNull();
     expect(parseRunnerCommand({ type: 'queue_cancel', scope: 'everything' })).toBeNull();
     expect(parseRunnerCommand({ type: 'path_complete', path: 'src', kind: 'both' })).toBeNull();
-    expect(parseRunnerCommand({ type: 'agent_history', agentId: 'a1', lines: -1 })).toBeNull();
+    expect(parseRunnerCommand({ type: 'agent_history', agentId: 'a1', limit: -1 })).toBeNull();
     expect(parseRunnerCommand({ type: 'persona_remove', name: 'mentor', confirm: 'yes' })).toBeNull();
   });
 
@@ -584,6 +584,11 @@ describe('orchestration readers', () => {
 
   it('round-trips a job snapshot and refuses a drifted one', () => {
     expect(parseJobOutput({ job: JOB })).toEqual({ job: JOB });
+    expect(parseJobOutput({ job: { ...JOB, status: 'cancelling' } })).toEqual({
+      job: { ...JOB, status: 'cancelling' },
+    });
+    expect(parseJobOutput({ job: { ...JOB, status: 'running' } })?.job.status).toBe('running');
+    expect(parseJobOutput({ job: { ...JOB, status: 'cancelling' } })?.job.status).not.toBe('running');
     expect(parseJobOutput({ job: { ...JOB, status: 'exploded' } })).toBeNull();
     expect(parseJobOutput({ job: { ...JOB, agentId: '' } })).toBeNull();
     expect(parseJobOutput({ job: { ...JOB, createdAt: -1 } })).toBeNull();
@@ -592,11 +597,48 @@ describe('orchestration readers', () => {
     for (const input of NOT_AN_OBJECT) expect(parseJobOutput(input)).toBeNull();
   });
 
-  it('round-trips a child transcript and refuses anything else', () => {
-    expect(parseAgentHistory({ agentId: 'agent-1', text: 'hello' })).toEqual({ agentId: 'agent-1', text: 'hello' });
-    expect(parseAgentHistory({ agentId: 'agent-1', text: '' })).toEqual({ agentId: 'agent-1', text: '' });
+  it('round-trips structured child transcript rows and refuses anything else', () => {
+    const data = {
+      agentId: 'agent-1',
+      messages: [
+        { id: 's1', message: { role: 'user', content: [{ type: 'text', text: 'hi' }] } },
+        { message: { role: 'assistant', content: [{ type: 'text', text: 'ok' }] } },
+      ],
+      truncation: { omittedRows: 0, reason: 'none' },
+    };
+    expect(parseAgentHistory(data)).toEqual(data);
+    // An empty transcript with no truncation is a legal response.
+    expect(parseAgentHistory({ agentId: 'agent-1', messages: [], truncation: { omittedRows: 0, reason: 'none' } }))
+      .toEqual({ agentId: 'agent-1', messages: [], truncation: { omittedRows: 0, reason: 'none' } });
+    // Display blocks survive untouched: image data and full tool calls are
+    // the renderer's input, signatures are the runner's job to strip.
+    expect(parseAgentHistory({
+      agentId: 'agent-1',
+      messages: [{ id: 'a1', message: { role: 'assistant', content: [
+        { type: 'thinking', thinking: 'plan' },
+        { type: 'image', data: 'abcd', mimeType: 'image/png' },
+        { type: 'toolCall', id: 'call-1', name: 'bash', arguments: { cmd: 'ls' } },
+      ] } }],
+      truncation: { omittedRows: 7, reason: 'limit_and_bytes' },
+    })?.messages[0].message).toEqual({ role: 'assistant', content: [
+      { type: 'thinking', thinking: 'plan' },
+      { type: 'image', data: 'abcd', mimeType: 'image/png' },
+      { type: 'toolCall', id: 'call-1', name: 'bash', arguments: { cmd: 'ls' } },
+    ] });
+    // Fail closed on any drift: no half-valid transcript is ever handed to
+    // the projector.
+    expect(parseAgentHistory({ ...data, messages: 'rows' })).toBeNull();
+    expect(parseAgentHistory({ ...data, messages: [{ id: 's1' }] })).toBeNull();
+    expect(parseAgentHistory({ ...data, messages: [{ message: 5 }] })).toBeNull();
+    expect(parseAgentHistory({ ...data, messages: [{ message: { content: [] } }] })).toBeNull();
+    expect(parseAgentHistory({ ...data, truncation: { omittedRows: 0, reason: 'everything' } })).toBeNull();
+    expect(parseAgentHistory({ ...data, truncation: { omittedRows: -1, reason: 'none' } })).toBeNull();
+    expect(parseAgentHistory({ ...data, truncation: { reason: 'none' } })).toBeNull();
+    expect(parseAgentHistory({ ...data, truncation: { omittedRows: 0 } })).toBeNull();
+    expect(parseAgentHistory({ ...data, truncation: 'none' })).toBeNull();
+    expect(parseAgentHistory({ agentId: 'agent-1', messages: [] })).toBeNull();
+    expect(parseAgentHistory({ agentId: '', messages: [], truncation: { omittedRows: 0, reason: 'none' } })).toBeNull();
     expect(parseAgentHistory({ agentId: 'agent-1' })).toBeNull();
-    expect(parseAgentHistory({ agentId: '', text: 'x' })).toBeNull();
     for (const input of NOT_AN_OBJECT) expect(parseAgentHistory(input)).toBeNull();
   });
 
@@ -860,6 +902,11 @@ describe('workflow readers', () => {
 
   it('round-trips a detail projection and refuses a drifted nested row', () => {
     expect(parseWorkflowDetail(DETAIL)).toEqual(DETAIL);
+    expect(parseWorkflowDetail({
+      ...DETAIL,
+      jobs: [{ ...DETAIL.jobs[0], status: 'cancelling' }],
+    })?.jobs[0]?.status).toBe('cancelling');
+    expect(parseWorkflowDetail({ ...DETAIL, status: 'cancelling' })).toBeNull();
     expect(parseWorkflowDetail({ ...DETAIL, worktree: undefined })).toBeNull();
     expect(parseWorkflowDetail({ ...DETAIL, integration: { ...DETAIL.integration, step: 'melted' } })).toBeNull();
     expect(parseWorkflowDetail({ ...DETAIL, subagents: 'none' })).toBeNull();
@@ -997,6 +1044,19 @@ describe('todo child readers', () => {
 
   it('round-trips a detail snapshot and enforces its own invariants', () => {
     expect(parseTodoChildDetail(DETAIL)).toEqual(DETAIL);
+    expect(parseTodoChildDetail({
+      ...DETAIL,
+      jobs: [{ ...DETAIL.jobs[0], status: 'cancelling' }],
+    })?.jobs[0]?.status).toBe('cancelling');
+    expect(parseTodoChildDetail({ ...DETAIL, status: 'cancelling' })).toBeNull();
+    expect(parseTodoChildDetail({
+      ...DETAIL,
+      tasks: [{ ...DETAIL.tasks[0], status: 'cancelling' }],
+    })).toBeNull();
+    expect(parseTodoChildDetail({
+      ...DETAIL,
+      receipts: [{ ...DETAIL.receipts[0], status: 'cancelling' }],
+    })).toBeNull();
     expect(parseTodoChildDetail({ ...DETAIL, isRunning: false })).toBeNull();
     expect(parseTodoChildDetail({ ...DETAIL, todoId: 'other-child' })).toBeNull();
     expect(parseTodoChildDetail({ ...DETAIL, parent: { ...DETAIL.parent, sessionId: 'other-parent' } })).toBeNull();

@@ -60,7 +60,7 @@ fn make_linked_sessions(
     let backup_provider = backup.provider.clone();
     let backup_for_resolver = backup.clone();
     let session = Session::new(SessionOptions {
-        model: primary,
+        model: Some(primary),
         cwd: cwd.path().to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,
@@ -834,7 +834,7 @@ async fn orchestration_definition_model_list_falls_back_in_order() {
         AgentCatalog::from_agents(vec![definition]),
         artifacts.path().join("artifacts"),
     )
-    .with_parent_model(parent.model().expect("parent model"));
+    .with_parent_model(Some(parent.model().expect("parent model")));
     config.default_agent = "researcher".to_owned();
     let runtime = OrchestrationRuntime::new(
         config,
@@ -1028,7 +1028,7 @@ async fn child_weekly_limit_uses_configured_sequence_with_retry_and_credential_s
     let final_provider = final_model.provider.clone();
     let cwd = tempfile::tempdir().expect("child fallback cwd");
     let parent = Session::new(SessionOptions {
-        model: primary.clone(),
+        model: Some(primary.clone()),
         cwd: cwd.path().to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,
@@ -1092,7 +1092,7 @@ async fn child_weekly_limit_uses_configured_sequence_with_retry_and_credential_s
         AgentCatalog::from_agents(vec![definition]),
         cwd.path().join("artifacts"),
     )
-    .with_parent_model(primary.clone());
+    .with_parent_model(Some(primary.clone()));
     config.default_agent = "researcher".to_owned();
     let child_factory = OrchestrationRuntime::child_factory_from_session(&parent);
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();

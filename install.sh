@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# rpi installer (macOS / Linux).
+# rpi installer (Linux). macOS is currently unavailable and is not installed.
 #
 # Downloads the matching platform artifact from this repo's GitHub Releases,
 # verifies its SHA-256 against the release's SHA256SUMS manifest, and installs
@@ -87,20 +87,7 @@ PLATFORM_ARCH=""
 TRIPLE=""
 case "$OS" in
     Darwin)
-        PLATFORM_OS="macos"
-        case "$ARCH" in
-            arm64|aarch64)
-                PLATFORM_ARCH="aarch64"
-                TRIPLE="aarch64-apple-darwin"
-                ;;
-            x86_64)
-                PLATFORM_ARCH="x86_64"
-                TRIPLE="x86_64-apple-darwin"
-                ;;
-            *)
-                err "unsupported macOS architecture: $ARCH"
-                ;;
-        esac
+        err "macOS is currently unavailable"
         ;;
     Linux)
         PLATFORM_OS="linux"
@@ -119,7 +106,7 @@ case "$OS" in
         esac
         ;;
     *)
-        err "unsupported OS: $OS (Windows: use install.ps1)"
+        err "unsupported OS: $OS (Windows builds are not published)"
         ;;
 esac
 
@@ -990,11 +977,7 @@ case ":$PATH:" in
                 persist_line "${ZDOTDIR:-$HOME}/.zshrc" "$EXPORT_LINE"
                 ;;
             */bash)
-                if [ "$PLATFORM_OS" = "macos" ]; then
-                    persist_line "$HOME/.bash_profile" "$EXPORT_LINE"
-                else
-                    persist_line "$HOME/.bashrc" "$EXPORT_LINE"
-                fi
+                persist_line "$HOME/.bashrc" "$EXPORT_LINE"
                 ;;
             */fish)
                 FISH_CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/fish"

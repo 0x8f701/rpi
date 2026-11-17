@@ -1,36 +1,177 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
+import crypto from 'node:crypto';
 import assert from 'node:assert/strict';
-
+import { createFreshSessionViaManage } from './lib/session-lifecycle.mjs';
+import { clickFeature, openSessionsDrawer } from './lib/feature-menu.mjs';
 const env = process.env;
 const files = { dirty: env.RPI_DIRTY_FILE || 'app.rs', critical: env.RPI_CRIT_FILE || 'crit.rs', overdesign: env.RPI_WARN_FILE || 'warn.rs', naming: env.RPI_INFO_FILE || 'info.rs', preview: env.RPI_PREVIEW_FILE || 'notes.md' };
 const IDENTITY_KEYS = ['snapshotId', 'path', 'oldStart', 'oldCount', 'newStart', 'newCount', 'contentHash'];
 const FINDINGS_SCHEMA_KEYS = ['category', 'side', 'startLine', 'endLine', 'summary', 'evidence'];
 const triageSchema = { type: 'object', additionalProperties: false, required: ['core', 'skipped'], properties: { core: { type: 'array', items: { type: 'string' } }, skipped: { type: 'integer', minimum: 0 } } };
+const purposeSchema = { type: 'object', additionalProperties: false, required: ['repositories', 'changes'], properties: { repositories: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['repo', 'purpose'], properties: { repo: { type: 'string', minLength: 1 }, purpose: { type: 'string', minLength: 1 } } } }, changes: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['repo', 'kind', 'id', 'purpose'], properties: { repo: { type: 'string', minLength: 1 }, kind: { type: 'string', enum: ['commit', 'committed_file', 'staged', 'unstaged', 'untracked'] }, id: { type: 'string', minLength: 1 }, purpose: { type: 'string', minLength: 1 } } } } } };
 const providerMode = process.argv[2] === '--provider';
-const TLDR_GOOD = [
-  'Pinned diff changes crit.rs, warn.rs, info.rs, app.rs, and notes.md.',
-  '',
-  '## Details',
-  '',
-  '- `crit.rs` `crit_one` adds `todo!()` on the new side.',
-  '- `warn.rs` inserts `WARN-CHANGED` between the two base lines.',
-  '- `info.rs` replaces the second baseline line with `INFO-BETA`.',
-  '- `app.rs` changes `beta` to `BETA`.',
-  '- `notes.md` appends `PREVIEW-EXTRA line`.',
-  '',
-  '```mermaid',
-  'flowchart LR',
-  '  crit_one --> WARN_CHANGED',
-  '  INFO_BETA --> notes',
-  '```',
-].join('\n');
-const TLDR_LATE = [
-  'STALE-LATE-SNAPSHOT must never paint over the pinned summary.',
-  '',
-  'This body arrived after Stop and is rejected.',
-].join('\n');
+const SUMMARY_MARKER = 'Summarize repository changes using the required purpose JSON.\n';
+const DESIGNATED_KEYS = '\nDesignated purpose keys JSON:\n';
+const SUMMARY_FACTS = '\nRepository facts JSON:\n';
+const DESIGNATED_CONTRACT = 'This batch designates exactly these keys.';
+const OLD_ALL_KEYS = 'Include every repository, commit, committed file, staged file, unstaged file, and untracked file from the facts exactly once.';
+const KIND_ORDER = ['commit', 'committed_file', 'staged', 'unstaged', 'untracked'];
+const textDigest = text => crypto.createHash('sha256').update(text, 'utf8').digest('hex');
+let summaryTruthCache = null;
+function summaryTruth() {
+  if (!summaryTruthCache) {
+    assert.ok(env.RPI_SUMMARY_TRUTH, 'RPI_SUMMARY_TRUTH is required');
+    summaryTruthCache = JSON.parse(fs.readFileSync(env.RPI_SUMMARY_TRUTH, 'utf8'));
+  }
+  return summaryTruthCache;
+}
+function largeSpecFor(file) {
+  const large = summaryTruth().large;
+  return large && file && Object.hasOwn(large.files, file.path) ? large.files[file.path] : null;
+}
+function largePurpose(file) {
+  const spec = largeSpecFor(file);
+  if (!spec || file.status !== 'modified' || typeof file.patch !== 'string') return '';
+  for (const [key, marker] of [['head', 'HEAD'], ['middle', 'MIDDLE'], ['tail', 'TAIL']]) {
+    if (file.patch.indexOf(`+${spec.tag}-${marker}-MARKER`) !== spec.markers[key]) return '';
+  }
+  return spec.token;
+}
+function receivedLargeRecords(facts) {
+  const records = [];
+  for (const repository of facts.repositories) {
+    for (const [kind, files] of [['staged', repository.staged], ['unstaged', repository.unstaged], ['untracked', repository.untracked]]) {
+      for (const file of files || []) if (largeSpecFor(file)) records.push({ repository, kind, file });
+    }
+    for (const commit of repository.commits || []) {
+      for (const file of commit.files || []) if (largeSpecFor(file)) records.push({ repository, kind: 'committed_file', file });
+    }
+  }
+  return records;
+}
+function assertLargeRecord(repository, kind, file) {
+  const large = summaryTruth().large;
+  const spec = largeSpecFor(file);
+  assert.equal(repository.label, large.repo, `large record repo ${repository.label}`);
+  assert.equal(kind, 'unstaged', `large record kind ${kind}`);
+  assert.equal(file.status, 'modified', `large record status ${file.status}`);
+  assert.equal(file.previous_path, null, `large record previous path ${file.previous_path}`);
+  assert.equal(typeof file.patch, 'string', 'large record patch is missing');
+  const bytes = Buffer.byteLength(file.patch, 'utf8');
+  assert.equal(bytes, spec.patchBytes, `${file.path} patch byte count`);
+  assert.equal(textDigest(file.patch), spec.patchSha256, `${file.path} patch sha256`);
+  for (const [key, marker] of [['head', 'HEAD'], ['middle', 'MIDDLE'], ['tail', 'TAIL']]) {
+    assert.equal(file.patch.indexOf(`+${spec.tag}-${marker}-MARKER`), spec.markers[key], `${file.path} ${key} marker byte offset`);
+  }
+  assert.ok(file.patch.endsWith(`+${spec.tag}-TAIL-MARKER`), `${file.path} patch tail was truncated`);
+}
+function summaryParts(userText) {
+  assert.ok(userText.startsWith(SUMMARY_MARKER), 'summary prompt marker is not first');
+  const keysAt = userText.indexOf(DESIGNATED_KEYS);
+  const factsAt = userText.indexOf(SUMMARY_FACTS);
+  assert.ok(keysAt > SUMMARY_MARKER.length && factsAt > keysAt, 'designated keys do not precede repository facts');
+  const contract = userText.slice(SUMMARY_MARKER.length, keysAt);
+  assert.ok(!contract.includes(OLD_ALL_KEYS), 'old all-keys protocol accepted');
+  for (const required of ['"repositories"', '"changes"', 'commit|committed_file|staged|unstaged|untracked', 'OID:displaypath', 'first colon', DESIGNATED_CONTRACT, 'JSON only']) {
+    assert.ok(contract.includes(required), `summary contract missing ${required}`);
+  }
+  assert.ok(!contract.trim().startsWith('{'), 'contract paragraph was parsed as facts');
+  const languageAt = contract.lastIndexOf('Write every purpose in the language tagged `');
+  if (languageAt >= 0) {
+    const languageLine = contract.slice(languageAt);
+    assert.ok(!languageLine.includes('\n') && languageLine.endsWith('.'), 'language line is not the last contract line before Designated purpose keys');
+  }
+  const designated = JSON.parse(userText.slice(keysAt + DESIGNATED_KEYS.length, factsAt).trim());
+  const facts = JSON.parse(userText.slice(factsAt + SUMMARY_FACTS.length).trim());
+  assert.ok(Array.isArray(designated.repositories), 'designated repositories are missing');
+  assert.ok(designated.repositories.every(label => typeof label === 'string' && label.length > 0), 'designated repositories are not label strings');
+  assert.ok(Array.isArray(designated.changes), 'designated changes are missing');
+  for (const change of designated.changes) {
+    assert.deepEqual(Object.keys(change).sort(), ['id', 'kind', 'repo'], `designated change carries extra fields: ${JSON.stringify(change)}`);
+    assert.ok(!Object.hasOwn(change, 'purpose'), 'designated change carries a purpose');
+  }
+  return { contract, designated, facts };
+}
+
+function purposeFor(file) {
+  const patch = typeof file.patch === 'string' ? file.patch : '';
+  const stats = file.lines?.kind === 'text' ? `+${file.lines.insertions}/-${file.lines.deletions}` : file.lines?.kind || 'unknown';
+  const previous = file.previous_path ? `${file.previous_path} -> ` : '';
+  const large = largePurpose(file);
+  const marker = large || (patch.includes('todo!()') ? 'todo' : patch.includes('WARN-CHANGED') ? 'warn' : patch.includes('INFO-BETA') ? 'info' : patch.includes('BETA') ? 'beta' : patch.includes('PREVIEW-EXTRA') ? 'preview' : patch.includes('both work') ? 'work' : patch.includes('both index') ? 'index' : patch.includes('ahead only') ? 'ahead' : '');
+  return `${file.status} ${previous}${file.path} ${stats}${marker ? ` ${marker}` : ''}`.trim();
+}
+
+function originPurpose(repository) {
+  return `${repository.label} ${repository.origin?.outcome || 'unknown'} ahead ${repository.origin?.ahead ?? 0}`;
+}
+
+function designatedFromFacts(facts) {
+  assert.ok(Array.isArray(facts.repositories) && facts.repositories.length > 0, 'facts contain no repositories');
+  const changes = [];
+  for (const repository of facts.repositories) {
+    assert.match(repository.label, /^root\d+(\/|$)/, `repo label is not root-relative: ${repository.label}`);
+    for (const commit of repository.commits || []) {
+      changes.push({ repo: repository.label, kind: 'commit', id: commit.oid });
+      for (const file of commit.files || []) changes.push({ repo: repository.label, kind: 'committed_file', id: `${commit.oid}:${file.path}` });
+    }
+    for (const [kind, files] of [['staged', repository.staged], ['unstaged', repository.unstaged], ['untracked', repository.untracked]]) {
+      for (const file of files || []) changes.push({ repo: repository.label, kind, id: file.path });
+    }
+  }
+  changes.sort((left, right) => left.repo.localeCompare(right.repo) || KIND_ORDER.indexOf(left.kind) - KIND_ORDER.indexOf(right.kind) || left.id.localeCompare(right.id));
+  return { repositories: facts.repositories.map(repository => repository.label), changes };
+}
+
+function purposeDocument(facts, designated, purposeOverride) {
+  const expected = designatedFromFacts(facts);
+  assert.equal(facts.repositories.length, 1, 'summary facts are not one repository');
+  const labels = new Map(facts.repositories.map(repository => [repository.label, repository]));
+  const repositoryKeys = designated.repositories;
+  assert.ok(repositoryKeys.length === 0 || JSON.stringify(repositoryKeys) === JSON.stringify(expected.repositories), 'designated repository key is neither absent nor the repository');
+  const owned = new Set(expected.changes.map(item => `${item.repo}\0${item.kind}\0${item.id}`));
+  const override = typeof purposeOverride === 'string' && purposeOverride.length > 0 ? purposeOverride : '';
+  const repositories = repositoryKeys.map(label => {
+    const repository = labels.get(label);
+    assert.ok(repository, `designated repository missing from facts: ${label}`);
+    const purpose = override || originPurpose(repository);
+    assert.equal(purpose.trim(), purpose, `blank repository purpose for ${label}`);
+    return { repo: label, purpose };
+  });
+  const seen = new Set(repositoryKeys.map(label => `${label}\0repository`));
+  const changes = designated.changes.map(item => {
+    const repository = labels.get(item.repo);
+    assert.ok(repository, `designated change repo missing: ${item.repo}`);
+    const identity = `${item.repo}\0${item.kind}\0${item.id}`;
+    assert.ok(owned.has(identity), `designated change is not an owned fact key: ${identity}`);
+    let purpose = override;
+    if (!purpose && item.kind === 'commit') {
+      const commit = (repository.commits || []).find(record => record.oid === item.id);
+      assert.ok(commit, `designated commit missing: ${item.id}`);
+      purpose = commit.subject;
+    } else if (!purpose && item.kind === 'committed_file') {
+      const split = item.id.indexOf(':');
+      assert.ok(split > 0 && split < item.id.length - 1, `committed file id is not OID:path: ${item.id}`);
+      const commit = (repository.commits || []).find(record => record.oid === item.id.slice(0, split));
+      const file = (commit?.files || []).find(record => record.path === item.id.slice(split + 1));
+      assert.ok(file, `designated committed file missing: ${item.id}`);
+      purpose = purposeFor(file);
+    } else if (!purpose) {
+      const file = (repository[item.kind] || []).find(record => record.path === item.id);
+      assert.ok(file, `designated ${item.kind} missing: ${item.id}`);
+      purpose = purposeFor(file);
+    }
+    assert.equal(typeof purpose, 'string', 'purpose is not text');
+    assert.ok(purpose.trim() === purpose && purpose.length > 0, `blank purpose for ${item.kind} ${item.id}`);
+    assert.ok(!seen.has(identity), `duplicate purpose key ${identity}`);
+    seen.add(identity);
+    return { repo: item.repo, kind: item.kind, id: item.id, purpose };
+  });
+  assert.equal(seen.size, designated.repositories.length + designated.changes.length, 'reply omitted a designated key');
+  return JSON.stringify({ repositories, changes });
+}
 
 function lastUserText(body) {
   const lastUser = [...body.messages].reverse().find(message => message.role === 'user');
@@ -113,8 +254,9 @@ function findingsDocument(text, mode) {
   const identities = promptIdentities(text);
   if (mode === 'auto') assert.equal(identities.length, 1, 'Auto findings prompt must scope exactly one hunk');
   if (mode === 'highlight') {
-    assert.ok(identities.length >= Object.keys(files).length, 'Highlight scope dropped a fixture hunk');
-    assert.deepEqual(identities.map(identity => identity.path).sort(), Object.values(files).sort(), 'Highlight scope paths');
+    const expected = [...Object.values(files), 'added.txt', 'both.rs', 'kept.txt', 'loose.txt'].sort();
+    assert.ok(identities.length >= expected.length, 'Highlight scope dropped a fixture hunk');
+    assert.deepEqual(identities.map(identity => identity.path).sort(), expected, 'Highlight scope paths');
   }
   return {
     hunks: identities.map(identity => ({
@@ -143,7 +285,8 @@ function assertNoTools(body) {
 }
 
 async function provider(portFile) {
-  const state = { requests: [], errors: [], held: [], released: [], fail: new Set(), tldrLate: false };
+  const state = { requests: [], errors: [], held: [], released: [], fail: new Set(), tldrLate: false, tldrMalformed: false, tldrGeneration: 0, tldrSeen: 0 };
+  const largeSeenByGeneration = new Map();
   const holds = new Set();
   const pending = new Map();
   const arrivals = [];
@@ -154,7 +297,11 @@ async function provider(portFile) {
       const json = value => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(value)); };
       if (endpoint.pathname === '/control/state') return json(state);
       if (endpoint.pathname === '/control/await') {
-        const ready = () => state.requests.filter(entry => entry.kind === endpoint.searchParams.get('kind')).length >= Number(endpoint.searchParams.get('count'));
+        const kind = endpoint.searchParams.get('kind');
+        const count = Number(endpoint.searchParams.get('count'));
+        const generation = endpoint.searchParams.has('generation') ? Number(endpoint.searchParams.get('generation')) : null;
+        const batch = endpoint.searchParams.has('batch') ? Number(endpoint.searchParams.get('batch')) : null;
+        const ready = () => state.requests.filter(entry => entry.kind === kind && (generation === null || entry.generation === generation) && (batch === null || entry.batch === batch)).length >= count;
         if (!ready()) await new Promise(resolve => arrivals.push({ ready, resolve }));
         return json(state);
       }
@@ -164,12 +311,26 @@ async function provider(portFile) {
         if (kind) state.fail.add(kind); else state.fail.clear();
         return json({ ok: true });
       }
-      if (endpoint.pathname === '/control/tldr-late') { state.tldrLate = true; return json({ ok: true }); }
+      if (endpoint.pathname === '/control/tldr-late') { state.tldrLate = state.tldrGeneration; return json({ ok: true, generation: state.tldrGeneration }); }
+      if (endpoint.pathname === '/control/tldr-malformed') { state.tldrMalformed = state.tldrGeneration; return json({ ok: true, generation: state.tldrGeneration }); }
+      if (endpoint.pathname === '/control/tldr-generation') {
+        state.tldrGeneration += 1;
+        state.tldrSeen = 0;
+        if (state.tldrLate !== state.tldrGeneration) state.tldrLate = false;
+        if (state.tldrMalformed !== state.tldrGeneration) state.tldrMalformed = false;
+        return json({ ok: true, generation: state.tldrGeneration });
+      }
       if (endpoint.pathname === '/control/release') {
         const kind = endpoint.searchParams.get('kind');
-        holds.delete(kind);
-        for (const [id, entry] of pending) if (entry.kind === kind) { pending.delete(id); entry.finish(); state.released.push(id); }
-        if (kind === 'tldr' && state.tldrLate) state.tldrLate = false;
+        const one = endpoint.searchParams.get('one') === '1';
+        if (!one) holds.delete(kind);
+        const ready = [...pending].filter(([, entry]) => entry.kind === kind).sort((left, right) => left[0] - right[0]);
+        for (const [id, entry] of one ? ready.slice(0, 1) : ready) {
+          pending.delete(id);
+          entry.finish();
+          state.released.push(id);
+        }
+
         return json({ ok: true });
       }
       assert.equal(req.method, 'POST', `unexpected provider endpoint ${req.method} ${req.url}`);
@@ -180,6 +341,7 @@ async function provider(portFile) {
       const schemaName = body.response_format?.json_schema?.name;
       const userText = lastUserText(body);
       let kind, answer, failing = false;
+      let large = [];
       const identities = userText.includes('Requested hunks:') ? promptIdentities(userText) : [];
       if (schemaName === 'review_triage') {
         kind = 'triage';
@@ -188,7 +350,7 @@ async function provider(portFile) {
         assert.deepEqual(body.response_format.json_schema.schema, triageSchema, 'Stage1 schema differs from strict contract');
         assert.ok(!userText.includes('TRIAGE:'), 'obsolete trailer triage protocol');
         const tokens = [...userText.matchAll(/Hunk: ([^\n]+)/g)].map(match => match[1]);
-        assert.deepEqual([...tokens].sort(), Object.values(files).map(file => `${file}@${file === files.preview ? '4-4' : '1-1'}`).sort(), 'triage must scan all five exact hunks');
+        assert.deepEqual([...tokens].sort(), [...Object.values(files).map(file => `${file}@${file === files.preview ? '4-4' : '1-1'}`), 'added.txt@0-1', 'both.rs@1-1', 'kept.txt@1-0', 'loose.txt@0-1'].sort(), 'triage must scan all nine exact hunks');
         const core = [files.critical, files.overdesign].map(file => `${file}@1-1`);
         answer = JSON.stringify({ core, skipped: tokens.length - core.length });
         state.core = core;
@@ -219,22 +381,45 @@ async function provider(portFile) {
           answer = JSON.stringify(document);
         } else answer = JSON.stringify(findingsDocument(userText, 'highlight'));
         failing = mode !== 'ok';
-      } else if (userText.startsWith('Write one Markdown document about only the supplied current diff.')) {
+      } else if (userText.startsWith(SUMMARY_MARKER) && userText.includes(DESIGNATED_KEYS) && userText.includes(SUMMARY_FACTS)) {
         kind = 'tldr';
-        assert.equal(schemaName, undefined, 'TLDR request carried a json schema');
-        assert.equal(body.response_format, undefined, 'TLDR request carried response_format');
+        assert.equal(body.response_format?.type, 'json_schema', 'TLDR request omitted the strict purpose schema');
+        assert.equal(schemaName, 'review_purpose', 'TLDR request schema was not review_purpose');
+        assert.equal(body.response_format.json_schema.strict, true, 'TLDR purpose schema was not strict');
+        assert.deepEqual(body.response_format.json_schema.schema, purposeSchema, 'TLDR purpose schema differs from the strict contract');
         assertNoTools(body);
         assert.equal(body.messages.filter(message => message.role === 'user').length, 1, 'TLDR prompt included conversation history');
-        assert.ok(userText.includes('comparisonLabel:'), 'TLDR prompt missing comparison label');
-        assert.match(userText, /Respond in the language tagged `zh(?:-CN)?`\./, 'configured 中文 missing at TLDR boundary');
-        for (const file of Object.values(files)) assert.ok(userText.includes(`File: ${file}`), `TLDR prompt omitted ${file}`);
-        answer = state.tldrLate ? TLDR_LATE : TLDR_GOOD;
+        assert.ok(!userText.includes('Write one Markdown document'), 'old TLDR prompt accepted');
+        assert.ok(!userText.includes(OLD_ALL_KEYS), 'old all-keys protocol accepted');
+        assert.ok(!userText.includes('comparisonLabel:'), 'TLDR prompt still carries the selected diff');
+        if (state.tldrGeneration === 0) { state.tldrGeneration = 1; state.tldrSeen = 0; }
+        state.tldrSeen += 1;
+        const summary = summaryParts(userText);
+        const receivedLarge = receivedLargeRecords(summary.facts);
+        for (const { repository, kind: recordKind, file } of receivedLarge) assertLargeRecord(repository, recordKind, file);
+        const priorKeys = largeSeenByGeneration.get(state.tldrGeneration) || [];
+        for (const { repository, kind: recordKind, file } of receivedLarge) {
+          const identity = `${repository.label}\0${recordKind}\0${file.path}`;
+          assert.ok(!priorKeys.includes(identity), `duplicate large record ${identity} in generation ${state.tldrGeneration}`);
+          priorKeys.push(identity);
+        }
+        largeSeenByGeneration.set(state.tldrGeneration, priorKeys);
+        large = receivedLarge.map(({ repository, kind: recordKind, file }) => ({
+          repo: repository.label,
+          kind: recordKind,
+          path: file.path,
+          patchBytes: Buffer.byteLength(file.patch, 'utf8'),
+          patchSha256: textDigest(file.patch),
+        }));
+        const stale = state.tldrLate === state.tldrGeneration;
+        const malformed = state.tldrMalformed === state.tldrGeneration && state.tldrSeen === 1;
+        answer = malformed ? '{"repositories":[],"changes":[],"extra":true}' : stale ? purposeDocument(summary.facts, summary.designated, 'STALE-LATE-SNAPSHOT') : purposeDocument(summary.facts, summary.designated);
       } else if (userText.includes('User comment:\nOPS accepted comment')) {
         kind = 'comment';
         answer = Array.from({ length: 90 }, (_, index) => `Comment reply ${index + 1}: accepted follow proof.`).join('\n');
       } else throw new Error(`unexpected model prompt: schema=${schemaName ?? 'none'} lastUser=${userText.slice(0, 180)}`);
       const id = ++sequence;
-      state.requests.push({ id, kind, model: body.model, scope: kind === 'auto' || kind === 'highlight' ? promptIdentities(userText).map(identity => identity.path) : undefined, target: kind === 'auto' ? promptIdentities(userText)[0]?.path : undefined });
+      state.requests.push({ id, kind, model: body.model, generation: kind === 'tldr' ? state.tldrGeneration : undefined, batch: kind === 'tldr' ? state.tldrSeen : undefined, promptBytes: Buffer.byteLength(userText, 'utf8'), promptSha256: textDigest(userText), large, scope: kind === 'auto' || kind === 'highlight' ? promptIdentities(userText).map(identity => identity.path) : undefined, target: kind === 'auto' ? promptIdentities(userText)[0]?.path : undefined });
       const finish = () => {
         const chunk = content => `data: ${JSON.stringify({ id: `ops-${id}`, object: 'chat.completion.chunk', model: body.model, choices: [{ index: 0, delta: { role: 'assistant', content }, finish_reason: null }] })}\n\n`;
         const terminal = `data: ${JSON.stringify({ id: `ops-${id}`, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`;
@@ -248,7 +433,11 @@ async function provider(portFile) {
         res.write(chunk(answer.slice(0, splitAt)));
         setTimeout(() => res.end(chunk(answer.slice(splitAt)) + terminal), 3000);
       };
-      if (holds.has(kind)) { state.held.push(id); pending.set(id, { kind, finish }); } else finish();
+      if (holds.has(kind)) {
+        state.held.push(id);
+        pending.set(id, { kind, finish });
+        if (kind === 'tldr') holds.delete(kind);
+      } else finish();
       for (const arrival of arrivals) if (arrival.ready()) arrival.resolve();
     } catch (error) {
       console.error(`provider request error: ${error.message}`);
@@ -313,7 +502,7 @@ async function journey() {
     window.__ops.holdSnapshots = false; window.__ops.heldSnapshots = [];
     for (const raw of held) window.__opsSocket.dispatchEvent(new MessageEvent('message', { data: raw }));
   });
-  const gapEscapeStop = async operation => {
+  const gapEscapeStop = async (operation, closesBefore) => {
     const stopsBefore = (await capture()).sent.filter(frame => frame.type === 'code_review_stop').length;
     await page.evaluate(() => { document.body.tabIndex = -1; document.body.focus(); });
     await page.keyboard.press('Escape');
@@ -322,7 +511,7 @@ async function journey() {
       return sent.length > stopsBefore && sent.at(-1).operation === operation;
     }, 'ACK-gap Escape Stop frame', { stopsBefore, operation });
     const framesNow = await capture();
-    assert.equal(framesNow.sent.filter(frame => frame.type === 'code_review_close').length, 0, `${operation} gap Escape closed the panel`);
+    assert.equal(framesNow.sent.filter(frame => frame.type === 'code_review_close').length, closesBefore, `${operation} gap Escape closed the panel`);
     check(await page.locator('#code-review-panel').isVisible(), `${operation} gap Escape closed the panel`);
     return framesNow;
   };
@@ -401,13 +590,25 @@ async function journey() {
     check(controls.every(control => control.reachable), `summary controls obscured: ${JSON.stringify(controls)}`);
   };
   const pairedShot = async (name, beforeEach) => {
+    const scrollHidden = () => {
+      const port = document.querySelector('.transcript-scrollport');
+      const btn = port?.querySelector('button.transcript-scroll-bottom');
+      const foot = document.querySelector('.app-main > footer');
+      const prior = document.activeElement;
+      btn?.focus();
+      const refused = document.activeElement !== btn;
+      if (prior instanceof HTMLElement) prior.focus();
+      return !!btn && !!foot && refused && getComputedStyle(port).visibility === 'hidden' && getComputedStyle(btn).visibility === 'hidden' && document.activeElement !== btn && getComputedStyle(foot).display === 'none';
+    };
     await header();
     if (beforeEach) await beforeEach();
+    check(await page.evaluate(scrollHidden), `${name} desktop: scroll-to-bottom visible or focusable during review`);
     await shot(`${name}-desktop`);
     await page.setViewportSize({ width: 390, height: 844 });
     if (await page.locator('.code-review__tab-bar').count()) await page.getByRole('button', { name: 'Diff', exact: true }).click();
     await header();
     if (beforeEach) await beforeEach();
+    check(await page.evaluate(scrollHidden), `${name} mobile: scroll-to-bottom visible or focusable during review`);
     await shot(`${name}-mobile`);
     await page.setViewportSize({ width: 1280, height: 900 });
   };
@@ -466,7 +667,11 @@ async function journey() {
     await proveFocusRing('#code-review-tree-toggle');
   };
   const select = async file => {
-    if (page.viewportSize().width < 721) await page.getByRole('button', { name: 'Files', exact: true }).click();
+    const focus = page.getByRole('button', { name: 'Exit focus mode', exact: true });
+    if (await focus.count() && await focus.isVisible()) await focus.click();
+    const expand = page.getByRole('button', { name: 'Expand file tree', exact: true });
+    if (await expand.count() && await expand.isVisible()) await expand.click();
+    if (page.viewportSize().width < 721) await page.locator('#code-review-panel').getByRole('button', { name: 'Files', exact: true }).click();
     await page.locator(`button.code-review__file[data-file-path="${file}"]`).click();
     await page.locator('button.code-review__hunk-header:not([disabled])').waitFor();
   };
@@ -532,7 +737,7 @@ async function journey() {
     page.on('console', message => { if (message.type() === 'error') report.errors.push(`console: ${message.text()}`); });
     await page.addInitScript(token => {
       localStorage.setItem('rpi-web-token', token); localStorage.setItem(`rpi-web-token:${location.host}`, token);
-      const Native = WebSocket, frames = { sent: [], received: [], allReceived: [], parseErrors: [], toasts: [], failNext: false, holdSnapshots: false, heldSnapshots: [] };
+      const Native = WebSocket, frames = { sent: [], received: [], allReceived: [], parseErrors: [], toasts: [], failNext: false, failSnapshots: 0, holdSnapshots: false, heldSnapshots: [], snapshotSendOwners: [] };
       class Traced extends Native {
         constructor(...args) {
           super(...args);
@@ -551,9 +756,16 @@ async function journey() {
         }
         send(raw) {
           const frame = JSON.parse(raw); frames.sent.push(frame);
+          if (frame.type === 'code_review_snapshot') frames.snapshotSendOwners.push({ id: frame.id, callback: window.__currentSendCallback ?? null });
           if (frames.failNext && frame.type === 'code_review_highlight') {
             frames.failNext = false;
             queueMicrotask(() => this.dispatchEvent(new MessageEvent('message', { data: JSON.stringify({ type: 'response', id: frame.id, command: frame.type, success: false, error: 'operations action failure', sessionId: frame.sessionId }) })));
+            return;
+          }
+          // INJECTED client fault: a non-not-open failure for this REAL poll id.
+          if (frames.failSnapshots > 0 && frame.type === 'code_review_snapshot') {
+            frames.failSnapshots -= 1;
+            queueMicrotask(() => this.dispatchEvent(new MessageEvent('message', { data: JSON.stringify({ type: 'response', id: frame.id, command: frame.type, success: false, error: 'injected client snapshot failure', sessionId: frame.sessionId }) })));
             return;
           }
           return super.send(raw);
@@ -566,6 +778,7 @@ async function journey() {
     await page.locator('#send-btn:not([disabled])').waitFor();
     await page.fill('#prompt-input', '/review HEAD'); await page.press('#prompt-input', 'Enter');
     await page.locator('#code-review-panel').waitFor(); await select(files.critical);
+    check(await page.evaluate(() => document.getElementById('prompt-input')?.value === ''), 'typed /review open did not consume the command draft — the command-origin contract broke');
     await page.locator('button.code-review__hunk-header').click();
     const language = page.getByLabel('Auto review reply language');
     check(await language.locator('option:checked').innerText() === '中文', '中文 not preselected');
@@ -671,7 +884,7 @@ async function journey() {
     const highlighted = painted.reviewFindings.filter(result => result.findings.length > 0);
     assert.equal(highlighted.length, 3, 'exactly three non-empty highlight identities');
     const empty = painted.reviewFindings.filter(result => result.findings.length === 0);
-    check(empty.some(result => result.identity.path === files.dirty) && empty.some(result => result.identity.path === files.preview), 'Highlight omitted a clean scoped hunk');
+    check(['added.txt', 'both.rs', 'kept.txt', 'loose.txt', files.dirty, files.preview].every(path => empty.some(result => result.identity.path === path)), 'Highlight omitted a clean scoped hunk');
     for (const result of painted.reviewFindings) {
       assert.deepEqual(Object.keys(result.identity).sort(), [...IDENTITY_KEYS].sort(), `${result.identity.path} identity fields`);
       assert.equal(result.identity.snapshotId, painted.snapshotId, `${result.identity.path} snapshot id`);
@@ -740,13 +953,43 @@ async function journey() {
     await terminal();
 
     phase = 'tldr';
-    await control('hold', 'tldr'); await mark();
+    let summaryGeneration = 0;
+    const expectedSummaryBatches = new Map();
+    const beginSummary = async () => {
+      const advanced = await control('tldr-generation');
+      summaryGeneration = advanced.generation;
+      await control('hold', 'tldr');
+      return summaryGeneration;
+    };
+    const awaitSummary = async (count, generation = summaryGeneration) => control('await', `tldr&count=${count}&generation=${generation}`);
+    const releaseOpenSummary = async generation => {
+      const open = (await control('state')).requests.filter(entry => entry.kind === 'tldr' && entry.generation === generation);
+      assert.ok(open.length >= 1, `summary generation ${generation} had no open request`);
+      for (const entry of open) {
+        await control('release', 'tldr&one=1');
+      }
+      expectedSummaryBatches.set(generation, open.length);
+    };
+    const releaseSummary = async () => {
+      const generation = summaryGeneration;
+      const expected = 5;
+      for (let batch = 1; batch <= expected; batch += 1) {
+        await control('await', `tldr&count=1&generation=${generation}&batch=${batch}`);
+        const seen = (await control('state')).requests.filter(entry => entry.kind === 'tldr' && entry.generation === generation).map(entry => entry.batch);
+        assert.deepEqual(seen, Array.from({ length: batch }, (_, index) => index + 1), `summary generation ${generation} batch ${batch} was not next`);
+        if (batch < expected) await control('hold', 'tldr');
+        await control('release', 'tldr&one=1');
+      }
+      expectedSummaryBatches.set(generation, expected);
+    };
+    await mark();
+    const stoppedGeneration = await beginSummary();
     await page.locator('#code-review-tldr').click();
     await wait(command => window.__ops.received.some(frame => frame.success && frame.command === command && frame.data?.state === 'running' && typeof frame.data?.tldrGeneration === 'number'), 'TLDR start ack', 'code_review_tldr');
     await stateWait('tldrState', 'running');
     await page.locator('.code-review-tldr').waitFor();
     check(await page.locator('.code-review-tldr').getAttribute('data-tldr-state') === 'running', 'TLDR pane did not open running');
-    await control('await', 'tldr&count=1');
+    await awaitSummary(1, stoppedGeneration);
     await pairedShot('09-tldr-running', async () => {
       await requireActionToast('Highlight:');
       await requireSummaryHitTargets();
@@ -756,16 +999,19 @@ async function journey() {
     await page.locator('.code-review-tldr').getByRole('button', { name: 'Stop generating summary', exact: true }).click();
     await requireActionToast('Highlight:');
     await stateWait('tldrState', 'idle', tldrFrom);
-    await control('tldr-late'); await control('release', 'tldr');
+    await control('tldr-late');
+    await releaseOpenSummary(stoppedGeneration);
     const stoppedTldr = await barrier();
     assert.equal(stoppedTldr.tldrState, 'idle', 'late TLDR revived a stopped empty summary');
     assert.equal(stoppedTldr.tldrMarkdown, '', 'late TLDR snapshot painted markdown');
     const stoppedBody = (await page.locator('.code-review-tldr__body').innerText()).trim();
     check(stoppedBody === '', `stopped TLDR painted markdown: ${stoppedBody}`);
     check(!stoppedBody.includes('STALE-LATE-SNAPSHOT'), 'late TLDR marker painted over the empty same-snapshot summary');
-    await control('hold', 'tldr'); await mark();
+    await mark();
+    await beginSummary();
     await page.locator('#code-review-tldr').click();
-    await control('await', 'tldr&count=2'); await control('release', 'tldr'); await stateWait('tldrState', 'done');
+    await releaseSummary();
+    await stateWait('tldrState', 'done');
     const summary = page.locator('.code-review-tldr');
     await summary.waitFor();
     check(await summary.getAttribute('data-tldr-state') === 'done', 'TLDR did not settle done');
@@ -773,43 +1019,349 @@ async function journey() {
     check(await viewport.getAttribute('data-expanded') === 'true', 'TLDR did not open expanded');
     check(await summary.getByRole('button', { name: 'Collapse details', exact: true }).getAttribute('aria-expanded') === 'true', 'open TLDR control is not Collapse details');
     const openedText = await summary.locator('.code-review-tldr__body').innerText();
-    check(openedText.includes('PREVIEW-EXTRA') && openedText.includes('crit_one'), 'opened expanded markdown dropped the supplied detail');
+    const gitTruth = JSON.parse(fs.readFileSync(path.join(env.RPI_WORKSPACE, '../summary-git-truth.json'), 'utf8'));
+    const repoHeadings = await summary.locator('.code-review-tldr__body h2').evaluateAll(nodes => nodes.map(node => (node.textContent || '').trim()));
+    assert.deepEqual(repoHeadings, gitTruth.labels, `summary repo headings: ${JSON.stringify(repoHeadings)}`);
+    check(openedText.includes(`origin/review-base ahead ${gitTruth.primary.ahead}`), 'summary ahead count is not git truth');
+    check(openedText.includes(gitTruth.primary.head) && openedText.includes(gitTruth.primary.origin), 'summary omitted pinned OIDs');
+    check(openedText.includes('no origin'), 'bare repo did not render no origin');
+    const stagedNeedle = `M both.rs ${gitTruth.both.staged}`;
+    const unstagedNeedle = `M both.rs ${gitTruth.both.unstaged}`;
+    if (stagedNeedle === unstagedNeedle) check(openedText.split(stagedNeedle).length - 1 >= 2, 'both.rs staged and unstaged counts collapsed');
+    else check(openedText.includes(stagedNeedle) && openedText.includes(unstagedNeedle), 'both.rs layer counts are not git numstat');
+    check(openedText.includes('work') && openedText.includes('index'), 'both.rs layer purposes missing');
+    check(openedText.includes(`A added.txt ${gitTruth.added}`) && openedText.includes(`D kept.txt ${gitTruth.deleted}`) && openedText.includes('R old-name.txt -> new-name.txt'), 'added deleted rename counts missing');
+    for (const name of ['left.txt', 'right.txt']) {
+      const spec = gitTruth.large.files[name];
+      check(openedText.includes(`M ${name} ${spec.numstat}`), `large ${name} numstat missing from the summary`);
+      check(openedText.includes(spec.token), `large ${name} patch-derived purpose missing from the summary`);
+    }
+    const layers = await summary.locator('.code-review-tldr__body').evaluate(node => {
+      const sections = { Commits: '', Staged: '', Unstaged: '' };
+      let repo = '';
+      let bucket = '';
+      for (const element of node.querySelectorAll('h2, h3, li, p')) {
+        const text = (element.textContent || '').trim();
+        if (element.tagName === 'H2') { repo = text; bucket = ''; continue; }
+        if (repo !== 'root0') continue;
+        if (element.tagName === 'H3') {
+          if (text === 'Commits') bucket = 'Commits';
+          else if (text === 'Staged' || text === 'Unstaged') bucket = text;
+          else if (text === 'Untracked') bucket = '';
+          continue;
+        }
+        if (bucket) sections[bucket] += `\n${element.textContent || ''}`;
+      }
+      return sections;
+    });
+    check(layers.Staged.includes(stagedNeedle), 'Staged section lacks the staged both.rs count');
+    check(layers.Unstaged.includes(unstagedNeedle), 'Unstaged section lacks the unstaged both.rs count');
+    check(layers.Staged.includes('pixel.png') && layers.Staged.includes('binary'), 'staged binary pixel.png missing');
+    check(layers.Commits.includes('pixel.png') && layers.Commits.includes('binary'), 'committed binary pixel.png missing');
+    check(openedText.includes('loose.txt'), 'untracked loose.txt missing');
     check((await viewport.evaluate(node => getComputedStyle(node).overflowY)) === 'auto', 'expanded TLDR viewport does not scroll');
-    await summary.locator('.md-mermaid-host svg, .md-mermaid-host--rendered svg').waitFor();
-    check(await summary.locator('.md-mermaid-error').count() === 0, 'Mermaid degraded to the source fallback');
     await summary.getByRole('button', { name: 'Collapse details', exact: true }).click();
     check(await viewport.getAttribute('data-expanded') === 'false', 'Collapse details did not clip');
     check((await viewport.evaluate(node => getComputedStyle(node).overflow)) === 'hidden', 'compact TLDR viewport is not clipped');
     const collapsedText = await summary.locator('.code-review-tldr__body').innerText();
-    check(collapsedText.includes('PREVIEW-EXTRA') && collapsedText.includes('crit_one') && collapsedText === openedText, 'collapse changed the markdown body');
+    check(collapsedText.includes('root0') && collapsedText === openedText, 'collapse changed the markdown body');
     await summary.getByRole('button', { name: 'Expand details', exact: true }).click();
     check(await viewport.getAttribute('data-expanded') === 'true', 'Expand details did not unclip');
     check((await viewport.evaluate(node => getComputedStyle(node).overflowY)) === 'auto', 'reexpand did not restore scroll');
     const reexpandedText = await summary.locator('.code-review-tldr__body').innerText();
-    check(reexpandedText.includes('PREVIEW-EXTRA') && reexpandedText.includes('crit_one') && reexpandedText === openedText, 'reexpand changed the markdown body');
-    await summary.locator('.md-mermaid-host svg, .md-mermaid-host--rendered svg').waitFor();
-    check(await summary.locator('.md-mermaid-error').count() === 0, 'Mermaid missing after reexpand');
-    await pairedShot('09-tldr-expanded', async () => {
+    check(reexpandedText.includes(gitTruth.primary.head) && reexpandedText === openedText, 'reexpand changed the markdown body');
+    const showLayer = async (title, needle) => {
       if (await page.locator('.code-review-tldr__viewport[data-expanded="false"]').count()) {
         await page.locator('.code-review-tldr').getByRole('button', { name: 'Expand details', exact: true }).click();
       }
-    });
+      const visible = await page.locator('.code-review-tldr__viewport').evaluate((node, target) => {
+        const heading = [...node.querySelectorAll('h3')].find(element => (element.textContent || '').trim() === target.title);
+        let cursor = heading ? heading.nextElementSibling : null;
+        let row = null;
+        while (cursor && cursor.tagName !== 'H2' && cursor.tagName !== 'H3') {
+          row = [...cursor.querySelectorAll('li, p')].find(element => (element.textContent || '').includes(target.needle)) || ((cursor.textContent || '').includes(target.needle) ? cursor : null);
+          if (row) break;
+          cursor = cursor.nextElementSibling;
+        }
+        if (!row) return false;
+        row.scrollIntoView({ block: 'center' });
+        const box = row.getBoundingClientRect();
+        const frame = node.getBoundingClientRect();
+        return box.height > 0 && box.top >= 0 && box.bottom <= window.innerHeight && box.top < frame.bottom && box.bottom > frame.top;
+      }, { title, needle });
+      check(visible, `${title} ${needle} is outside the visible frame`);
+    };
+    await pairedShot('09-tldr-staged', () => showLayer('Staged', stagedNeedle));
+    await pairedShot('09-tldr-unstaged', () => showLayer('Unstaged', unstagedNeedle));
     const goodMarkdown = (await barrier()).tldrMarkdown;
-    check(goodMarkdown.includes('Pinned diff changes'), 'done TLDR lost the overview');
-    await control('hold', 'tldr'); await control('tldr-late'); await mark();
+    check(goodMarkdown.includes('## root0') && goodMarkdown.includes(gitTruth.primary.head), 'done TLDR lost the host inventory');
+    const finalState = await control('state');
+    const doneRequests = finalState.requests.filter(entry => entry.kind === 'tldr' && entry.generation === summaryGeneration);
+    assert.equal(doneRequests.length, 5, `done generation batches: ${doneRequests.map(entry => entry.batch)}`);
+    assert.deepEqual(doneRequests.map(entry => entry.batch), [1, 2, 3, 4, 5], 'done generation batch order');
+    for (const entry of doneRequests) check(entry.promptBytes < 2 * 1024 * 1024, `batch ${entry.batch} prompt ${entry.promptBytes} exceeds 2 MiB`);
+    const largeSeen = doneRequests.flatMap(entry => entry.large);
+    assert.deepEqual(largeSeen.map(record => `${record.repo}\0${record.kind}\0${record.path}`).sort(), ['root0/big\0unstaged\0left.txt', 'root0/big\0unstaged\0right.txt'], 'done generation large file/status keys');
+    for (const record of largeSeen) {
+      const spec = gitTruth.large.files[record.path];
+      assert.equal(record.patchBytes, spec.patchBytes, `${record.path} exact patch bytes across batches`);
+      assert.equal(record.patchSha256, spec.patchSha256, `${record.path} exact patch sha256 across batches`);
+    }
+    assert.ok(largeSeen.reduce((sum, record) => sum + record.patchBytes, 0) > 2 * 1024 * 1024, 'cumulative large patch bytes did not exceed 2 MiB');
+    const largePrompts = doneRequests.filter(entry => entry.large.length > 0);
+    assert.equal(largePrompts.length, 2, 'large records were not split into two batches');
+    assert.ok(largePrompts[0].promptBytes > 1100000 && largePrompts[1].promptBytes > 1100000, 'large batch prompts are not full');
+    assert.notEqual(largePrompts[0].promptSha256, largePrompts[1].promptSha256, 'large batch prompts are identical');
+    assert.ok(largePrompts.reduce((sum, entry) => sum + entry.promptBytes, 0) > 2 * 1024 * 1024, 'large batch prompt bytes did not total over 2 MiB');
+    const stoppedRequests = finalState.requests.filter(entry => entry.kind === 'tldr' && entry.generation === stoppedGeneration);
+    check(stoppedRequests.length >= 1 && stoppedRequests.every(entry => entry.large.length === 0), 'stopped generation counted large records');
+    const startedBatches = [...fs.readFileSync(path.join(evidence, 'rpi.stderr'), 'utf8').matchAll(/summary_batch category=start batch=(\d+)\/(\d+) designated_keys=\d+ estimated_input_bytes=(\d+)/g)].map(match => ({ batch: Number(match[1]), total: Number(match[2]), bytes: Number(match[3]) }));
+    const finalStarts = startedBatches.slice(-5);
+    assert.equal(finalStarts.length, 5, `summary start lines: ${JSON.stringify(startedBatches)}`);
+    finalStarts.forEach((line, index) => {
+      assert.equal(line.batch, index + 1, `stderr batch ${index + 1}`);
+      assert.equal(line.total, 5, `stderr batch total ${line.total}`);
+      assert.equal(line.bytes, doneRequests[index].promptBytes, `stderr batch ${index + 1} estimated_input_bytes`);
+    });
+    await mark();
+    const lateGeneration = await beginSummary();
+    await control('tldr-late');
     await page.locator('#code-review-tldr').click();
     await stateWait('tldrState', 'running');
-    await control('await', 'tldr&count=3');
+    await awaitSummary(1, lateGeneration);
     const lateFrom = (await capture()).received.length;
     await page.locator('#code-review-tldr').click();
     await stateWait('tldrState', 'done', lateFrom);
-    await control('release', 'tldr');
+    await releaseOpenSummary(lateGeneration);
     const afterLate = await barrier();
     assert.equal(afterLate.tldrMarkdown, goodMarkdown, 'late TLDR replaced the last-good snapshot');
     assert.equal(afterLate.tldrState, 'done', 'late TLDR changed the settled state');
     check(!(await page.locator('.code-review-tldr__body').innerText()).includes('STALE-LATE-SNAPSHOT'), 'stale TLDR body painted');
-    await page.locator('.code-review-tldr').getByRole('button', { name: 'Close summary', exact: true }).click();
-    await page.locator('.code-review-tldr').waitFor({ state: 'detached' });
+    await mark();
+    const malformedGeneration = await beginSummary();
+    await control('tldr-malformed');
+    await page.locator('#code-review-tldr').click();
+    await awaitSummary(1, malformedGeneration);
+    await releaseOpenSummary(malformedGeneration);
+    await stateWait('tldrState', 'failed');
+    const afterMalformed = await barrier();
+    assert.equal(afterMalformed.tldrMarkdown, goodMarkdown, 'malformed purpose replaced last-good');
+    check((await page.locator('.code-review-tldr__body').innerText()).includes(gitTruth.primary.head), 'malformed purpose changed the visible last-good');
+    check(!(await page.locator('.code-review-tldr__body').innerText()).includes('"extra"'), 'malformed JSON painted');
+    const purposeToast = page.locator('#toasts .toast--error').filter({ hasText: 'purpose JSON rejected' }).filter({ hasText: 'unknown field' }).filter({ hasText: 'repositories' }).filter({ hasText: 'changes' });
+    await purposeToast.waitFor();
+    check(await purposeToast.count() === 1, 'malformed purpose did not emit exactly one purpose JSON rejection toast');
+    await purposeToast.click();
+    await purposeToast.waitFor({ state: 'detached' });
+    check(await page.locator('#toasts .toast--error').filter({ hasText: 'purpose JSON rejected' }).count() === 0, 'malformed purpose toast remained after dismiss');
+    const waitFor = async (target, fn, label, timeoutMs = 30000, arg) => {
+      try { await target.waitForFunction(fn, arg, { timeout: timeoutMs }); }
+      catch (error) { throw new Error(`${phase}: ${label}; ${error.message}`); }
+    };
+    const highlightToast = page.locator('#toasts .toast--error').filter({ hasText: 'Highlight:' });
+    while (await highlightToast.count()) {
+      await highlightToast.first().click();
+      await highlightToast.first().waitFor({ state: 'detached' });
+    }
+    check(await page.locator('#toasts .toast--error').filter({ hasText: 'Highlight:' }).count() === 0, 'asserted Highlight toast remained before the clean summary');
+
+    const selectMockTwo = async () => {
+      const model = page.getByLabel('Review reply model');
+      await model.waitFor();
+      const selected = await model.evaluate(el => el.selectedOptions[0]?.textContent ?? '');
+      if (selected === 'Steering Mock Two') return;
+      const acksBefore = (await capture()).received.filter(frame => frame.command === 'code_review_set_model' && frame.success).length;
+      await model.selectOption({ label: 'Steering Mock Two' });
+      await wait(acksBefore => window.__ops.received.filter(frame => frame.command === 'code_review_set_model' && frame.success).length > acksBefore, 'reopened review model ack', acksBefore);
+      const switched = await model.evaluate(el => ({ value: el.value, label: el.selectedOptions[0]?.textContent ?? '' }));
+      check(switched.label === 'Steering Mock Two', `reopened review model wrong: ${JSON.stringify(switched)}`);
+    };
+    const seedSummary = async () => {
+      if (await page.locator('#code-review-panel').count() === 0) {
+        await page.fill('#prompt-input', '/review HEAD');
+        await page.press('#prompt-input', 'Enter');
+        await page.locator('#code-review-panel').waitFor();
+      }
+      await selectMockTwo();
+      await mark();
+      await beginSummary();
+      await page.locator('#code-review-tldr').click();
+      await awaitSummary(1);
+      await releaseSummary();
+      await stateWait('tldrState', 'done');
+      const body = page.locator('.code-review-tldr__body');
+      await body.filter({ hasText: gitTruth.primary.head }).waitFor();
+      const seedText = await body.innerText();
+      check(seedText.includes(gitTruth.primary.head), 'fresh summary OID was not visible before the session switch');
+      for (const name of ['left.txt', 'right.txt']) {
+        check(seedText.includes(gitTruth.large.files[name].token), `${page.viewportSize().width}: large ${name} purpose missing from the fresh summary`);
+      }
+      check(await page.locator('.code-review-tldr').getAttribute('data-tldr-state') === 'done', 'fresh summary was not ready before the session switch');
+    };
+    const assertChromeWhileSummaryOpen = async () => {
+      const review = await page.locator('#code-review-panel').evaluate(node => {
+        const box = node.getBoundingClientRect();
+        const style = getComputedStyle(node);
+        const root = getComputedStyle(document.documentElement);
+        const px = name => {
+          const raw = root.getPropertyValue(name).trim();
+          const value = Number.parseFloat(raw);
+          return raw.endsWith('px') && Number.isFinite(value) ? value : null;
+        };
+        return {
+          top: box.top,
+          left: box.left,
+          right: box.right,
+          bottom: box.bottom,
+          height: box.height,
+          cssTop: style.top,
+          cssBottom: style.bottom,
+          cssHeight: style.height,
+          headerHeight: px('--app-header-height'),
+          footerHeight: px('--app-footer-height'),
+          viewportWidth: window.innerWidth,
+          viewportHeight: window.innerHeight,
+        };
+      });
+      const footerTop = review.footerHeight === null ? null : review.viewportHeight - review.footerHeight;
+      check(!(review.top <= 1 && review.bottom >= review.viewportHeight - 1 && review.cssTop === '0px' && (review.cssBottom === '0px' || review.cssHeight === '100dvh' || review.height >= review.viewportHeight - 1)), `review still uses the old full-viewport inset (${JSON.stringify(review)})`);
+      check(review.headerHeight !== null && Math.abs(review.top - review.headerHeight) <= 1, `review top ${review.top} is not the header bottom ${review.headerHeight}`);
+      check(footerTop !== null && Math.abs(review.bottom - footerTop) <= 1, `review bottom ${review.bottom} is not the footer top ${footerTop}`);
+      check(review.height < review.viewportHeight - 1 && review.cssHeight !== '100dvh', `review height still covers the viewport (${review.cssHeight}, box ${review.height})`);
+      const targets = [
+        ['header', 'header'],
+        ['feature menu trigger', '#feature-menu-btn'],
+      ];
+      for (const [label, selector] of targets) {
+        const hit = await page.locator(selector).evaluate(node => {
+          const box = node.getBoundingClientRect();
+          const style = getComputedStyle(node);
+          const x = Math.min(Math.max(box.left + Math.min(box.width / 2, 8), 0), window.innerWidth - 1);
+          const y = Math.min(Math.max(box.top + box.height / 2, 0), window.innerHeight - 1);
+          const top = document.elementFromPoint(x, y);
+          return {
+            width: box.width,
+            height: box.height,
+            visible: style.display !== 'none' && style.visibility !== 'hidden' && Number.parseFloat(style.opacity || '1') > 0 && box.width > 0 && box.height > 0 && box.bottom > 0 && box.top < window.innerHeight,
+            interactable: top === node || node.contains(top),
+          };
+        });
+        check(hit.visible && hit.interactable, `${label} is not visible and interactable while summary is open: ${JSON.stringify(hit)}`);
+      }
+      const footerState = await page.evaluate(() => {
+        const f = document.querySelector('.app-main > footer');
+        if (!f) return null;
+        const cs = getComputedStyle(f);
+        return {
+          display: cs.display,
+          heightVar: Number.parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--app-footer-height')) || 0,
+          rectH: f.getBoundingClientRect().height,
+        };
+      });
+      check(footerState !== null && footerState.display === 'none' && footerState.heightVar === 0, `composer footer must be WHOLE-hidden at 0px while review is open: ${JSON.stringify(footerState)}`);
+      await page.evaluate(() => { document.body.tabIndex = -1; document.body.focus(); });
+      for (let i = 0; i < 40; i++) {
+        await page.keyboard.press('Tab');
+        const landed = await page.evaluate(() => {
+          const footer = document.querySelector('.app-main > footer');
+          return { inside: footer !== null && footer.contains(document.activeElement), id: document.activeElement?.id || document.activeElement?.tagName || '' };
+        });
+        check(!landed.inside, `Tab ${i + 1} focus entered the hidden composer footer (${landed.id}) — display:none must keep it out of the tab order at EVERY step, not just the last`);
+      }
+    };
+    const ensureSidebarOpen = async () => {
+      const open = await page.evaluate(() => document.querySelector('.app-layout')?.classList.contains('app-layout--drawer-open') === true);
+      if (!open) await openSessionsDrawer(page);
+      await wait(() => {
+        const button = document.getElementById('sidebar-manage-btn');
+        const box = button?.getBoundingClientRect();
+        return document.querySelector('.app-layout')?.classList.contains('app-layout--drawer-open') === true && !!box && box.width > 0 && box.height > 0;
+      }, 'session sidebar did not open');
+    };
+    const clickSessionRow = async (sessionId, label, { summaryOpen = false } = {}) => {
+      const row = page.locator(`.session-sidebar__switch[data-session-id="${sessionId}"]`);
+      await row.waitFor({ state: 'visible' });
+      const hitCheck = () => row.evaluate(node => {
+        const box = node.getBoundingClientRect();
+        const x = box.left + Math.min(Math.max(box.width / 2, 1), box.width - 1);
+        const y = box.top + box.height / 2;
+        const top = document.elementFromPoint(x, y);
+        return {
+          width: box.width,
+          height: box.height,
+          interactable: top === node || node.contains(top),
+          top: top ? `${top.id || top.tagName}.${top.className || ''}` : null,
+        };
+      });
+      let hit = await hitCheck();
+      if (!hit.interactable) {
+        // Fullshell desktop legitimately covers the rail while the review is
+        // open — take the REAL ≤720 sessions drawer (z 50 above the panel);
+        // the review is never closed, so the ownership test stays alive.
+        const before = page.viewportSize();
+        await page.setViewportSize({ width: 390, height: 844 });
+        await openSessionsDrawer(page);
+        await wait(() => document.querySelector('.app-layout--drawer-open') !== null, `${label} sessions drawer did not open over the review`);
+        hit = await hitCheck();
+        await row.click();
+        await wait(() => document.querySelector('.app-layout--drawer-open') === null, `${label} drawer did not auto-close after the switch`);
+        await page.setViewportSize({ width: before.width, height: before.height });
+        return;
+      }
+      check(hit.width > 0 && hit.height > 0 && hit.interactable, `${label} session row is covered: ${JSON.stringify(hit)}`);
+      if (summaryOpen) {
+        check(await page.locator('#code-review-panel').count() === 1, `${label} review closed before the row click`);
+        check(await page.locator('.code-review-tldr').count() === 1, `${label} summary closed before the row click`);
+      }
+      await row.click();
+    };
+    await page.setViewportSize({ width: 1280, height: 900 });
+    if (await page.locator('#code-review-panel').count()) {
+      await page.getByRole('button', { name: 'Close code review panel', exact: true }).click();
+      await page.locator('#code-review-panel').waitFor({ state: 'detached' });
+    }
+    await ensureSidebarOpen();
+    const otherSession = await createFreshSessionViaManage(page, waitFor, 'summary switch target', { closePanel: false });
+    await page.getByRole('button', { name: 'Close session panel', exact: true }).click();
+    await page.locator('#session-panel').waitFor({ state: 'detached' });
+    await page.locator(`.session-sidebar__switch[data-session-id="${otherSession.beforeSessionId}"]`).click();
+    await wait(id => document.querySelector('.session-sidebar__row--active .session-sidebar__switch')?.dataset.sessionId === id, 'did not return to the summary session before the proof', otherSession.beforeSessionId);
+    for (const [width, height] of [[1280, 900], [390, 844]]) {
+      await page.setViewportSize({ width, height });
+      await seedSummary();
+      await assertChromeWhileSummaryOpen();
+      await showLayer('Staged', stagedNeedle);
+      check(await page.locator('#toasts .toast--error').count() === 0, `${width}: error toast painted before the clean staged shot`);
+      await shot(`summary-clean-staged-${width}`);
+      await showLayer('Unstaged', unstagedNeedle);
+      check(await page.locator('#toasts .toast--error').count() === 0, `${width}: error toast painted before the clean unstaged shot`);
+      await shot(`summary-clean-unstaged-${width}`);
+      const summaryOid = gitTruth.primary.head;
+      check(await page.locator('#code-review-panel').count() === 1, 'review closed before the session switch');
+      check(await page.locator('.code-review-tldr').count() === 1, 'summary closed before the session switch');
+      check(await page.locator('#session-panel').count() === 0, 'Manage Session opened before the direct row switch');
+      await ensureSidebarOpen();
+      await clickSessionRow(otherSession.sessionId, `${width} switch`, { summaryOpen: true });
+      await wait(id => document.querySelector('.session-sidebar__row--active .session-sidebar__switch')?.dataset.sessionId === id, 'direct session row did not switch', otherSession.sessionId);
+      check(await page.locator('.code-review-tldr').count() === 0, 'old summary stayed after session switch');
+      check(!(await page.locator('body').innerText()).includes(summaryOid), 'old summary OID painted after session switch');
+      await ensureSidebarOpen();
+      await page.locator(`.session-sidebar__switch[data-session-id="${otherSession.beforeSessionId}"]`).click();
+      await wait(id => document.querySelector('.session-sidebar__row--active .session-sidebar__switch')?.dataset.sessionId === id, 'session switch did not return', otherSession.beforeSessionId);
+      check(await page.locator('.code-review-tldr').count() === 0, 'old summary repainted after returning');
+    }
+    await page.setViewportSize({ width: 1280, height: 900 });
+    if (await page.locator('#code-review-panel').count() === 0) {
+      await page.fill('#prompt-input', '/review HEAD');
+      await page.press('#prompt-input', 'Enter');
+      await page.locator('#code-review-panel').waitFor();
+      await select(files.critical);
+    }
+    await selectMockTwo();
+    if (await page.locator('.code-review-tldr').count()) {
+      await page.locator('.code-review-tldr').getByRole('button', { name: 'Close summary', exact: true }).click();
+      await page.locator('.code-review-tldr').waitFor({ state: 'detached' });
+    }
     await terminal();
 
     phase = 'targeted-stop';
@@ -871,11 +1423,30 @@ async function journey() {
 
     phase = 'ack-gap';
     for (const [operation, ackCommand, ackField] of [['autoReview', 'code_review_auto_review', 'batchId'], ['highlight', 'code_review_highlight', 'highlightGeneration'], ['tldr', 'code_review_tldr', 'tldrGeneration']]) {
+      const frozen = await barrier();
+      const gapField = operation === 'autoReview' ? 'autoReviewState' : operation === 'highlight' ? 'highlightState' : 'tldrState';
+      const gapValue = operation === 'tldr' ? frozen.tldrState : operation === 'autoReview' ? 'failed' : 'idle';
       await holdSnapshots(); await mark();
-      await control('hold', operation === 'autoReview' ? 'triage' : operation);
-      const startsBefore = (await capture()).sent.filter(frame => frame.type === ackCommand).length;
+      // Arm an UNSETTLED flight of this panel before the ACK path exercises it.
+      await wait(() => (window.__ops.heldSnapshots || []).length > 0, 'an owned snapshot response is held before the ACK trigger');
+      let gapGeneration = null;
+      if (operation === 'tldr') {
+        gapGeneration = await beginSummary();
+        expectedSummaryBatches.set(gapGeneration, 1);
+        await control('hold', 'tldr'); // hold BEFORE the start: the Stop must cancel a real arrived request, not a pre-dispatch cancel
+      } else await control('hold', operation === 'autoReview' ? 'triage' : operation);
+      const beforeGap = await capture();
+      const startsBefore = beforeGap.sent.filter(frame => frame.type === ackCommand).length;
+      const closesBefore = beforeGap.sent.filter(frame => frame.type === 'code_review_close').length;
+      const heldSnapshotIds = beforeGap.heldSnapshots.map(raw => JSON.parse(raw).id); // frozen pre-ACK ids, sampled before the click
       await page.locator(operationButtonId(operation)).click();
       await wait(ackCommand => window.__ops.received.some(frame => frame.success && frame.command === ackCommand && frame.data?.state !== undefined), 'start ACK during the gap', ackCommand);
+      // ACK contract: releaseSnapshotFlight drops the pre-ACK join and issues exactly ONE fresh owned snapshot request.
+      await page.evaluate(() => new Promise(resolve => window.setTimeout(resolve, 0)));
+      const postAckSnapshotSends = (await capture()).sent.slice(beforeGap.sent.length).filter(frame => frame.type === 'code_review_snapshot');
+      assert.equal(postAckSnapshotSends.length, 1, `${operation} ACK issued ${postAckSnapshotSends.length} code_review_snapshot sends instead of exactly one fresh owned request`);
+      assert.ok(!heldSnapshotIds.includes(postAckSnapshotSends[0].id), `${operation} ACK reused a held pre-ACK snapshot request id instead of opening a fresh owned flight`);
+      if (operation === 'tldr') await control('await', `tldr&count=1&generation=${gapGeneration}&batch=1`); // event barrier: the real provider request has ENTERED before the Stop
       check((await page.locator(operationButtonId(operation)).getAttribute('class') || '').includes('code-review__action--stop'), `${operation} gap button is not Stop with snapshots held`);
       const ackFrames = (await capture()).received.filter(frame => frame.success && frame.command === ackCommand);
       assert.ok(ackFrames.some(frame => typeof frame.data[ackField] === 'number'), `${ackCommand} ACK carries no ${ackField} identity`);
@@ -884,16 +1455,17 @@ async function journey() {
         await page.locator(operationButtonId(operation)).click();
         await wait(({ stopsBefore, operation }) => window.__ops.sent.filter(frame => frame.type === 'code_review_stop').length > stopsBefore && window.__ops.sent.filter(frame => frame.type === 'code_review_stop').at(-1).operation === operation, 'second-click Stop frame', { stopsBefore, operation });
       } else {
-        await gapEscapeStop(operation);
+        await gapEscapeStop(operation, closesBefore);
       }
       const after = await capture();
-      assert.equal(after.sent.filter(frame => frame.type === 'code_review_close').length, 0, `${operation} gap closed the review`);
+      assert.equal(after.sent.filter(frame => frame.type === 'code_review_close').length, closesBefore, `${operation} gap closed the review`);
       assert.equal(after.sent.filter(frame => frame.type === ackCommand).length, startsBefore + 1, `${operation} gap issued a second start`);
       check(await page.locator(operationButtonId(operation)).evaluate(el => el.classList.contains('code-review__action--stop')), `${operation} gap lost the Stop chrome before release`);
       await releaseSnapshots();
-      const gapField = operation === 'autoReview' ? 'autoReviewState' : operation === 'highlight' ? 'highlightState' : 'tldrState';
-      const gapValue = operation === 'autoReview' ? 'failed' : operation === 'highlight' ? 'idle' : 'done';
       await wait(({ field, value }) => window.__ops.received.some(frame => frame.success === true && frame.data?.[field] === value), `${gapField}=${gapValue}`, { field: gapField, value: gapValue });
+      const settled = await barrier();
+      assert.equal(settled[gapField], gapValue, `${operation} gap did not restore the frozen state`);
+      if (operation === 'tldr') assert.equal(settled.tldrMarkdown, frozen.tldrMarkdown, 'tldr gap replaced the frozen summary');
       await control('release', operation === 'autoReview' ? 'triage' : operation);
       await terminal();
     }
@@ -906,10 +1478,12 @@ async function journey() {
     await terminal();
     await pairedShot('06-action-toast', async () => {
       await requireActionToast();
-      await requireSummaryHitTargets();
+      if (await page.locator('.code-review-tldr').count()) await requireSummaryHitTargets();
     });
-    await page.locator('.code-review-tldr').getByRole('button', { name: 'Close summary', exact: true }).click();
-    await page.locator('.code-review-tldr').waitFor({ state: 'detached' });
+    if (await page.locator('.code-review-tldr').count()) {
+      await page.locator('.code-review-tldr').getByRole('button', { name: 'Close summary', exact: true }).click();
+      await page.locator('.code-review-tldr').waitFor({ state: 'detached' });
+    }
     await requireActionToast();
 
     phase = 'reopen-cycle';
@@ -918,6 +1492,12 @@ async function journey() {
       const receivedBefore = (await capture()).received.length;
       await page.getByRole('button', { name: 'Close code review panel', exact: true }).click();
       await page.locator('#code-review-panel').waitFor({ state: 'detached' });
+      await wait(() => document.activeElement?.id === 'prompt-input'
+        && getComputedStyle(document.querySelector('.app-main > footer')).display !== 'none'
+        && (Number.parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--app-footer-height')) || 0) > 0
+        && getComputedStyle(document.querySelector('.transcript-scrollport')).visibility === 'visible'
+        && (document.querySelector('button.transcript-scroll-bottom')?.getBoundingClientRect().width || 0) >= 44,
+      `review close ${cycle} did not restore the footer, prompt focus, and scroll-to-bottom layout`);
       await page.fill('#prompt-input', '/review HEAD'); await page.press('#prompt-input', 'Enter');
       await page.locator('#code-review-panel').waitFor();
       await openHunk(files.critical);
@@ -941,6 +1521,7 @@ async function journey() {
       await page.setViewportSize({ width: 1280, height: 900 });
       await header();
     }
+    await selectMockTwo();
     for (const [name, viewport] of [['desktop', { width: 1280, height: 900 }], ['mobile', { width: 390, height: 844 }]]) {
       phase = `${name}-surface`; await page.setViewportSize(viewport); await header(); await select(files.preview);
       await page.getByRole('button', { name: 'Preview', exact: true }).click();
@@ -991,18 +1572,25 @@ async function journey() {
     assert.equal(kinds.filter(kind => kind === 'triage').length, 4, 'final triage request count');
     assert.equal(kinds.filter(kind => kind === 'auto').length, 4, 'auto findings request count');
     assert.equal(kinds.filter(kind => kind === 'highlight').length, 4, 'highlight request count');
-    assert.equal(kinds.filter(kind => kind === 'tldr').length, 4, 'tldr request count');
+    const summaryRequests = report.provider.requests.filter(entry => entry.kind === 'tldr');
+    const generations = [...new Set(summaryRequests.map(entry => entry.generation))].sort((left, right) => left - right);
+    assert.deepEqual(generations, [...expectedSummaryBatches.keys()].sort((left, right) => left - right), 'summary generations differ from the journey record');
+    for (const generation of generations) {
+      const batches = summaryRequests.filter(entry => entry.generation === generation).map(entry => entry.batch);
+      const expected = expectedSummaryBatches.get(generation);
+      assert.deepEqual(batches, Array.from({ length: expected }, (_, index) => index + 1), `summary generation ${generation} batches were not ${expected}`);
+    }
     assert.equal(kinds.filter(kind => kind === 'comment').length, 2, 'accepted comment reply count');
     assert.equal(report.provider.released.length, report.provider.held.length, 'unreleased held model requests');
     const autoTargets = report.provider.requests.filter(entry => entry.kind === 'auto').map(entry => entry.target);
     check(autoTargets.every(target => target === files.critical || target === files.overdesign), `auto scoped an unselected hunk: ${JSON.stringify(autoTargets)}`);
-    check(report.provider.requests.filter(entry => entry.kind === 'highlight').every(entry => entry.scope.length === 5), 'highlight scope was not the full fixture');
+    check(report.provider.requests.filter(entry => entry.kind === 'highlight').every(entry => entry.scope.length === 9), 'highlight scope was not the full fixture');
     check(report.provider.requests.every(entry => entry.model === 'mock-2'), 'model picker did not reach provider boundary');
     assert.equal(frames.sent.filter(frame => frame.type === 'code_review_comment').length, 2, 'accepted same-hunk comment count');
     assert.deepEqual(frames.sent.filter(frame => frame.type === 'code_review_stop').map(frame => frame.operation), ['tldr', 'tldr', 'autoReview', 'highlight', 'autoReview', 'highlight', 'tldr'], 'exact targeted and gap stop frames');
     assert.equal(frames.sent.filter(frame => frame.type === 'code_review_auto_review').length, 4, 'auto click count');
     assert.equal(frames.sent.filter(frame => frame.type === 'code_review_highlight').length, 5, 'highlight click count');
-    assert.equal(frames.sent.filter(frame => frame.type === 'code_review_tldr').length, 4, 'tldr click count');
+    assert.equal(frames.sent.filter(frame => frame.type === 'code_review_tldr').length, 7, 'tldr click count');
     for (const [operation, field, expected, startCommand] of [['autoReview', 'autoReviewState', 'failed', 'code_review_auto_review'], ['highlight', 'highlightState', 'idle', 'code_review_highlight']]) {
       const ackIndex = frames.allReceived.findIndex(frame => frame.command === 'code_review_stop' && frame.success && frame.data?.operation === operation);
       check(ackIndex >= 0, `${operation} stop acknowledgement absent`);
@@ -1018,7 +1606,201 @@ async function journey() {
     const lateToasts = frames.toasts.slice(toastBefore);
     check(lateToasts.length === 1 && lateToasts.every(text => text.includes('operations action failure')), `final capture added ${JSON.stringify(lateToasts)} instead of exactly one operations action failure toast`);
     await terminal();
-    report.frames = { sent: frames.sent.length, received: frames.allReceived.length, stops: 7, autoReview: 4, highlight: 5, tldr: 4, comment: 2 };
+    // ---- PRESERVE LEG (desktop first; mobile after the product GO): a
+    // non-empty main draft + a REAL attachment chip must survive the REAL
+    // Files right-click review route (a surface open is not a command
+    // submit). Actual close order: review × first (footer must stay hidden
+    // under the open Files drawer), then Files close → main visible; the
+    // exact draft, chip identity, autofocus, and a keyboard suffix are
+    // asserted BEFORE any fill/focus. Surface origin preserves the draft
+    // (the typed /review command origin consumes it — asserted at bootstrap).
+    for (const [preserveName, preserveViewport] of [['desktop', { width: 1280, height: 900 }], ['mobile', { width: 390, height: 844 }]]) {
+      phase = `${preserveName}-preserve`;
+      await page.setViewportSize(preserveViewport);
+      await waitFor(page, (size) => window.innerWidth === size.width && window.innerHeight === size.height, 'preserve viewport did not settle', 10000, preserveViewport);
+    if (await page.locator('#code-review-panel').count()) {
+      await page.getByRole('button', { name: 'Close code review panel', exact: true }).click();
+      await page.locator('#code-review-panel').waitFor({ state: 'detached' });
+    }
+    const preserveDraft = 'unrelated preserve draft line';
+    await page.fill('#prompt-input', preserveDraft);
+    const [preserveChooser] = await Promise.all([page.waitForEvent('filechooser'), page.locator('#attach-btn').click()]);
+    await preserveChooser.setFiles(attachPath);
+    await wait((want) => (document.querySelector('#composer-attachments .composer-attachment__name')?.textContent || '').trim() === want, 'preserve: main composer attachment chip missing', attachFile);
+    const preserveToggle = () => clickFeature(page, '#file-explorer-toggle-btn');
+    await preserveToggle();
+    await page.locator('section.file-explorer').waitFor();
+    const clickRow = page.locator('button.file-explorer__row--dir').first();
+    const clickBox = await clickRow.boundingBox();
+    const clickHit = await clickRow.evaluate(node => {
+      const r = node.getBoundingClientRect();
+      const top = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+      return { isSelf: top === node || node.contains(top), topCls: typeof top?.className === 'string' ? top.className : '' };
+    });
+    if (!clickHit.isSelf) fail(`preserve: the first dir row is not its own hit target before the right-click: ${JSON.stringify({ clickBox, clickHit })}`);
+    await clickRow.click({ button: 'right' });
+    await page.locator('[data-testid="file-explorer-review-dialog"]').waitFor();
+    await page.getByRole('button', { name: 'Review', exact: true }).click();
+    await page.locator('#code-review-panel').waitFor();
+    await page.locator('#code-review-panel .code-review__head').waitFor();
+    await shot(`preserve-${preserveName}-review-open`);
+    await wait(() => document.querySelector('section.file-explorer') === null
+      && getComputedStyle(document.querySelector('.app-main > footer')).display === 'none',
+    'preserve: review open did not close Files (fullshell design) and hide the composer footer');
+    await page.getByRole('button', { name: 'Close code review panel', exact: true }).click();
+    await page.locator('#code-review-panel').waitFor({ state: 'detached' });
+    await wait(({ draft, chip }) => document.activeElement?.id === 'prompt-input'
+      && getComputedStyle(document.querySelector('.app-main > footer')).display !== 'none'
+      && document.getElementById('prompt-input')?.value === draft
+      && (document.querySelector('#composer-attachments .composer-attachment__name')?.textContent || '').trim() === chip,
+    'preserve: close did not restore footer/focus/exact draft/chip identity', { draft: preserveDraft, chip: attachFile }).catch(async () => {
+      const s = await page.evaluate(() => ({ len: document.getElementById('prompt-input')?.value.length ?? -1, focus: document.activeElement?.id === 'prompt-input', footer: getComputedStyle(document.querySelector('.app-main > footer')).display }));
+      throw new Error(`preserve: close-restore failed — draftLength=${s.len}/${preserveDraft.length} focus=${s.focus} footer=${s.footer}`);
+    });
+    await page.keyboard.type(' ok');
+    await wait((base) => document.getElementById('prompt-input')?.value === `${base} ok`, 'preserve: keyboard suffix did not land in the autofocused composer', preserveDraft);
+    await shot(`preserve-${preserveName}-close-restored`);
+    }
+    phase = 'snapshot-pressure';
+    // code_review_snapshot senders: CodeReviewPanel bootstrap/poll/probe; hold = CLIENT pending proof only.
+    const pressure = { firstHeldId: null, causalOwnerFound: false, baseline: null, tickCount: 0, txids: 0, responseIds: 0, maxPending: 0, filesList: '', failureSource: '', snapshotFailures: 0, errorToasts: 0, staleFailureToasts: 0 };
+    report.snapshotPressure = pressure;
+    const errorsAtStart = report.errors.length;
+    const toastsAtStart = (await capture()).toasts.length;
+    const respondId = async (action, type, label) => {
+      const at = (await capture()).sent.length;
+      await action();
+      await wait(({ at: savedAt, type }) => window.__ops.sent.slice(savedAt).some(frame => frame.type === type), `${label}: no new ${type} send`, { at, type });
+      const id = await page.evaluate(({ at, type }) => window.__ops.sent.slice(at).find(frame => frame.type === type)?.id || '', { at, type });
+      check(id !== '', `${label}: no new ${type} send observed`);
+      await wait(pid => window.__ops.received.some(frame => frame.id === pid && frame.success), label, id);
+      return id;
+    };
+    // Preserve-phase assertions already passed; clear their leftover attachment
+    // chips via the real remove buttons so the slash is not read as a prompt.
+    while (await page.locator('#composer-attachments .composer-attachment__remove').count()) {
+      await page.locator('#composer-attachments .composer-attachment__remove').first().click();
+    }
+    await wait(() => document.querySelector('#composer-attachments .composer-attachment') === null, 'composer attachment chips removed before the review open');
+    await page.evaluate(() => {
+      const Native = window.setTimeout;
+      window.__tickLog = [];
+      window.__currentSendCallback = null;
+      window.setTimeout = (fn, ms, ...rest) => (ms === 1500 || ms === 200)
+        ? Native(() => {
+            const previous = window.__currentSendCallback;
+            window.__currentSendCallback = fn;
+            try { window.__tickLog.push(fn); fn(); } finally { window.__currentSendCallback = previous; }
+          }, ms, ...rest)
+        : Native(fn, ms, ...rest);
+    });
+    await respondId(async () => {
+      await page.fill('#prompt-input', '/review HEAD'); await page.press('#prompt-input', 'Enter');
+    }, 'code_review_open', 'review open settled before the pressure hold');
+    const sentAtHold = (await capture()).sent.length;
+    await holdSnapshots();
+    await wait(() => window.__ops.heldSnapshots.some(raw => {
+      const id = JSON.parse(raw).id;
+      const owner = window.__ops.snapshotSendOwners.find(entry => entry.id === id);
+      return !!(owner && owner.callback);
+    }), 'first held owned snapshot response with a causal poll-tick owner');
+    const bound = await page.evaluate(() => {
+      for (const raw of window.__ops.heldSnapshots) {
+        const id = JSON.parse(raw).id;
+        const owner = window.__ops.snapshotSendOwners.find(entry => entry.id === id);
+        if (owner && owner.callback) {
+          window.__pressurePollFn = owner.callback;
+          window.__pressurePollFires = window.__tickLog.filter(fn => fn === owner.callback).length;
+          return { id, found: true, fires: window.__pressurePollFires, sent: window.__ops.sent.length };
+        }
+      }
+      return { id: null, found: false, fires: 0, sent: window.__ops.sent.length };
+    });
+    pressure.firstHeldId = bound.id;
+    pressure.causalOwnerFound = bound.found;
+    pressure.baseline = bound.sent;
+    pressure.tickCount = bound.fires;
+    report.snapshotPressure = pressure;
+    check(bound.found && bound.id, 'no held response with a causal poll-tick owner — scenario not armed');
+    const afterFirstHeldSent = pressure.baseline;
+    await wait(() => window.__tickLog.filter(fn => fn === window.__pressurePollFn).length >= window.__pressurePollFires + 2, 'two more real poll-loop tick firings (causally owned callback)');
+    pressure.tickCount = await page.evaluate(() => window.__tickLog.filter(fn => fn === window.__pressurePollFn).length);
+    report.snapshotPressure = pressure;
+    const held = await page.evaluate(({ at, from }) => ({
+      heldIds: window.__ops.heldSnapshots.map(raw => JSON.parse(raw).id),
+      ownedSends: window.__ops.sent.slice(at).filter(frame => frame.type === 'code_review_snapshot').length,
+      tailSends: window.__ops.sent.slice(from).filter(frame => frame.type === 'code_review_snapshot').length,
+    }), { at: sentAtHold, from: afterFirstHeldSent });
+    pressure.txids = held.ownedSends; pressure.responseIds = held.heldIds.length; pressure.maxPending = held.heldIds.length;
+    report.snapshotPressure = pressure;
+    check(held.heldIds.length >= 1, 'hold never captured an owned snapshot response — scenario not armed');
+    check(held.tailSends === 0, `singleflight broke: ${held.tailSends} duplicate owned code_review_snapshot sends after the first held response across >=2 causally-owned poll ticks (same owner/revision — any callback counts, must be 0)`);
+    check(held.heldIds.length < 16, `client pending reached ${held.heldIds.length} unresolved owned snapshots (client-side bound; backend 16-slot saturation not claimed)`);
+    await page.getByRole('button', { name: 'Close code review panel', exact: true }).click();
+    await page.locator('#code-review-panel').waitFor({ state: 'detached' });
+    await clickFeature(page, '#file-explorer-toggle-btn');
+    await page.locator('section.file-explorer').waitFor();
+    await respondId(() => page.locator('button.file-explorer__row--dir').first().click(), 'file_explorer_list', 'Files list RPC succeeded while snapshot responses stayed held');
+    pressure.filesList = 'file_explorer_list';
+    report.snapshotPressure = pressure;
+    await clickFeature(page, '#file-explorer-toggle-btn');
+    await wait(() => document.querySelector('section.file-explorer') === null, 'Files closed before the review remount');
+    const sentBeforeRemount = (await capture()).sent.length;
+    await respondId(async () => {
+      await page.fill('#prompt-input', '/review HEAD'); await page.press('#prompt-input', 'Enter');
+    }, 'code_review_open', 'remount open settled while the old flight is still held');
+    await page.locator('#code-review-panel .code-review__head').waitFor();
+    // The unmounted owner's request stays UNSETTLED; the new mount owns its flight.
+    await wait(({ at, old }) => window.__ops.sent.slice(at).some(frame => frame.type === 'code_review_snapshot' && !old.includes(frame.id)
+      && window.__ops.heldSnapshots.some(raw => JSON.parse(raw).id === frame.id)), 'new-epoch snapshot request and its held response while the old request stays pending', { at: sentBeforeRemount, old: held.heldIds });
+    const remount = await capture();
+    const newEpochId = (remount.heldSnapshots || []).map(raw => JSON.parse(raw).id).find(id => !held.heldIds.includes(id)) ?? '';
+    check(newEpochId !== '' && !held.heldIds.includes(newEpochId), 'new epoch reused the unmounted owner request id');
+    const remountSnapshotFails = remount.received.filter(frame => frame.command === 'code_review_snapshot' && frame.success === false).length;
+    check(remountSnapshotFails === 0, `remount produced ${remountSnapshotFails} failed owned snapshots`);
+    // Release ONLY the new epoch's response; the old frame stays undelivered.
+    const releasedNew = await page.evaluate(old => {
+      window.__ops.holdSnapshots = false;
+      const heldFrames = window.__ops.heldSnapshots || [];
+      window.__ops.heldSnapshots = [];
+      let dispatched = 0;
+      for (const raw of heldFrames) if (!old.includes(JSON.parse(raw).id)) { dispatched += 1; window.__opsSocket.dispatchEvent(new MessageEvent('message', { data: raw })); }
+      return dispatched;
+    }, held.heldIds);
+    check(releasedNew >= 1, 'no independent new-epoch response was held to release');
+    await wait(id => window.__ops.received.some(frame => frame.id === id && frame.success === true), 'new-epoch flight settled on its own response while the old request stays pending', newEpochId);
+    const remounted = await capture();
+    check(!remounted.received.some(frame => held.heldIds.includes(frame.id)), 'a response for the unmounted owner was delivered before its single failure release');
+    check(remounted.toasts.length === toastsAtStart, `settling the new epoch while the unmounted owner stayed pending leaked ${remounted.toasts.length - toastsAtStart} user-visible errors`);
+    const projection = () => page.evaluate(() => { const panel = document.querySelector('#code-review-panel'); return panel === null ? null : { label: panel.querySelector('.code-review__label')?.textContent?.trim() ?? '', totals: panel.querySelector('.code-review__totals')?.textContent?.trim() ?? '', files: panel.querySelectorAll('button.code-review__file').length }; });
+    const lastGoodProjection = await projection();
+    // Exactly ONE release for the old id, and it is a FAILURE (still pending).
+    const staleSend = remounted.sent.find(frame => frame.id === held.heldIds[0]);
+    check(staleSend !== undefined, 'the unmounted request id is absent from the sent log');
+    await page.evaluate(({ id, sessionId }) => {
+      window.__opsSocket.dispatchEvent(new MessageEvent('message', { data: JSON.stringify({ type: 'response', id, command: 'code_review_snapshot', success: false, error: 'late unmounted-owner snapshot failure', sessionId }) }));
+    }, { id: held.heldIds[0], sessionId: staleSend.sessionId });
+    await wait(id => window.__ops.received.some(frame => frame.id === id && frame.success === false), 'the still-pending unmounted request failed exactly once', held.heldIds[0]);
+    const stale = await capture();
+    check(stale.received.filter(frame => frame.id === held.heldIds[0] && frame.success === false).length === 1, 'the unmounted request received more than one failure release');
+    check(!stale.received.some(frame => frame.id === held.heldIds[0] && frame.success === true), 'the unmounted request was settled with a success before its failure release');
+    pressure.staleFailureToasts = stale.toasts.length - toastsAtStart;
+    check(pressure.staleFailureToasts === 0, `a failure addressed to the unmounted owner's exact request id leaked ${pressure.staleFailureToasts} user-visible errors onto the new mount`);
+    assert.deepEqual(await projection(), lastGoodProjection, 'a failure addressed to the unmounted owner changed the new mount\'s last-good projection');
+    await mark();
+    const lastGoodInjected = await projection();
+    await page.evaluate(() => { window.__ops.failSnapshots = 3; });
+    await wait(count => window.__ops.received.filter(frame => frame.command === 'code_review_snapshot' && frame.success === false).length >= count, 'three injected failures answered for real live poll request ids', 3);
+    const failed = await capture();
+    const injected = failed.received.filter(frame => frame.command === 'code_review_snapshot' && frame.success === false);
+    check(injected.length >= 3 && injected.every(frame => failed.sent.some(sent => sent.type === 'code_review_snapshot' && sent.id === frame.id)), 'injected failures did not answer real sent poll request ids');
+    check(injected.every(frame => frame.data?.code !== 'code_review_not_open'), 'injected failure was the typed not-open recovery');
+    pressure.failureSource = 'client_fault_injection'; pressure.snapshotFailures = injected.length; pressure.errorToasts = failed.toasts.length - toastsAtStart;
+    report.snapshotPressure = pressure;
+    assert.deepEqual(await projection(), lastGoodInjected, 'injected snapshot failures changed the last-good workspace');
+    check(pressure.errorToasts === 1, `error ownership broke: ${pressure.errorToasts} user-visible error toasts across ${pressure.snapshotFailures} injected snapshot failures (exactly 1 per stretch)`);
+    check(await page.locator('#toasts .toast--error').count() === 1, 'visible error toast DOM count is not exactly 1');
+    check(report.errors.length === errorsAtStart, `unexpected console/pageerror during pressure: ${report.errors.slice(errorsAtStart).join(' | ')}`);
     report.status = 'PASSED';
   } catch (error) {
     report.status = 'FAILED';

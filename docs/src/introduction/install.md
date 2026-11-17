@@ -2,13 +2,15 @@
 
 The release archive contains the compiled `rpi` executable; ordinary installation does not require Rust or a source checkout.
 
-## Linux and macOS
+## Linux
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/0x8f701/rpi/master/install.sh | sh
 ```
 
-The installer selects x86-64 or AArch64 Linux/macOS assets, downloads the release archive, verifies it against `SHA256SUMS`, and activates the binary. Its ordinary install root is the user's `.rpi` directory, with `bin/rpi` selecting a versioned download. `RPI_HOME` overrides that install root.
+The installer selects x86-64 or AArch64 Linux assets, downloads the release archive, verifies it against `SHA256SUMS`, and activates the binary. Its ordinary install root is the user's `.rpi` directory, with `bin/rpi` selecting a versioned download. `RPI_HOME` overrides that install root.
+
+macOS CLI and desktop artifacts are temporarily unavailable from tagged releases.
 
 For reproducible installation, download an installer from a reviewed release tag and pass `--version` with that release version. Do not mix an unreviewed moving installer with a claim of fully pinned installation.
 
@@ -16,13 +18,7 @@ The Unix installer rejects unsupported operating systems/architectures and obsol
 
 ## Windows
 
-Use the repository's PowerShell installer:
-
-```powershell
-irm https://raw.githubusercontent.com/0x8f701/rpi/master/install.ps1 | iex
-```
-
-Windows does not provide the Linux/macOS confinement backends. Confined modes are rejected; `danger-full-access` runs with host authority. Read [sandbox confinement](../reference/sandbox-isolation.md) before running untrusted code.
+Windows artifacts are not published, so there is no release installation for Windows. Windows also does not provide the Linux/macOS confinement backends. Confined modes are rejected; `danger-full-access` runs with host authority. Read [sandbox confinement](../reference/sandbox-isolation.md) before running untrusted code.
 
 ## Verify and configure
 

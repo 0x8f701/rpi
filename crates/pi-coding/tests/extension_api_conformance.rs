@@ -100,7 +100,7 @@ fn session(project: &Path, model: &Model) -> Result<Session> {
     std::fs::create_dir_all(&session_dir)?;
     let session = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model: model.clone(),
+            model: Some(model.clone()),
             cwd: project.to_path_buf(),
             system_prompt: String::new(),
             thinking_level: pi_agent::ThinkingLevel::Off,

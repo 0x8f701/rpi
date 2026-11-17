@@ -12,6 +12,7 @@ import {
   applySessionEvent,
   applySessionSnapshot,
   dispatchComposerPrompt,
+  hasSettledReplyRow,
   mergeSessionHistory,
   registerPendingUser,
   removePendingUser,
@@ -27,6 +28,7 @@ import type { RunnerView } from '../src/chat/runners.ts';
 import type { RunnerCommand } from '../src/chat/protocol.ts';
 import type { EventFrame } from '../src/types.ts';
 import type { Item } from '../src/transcript.ts';
+import { messagesToItems } from '../src/transcript.ts';
 import { dispatchMarkdownPathClick, subscribeMarkdownOpenPath } from '../src/markdown.ts';
 import type { ComposerAttachment } from '../src/attachments.ts';
 import { rememberTmuxFileDestination } from '../src/tmuxFile.ts';
@@ -39,6 +41,44 @@ function check(name: string, condition: boolean, detail = ''): void {
   assertions += 1;
   if (!condition) failures.push(`${name}${detail ? `: ${detail}` : ''}`);
 }
+interface RawKeyEvent {
+  key: string;
+  ctrlKey: boolean;
+  metaKey: boolean;
+  altKey: boolean;
+  shiftKey: boolean;
+  isComposing: boolean;
+  keyCode: number;
+  preventDefault(): void;
+  stopPropagation(): void;
+}
+
+/** Shared composer textarea node fixture for every rtR mount: value/selection
+ *  state, setSelectionRange, and the recorded element-level CAPTURE keydown
+ *  listener the inline autocomplete installs. Every textarea ref in this file
+ *  must come from here so picker effects never meet a listener-less stub. */
+const makeComposerStub = () => {
+  const keyListeners: Array<(event: RawKeyEvent) => void> = [];
+  const stub = {
+    value: '',
+    selectionStart: 0,
+    selectionEnd: 0,
+    style: {} as Record<string, string>,
+    scrollTop: 0,
+    scrollHeight: 0,
+    clientHeight: 0,
+    focus() {},
+    setSelectionRange(start: number, end: number) {
+      stub.selectionStart = start;
+      stub.selectionEnd = end;
+    },
+    addEventListener(type: string, listener: (event: RawKeyEvent) => void) {
+      if (type === 'keydown') keyListeners.push(listener);
+    },
+    removeEventListener() {},
+  };
+  return { stub, keyListeners };
+};
 
 const project: ProjectRecord = {
   id: 'project-a',
@@ -1051,10 +1091,7 @@ const emptyTranscript = (): SessionTranscriptState => ({ items: [], activeAssist
         }
         await act(async () => {
           mounted = create(createElement(SessionView, { ...props, ...staleT }), {
-            createNodeMock: () => ({
-              scrollTop: 0, scrollHeight: 0, clientHeight: 0,
-              value: '', style: {}, focus() {},
-            }),
+            createNodeMock: () => makeComposerStub().stub,
           });
         });
         check(`${schedule}: mount has no transcript load error`,
@@ -1094,6 +1131,377 @@ const emptyTranscript = (): SessionTranscriptState => ({ items: [], activeAssist
   } finally {
     if (previousWindow) Object.defineProperty(globalThis, 'window', previousWindow);
     else Reflect.deleteProperty(globalThis, 'window');
+  }
+}
+
+// ---- settled refill component policy: stale drops silent, real errors reported ----
+// Exercises the REAL component callback through the existing TeamStore harness:
+// T1 pending → response after T2 start / epoch bump is rejected (silent), the
+// clean path hydrates, and a parse failure reaches the central sink.
+{
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    value: {
+      setTimeout: globalThis.setTimeout,
+      clearTimeout: globalThis.clearTimeout,
+      getComputedStyle: () => ({ lineHeight: '20px', paddingTop: '0px', paddingBottom: '0px' }),
+    },
+  });
+  try {
+    const endMessage = { role: 'assistant', content: [{ type: 'text', text: 'answer' }], stopReason: 'stop', timestamp: 2000 };
+    for (const scenario of ['control', 'active-turn', 'epoch', 'parse-error'] as const) {
+      const mapping = { ...activeMapping, id: `refill-${scenario}`, sessionId: `session-refill-${scenario}` };
+      const store = new TeamStore({
+        runners: {
+          snapshot: () => [runner],
+          command: async () => ({ type: 'response', command: 'x', success: true, data: {} }),
+        },
+      });
+      let mounted: ReactTestRenderer | undefined;
+      let sequence = 0;
+      const emit = (type: string, turnId: string, detail: Record<string, unknown> = {}) => {
+        store.applyRunnerEvent(runner.id, { ...detail, type, turnId, sessionId: mapping.sessionId, sequence: ++sequence });
+      };
+      const readAuthority = () => {
+        const session = store.snapshot().sessions[runnerSessionKey(runner.id, mapping.sessionId)];
+        if (!session || session.mappingId !== mapping.id) return null;
+        return { activeTurnId: session.activeTurnId, isStreaming: session.isStreaming };
+      };
+      const errors: string[] = [];
+      const resolvers: Array<(data: unknown) => void> = [];
+      let getMessages = 0;
+      const props = {
+        runner,
+        mappingId: mapping.id,
+        sessionId: mapping.sessionId,
+        cwd: project.cwd,
+        sendCommand: async (command: RunnerCommand) => {
+          if (command.type !== 'get_messages') return {};
+          getMessages += 1;
+          if (getMessages === 1) return { messages: [] };
+          const { promise, resolve } = Promise.withResolvers<unknown>();
+          resolvers.push(resolve);
+          return promise;
+        },
+        events: (listener: (frame: unknown) => void) => store.subscribeSession(runner.id, mapping.sessionId, listener),
+        readAuthority,
+        onTransportError: (message: string) => { if (message) errors.push(message); },
+      };
+      try {
+        store.reconcileInputs([project], [mapping], [runner]);
+        await act(async () => {
+          mounted = create(createElement(SessionView, props), {
+            // Precise refs only: the composer textarea needs a node; every
+            // other host ref (markdown bodies, transcript, buttons) is null so
+            // their effects legally take the `if (!node) return` path. The
+            // refill policy under test lives in event/effect logic, not DOM.
+            createNodeMock: (element: { type?: unknown }) => (
+              element.type === 'textarea'
+                ? makeComposerStub().stub
+                : null
+            ),
+          });
+        });
+        await act(async () => {
+          emit('turn_started', 'turn-t', { runtimeIncarnation: 'inc-1' });
+          emit('message_start', 'turn-t', { runtimeIncarnation: 'inc-1', itemId: 'item-1', message: { role: 'assistant', content: [] } });
+          emit('message_end', 'turn-t', { runtimeIncarnation: 'inc-1', itemId: 'item-1', message: endMessage });
+          emit('turn_terminal', 'turn-t', { runtimeIncarnation: 'inc-1' });
+          await Promise.resolve();
+          await Promise.resolve();
+        });
+        check(`${scenario}: terminal refill requested once`, resolvers.length === 1, JSON.stringify({ getMessages }));
+        if (scenario === 'active-turn') {
+          await act(async () => { emit('turn_started', 'turn-u', { runtimeIncarnation: 'inc-1' }); });
+        } else if (scenario === 'epoch') {
+          await act(async () => {
+            mounted!.update(createElement(SessionView, { ...props, runner: { ...runner, connectionEpoch: runner.connectionEpoch + 1 } }));
+          });
+        }
+        await act(async () => {
+          if (scenario === 'parse-error') resolvers[0]?.({});
+          else resolvers[0]?.({ messages: [{ id: 'row-1', message: endMessage }] });
+          await Promise.resolve();
+          await Promise.resolve();
+        });
+        const hydrated = mounted!.root.findAllByProps({ 'data-entry-id': 'row-1' });
+        if (scenario === 'control') {
+          check('control: latest terminal hydrates the settled reply', hydrated.length > 0, JSON.stringify(errors));
+          check('control: hydration reports no error', errors.length === 0, JSON.stringify(errors));
+        } else if (scenario === 'parse-error') {
+          check('parse failure is reported through the central sink with fixed context',
+            errors.length === 1 && errors[0].startsWith('Settled reply hydration failed'), JSON.stringify(errors));
+          check('parse failure keeps the live row (no fabricated entry id)', hydrated.length === 0);
+        } else {
+          check(`${scenario}: stale response is dropped silently`, hydrated.length === 0 && errors.length === 0, JSON.stringify(errors));
+        }
+      } finally {
+        try {
+          if (mounted) await act(async () => mounted!.unmount());
+        } finally {
+          store.dispose();
+        }
+      }
+    }
+  } finally {
+    if (previousWindow) Object.defineProperty(globalThis, 'window', previousWindow);
+    else Reflect.deleteProperty(globalThis, 'window');
+  }
+}
+
+// ---- settled-reply hydration: exact wire identity, cut merge, stale gates ----
+// bg2404/RA15: a settled /chat reply must adopt its durable transcript row
+// (authoritative entryId) without duplicating the synthetic live item. Row
+// identity is the EXACT MessageEnd payload — never a timestamp.
+{
+  const endMessage = {
+    role: 'assistant',
+    content: [{ type: 'text', text: 'answer' }],
+    stopReason: 'stop',
+    timestamp: 2000,
+  };
+  check('settled reply row matches the exact wire message',
+    hasSettledReplyRow([{ id: 'row-x', message: endMessage }], endMessage));
+  check('a shared timestamp alone is not row identity',
+    !hasSettledReplyRow([{ id: 'row-x', message: { ...endMessage, content: [{ type: 'text', text: 'other' }] } }], endMessage));
+  check('a row without an authoritative id cannot hydrate the reply',
+    !hasSettledReplyRow([{ message: endMessage }], endMessage));
+  check('missing rows keep the live item (no drop, no retry)',
+    !hasSettledReplyRow([], endMessage));
+
+  const liveFinal: Item = {
+    kind: 'assistant',
+    id: 'proto:turn-1:message:1',
+    status: 'final',
+    blocks: [{ type: 'text', text: 'answer' }],
+    timestamp: 2000,
+  };
+  const cutState: SessionTranscriptState = { items: [liveFinal], activeAssistantId: null };
+  const merged = mergeSessionHistory(
+    messagesToItems([{ id: 'row-x', message: endMessage }]),
+    cutState,
+    cutState.items,
+  );
+  check('terminal refill replaces the synthetic live row with the hydrated row',
+    merged.items.length === 1
+      && merged.items[0].kind === 'assistant'
+      && merged.items[0].entryId === 'row-x',
+    JSON.stringify(merged.items));
+  check('terminal refill does not duplicate a synthetic live row',
+    !merged.items.some((item) => item.kind === 'assistant' && item.entryId === undefined),
+    JSON.stringify(merged.items));
+  check('foreign history is rejected before merge (live items preserved)',
+    !hasSettledReplyRow([{ id: 'row-y', message: { ...endMessage, content: [{ type: 'text', text: 'older' }] } }], endMessage));
+}
+
+// ---- composer Ctrl edit keys + inline slash autocomplete (real behavior) ----
+// Real mounted SessionView behavior: the composer textarea ref receives a
+// precise node stub (value/selection/setSelectionRange plus the recorded
+// element-level CAPTURE keydown listener the inline autocomplete installs),
+// and keys are dispatched as raw events into the rendered handlers.
+{
+
+  const catalog = {
+    commands: [
+      { name: 'review', description: 'Review the current diff', source: 'builtin', argumentHint: '', requiresArguments: true },
+      { name: 'compact', description: 'Compact the transcript', source: 'builtin', argumentHint: '', requiresArguments: false },
+      { name: 'skill:alpha', skillName: 'alpha', description: 'Alpha skill', source: 'skill', argumentHint: '', requiresArguments: false },
+    ],
+  };
+
+  const mountComposerSession = async (attachments?: ComposerAttachment[]) => {
+    const sent: RunnerCommand[] = [];
+    const { stub, keyListeners } = makeComposerStub();
+    let mounted: ReactTestRenderer | null = null;
+    await act(async () => {
+      mounted = create(createElement(SessionView, {
+        runner,
+        mappingId: activeMapping.id,
+        sessionId: activeMapping.sessionId,
+        cwd: project.cwd,
+        sendCommand: async (command: RunnerCommand) => {
+          sent.push(command);
+          return command.type === 'get_commands' ? catalog : {};
+        },
+        events: () => () => {},
+        onTransportError: () => {},
+        initialAttachments: attachments,
+      }), {
+        createNodeMock: (element: { type?: unknown }) => (element.type === 'textarea' ? stub : null),
+      });
+    });
+    const view = mounted!;
+    const textarea = view.root.findByProps({ 'aria-label': 'Session prompt' });
+    // Deterministic microtask drain for the catalog fetch promise chain
+    // (the repo's own act idiom — no real timers).
+    const flush = async () => {
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+    };
+    const type = async (value: string) => {
+      await act(async () => {
+        // A real browser keeps the DOM textarea value in sync with the
+        // controlled draft; the stub mirrors that here.
+        stub.value = value;
+        textarea.props.onChange({ target: { value } });
+      });
+    };
+    const fireComposerKey = async (init: { key: string; ctrlKey?: boolean; shiftKey?: boolean; isComposing?: boolean; keyCode?: number }) => {
+      let prevented = false;
+      await act(async () => {
+        textarea.props.onKeyDown({
+          key: init.key,
+          ctrlKey: init.ctrlKey ?? false,
+          metaKey: false,
+          altKey: false,
+          shiftKey: init.shiftKey ?? false,
+          nativeEvent: { isComposing: init.isComposing ?? false, keyCode: init.keyCode ?? 0, which: init.keyCode ?? 0 },
+          preventDefault: () => { prevented = true; },
+        });
+      });
+      return prevented;
+    };
+    const fireInlineKey = async (init: { key: string; shiftKey?: boolean; isComposing?: boolean; keyCode?: number }) => {
+      await act(async () => {
+        for (const listener of [...keyListeners]) {
+          listener({
+            key: init.key,
+            ctrlKey: false,
+            metaKey: false,
+            altKey: false,
+            shiftKey: init.shiftKey ?? false,
+            isComposing: init.isComposing ?? false,
+            keyCode: init.keyCode ?? 0,
+            preventDefault() {},
+            stopPropagation() {},
+          });
+        }
+      });
+    };
+    const options = () => view.root.findAllByProps({ role: 'option' });
+    // JSX text + expression (`/{command.name}`) renders children as an ARRAY;
+    // read the RENDERED label text, not the raw children shape.
+    const nameLabels = () => view.root.findAllByProps({ className: 'command-picker__name' }).map((node) => (
+      Array.isArray(node.props.children) ? node.props.children.join('') : String(node.props.children)
+    ));
+    const attached = () => view.root.findAllByProps({ 'aria-label': 'Attached files' });
+    const unmount = async () => { await act(async () => { view.unmount(); }); };
+    return { sent, stub, textarea, flush, type, fireComposerKey, fireInlineKey, options, nameLabels, attached, unmount };
+  };
+
+  // Ctrl+U: clears TEXT only — attachments preserved, nothing sent.
+  {
+    const ctx = await mountComposerSession([{ id: 'a1', name: 'notes.ts', size: 12, mimeType: 'text/plain', kind: 'code' }]);
+    await ctx.type('hello world');
+    ctx.stub.selectionStart = 11;
+    ctx.stub.selectionEnd = 11;
+    await ctx.fireComposerKey({ key: 'u', ctrlKey: true, keyCode: 85 });
+    check('Ctrl+U clears the whole draft', ctx.textarea.props.value === '');
+    check('Ctrl+U writes the caret back to the start', ctx.stub.selectionStart === 0 && ctx.stub.selectionEnd === 0);
+    check('Ctrl+U preserves the attachment chips', ctx.attached().length === 1);
+    check('Ctrl+U sends no prompt', !ctx.sent.some((c) => c.type === 'prompt'));
+    await ctx.type('partial');
+    await ctx.fireComposerKey({ key: 'u', ctrlKey: true, isComposing: true, keyCode: 229 });
+    check('IME-composed Ctrl+U never intercepts', ctx.textarea.props.value === 'partial');
+    await ctx.fireComposerKey({ key: 'u', ctrlKey: true, shiftKey: true, keyCode: 85 });
+    check('Ctrl+Shift+U stays with the browser', ctx.textarea.props.value === 'partial');
+    await ctx.unmount();
+  }
+
+  // Ctrl+A / Ctrl+E / Ctrl+W operate on the current physical line.
+  {
+    const ctx = await mountComposerSession();
+    await ctx.type('ab\ncd');
+    ctx.stub.selectionStart = 4;
+    ctx.stub.selectionEnd = 4;
+    await ctx.fireComposerKey({ key: 'a', ctrlKey: true, keyCode: 65 });
+    check('Ctrl+A moves to the current physical line start', ctx.stub.selectionStart === 3 && ctx.textarea.props.value === 'ab\ncd', JSON.stringify({ selectionStart: ctx.stub.selectionStart, selectionEnd: ctx.stub.selectionEnd, stubValue: ctx.stub.value, draft: ctx.textarea.props.value }));
+    await ctx.fireComposerKey({ key: 'e', ctrlKey: true, keyCode: 69 });
+    check('Ctrl+E moves to the current physical line end', ctx.stub.selectionEnd === 5, JSON.stringify({ selectionStart: ctx.stub.selectionStart, selectionEnd: ctx.stub.selectionEnd, stubValue: ctx.stub.value, draft: ctx.textarea.props.value }));
+    await ctx.type('hello world');
+    ctx.stub.selectionStart = 11;
+    ctx.stub.selectionEnd = 11;
+    await ctx.fireComposerKey({ key: 'w', ctrlKey: true, keyCode: 87 });
+    check('Ctrl+W deletes the previous word', ctx.textarea.props.value === 'hello ' && ctx.stub.selectionStart === 6);
+    await ctx.unmount();
+  }
+
+  // Inline slash autocomplete: one shared catalog, default-first Enter pick
+  // that never sends, Arrow navigation, Escape dismissal, IME guard.
+  {
+    const ctx = await mountComposerSession();
+    await ctx.type('/rev');
+    await ctx.flush();
+    check('typing a slash token opens the inline popup', ctx.options().length === 1, JSON.stringify({ optionCount: ctx.options().length, nameLabels: ctx.nameLabels(), sentTypes: ctx.sent.map((c) => c.type) }));
+    check('inline candidates reuse the picker catalog', JSON.stringify(ctx.nameLabels()) === JSON.stringify(['/review']), JSON.stringify({ nameLabels: ctx.nameLabels(), optionCount: ctx.options().length, sentTypes: ctx.sent.map((c) => c.type) }));
+    check('the catalog is fetched exactly once', ctx.sent.filter((c) => c.type === 'get_commands').length === 1, JSON.stringify(ctx.sent.map((c) => c.type)));
+    await ctx.fireInlineKey({ key: 'Enter', keyCode: 13 });
+    check('Enter picks the default first candidate and never sends', ctx.textarea.props.value === '/review ' && !ctx.sent.some((c) => c.type === 'prompt'));
+    check('the settled token keeps the popup closed', ctx.options().length === 0);
+    await ctx.type('/rev');
+    await ctx.fireInlineKey({ key: 'Enter', keyCode: 229, isComposing: true });
+    check('IME Enter neither picks nor sends', ctx.textarea.props.value === '/rev' && !ctx.sent.some((c) => c.type === 'prompt'));
+    await ctx.fireInlineKey({ key: 'Escape' });
+    check('Escape dismisses the inline popup', ctx.options().length === 0 && ctx.textarea.props.value === '/rev');
+    await ctx.fireInlineKey({ key: 'Enter', keyCode: 13 });
+    await ctx.fireComposerKey({ key: 'Enter', keyCode: 13 });
+    await ctx.flush();
+    check('dismissed popup leaves Enter to the composer (unknown slash never sends a prompt)', !ctx.sent.some((c) => c.type === 'prompt'));
+    check('the catalog was still fetched exactly once', ctx.sent.filter((c) => c.type === 'get_commands').length === 1, JSON.stringify(ctx.sent.map((c) => c.type)));
+    // Full keyboard contract: the dismissal suppresses only the continuous
+    // token it was issued for — Esc → clear → retyping the SAME token
+    // (/rev, the original value) reopens the popup; a settled pick stays
+    // closed (asserted above).
+    await ctx.type('');
+    await ctx.type('/rev');
+    await ctx.flush();
+    check('Esc then clear then retyping the same token reopens the popup', ctx.options().length === 1, JSON.stringify({ optionCount: ctx.options().length, draft: ctx.textarea.props.value }));
+    await ctx.unmount();
+  }
+
+  // Arrow navigation moves the highlight; a changed query resets to first.
+  {
+    const ctx = await mountComposerSession();
+    await ctx.type('/');
+    await ctx.flush();
+    check('an empty slash token lists the primary commands', ctx.options().length === 2);
+    await ctx.fireInlineKey({ key: 'ArrowDown' });
+    const selected = ctx.options().map((option) => option.props['aria-selected']);
+    check('ArrowDown moves the highlight to the next candidate', JSON.stringify(selected) === JSON.stringify([false, true]));
+    await ctx.fireInlineKey({ key: 'Enter', keyCode: 13 });
+    check('Enter picks the highlighted candidate', ctx.textarea.props.value === '/compact');
+    await ctx.type('/rev');
+    await ctx.flush();
+    await ctx.fireInlineKey({ key: 'Enter', keyCode: 13 });
+    check('a changed query resets to the first default candidate', ctx.textarea.props.value === '/review ');
+    await ctx.unmount();
+  }
+
+  // The /skill token drills the popup into skill candidates.
+  {
+    const ctx = await mountComposerSession();
+    await ctx.type('/skill al');
+    await ctx.flush();
+    check('/skill token lists matching skill candidates', JSON.stringify(ctx.nameLabels()) === JSON.stringify(['alpha']));
+    await ctx.fireInlineKey({ key: 'Enter', keyCode: 13 });
+    check('Enter stages the full /skill token without sending', ctx.textarea.props.value === '/skill alpha' && !ctx.sent.some((c) => c.type === 'prompt'));
+    check('the settled /skill token keeps the popup closed', ctx.options().length === 0);
+    await ctx.unmount();
+  }
+
+  // Without candidates the original submit path is untouched.
+  {
+    const ctx = await mountComposerSession();
+    await ctx.type('hello');
+    await ctx.fireInlineKey({ key: 'Enter', keyCode: 13 });
+    await ctx.fireComposerKey({ key: 'Enter', keyCode: 13 });
+    await ctx.flush();
+    check('no candidates: Enter keeps the original prompt submit', ctx.sent.some((c) => c.type === 'prompt' && c.message === 'hello'));
+    await ctx.unmount();
   }
 }
 

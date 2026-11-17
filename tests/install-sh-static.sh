@@ -205,31 +205,17 @@ grep -Fq 'printf '\''%s\n'\'' "$$" > "$LOCKFILE" && chmod 0600 "$LOCKFILE"' "$IN
 grep -Fq 'chmod 0600 "$STATE_FILE" || fail_after_rollback "could not secure rpi update state permissions"' "$INSTALLER"
 if command -v pwsh >/dev/null 2>&1; then
   POWERSHELL_INSTALLER="$POWERSHELL_INSTALLER" pwsh -NoProfile -Command '$errors = $null; [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $env:POWERSHELL_INSTALLER), [ref]$null, [ref]$errors) | Out-Null; if ($errors.Count -ne 0) { $errors | ForEach-Object { Write-Error $_ }; exit 1 }'
+  # install.ps1 fails closed: both entry points exit non-zero with the Windows
+  # unavailability notice and leave an isolated HOME/RPI_HOME untouched.
+  # PSModuleAnalysisCachePath is pinned so pwsh's own cache cannot dirty the
+  # sandbox; every remaining write would come from install.ps1.
+  PS_SANDBOX="$ROOT/pwsh-sandbox"; mkdir -p "$PS_SANDBOX/home" "$PS_SANDBOX/rpi"
+  for ps_args in '' '-Help'; do
+    if HOME="$PS_SANDBOX/home" RPI_HOME="$PS_SANDBOX/rpi" PSModuleAnalysisCachePath=/dev/null pwsh -NoProfile -File "$POWERSHELL_INSTALLER" $ps_args >"$ROOT/pwsh$ps_args.out" 2>&1; then exit 1; fi
+    grep -Fq 'Windows builds are not published' "$ROOT/pwsh$ps_args.out"
+  done
+  [ -z "$(find "$PS_SANDBOX/home" "$PS_SANDBOX/rpi" -mindepth 1 -print)" ]
+else
+  printf 'SKIP: pwsh not found; install.ps1 execution checks not run\n'
 fi
-grep -Fq 'function Get-CandidateIdentityFailure([string]$Path, [string]$ExpectedVersion)' "$POWERSHELL_INSTALLER"
-grep -Fq '$CandidateOutput.Count -ne 1 -or [string]$CandidateOutput[0] -cne "rpi $ExpectedVersion"' "$POWERSHELL_INSTALLER"
-PRE_SMOKE_LINE="$(grep -n 'Get-CandidateIdentityFailure $Binary.FullName $ResolvedVersion' "$POWERSHELL_INSTALLER" | cut -d: -f1)"
-STAGED_SMOKE_LINE="$(grep -n 'Get-CandidateIdentityFailure $Staged $ResolvedVersion' "$POWERSHELL_INSTALLER" | cut -d: -f1)"
-ACTIVATION_LINE="$(grep -n '\[PiInstall.Native\]::MoveFileEx($Staged, $Dest' "$POWERSHELL_INSTALLER" | cut -d: -f1)"
-STATE_COMMIT_LINE="$(grep -n 'Move-Item -LiteralPath $StateTmp -Destination $StatePath' "$POWERSHELL_INSTALLER" | cut -d: -f1)"
-[ -n "$PRE_SMOKE_LINE" ] && [ -n "$STAGED_SMOKE_LINE" ] && [ -n "$ACTIVATION_LINE" ] && [ -n "$STATE_COMMIT_LINE" ]
-[ "$PRE_SMOKE_LINE" -lt "$ACTIVATION_LINE" ]
-[ "$STAGED_SMOKE_LINE" -lt "$ACTIVATION_LINE" ]
-[ "$PRE_SMOKE_LINE" -lt "$STATE_COMMIT_LINE" ]
-
-# PowerShell installer: GITHUB_TOKEN authenticates only the fixed GitHub API
-# endpoint; downloads and custom RPI_UPDATE_BASE_URL endpoints never see it.
-grep -Fq '#   GITHUB_TOKEN           authenticate the fixed GitHub API endpoint (default:' "$POWERSHELL_INSTALLER"
-grep -Fq '$GitHubApiBase = "https://api.github.com/repos/$Repo/releases"' "$POWERSHELL_INSTALLER"
-grep -Fq 'if ($env:GITHUB_TOKEN -and $ApiBase -eq $GitHubApiBase)' "$POWERSHELL_INSTALLER"
-grep -Fq '$ApiHeaders["Authorization"] = "Bearer $env:GITHUB_TOKEN"' "$POWERSHELL_INSTALLER"
-grep -Fq 'Invoke-RestMethod -Uri $ReleaseUrl -Headers $ApiHeaders' "$POWERSHELL_INSTALLER"
-grep -Fq 'Invoke-WebRequest -Uri $ArchiveAsset.browser_download_url -Headers $Headers' "$POWERSHELL_INSTALLER"
-grep -Fq 'Invoke-WebRequest -Uri $SumsAsset.browser_download_url -Headers $Headers' "$POWERSHELL_INSTALLER"
-TOKEN_BASE_LINE="$(grep -Fn '$GitHubApiBase = "https://api.github.com/repos/$Repo/releases"' "$POWERSHELL_INSTALLER" | cut -d: -f1)"
-AUTH_HEADER_LINE="$(grep -Fn '$ApiHeaders["Authorization"] = "Bearer $env:GITHUB_TOKEN"' "$POWERSHELL_INSTALLER" | cut -d: -f1)"
-API_CALL_LINE="$(grep -Fn 'Invoke-RestMethod -Uri $ReleaseUrl -Headers $ApiHeaders' "$POWERSHELL_INSTALLER" | cut -d: -f1)"
-[ -n "$TOKEN_BASE_LINE" ] && [ -n "$AUTH_HEADER_LINE" ] && [ -n "$API_CALL_LINE" ]
-[ "$TOKEN_BASE_LINE" -lt "$AUTH_HEADER_LINE" ]
-[ "$AUTH_HEADER_LINE" -lt "$API_CALL_LINE" ]
-printf 'install.sh focused behavior tests passed (16 install attempts, 2 legacy-name rejection checks, 1 identity mismatch rejection, 2 bounded network retries, 4 PowerShell identity contracts, 1 umask-hardening install, 6 PowerShell token-scoping contracts)\n'
+printf 'install.sh focused behavior tests passed\n'

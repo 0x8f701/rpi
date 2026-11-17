@@ -857,7 +857,7 @@ impl AcpServer {
                     Ok(Some(self.handle_todo_child(&id, method, &params).await))
                 }
                 "session/prompt" => self.handle_prompt(&id, &params, outbound, tasks).await,
-                "session/cancel" => Ok(self.handle_cancel(Some(&id), &params).await),
+                "session/cancel" => self.handle_cancel(Some(&id), &params).await,
                 "session/close" => self.handle_session_close(&id, &params).await,
                 other => Ok(Some(rpc_error(
                     &id,
@@ -867,7 +867,7 @@ impl AcpServer {
             },
             Ok(Incoming::Notification { method, params }) => match method.as_str() {
                 "session/cancel" => {
-                    let _ = self.handle_cancel(None, &params).await;
+                    self.handle_cancel(None, &params).await?;
                     Ok(None)
                 }
                 // Unknown notifications are ignored per JSON-RPC 2.0.
@@ -1042,7 +1042,7 @@ impl AcpServer {
             }
         };
         let options = pi_coding::SessionOptions {
-            model: model.clone(),
+            model: Some(model.clone()),
             cwd: cwd.clone(),
             system_prompt: String::new(),
             thinking_level,
@@ -1076,6 +1076,7 @@ impl AcpServer {
             extension_runtime: runtime,
             extension_permissions: permissions,
             orchestration,
+            orchestration_explicit,
             goal_tool,
             todo_child_tool,
         } = candidate;
@@ -1110,6 +1111,7 @@ impl AcpServer {
             extension_runtime: runtime,
             extension_permissions: permissions,
             orchestration,
+            orchestration_explicit,
             goal_tool,
             todo_child_tool,
         };
@@ -1401,19 +1403,24 @@ impl AcpServer {
     /// requests with the `cancelled` outcome. Returns the JSON-RPC response
     /// when the client sent `session/cancel` as a request (the spec defines
     /// it as a notification, so this is `None` for notifications).
-    async fn handle_cancel(&mut self, id: Option<&Value>, params: &Value) -> Option<Value> {
+    async fn handle_cancel(&mut self, id: Option<&Value>, params: &Value) -> Result<Option<Value>> {
         let Some(session_id) = params.get("sessionId").and_then(Value::as_str) else {
-            return id
-                .map(|id| rpc_error(id, INVALID_PARAMS, "session/cancel requires a sessionId"));
+            return Ok(id
+                .map(|id| rpc_error(id, INVALID_PARAMS, "session/cancel requires a sessionId")));
         };
         if let Some(state) = self.turns.get(session_id) {
             state.cancelled.store(true, Ordering::Release);
         }
-        if let Some(session) = self.sessions.get(session_id) {
-            session.application.abort().await;
-        }
+        let abort_error = if let Some(session) = self.sessions.get(session_id) {
+            session.application.abort().await.err()
+        } else {
+            None
+        };
         self.resolve_pending_for_session(session_id);
-        id.map(|id| rpc_result(id, json!({})))
+        if let Some(error) = abort_error {
+            return Err(error).context("aborting ACP session");
+        }
+        Ok(id.map(|id| rpc_result(id, json!({}))))
     }
 
     async fn handle_session_close(&mut self, id: &Value, params: &Value) -> Result<Option<Value>> {
@@ -1431,11 +1438,18 @@ impl AcpServer {
                 format!("unknown session: {session_id}"),
             )));
         };
-        if let Some(state) = self.turns.remove(session_id) {
+        if let Some(state) = self.turns.get(session_id) {
             state.cancelled.store(true, Ordering::Release);
         }
-        session.application.abort().await;
+        let abort_error = session
+            .application
+            .abort()
+            .await
+            .err();
         session.application.cleanup().await;
+        if let Some(error) = abort_error {
+            return Err(error).context("aborting ACP session before close");
+        }
         Ok(Some(rpc_result(id, json!({}))))
     }
 
@@ -1479,15 +1493,27 @@ impl AcpServer {
     /// Make cancellation observable before connection teardown waits for
     /// prompt tasks. Pending approvals must resolve before the join, or a
     /// disconnected client can hold teardown for the permission timeout.
-    async fn cancel_active_turns(&self) {
+    async fn cancel_active_turns(&self) -> Result<()> {
         for state in self.turns.values() {
             state.cancelled.store(true, Ordering::Release);
         }
         for session_id in self.sessions.keys() {
             self.resolve_pending_for_session(session_id);
         }
+        let mut errors = Vec::new();
         for session in self.sessions.values() {
-            session.application.abort().await;
+            if let Err(error) = session.application.abort().await {
+                errors.push(error);
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            let mut combined = errors.remove(0);
+            for error in errors {
+                combined = combined.context(format!("additional ACP abort failed: {error:#}"));
+            }
+            Err(combined.context("aborting ACP sessions"))
         }
     }
 
@@ -1987,10 +2013,17 @@ async fn run_connection_loop(
         Ok(())
     }
     .await;
-    server.cancel_active_turns().await;
+    let abort_error = server.cancel_active_turns().await.err();
     while tasks.join_next().await.is_some() {}
     server.finalize().await;
-    result
+    match (result, abort_error) {
+        (Ok(()), None) => Ok(()),
+        (Err(error), None) => Err(error),
+        (Ok(()), Some(error)) => Err(error),
+        (Err(error), Some(abort_error)) => Err(error.context(format!(
+            "ACP abort also failed: {abort_error:#}"
+        ))),
+    }
 }
 
 /// Build the shared session blueprint for the ACP mode: catalogs loaded,

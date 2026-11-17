@@ -249,6 +249,9 @@ async function main(): Promise<void> {
       planComposerSubmitKind({ streaming: false, requested: 'steer' }) === 'steer');
     check('session_processing is a closed rpc code',
       rpcErrorCode({ code: SESSION_PROCESSING_CODE }) === 'session_processing');
+    check('model_not_configured is a closed rpc code, never inferred from the message',
+      rpcErrorCode({ code: 'model_not_configured' }) === 'model_not_configured'
+      && rpcErrorCode({ code: 'No model is configured for this agent' }) === undefined);
     check('busy_capacity is a closed rpc code',
       rpcErrorCode({ code: 'busy_capacity' }) === 'busy_capacity'
       && isBusyCapacityError({ rpcCode: 'busy_capacity' }) === true

@@ -7,6 +7,70 @@ function panelSessionId() {
   return idx >= 0 ? (dts[idx]?.nextElementSibling?.textContent || '').trim() : '';
 }
 
+// Active catalog row vs the sidebar scroller. DOM presence is not visibility:
+// New/Fork activate the row but only runSwitch scrolls it into view, so an
+// offscreen selected row is the reported failure. Never scroll before reading.
+export async function readActiveSidebarRow(page) {
+  return page.evaluate(() => {
+    const sidebar = document.querySelector('.session-sidebar');
+    const row = document.querySelector('.session-sidebar__row--active');
+    const button = row?.querySelector('.session-sidebar__switch') || null;
+    const dts = [...document.querySelectorAll('#session-panel dl dt')];
+    const idx = dts.findIndex((dt) => (dt.textContent || '').trim() === 'Session id');
+    const panel = idx >= 0 ? (dts[idx]?.nextElementSibling?.textContent || '').trim() : '';
+    const fileDt = dts.find((dt) => (dt.textContent || '').trim() === 'Session file');
+    const sessionFile = (fileDt?.nextElementSibling?.getAttribute('title') || fileDt?.nextElementSibling?.textContent || '').trim();
+    const rowBox = row ? row.getBoundingClientRect() : null;
+    const sideBox = sidebar ? sidebar.getBoundingClientRect() : null;
+    const intersects = rowBox !== null && sideBox !== null
+      && rowBox.width > 0 && rowBox.height > 0
+      && sideBox.width > 0 && sideBox.height > 0
+      && rowBox.bottom > sideBox.top && rowBox.top < sideBox.bottom
+      && rowBox.right > sideBox.left && rowBox.left < sideBox.right;
+    const activeRows = document.querySelectorAll('.session-sidebar__row--active').length;
+    const sid = button?.dataset.sessionId || '';
+    const matches = sid === '' ? [] : [...document.querySelectorAll('.session-sidebar__switch')]
+      .filter((candidate) => candidate.dataset.sessionId === sid);
+    return {
+      active: sid,
+      panel,
+      sessionFile,
+      source: button?.dataset.sessionSource || '',
+      loaded: row?.getAttribute('data-loaded') === 'true',
+      activeClassCount: activeRows,
+      catalogCount: matches.length,
+      intersects,
+      row: rowBox,
+      sidebar: sideBox,
+    };
+  });
+}
+
+export function assertExactActiveSidebarRow(state, label, { previousIds = [], requireLoaded = true, requirePanel = true } = {}) {
+  const previous = previousIds.filter(Boolean);
+  if (!state || state.activeClassCount !== 1 || state.catalogCount !== 1) {
+    throw new Error(`${label}: active catalog row is not exactly one (state=${JSON.stringify(state)})`);
+  }
+  if (!state.active || previous.includes(state.active)) {
+    throw new Error(`${label}: active row id missing or stayed on a previous id (previous=${JSON.stringify(previous)}, state=${JSON.stringify(state)})`);
+  }
+  if (requirePanel && state.active !== state.panel) {
+    throw new Error(`${label}: active row data-session-id != panel Session id (state=${JSON.stringify(state)})`);
+  }
+  if (!requirePanel && state.panel !== '' && state.panel !== state.active) {
+    throw new Error(`${label}: closed-panel check saw a different panel Session id (state=${JSON.stringify(state)})`);
+  }
+  if (requireLoaded && state.loaded !== true) {
+    throw new Error(`${label}: catalog row is not the loaded identity (state=${JSON.stringify(state)})`);
+  }
+  if (requirePanel && (!state.sessionFile || state.sessionFile === '—' || state.sessionFile === 'Unavailable' || !state.sessionFile.includes(state.active))) {
+    throw new Error(`${label}: panel Session file is not the new session identity (state=${JSON.stringify(state)})`);
+  }
+  if (state.intersects !== true) {
+    throw new Error(`${label}: selected row is in the DOM but does not intersect the sidebar viewport (no scroll was applied) (state=${JSON.stringify(state)})`);
+  }
+}
+
 export async function assertSidebarNewActionAbsent(page, label = 'obsolete sidebar New action still rendered') {
   const present = await page.evaluate(() => document.getElementById('sidebar-new-session-btn') !== null);
   if (present) throw new Error(label);

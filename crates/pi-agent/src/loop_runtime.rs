@@ -17,9 +17,10 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use serde_json::Value;
 
 use crate::{
-    AbortSignal, AfterToolCallContext, AgentContext, AgentEvent, AgentLoopConfig, AgentMessage,
-    AgentTool, AgentToolResult, BeforeToolCallContext, EventSink, ShouldStopAfterTurnContext,
-    StreamFn, ThinkingLevel, ToolCallContext, ToolExecutionMode, ToolUpdateFn,
+    AbortError, AbortSignal, AfterToolCallContext, AgentContext, AgentEvent, AgentLoopConfig,
+    AgentMessage, AgentTool, AgentToolResult, BeforeToolCallContext, EventSink,
+    ShouldStopAfterTurnContext, StreamFn, ThinkingLevel, ToolCallContext, ToolExecutionError,
+    ToolExecutionMode, ToolUpdateFn,
 };
 
 #[derive(Clone, Debug)]
@@ -124,6 +125,29 @@ pub async fn run_agent_loop_continue(
     Ok(new_messages)
 }
 
+/// Commit bit: the listener failed after this `MessageEnd` was written to agent state, so queue restore must skip it.
+pub(crate) struct MessageCommittedBeforeListenerFailure {
+    pub(crate) source: anyhow::Error,
+}
+
+impl std::fmt::Debug for MessageCommittedBeforeListenerFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.source, f)
+    }
+}
+
+impl std::fmt::Display for MessageCommittedBeforeListenerFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.source, f)
+    }
+}
+
+impl std::error::Error for MessageCommittedBeforeListenerFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 /// Restores drained-but-undelivered pending messages through the loop
 /// config's restore hook: steering back to the steering queue head, follow-up
 /// batches back to the follow-up queue head, each preserving FIFO order. A
@@ -177,13 +201,7 @@ async fn run_loop(
                 return Err(error);
             }
 
-            // Deliver the drained pending messages transactionally: a message
-            // is pushed into the context only after its MessageEnd emit (and
-            // its listeners) succeeded. On any emit failure the undelivered
-            // tail — the failing message included, unless the agent state
-            // already committed it — returns to the head of its queue in the
-            // original order, so a failed transform/listener never drops
-            // acknowledged steering.
+            // Transactional delivery: on emit failure the undelivered tail returns to the queue head; only a committed `MessageEnd` (`MessageCommittedBeforeListenerFailure`) withholds itself.
             let mut delivery_error = None;
             for index in 0..pending.len() {
                 let message = pending[index].clone();
@@ -205,7 +223,16 @@ async fn run_loop(
                         new_messages.push(message);
                     }
                     Err(error) => {
-                        restore_pending(&config, pending_from_follow_up, &pending[index..]).await;
+                        let committed = error
+                            .downcast_ref::<MessageCommittedBeforeListenerFailure>()
+                            .is_some();
+                        let restore_from = index + usize::from(committed);
+                        restore_pending(
+                            &config,
+                            pending_from_follow_up,
+                            &pending[restore_from..],
+                        )
+                        .await;
                         delivery_error = Some(error);
                         break;
                     }
@@ -226,7 +253,25 @@ async fn run_loop(
             .await?;
             new_messages.push(Message::Assistant(message.clone()));
 
-            if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
+            if message.stop_reason == StopReason::Aborted {
+                let terminal_error = message
+                    .error_message
+                    .clone()
+                    .unwrap_or_else(|| format!("assistant stopped with {:?}", message.stop_reason));
+                let _turn_listener_error = emit(AgentEvent::TurnEnd {
+                    message,
+                    tool_results: Vec::new(),
+                })
+                .await
+                .err();
+                let _agent_listener_error = emit(AgentEvent::AgentEnd {
+                    messages: new_messages.clone(),
+                })
+                .await
+                .err();
+                return Err(anyhow::Error::from(AbortError).context(terminal_error));
+            }
+            if message.stop_reason == StopReason::Error {
                 let terminal_error = message
                     .error_message
                     .clone()
@@ -845,7 +890,23 @@ async fn execute_prepared_tool_call(
 
     Ok(match execution {
         Ok(Ok(result)) => (result, false),
-        Ok(Err(error)) => (error_tool_result(error.to_string()), true),
+        Ok(Err(error)) => {
+            // A tool that observed an aborted signal must terminate the run
+            // with the typed error so consumers stop instead of retrying a
+            // doomed call. Only the error's type decides this; prose that
+            // merely looks like an abort stays an ordinary tool error.
+            if error.downcast_ref::<AbortError>().is_some() {
+                return Err(error);
+            }
+            // A structured tool failure carries a full result (content and
+            // details). Take it back owned — no clone — and keep the call
+            // failed; the producer's `terminate` choice travels with the
+            // result. Anything untyped stays on the plain-text path below.
+            match error.downcast::<ToolExecutionError>() {
+                Ok(carrier) => return Ok((carrier.into_result(), true)),
+                Err(error) => (error_tool_result(error.to_string()), true),
+            }
+        }
         Err(panic) => (error_tool_result(panic_message(panic)), true),
     })
 }
@@ -1029,39 +1090,74 @@ fn error_tool_result(message: impl Into<String>) -> AgentToolResult {
 /// tried in order — const, default, enum members, anyOf/oneOf branches, then
 /// type-derived candidates honoring numeric/string/array/object constraints —
 /// and only a candidate that the complete schema validator accepts is
-/// returned. When no compact valid candidate can be synthesized (arbitrary
-/// patterns, allOf combinations), the caller omits the example instead of
-/// emitting an invalid one. Never echoes user-supplied argument values.
+/// returned. When the rejected object matches exactly one const on a property,
+/// only combinator branches with that same const are tried, so an earlier
+/// unrelated arm is not offered for a call that already selected another arm.
+/// When no compact valid candidate can be synthesized (arbitrary patterns,
+/// allOf combinations, or no branch for the matched const), the caller omits
+/// the example instead of emitting an invalid one. Never echoes user-supplied
+/// argument values.
 const SCHEMA_EXAMPLE_MAX_DEPTH: usize = 16;
 
-fn schema_example(schema: &pi_ai::Schema) -> Option<serde_json::Value> {
-    schema_example_at(schema, SCHEMA_EXAMPLE_MAX_DEPTH)
+fn schema_example_for(
+    schema: &pi_ai::Schema,
+    arguments: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    schema_example_at(
+        schema,
+        SCHEMA_EXAMPLE_MAX_DEPTH,
+        &matched_const(schema, arguments),
+    )
 }
 
-fn schema_example_at(schema: &pi_ai::Schema, depth: usize) -> Option<serde_json::Value> {
-    if depth == 0 {
+fn schema_example_at(
+    schema: &pi_ai::Schema,
+    depth: usize,
+    matched: &ConstMatch<'_>,
+) -> Option<serde_json::Value> {
+    if depth == 0 || matches!(matched, ConstMatch::Ambiguous) {
         return None;
     }
+    let accept = |candidate: &serde_json::Value| {
+        preserves_selected_const(candidate, matched) && schema.validate(candidate).is_ok()
+    };
     if let Some(const_value) = &schema.const_value {
-        if schema.validate(const_value).is_ok() {
+        if accept(const_value) {
             return Some(const_value.clone());
         }
     }
     if let Some(default) = &schema.default {
-        if schema.validate(default).is_ok() {
+        if accept(default) {
             return Some(default.clone());
         }
     }
     for member in &schema.enum_values {
-        if schema.validate(member).is_ok() {
+        if accept(member) {
             return Some(member.clone());
         }
     }
-    for branch in schema.any_of.iter().chain(&schema.one_of) {
-        if let Some(candidate) = schema_example_at(branch, depth - 1) {
-            if schema.validate(&candidate).is_ok() {
-                return Some(candidate);
+    let has_branches = !schema.any_of.is_empty() || !schema.one_of.is_empty();
+    if has_branches {
+        let branches = schema.any_of.iter().chain(&schema.one_of);
+        let selected: Vec<&pi_ai::Schema> = match matched {
+            ConstMatch::Selected(constraints) => branches
+                .filter(|branch| branch_preserves_consts(branch, constraints))
+                .collect(),
+            ConstMatch::None => branches.collect(),
+            ConstMatch::Ambiguous => Vec::new(),
+        };
+        if matches!(matched, ConstMatch::Selected(_)) && selected.is_empty() {
+            return None;
+        }
+        for branch in selected {
+            if let Some(candidate) = schema_example_at(branch, depth - 1, &ConstMatch::None) {
+                if accept(&candidate) {
+                    return Some(candidate);
+                }
             }
+        }
+        if matches!(matched, ConstMatch::Selected(_)) {
+            return None;
         }
     }
     let mut kinds = schema_type_kinds(schema);
@@ -1080,7 +1176,7 @@ fn schema_example_at(schema: &pi_ai::Schema, depth: usize) -> Option<serde_json:
             _ => None,
         };
         if let Some(candidate) = candidate {
-            if schema.validate(&candidate).is_ok() {
+            if accept(&candidate) {
                 return Some(candidate);
             }
         }
@@ -1155,7 +1251,7 @@ fn object_skeleton(
     let mut skeleton = serde_json::Map::new();
     for name in ordered {
         let field_schema = schema.properties.get(name)?;
-        if let Some(value) = schema_example_at(field_schema, depth) {
+        if let Some(value) = schema_example_at(field_schema, depth, &ConstMatch::None) {
             skeleton.insert(name.to_owned(), value);
         } else if schema.required.iter().any(|required| required == name) {
             // A required field with no valid candidate: no skeleton can
@@ -1176,9 +1272,96 @@ fn array_example(schema: &pi_ai::Schema, depth: usize) -> Option<serde_json::Val
     let item_schema = schema.items.as_deref()?;
     let mut items = Vec::with_capacity(min);
     for _ in 0..min {
-        items.push(schema_example_at(item_schema, depth)?);
+        items.push(schema_example_at(item_schema, depth, &ConstMatch::None)?);
     }
     Some(serde_json::Value::Array(items))
+}
+
+/// How a rejected object constrains corrected-example synthesis.
+enum ConstMatch<'a> {
+    /// No recognized const; the first valid candidate is used.
+    None,
+    /// Every returned candidate must preserve each selected const.
+    Selected(Vec<(&'a str, &'a serde_json::Value)>),
+    /// The consts do not share one combinator arm; omit the example.
+    Ambiguous,
+}
+
+fn matched_const<'a>(schema: &'a pi_ai::Schema, arguments: &'a serde_json::Value) -> ConstMatch<'a> {
+    let Some(object) = arguments.as_object() else {
+        return ConstMatch::None;
+    };
+    let mut names = declared_property_names(schema);
+    for branch in schema.one_of.iter().chain(&schema.any_of) {
+        for name in branch.properties.keys() {
+            if !names.contains(&name.as_str()) {
+                names.push(name.as_str());
+            }
+        }
+    }
+    let mut selected = Vec::new();
+    for name in names {
+        let Some(value) = object.get(name) else {
+            continue;
+        };
+        let recognized = schema
+            .properties
+            .get(name)
+            .and_then(|property| property.const_value.as_ref())
+            == Some(value)
+            || schema.one_of.iter().chain(&schema.any_of).any(|branch| {
+                branch
+                    .properties
+                    .get(name)
+                    .and_then(|property| property.const_value.as_ref())
+                    == Some(value)
+            });
+        if !recognized || selected.iter().any(|(existing, _)| *existing == name) {
+            continue;
+        }
+        selected.push((name, value));
+    }
+    if selected.is_empty() {
+        return ConstMatch::None;
+    }
+    let shares_arm = schema
+        .one_of
+        .iter()
+        .chain(&schema.any_of)
+        .any(|branch| branch_preserves_consts(branch, &selected));
+    if !shares_arm && (!schema.one_of.is_empty() || !schema.any_of.is_empty()) {
+        ConstMatch::Ambiguous
+    } else {
+        ConstMatch::Selected(selected)
+    }
+}
+
+fn preserves_selected_const(candidate: &serde_json::Value, matched: &ConstMatch<'_>) -> bool {
+    let ConstMatch::Selected(constraints) = matched else {
+        return true;
+    };
+    let Some(object) = candidate.as_object() else {
+        return false;
+    };
+    constraints
+        .iter()
+        .all(|(name, value)| object.get(*name) == Some(*value))
+}
+
+fn branch_preserves_consts(
+    branch: &pi_ai::Schema,
+    constraints: &[(&str, &serde_json::Value)],
+) -> bool {
+    constraints.iter().all(|(name, value)| {
+        match branch
+            .properties
+            .get(*name)
+            .and_then(|property| property.const_value.as_ref())
+        {
+            Some(const_value) => const_value == *value,
+            None => true,
+        }
+    })
 }
 
 fn string_example(schema: &pi_ai::Schema) -> Option<serde_json::Value> {
@@ -1255,7 +1438,7 @@ fn tool_validation_error(
         message.push(' ');
         message.push_str(&diagnostic);
     }
-    if let Some(example) = schema_example(schema) {
+    if let Some(example) = schema_example_for(schema, arguments) {
         message.push_str(&format!(
             " Corrected example: {}",
             serde_json::to_string(&example).unwrap_or_else(|_| "{}".to_owned())
@@ -2258,6 +2441,235 @@ mod validation_error_tests {
         assert_eq!(skeleton["optional_field"], json!(""));
     }
 
+    fn const_string(value: &str) -> Schema {
+        Schema {
+            schema_type: Some(Value::String("string".into())),
+            const_value: Some(Value::String(value.to_owned())),
+            ..Schema::default()
+        }
+    }
+
+    fn strict_arm(fields: Vec<(&str, Schema, bool)>) -> Schema {
+        let mut arm = Schema::object_ordered(
+            fields
+                .into_iter()
+                .map(|(name, schema, required)| (name.to_owned(), schema, required))
+                .collect(),
+        );
+        arm.additional_properties = Some(Value::Bool(false));
+        arm
+    }
+
+    /// Root object advertises every field; exclusive arms are selected by a
+    /// const on `op`. The first arm is unrelated to the later required-array arm.
+    fn discriminated_union_schema() -> Schema {
+        let mut send = strict_arm(vec![
+            ("op", const_string("send"), true),
+            ("to", Schema::string(), true),
+            ("message", Schema::string(), true),
+        ]);
+        let mut wait = strict_arm(vec![
+            ("op", const_string("wait"), true),
+            (
+                "ids",
+                Schema {
+                    schema_type: Some(Value::String("array".into())),
+                    items: Some(Box::new(Schema {
+                        schema_type: Some(Value::String("string".into())),
+                        min_length: Some(1),
+                        ..Schema::default()
+                    })),
+                    min_items: Some(1),
+                    ..Schema::default()
+                },
+                true,
+            ),
+            (
+                "timeoutMs",
+                Schema {
+                    schema_type: Some(Value::String("integer".into())),
+                    minimum: Some(0.0),
+                    ..Schema::default()
+                },
+                false,
+            ),
+        ]);
+        send.property_order = vec!["op".into(), "to".into(), "message".into()];
+        wait.property_order = vec!["op".into(), "ids".into(), "timeoutMs".into()];
+        let mut schema = Schema::object_ordered(vec![
+            (
+                "op".into(),
+                Schema {
+                    schema_type: Some(Value::String("string".into())),
+                    enum_values: vec![json!("send"), json!("wait")],
+                    ..Schema::default()
+                },
+                true,
+            ),
+            ("to".into(), Schema::string(), false),
+            ("message".into(), Schema::string(), false),
+            (
+                "ids".into(),
+                Schema {
+                    schema_type: Some(Value::String("array".into())),
+                    items: Some(Box::new(Schema::string())),
+                    ..Schema::default()
+                },
+                false,
+            ),
+            (
+                "timeoutMs".into(),
+                Schema {
+                    schema_type: Some(Value::String("integer".into())),
+                    minimum: Some(0.0),
+                    ..Schema::default()
+                },
+                false,
+            ),
+        ]);
+        schema.one_of = vec![send, wait];
+        schema
+    }
+
+    #[tokio::test]
+    async fn corrected_example_keeps_matching_const_arm_and_integer() {
+        let tool = tool_with_schema("hub", discriminated_union_schema());
+        let error = prepare_rejecting(
+            &tool,
+            json!({"op": "wait", "ids": ["private-job-id"], "timeoutMs": "1000"}),
+        )
+        .await;
+        let text = result_text(&error);
+        assert!(
+            text.contains("Field timeoutMs: expected integer, received string."),
+            "{text}"
+        );
+        assert!(!text.contains("private-job-id"), "{text}");
+        assert!(!text.contains("1000"), "{text}");
+        let example = text
+            .split("Corrected example: ")
+            .nth(1)
+            .expect("corrected example present");
+        let skeleton: Value = serde_json::from_str(example).expect("example is JSON");
+        pi_ai::validate_tool_arguments(&tool.as_tool_definition(), &skeleton)
+            .expect("corrected example must pass the complete schema");
+        assert_eq!(skeleton["op"], json!("wait"));
+        assert_eq!(skeleton["timeoutMs"], json!(0));
+        assert_eq!(skeleton["ids"], json!(["x"]));
+        assert!(skeleton.get("to").is_none(), "{skeleton}");
+        assert!(skeleton.get("message").is_none(), "{skeleton}");
+    }
+
+    #[tokio::test]
+    async fn corrected_example_uses_send_const_and_first_arm_without_const() {
+        let tool = tool_with_schema("hub", discriminated_union_schema());
+        let send_error = prepare_rejecting(
+            &tool,
+            json!({"op": "send", "to": "private-recipient", "timeoutMs": "1000"}),
+        )
+        .await;
+        let send_text = result_text(&send_error);
+        assert!(!send_text.contains("private-recipient"), "{send_text}");
+        assert!(!send_text.contains("1000"), "{send_text}");
+        let send_example = send_text
+            .split("Corrected example: ")
+            .nth(1)
+            .expect("send example present");
+        let send_skeleton: Value = serde_json::from_str(send_example).expect("send example JSON");
+        pi_ai::validate_tool_arguments(&tool.as_tool_definition(), &send_skeleton)
+            .expect("send example validates");
+        assert_eq!(send_skeleton["op"], json!("send"));
+        assert_eq!(send_skeleton["to"], json!(""));
+        assert_eq!(send_skeleton["message"], json!(""));
+        assert!(send_skeleton.get("ids").is_none(), "{send_skeleton}");
+
+        let missing = prepare_rejecting(&tool, json!({"timeoutMs": "1000"})).await;
+        let missing_text = result_text(&missing);
+        let missing_example = missing_text
+            .split("Corrected example: ")
+            .nth(1)
+            .expect("missing discriminator still has the first valid arm");
+        let missing_skeleton: Value =
+            serde_json::from_str(missing_example).expect("missing example JSON");
+        pi_ai::validate_tool_arguments(&tool.as_tool_definition(), &missing_skeleton)
+            .expect("missing-discriminator example validates");
+        assert_eq!(missing_skeleton["op"], json!("send"));
+        assert!(missing_skeleton.get("ids").is_none(), "{missing_skeleton}");
+    }
+
+    fn example_json(text: &str) -> Option<Value> {
+        text.split("Corrected example: ")
+            .nth(1)
+            .map(|example| serde_json::from_str(example).expect("example is JSON"))
+    }
+
+    #[tokio::test]
+    async fn selected_const_rejects_conflicting_default() {
+        let mut schema = discriminated_union_schema();
+        schema.default = Some(json!({"op": "send", "to": "", "message": ""}));
+        let tool = tool_with_schema("hub", schema);
+        let error = prepare_rejecting(
+            &tool,
+            json!({"op": "wait", "ids": ["private-job-id"], "timeoutMs": "1000"}),
+        )
+        .await;
+        let text = result_text(&error);
+        assert!(!text.contains("private-job-id"), "{text}");
+        let skeleton = example_json(&text).expect("default must not replace wait");
+        assert_eq!(skeleton["op"], json!("wait"));
+        assert_eq!(skeleton["timeoutMs"], json!(0));
+        assert!(skeleton.get("to").is_none(), "{skeleton}");
+    }
+
+    #[tokio::test]
+    async fn selected_const_omits_example_when_enum_excludes_it() {
+        let mut schema = discriminated_union_schema();
+        schema.enum_values = vec![json!({"op": "send", "to": "", "message": ""})];
+        let tool = tool_with_schema("hub", schema);
+        let error = prepare_rejecting(
+            &tool,
+            json!({"op": "wait", "ids": ["private-job-id"], "timeoutMs": "1000"}),
+        )
+        .await;
+        let text = result_text(&error);
+        assert!(
+            !text.contains("Corrected example"),
+            "a send-only enum cannot validate a wait example: {text}"
+        );
+        assert!(!text.contains("private-job-id"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn conflicting_consts_omit_corrected_example() {
+        let mut send = strict_arm(vec![
+            ("op", const_string("send"), true),
+            ("channel", const_string("mail"), true),
+        ]);
+        let mut wait = strict_arm(vec![
+            ("op", const_string("wait"), true),
+            ("channel", const_string("jobs"), true),
+        ]);
+        send.property_order = vec!["op".into(), "channel".into()];
+        wait.property_order = vec!["op".into(), "channel".into()];
+        let mut schema = Schema::object_ordered(vec![
+            ("op".into(), Schema::string(), true),
+            ("channel".into(), Schema::string(), true),
+        ]);
+        schema.one_of = vec![send, wait];
+        let tool = tool_with_schema("hub", schema);
+        let error = prepare_rejecting(&tool, json!({"op": "wait", "channel": "mail"})).await;
+        let text = result_text(&error);
+        assert!(
+            !text.contains("Corrected example"),
+            "wait plus mail belong to different arms: {text}"
+        );
+        assert!(!text.contains("mail"), "{text}");
+    }
+
+
+
+
+
     #[tokio::test]
     async fn parallel_mixed_batch_terminates_and_emits_each_sibling_once() {
         let executed = Arc::new(AtomicUsize::new(0));
@@ -2536,5 +2948,373 @@ mod sequential_terminate_tests {
                 "the skipped second call must not emit {prefix}call-2"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod provider_abort_tests {
+    use std::collections::VecDeque;
+
+    use parking_lot::Mutex as StdMutex;
+    use pi_ai::{Context, Model, SimpleStreamOptions, new_assistant_message_event_stream};
+
+    use super::*;
+    use crate::AbortController;
+
+    fn scripted_terminal(message: AssistantMessage) -> StreamFn {
+        let queue = Arc::new(StdMutex::new(VecDeque::from([message])));
+        Arc::new(
+            move |_model: Model, _context: Context, _options: SimpleStreamOptions| {
+                let queue = queue.clone();
+                Box::pin(async move {
+                    let message = queue.lock().pop_front().expect("scripted message");
+                    let stream = new_assistant_message_event_stream();
+                    let producer = stream.clone();
+                    tokio::spawn(async move {
+                        let terminal = if matches!(
+                            message.stop_reason,
+                            StopReason::Error | StopReason::Aborted
+                        ) {
+                            AssistantMessageEvent::Error {
+                                reason: message.stop_reason,
+                                error: message.clone(),
+                            }
+                        } else {
+                            AssistantMessageEvent::Done {
+                                reason: message.stop_reason,
+                                message: message.clone(),
+                            }
+                        };
+                        producer.push(terminal).await;
+                        producer.end(Some(message)).await;
+                    });
+                    stream
+                })
+            },
+        )
+    }
+
+    fn terminal(stop_reason: StopReason, error_message: &str) -> AssistantMessage {
+        AssistantMessage {
+            content: vec![ContentBlock::text("")],
+            stop_reason,
+            error_message: Some(error_message.to_owned()),
+            ..AssistantMessage::pending(&Model::default())
+        }
+    }
+
+    async fn run_terminal(message: AssistantMessage) -> anyhow::Result<Vec<AgentMessage>> {
+        let (_, abort) = AbortController::new();
+        let emit: EventSink = Arc::new(|_event| Box::pin(async { Ok(()) }));
+        run_agent_loop(
+            vec![Message::user_text("prompt", 1)],
+            AgentContext {
+                system_prompt: String::new(),
+                messages: Vec::new(),
+                tools: Vec::new(),
+            },
+            AgentLoopConfig {
+                model: Model::default(),
+                reasoning: ThinkingLevel::Off,
+                ..AgentLoopConfig::default()
+            },
+            emit,
+            scripted_terminal(message),
+            abort,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn provider_aborted_is_typed_and_error_keeps_provider_text() {
+        let aborted = run_terminal(terminal(
+            StopReason::Aborted,
+            "provider aborted the socket",
+        ))
+        .await
+        .expect_err("aborted provider stop must fail the loop");
+        assert!(
+            aborted.downcast_ref::<AbortError>().is_some(),
+            "StopReason::Aborted must be a typed AbortError, got {aborted:#}"
+        );
+        assert!(
+            format!("{aborted:#}").contains("provider aborted the socket"),
+            "provider abort text must stay on the error chain, got {aborted:#}"
+        );
+
+        let failed = run_terminal(terminal(StopReason::Error, "provider aborted the socket"))
+            .await
+            .expect_err("provider error must fail the loop");
+        assert!(
+            failed.downcast_ref::<AbortError>().is_none(),
+            "a real provider error must not become AbortError, got {failed:#}"
+        );
+        assert_eq!(format!("{failed:#}"), "provider aborted the socket");
+    }
+}
+
+#[cfg(test)]
+mod tool_abort_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use pi_ai::{Context, Model, Schema, SimpleStreamOptions, new_assistant_message_event_stream};
+
+    use super::*;
+    use crate::AbortController;
+
+    fn tool_turn() -> AssistantMessage {
+        AssistantMessage {
+            content: vec![ContentBlock::ToolCall(ToolCall {
+                id: "call-1".to_owned(),
+                name: "waiter".to_owned(),
+                arguments: serde_json::json!({}),
+                thought_signature: None,
+            })],
+            stop_reason: StopReason::ToolUse,
+            ..AssistantMessage::pending(&Model::default())
+        }
+    }
+
+    fn stop_turn() -> AssistantMessage {
+        AssistantMessage {
+            content: vec![ContentBlock::text("done")],
+            stop_reason: StopReason::Stop,
+            ..AssistantMessage::pending(&Model::default())
+        }
+    }
+
+    fn scripted_turns(calls: Arc<AtomicUsize>) -> StreamFn {
+        Arc::new(
+            move |_model: Model, _context: Context, _options: SimpleStreamOptions| {
+                let calls = calls.clone();
+                Box::pin(async move {
+                    let message = if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        tool_turn()
+                    } else {
+                        stop_turn()
+                    };
+                    let stream = new_assistant_message_event_stream();
+                    let producer = stream.clone();
+                    tokio::spawn(async move {
+                        producer
+                            .push(AssistantMessageEvent::Done {
+                                reason: message.stop_reason,
+                                message: message.clone(),
+                            })
+                            .await;
+                        producer.end(Some(message)).await;
+                    });
+                    stream
+                })
+            },
+        )
+    }
+
+    async fn run_with_tool(tool: AgentTool) -> (anyhow::Result<Vec<AgentMessage>>, usize) {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let stream = scripted_turns(stream_calls.clone());
+        let (_, abort) = AbortController::new();
+        let emit: EventSink = Arc::new(|_event| Box::pin(async { Ok(()) }));
+        let result = run_agent_loop(
+            vec![Message::user_text("prompt", 1)],
+            AgentContext {
+                system_prompt: String::new(),
+                messages: Vec::new(),
+                tools: vec![tool],
+            },
+            AgentLoopConfig {
+                model: Model::default(),
+                reasoning: ThinkingLevel::Off,
+                ..AgentLoopConfig::default()
+            },
+            emit,
+            stream,
+            abort,
+        )
+        .await;
+        (result, stream_calls.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn typed_tool_abort_fails_the_run_without_a_retry() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let counter = executions.clone();
+        let tool = AgentTool::new("waiter", "waits for abort", Schema::default(), move |_| {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Err(anyhow::Error::from(AbortError))
+            }
+        });
+
+        let (result, stream_calls) = run_with_tool(tool).await;
+        let error = result.expect_err("a typed tool abort must fail the run");
+        assert!(
+            error.downcast_ref::<AbortError>().is_some(),
+            "the consumer must receive a typed AbortError, got {error:#}"
+        );
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            1,
+            "an aborted tool must execute exactly once"
+        );
+        assert_eq!(
+            stream_calls, 1,
+            "an aborted tool must not start another model turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn untyped_abort_prose_stays_a_tool_error() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let counter = executions.clone();
+        let tool = AgentTool::new("waiter", "waits for abort", Schema::default(), move |_| {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                // Same prose as AbortError's Display must still stay untyped.
+                Err(anyhow!("Operation aborted"))
+            }
+        });
+
+        let (result, stream_calls) = run_with_tool(tool).await;
+        let messages = result.expect("an untyped abort-looking error must not fail the run");
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            stream_calls, 2,
+            "an ordinary tool error must let the loop continue"
+        );
+        let tool_result = messages
+            .iter()
+            .find_map(|message| match message {
+                Message::ToolResult(result) => Some(result),
+                _ => None,
+            })
+            .expect("the tool call must produce a result message");
+        assert!(tool_result.is_error, "the tool result must be an error");
+        let text = tool_result
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("Operation aborted"),
+            "the tool error text must be preserved, got {text}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tool_execution_error_tests {
+    use pi_ai::{Model, Schema};
+
+    use super::*;
+    use crate::AbortController;
+
+    fn prepared_for(tool: AgentTool) -> PreparedToolCall {
+        PreparedToolCall {
+            tool_call: ToolCall {
+                id: "call-1".to_owned(),
+                name: "carrier".to_owned(),
+                arguments: serde_json::json!({}),
+                thought_signature: None,
+            },
+            tool,
+            arguments: serde_json::json!({}),
+            model: Model::default(),
+            approval_token: None,
+        }
+    }
+
+    fn result_text(result: &AgentToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn carrier_content_and_details_pass_through_with_is_error_true() {
+        let tool = AgentTool::new("carrier", "structured failure", Schema::default(), |_| {
+            async move {
+                let mut result = AgentToolResult::text("git failed with exit code 128");
+                result.details = serde_json::json!({ "exit_code": 128, "stream": "stderr" });
+                result.terminate = true;
+                Err(anyhow::Error::new(ToolExecutionError::new(
+                    result,
+                    anyhow!("fatal: not a git repository"),
+                )))
+            }
+        });
+        let (_, abort) = AbortController::new();
+        let emit: EventSink = Arc::new(|_event| Box::pin(async { Ok(()) }));
+        let (result, is_error) =
+            execute_prepared_tool_call(prepared_for(tool), emit, abort, None)
+                .await
+                .expect("a carried tool failure must finalize as a tool result, not fail the run");
+
+        assert!(is_error, "a carried tool failure must always be an error");
+        assert_eq!(
+            result_text(&result),
+            "git failed with exit code 128",
+            "the producer's text content must pass through untouched"
+        );
+        assert_eq!(
+            result.details,
+            serde_json::json!({ "exit_code": 128, "stream": "stderr" }),
+            "the producer's details must pass through untouched"
+        );
+        assert!(
+            result.terminate,
+            "the producer's terminate choice must travel with the result"
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_tool_abort_propagates_as_before() {
+        let tool = AgentTool::new("waiter", "aborts", Schema::default(), |_| {
+            async move { Err(anyhow::Error::from(AbortError)) }
+        });
+        let (_, abort) = AbortController::new();
+        let emit: EventSink = Arc::new(|_event| Box::pin(async { Ok(()) }));
+        let error = execute_prepared_tool_call(prepared_for(tool), emit, abort, None)
+            .await
+            .expect_err("a typed abort must keep failing the run as before");
+
+        assert!(
+            error.downcast_ref::<AbortError>().is_some(),
+            "the abort must stay a typed AbortError, got {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn untyped_error_keeps_the_plain_text_path() {
+        let tool = AgentTool::new("plain", "plain failure", Schema::default(), |_| {
+            async move { Err(anyhow!("plain tool failure")) }
+        });
+        let (_, abort) = AbortController::new();
+        let emit: EventSink = Arc::new(|_event| Box::pin(async { Ok(()) }));
+        let (result, is_error) =
+            execute_prepared_tool_call(prepared_for(tool), emit, abort, None)
+                .await
+                .expect("an untyped tool error must finalize as a tool result");
+
+        assert!(is_error);
+        assert_eq!(
+            result_text(&result),
+            "plain tool failure",
+            "an untyped error must stay on the original stringified path"
+        );
+        assert!(!result.terminate);
+        assert_eq!(result.details, serde_json::json!({}));
     }
 }

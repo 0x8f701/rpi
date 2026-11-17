@@ -1074,12 +1074,14 @@ fn build_candidate(
         })
         .collect::<Vec<_>>();
     let available_models = crate::available_models();
-    let parent_model = pi_ai::Model::default();
+    // Resource discovery has no session, so there is no parent model to
+    // validate against. A definition that would inherit the parent model is
+    // not a defect here; explicit invalid model configuration still warns.
     diagnostics.extend(agents.iter().filter_map(|agent| {
         crate::agent_compatibility_error(
             agent,
             settings.agents.get(&agent.name),
-            &parent_model,
+            None,
             &available_models,
         )
         .map(|error| ResourceDiagnostic {
@@ -1894,7 +1896,7 @@ mod tests {
             });
         let session = crate::Session::new_with_additional_tools_filtered_and_discovery(
             crate::SessionOptions {
-                model,
+                model: Some(model),
                 cwd: cwd.clone(),
                 system_prompt: String::new(),
                 thinking_level: pi_agent::ThinkingLevel::Off,

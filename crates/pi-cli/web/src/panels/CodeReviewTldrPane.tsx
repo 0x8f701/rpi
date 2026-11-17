@@ -10,7 +10,10 @@
 // owner (`data-session-id` ancestor); this pane does not take an open-file callback.
 
 import { useCallback, useState } from 'react';
+import type { ReviewRepository } from '../codeReview';
 import { MarkdownBody } from '../MarkdownBody';
+import { ReplyActions } from '../ReplyActions';
+import { reviewRepositoryStamp } from './CodeReviewThreadDock';
 
 export type CodeReviewTldrState = 'idle' | 'running' | 'done' | 'failed';
 
@@ -20,9 +23,16 @@ export interface CodeReviewTldrPaneProps {
   state: CodeReviewTldrState;
   /** Session stamped as the markdown path owner. Empty leaves chips inert. */
   sessionId?: string;
-  /** The reviewing repository override, stamped `data-review-repo` so
-   *  repo-relative citations resolve through it. */
-  reviewRepo?: string;
+  /** Snapshot repository authority. Absent is not a review owner; null is
+   *  the session cwd. */
+  reviewRepo?: ReviewRepository;
+  /** Stable wire creation time (epoch ms) of `markdown`; absent or invalid
+   *  makes only the save action report through `onReplyActionError`. */
+  timestampMs?: number;
+  /** The host's central toast channel for reply-action failures (fixed
+   *  context, never reply text). Required: the pane never owns a toast. */
+  onReplyActionError: (message: string) => void;
+
   onStop: () => void;
   onClose: () => void;
   /** Fires after Markdown/Mermaid/image layout mutations. */
@@ -42,6 +52,8 @@ export function CodeReviewTldrPane({
   state,
   sessionId = '',
   reviewRepo,
+  timestampMs,
+  onReplyActionError,
   onStop,
   onClose,
   onLayoutChange,
@@ -59,7 +71,7 @@ export function CodeReviewTldrPane({
       aria-busy={running}
       data-tldr-state={state}
       data-session-id={sessionId}
-      data-review-repo={reviewRepo}
+      {...reviewRepositoryStamp(reviewRepo)}
     >
       <div className="code-review-tldr__head">
         <span className="code-review-tldr__title">Summary</span>
@@ -93,6 +105,15 @@ export function CodeReviewTldrPane({
           </button>
         </div>
       </div>
+      {markdown !== '' && (
+        <div className="msg--assistant" data-tldr-reply-band="true">
+          <ReplyActions
+            markdown={markdown}
+            timestampMs={timestampMs}
+            onError={onReplyActionError}
+          />
+        </div>
+      )}
       <div
         className={`code-review-tldr__viewport${expanded ? ' is-expanded' : ''}`}
         data-expanded={expanded ? 'true' : 'false'}

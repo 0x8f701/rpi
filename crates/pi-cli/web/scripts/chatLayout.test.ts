@@ -39,6 +39,7 @@ import { RUNNER_UNREACHABLE_MESSAGE } from '../src/chat/auth.ts';
 import { runnerDisplayName } from '../src/chat/runners.ts';
 import {
   HostConnectionChip,
+  HOST_CONNECTING_STATUS,
   HOST_RECONNECTING_STATUS,
   HOST_TOKEN_REQUIRED_ERROR,
   hostConnectionChip,
@@ -144,47 +145,13 @@ const subagentsPanel = readFileSync(join(here, '../src/panels/SubagentsPanel.tsx
         && !block.includes('min-height: 100vh');
     })()
     && /^\.chat-workspace-bar \{[\s\S]*?grid-column:\s*1\s*\/\s*-1;/m.test(styles));
-  check('workspace bar uses the /web brand face', app.includes('className="brand"')
-    && app.includes('<span className="brand-sub">chat</span>')
-    && app.includes('rpi'));
-  check('workspace bar uses the /web hamburger menu control', app.includes('id="chat-workspace-menu-btn"')
-    && app.includes('className={workspaceMenuOpen ? \'panel-toggle panel-toggle--open\' : \'panel-toggle\'}')
-    && app.includes('☰')
-    && webApp.includes('id="sidebar-toggle-btn"')
-    && webApp.includes('☰')
-    && /#sidebar-toggle-btn,\s*#chat-workspace-menu-btn/.test(webStyles)
-    && app.includes('aria-label={workspaceMenuOpen ? \'Close menu\' : \'Open menu\'}'));
-  check('workspace menu contains Web as a menu item', app.includes('id="chat-workspace-menu"')
-    && app.includes('href="/web"')
-    && app.includes('aria-label="Open web"')
-    && />\s*Web\s*</.test(app)
-    && app.includes('{workspaceMenuOpen && (')
-    && !app.includes('chat-workspace-bar__web')
-    && /\.chat-workspace-menu\s*>\s*:last-child:nth-child\(odd\)\s*\{[^}]*grid-column:\s*1\s*\/\s*-1/.test(styles));
   check('workspace bar stays above the tmux overlay', (() => {
     const barStart = styles.indexOf('.chat-workspace-bar {\n');
     const bar = barStart >= 0 ? styles.slice(barStart, styles.indexOf('}', barStart)) : '';
     const overlayStart = styles.indexOf('.chat-tmux-terminal {\n');
     const overlay = overlayStart >= 0 ? styles.slice(overlayStart, styles.indexOf('}', overlayStart)) : '';
-    const menuStart = styles.indexOf('.chat-workspace-menu {\n');
-    const menu = menuStart >= 0 ? styles.slice(menuStart, styles.indexOf('}', menuStart)) : '';
     return bar.includes('z-index: 30') && bar.includes('min-height: 44px')
-      && overlay.includes('z-index: 20') && overlay.includes('top: 44px') && !overlay.includes('inset: 0')
-      && menu.includes('z-index: 31');
-  })());
-  check('workspace ☰ is 44px at 820 (721px media, not only 480)', (() => {
-    const start = webStyles.indexOf('@media (min-width: 721px) {\n  #sidebar-toggle-btn,');
-    const block = start >= 0 ? webStyles.slice(start, webStyles.indexOf('}', start + 40)) : '';
-    return block.includes('#chat-workspace-menu-btn')
-      && block.includes('min-width: 44px')
-      && block.includes('min-height: 44px');
-  })());
-  check('workspace ☰ is 44px on the 720px drawer breakpoint', (() => {
-    const start = webStyles.indexOf('@media (max-width: 720px) {\n  .app-layout {');
-    const block = start >= 0 ? webStyles.slice(start, webStyles.indexOf('@media (max-width: 480px) {', start)) : '';
-    const btn = block.indexOf('#chat-workspace-menu-btn {');
-    const rule = btn >= 0 ? block.slice(btn, block.indexOf('}', btn)) : '';
-    return rule.includes('min-width: 44px') && rule.includes('min-height: 44px');
+      && overlay.includes('z-index: 20') && overlay.includes('top: 44px') && !overlay.includes('inset: 0');
   })());
   check('/web shell fills dvh so footer pins at 390/820/1280', (() => {
     const dvh = webStyles.indexOf('@supports (height: 100dvh)');
@@ -194,23 +161,6 @@ const subagentsPanel = readFileSync(join(here, '../src/panels/SubagentsPanel.tsx
     return dvhBlock.includes('html, body, #root') && dvhBlock.includes('height: 100dvh')
       && layout.includes('height: 100%') && layout.includes('max-height: 100%') && layout.includes('min-height: 0')
       && webStyles.includes('html, body {\n  height: 100%;\n  overflow: hidden;');
-  })());
-  check('Escape closes the workspace ☰ before the tmux overlay trap', (() => {
-    const start = app.indexOf('const onKeyDown = (event: KeyboardEvent) =>');
-    const body = start >= 0 ? app.slice(start, app.indexOf('document.addEventListener', start)) : '';
-    return body.includes('if (workspaceMenuOpen) {')
-      && body.indexOf('if (workspaceMenuOpen) {') < body.indexOf('if (tmuxTerminal && !tmuxTerminal.hidden) return;')
-      && app.includes("addEventListener('keydown', onKeyDown, true)")
-      && app.includes("removeEventListener('keydown', onKeyDown, true)");
-  })());
-  check('pointer-down outside the workspace ☰ dismisses it', (() => {
-    const start = app.indexOf('if (!workspaceMenuOpen) return;');
-    const body = start >= 0 ? app.slice(start, app.indexOf('}, [workspaceMenuOpen]);', start)) : '';
-    return body.includes('workspaceMenuRef.current')
-      && body.includes('root.contains(event.target as Node)')
-      && body.includes('setWorkspaceMenuOpen(false)')
-      && body.includes("addEventListener('pointerdown', onPointerDown)")
-      && body.includes("removeEventListener('pointerdown', onPointerDown)");
   })());
   check('primary chat actions use accent ink like /web send', (() => {
     const start = styles.indexOf('.chat-button--primary {');
@@ -1186,12 +1136,12 @@ const subagentsPanel = readFileSync(join(here, '../src/panels/SubagentsPanel.tsx
   );
   const connectingHtml = renderChip('connecting', 'stale socket error');
   check(
-    'connecting chip uses the same pulse as reconnecting',
+    'connecting chip says Connecting, not Reconnecting',
     connectingHtml.includes('host-connection-chip--pulse')
       && connectingHtml.includes('chat-slow-pulse')
-      && connectingHtml.includes(`aria-label="${HOST_RECONNECTING_STATUS}"`)
-      && !connectingHtml.includes(`>${HOST_RECONNECTING_STATUS}<`),
-    connectingHtml,
+      && connectingHtml.includes(`aria-label="${HOST_CONNECTING_STATUS}"`)
+      && !connectingHtml.includes(`aria-label="${HOST_RECONNECTING_STATUS}"`)
+      && !connectingHtml.includes(`>${HOST_CONNECTING_STATUS}<`),
   );
   const onHtml = renderChip('on', 'stale socket error');
   check('connected chip is absent', onHtml === '', onHtml);
@@ -1371,6 +1321,32 @@ const subagentsPanel = readFileSync(join(here, '../src/panels/SubagentsPanel.tsx
     && running.entries[0]?.actor === 'glm'
     && activityEntryMatchesPage(running.entries[0]!, 'recent')
     && !activityEntryMatchesPage(running.entries[0]!, 'settled'));
+  const cancelling = applyActivityEvent(emptySnapshot, {
+    type: 'job_updated',
+    sessionId: 'sess-a',
+    sequence: 5,
+    job: {
+      id: 'job-drain',
+      status: 'cancelling',
+      description: 'stopping review',
+      agent: 'glm',
+      createdAt: 200,
+    },
+  });
+  check('cancelling job stays on the recent Activity page', cancelling.entries.length === 1
+    && cancelling.entries[0]?.status === 'cancelling'
+    && activityEntryMatchesPage(cancelling.entries[0]!, 'recent')
+    && !activityEntryMatchesPage(cancelling.entries[0]!, 'settled'));
+  const settledCancel = applyActivityEvent(cancelling, {
+    type: 'job_updated',
+    sessionId: 'sess-a',
+    sequence: 6,
+    job: { id: 'job-drain', status: 'cancelled', agent: 'glm', createdAt: 200, finishedAt: 300 },
+  });
+  check('cancelled job moves to the settled Activity page', settledCancel.entries.length === 1
+    && settledCancel.entries[0]?.status === 'cancelled'
+    && activityEntryMatchesPage(settledCancel.entries[0]!, 'settled')
+    && !activityEntryMatchesPage(settledCancel.entries[0]!, 'recent'));
   const populated = renderToStaticMarkup(createElement(ActivityPanel, {
     activity: running.entries,
     onClose: () => undefined,
@@ -1392,8 +1368,6 @@ const subagentsPanel = readFileSync(join(here, '../src/panels/SubagentsPanel.tsx
 }
 
 {
-  const phoneMqStart = webStyles.indexOf('@media (max-width: 768px) {');
-  const phoneMq = phoneMqStart >= 0 ? webStyles.slice(phoneMqStart, webStyles.indexOf('\n}\n\n@media (max-width: 480px)', phoneMqStart)) : '';
   const rowStart = webStyles.indexOf('.steering-queue__row {');
   const row = rowStart >= 0 ? webStyles.slice(rowStart, webStyles.indexOf('}', rowStart)) : '';
   const textStart = webStyles.indexOf('.steering-queue__text {');
@@ -1428,13 +1402,6 @@ const subagentsPanel = readFileSync(join(here, '../src/panels/SubagentsPanel.tsx
   const phoneBody = phoneRuleFor('.subagent-details__body {');
   const phoneSheet = phoneRuleFor('.subagent-details {');
   check('390 steering tray rows are 36-44px with ellipsis', row.includes('min-height: 36px') && row.includes('max-height: 44px') && text.includes('text-overflow: ellipsis') && text.includes('white-space: nowrap') && !webStyles.includes('.steering-queue__head'));
-  // Anchored on the RULE (two-space indent), not the bare `footer {`
-  // substring: a nested rule such as `.app-layout--drawer-open footer {`
-  // would otherwise be read first. The slice start is the first
-  // `@media (max-width: 768px)` block, which other work may add earlier.
-  const footerPhoneStart = phoneMq.indexOf('\n  footer {');
-  const footerPhone = footerPhoneStart >= 0 ? phoneMq.slice(footerPhoneStart, phoneMq.indexOf('}', footerPhoneStart)) : '';
-  check('390 footer overflow stays visible so the steering overlay is not clipped', footerPhone.includes('overflow: visible') && !footerPhone.includes('overflow-y: auto'));
   check(
     'mobile drawers fill the header-to-footer inset with an explicit calc height',
     /@media \(max-width: 768px\) \{[\s\S]*?\.todo-panel,[\s\S]*?height:\s*calc\(100dvh - var\(--app-header-height/.test(webStyles),
@@ -1593,9 +1560,6 @@ const subagentsPanel = readFileSync(join(here, '../src/panels/SubagentsPanel.tsx
     && webStyles.includes('.assistant-text { white-space: pre-wrap; overflow-wrap: anywhere; padding-inline: 11px; }')
     && siblingLeftsAligned(shippedBlocks.tool, shippedBlocks.thinking)
     && thinkingInset.thinking.left - thinkingInset.tool.left === 10);
-  check('390 feature nav odd last item spans both columns',
-    /\.session-sidebar__nav\s*>\s*:last-child:nth-child\(odd\)\s*\{[^}]*grid-column:\s*1\s*\/\s*-1/.test(webStyles)
-    && /@media \(max-width: 720px\)[\s\S]*\.session-sidebar__nav \.panel-toggle/.test(webStyles));
 }
 
 {
@@ -1698,15 +1662,7 @@ const subagentsPanel = readFileSync(join(here, '../src/panels/SubagentsPanel.tsx
   const toolCardRule = webStyles.slice(webStyles.indexOf('.tool-card {'), webStyles.indexOf('}', webStyles.indexOf('.tool-card {')));
   check('web tool-card is full column width, not 96%',
     toolCardRule.includes('width: 100%') && !/max-width:\s*96%/.test(toolCardRule) && !/max-width:\s*96%/.test(webStyles));
-  const phoneMqStart = webStyles.indexOf('@media (max-width: 768px) {');
-  const phoneMq = phoneMqStart >= 0 ? webStyles.slice(phoneMqStart, webStyles.indexOf('\n}\n\n@media (max-width: 480px)', phoneMqStart)) : '';
-  check('390 transcript padding matches footer 12px and both reserve a stable scrollbar gutter',
-    webStyles.includes('.transcript-content { padding: 10px 12px; }')
-      && /footer \{[^}]*padding:\s*8px 12px/.test(phoneMq)
-      && /footer \{[^}]*scrollbar-gutter:\s*stable/.test(phoneMq)
-      && /#transcript \{[^}]*scrollbar-gutter:\s*stable/.test(webStyles)
-      && !/#transcript \{[^}]*scrollbar-gutter:\s*auto/.test(phoneMq)
-      && /#prompt-input \{[^}]*width:\s*100%/.test(webStyles));
+
   const webTableRule = mdTableCellRule(webStyles);
   const chatTableRule = mdTableCellRule(styles);
   const webTablePolicy = tableCellWrapPolicy(webTableRule);

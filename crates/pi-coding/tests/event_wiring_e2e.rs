@@ -75,7 +75,7 @@ fn session_with(model: Model, root: &Path) -> Session {
     fs::create_dir_all(&workspace).expect("test workspace");
     fs::create_dir_all(&sessions).expect("test sessions root");
     let session = Session::new(SessionOptions {
-        model,
+        model: Some(model),
         cwd: workspace,
         system_prompt: String::new(),
         thinking_level: pi_agent::ThinkingLevel::Off,

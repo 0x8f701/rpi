@@ -59,7 +59,7 @@ const BROWSER_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const BROWSER_PIPE_FRAME_LIMIT: usize = 1024 * 1024;
 const BROWSER_STDERR_TAIL_LIMIT: usize = 8 * 1024;
 const BROWSER_PROFILE_ID_KEY: &str = "_browserProfileId";
-/// Output byte budget for `extract` text — keeps agent context lean.
+/// Inline byte budget for extract output when no `path` is given.
 const EXTRACT_MAX_BYTES: usize = 16 * 1024;
 /// Cap on the number of tabs rendered by `list_tabs`.
 const LIST_TABS_MAX: usize = 20;
@@ -108,7 +108,11 @@ pub(crate) fn browser_tool_for_workspace(
             ),
             (
                 "path",
-                s_string("Workspace-relative output path for the screenshot PNG (screenshot only)"),
+                s_string(
+                    "Workspace-relative output path: the PNG file for screenshot, or a text \
+                     artifact file for extract (extract writes the full evaluated text and \
+                     returns a path/byte-count summary instead of the content)",
+                ),
             ),
             (
                 BROWSER_PROFILE_ID_KEY,
@@ -120,10 +124,12 @@ pub(crate) fn browser_tool_for_workspace(
     let description = format!(
         "Automate a governed headless Chromium/Chrome browser over its native debugging pipe. \
 Actions: navigate (url), click (selector), fill (selector, text), screenshot (path), \
-extract (selector? — page or element text), list_tabs, close. \
+extract (selector?, path? — page or element text; with path the FULL text is written to \
+that workspace file and only the relative path plus byte count are returned; without path \
+the evaluated text is returned inline up to {}KB), list_tabs, close. \
 Each call uses a fresh revision-owned profile and proves Chromium's native sandbox before CDP \
-commands are accepted. Screenshots stay within captured workspace authority. Outputs are \
-bounded to {}KB.",
+commands are accepted. Screenshots and extract artifacts stay within captured workspace \
+authority.",
         EXTRACT_MAX_BYTES / 1024
     );
     let execute_capture = capture_generation.clone();
@@ -235,7 +241,13 @@ fn validate_args(action: &Action, args: &Value) -> Result<()> {
             }
             Ok(())
         }
-        Action::Extract | Action::ListTabs | Action::Close => Ok(()),
+        Action::Extract => {
+            if !path.trim().is_empty() && Path::new(&path).is_absolute() {
+                bail!("browser: extract path must be workspace-relative");
+            }
+            Ok(())
+        }
+        Action::ListTabs | Action::Close => Ok(()),
     }?;
     // Non-navigate actions may carry an optional `url` (navigate first); it
     // must be valid when present.
@@ -417,11 +429,25 @@ impl BrowserSession {
             .await
             .map_err(|_| anyhow!("browser: CDP send failed"))?;
         let deadline = tokio::time::Instant::now() + COMMAND_TIMEOUT;
+        let mut skipped_frames = 0_u64;
         loop {
             let response = read_cdp_frame(&mut self.response_reader, deadline)
                 .await
-                .map_err(|error| anyhow!("browser: CDP receive failed: {error}"))?;
+                .with_context(|| {
+                    let process_status = match self.process.exit_status() {
+                        None => "running".to_owned(),
+                        Some(Ok(code)) => format!("exited({code})"),
+                        Some(Err(_)) => "exit-unknown".to_owned(),
+                    };
+                    format!(
+                        "browser: CDP receive failed for {method} (id {id}, \
+                         skipped_frames {skipped_frames}, stderr_bytes {}, \
+                         process_status {process_status})",
+                        self.stderr.byte_count()
+                    )
+                })?;
             if response.get("id").and_then(Value::as_u64) != Some(id) {
+                skipped_frames += 1;
                 continue;
             }
             if let Some(error) = response.get("error") {
@@ -521,7 +547,7 @@ impl BrowserSession {
 
 #[cfg(unix)]
 fn build_browser_argv(profile: &SandboxVisiblePath) -> Vec<String> {
-    vec![
+    let mut argv = vec![
         "--headless=new".to_owned(),
         "--remote-debugging-pipe".to_owned(),
         "--no-first-run".to_owned(),
@@ -534,8 +560,11 @@ fn build_browser_argv(profile: &SandboxVisiblePath) -> Vec<String> {
         "--disable-dev-shm-usage".to_owned(),
         "--window-size=1280,900".to_owned(),
         format!("--user-data-dir={}", profile.as_path().display()),
-        "about:blank".to_owned(),
-    ]
+    ];
+    #[cfg(target_os = "linux")]
+    argv.push("--incognito".to_owned());
+    argv.push("about:blank".to_owned());
+    argv
 }
 
 fn browser_target_fd_mappings() -> std::result::Result<Vec<CanonicalTargetFdMapping>, SandboxError>
@@ -997,9 +1026,10 @@ async fn mouse_click_at(session: &mut BrowserSession, x: f64, y: f64) -> Result<
     Ok(())
 }
 
-fn resolve_screenshot_path(workspace: &WorkspaceRoots, path: &str) -> Result<PathBuf> {
+/// Lexical workspace-root containment; symlink/no-follow checks stay in `PolicyFs`.
+fn resolve_output_path(workspace: &WorkspaceRoots, path: &str, kind: &str) -> Result<PathBuf> {
     if path.trim().is_empty() || path.contains('\0') {
-        bail!("browser: screenshot path is invalid");
+        bail!("browser: {kind} path is invalid");
     }
     let output = PathBuf::from(resolve_to_cwd(path, &workspace.cwd().to_string_lossy()));
     if !workspace
@@ -1007,15 +1037,15 @@ fn resolve_screenshot_path(workspace: &WorkspaceRoots, path: &str) -> Result<Pat
         .iter()
         .any(|root| output.starts_with(root))
     {
-        bail!("browser: screenshot path must stay within the workspace");
+        bail!("browser: {kind} path must stay within the workspace");
     }
     if output.file_name().is_none() {
-        bail!("browser: screenshot path must name a file");
+        bail!("browser: {kind} path must name a file");
     }
     Ok(output)
 }
 
-fn save_screenshot_bytes(
+fn save_output_bytes(
     fs: &Arc<PolicyFs>,
     output: &Path,
     bytes: Vec<u8>,
@@ -1062,7 +1092,7 @@ fn screenshot_result(
     if data.len() > SCREENSHOT_MAX_BASE64_BYTES {
         bail!("browser: screenshot exceeds the inline transport limit");
     }
-    save_screenshot_bytes(fs, output, bytes).map_err(anyhow::Error::from)?;
+    save_output_bytes(fs, output, bytes).map_err(anyhow::Error::from)?;
     let display_path = workspace
         .roots()
         .iter()
@@ -1181,7 +1211,7 @@ async fn run_action(
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(b64)
                 .context("browser: screenshot data was not valid base64")?;
-            let output = resolve_screenshot_path(workspace, &path)?;
+            let output = resolve_output_path(workspace, &path, "screenshot")?;
             screenshot_result(fs, workspace, &output, bytes)
         }
         Action::Extract => {
@@ -1198,6 +1228,17 @@ async fn run_action(
                 }
                 bail!("browser: page produced no text");
             };
+            let path = arg_str(args, "path");
+            if !path.trim().is_empty() {
+                let output = resolve_output_path(workspace, &path, "extract")?;
+                let bytes = text.as_bytes().to_vec();
+                let byte_count = bytes.len();
+                save_output_bytes(fs, &output, bytes).map_err(anyhow::Error::from)?;
+                return Ok(text_result(format!(
+                    "Extracted {byte_count} bytes from the page to {path} \
+                     (full text, not truncated; read the file to inspect it)"
+                )));
+            }
             let truncated = truncate_head(text, usize::MAX, EXTRACT_MAX_BYTES);
             let mut out = truncated.content;
             if truncated.truncated {
@@ -1490,6 +1531,104 @@ mod tests {
             tool.prepare_approval.is_some(),
             "browser must prepare an approval request so the host approval hook \
              mints the final native sandbox token"
+        );
+    }
+
+    #[test]
+    fn extract_path_rejects_unsafe_locations() {
+        for absolute_path in [
+            "/etc/passwd",
+            "/tmp/browser-extract-path-contract/inside.txt",
+        ] {
+            assert!(
+                validate_args(&Action::Extract, &json!({ "path": absolute_path })).is_err(),
+                "{absolute_path:?} must be rejected: extract paths are workspace-relative"
+            );
+        }
+        let workspace = WorkspaceRoots::for_tool_factory("/tmp/browser-extract-path-contract");
+        for unsafe_path in ["", "../escape.txt", "nested/../../escape.txt", "bad\0name"] {
+            assert!(
+                resolve_output_path(&workspace, unsafe_path, "extract").is_err(),
+                "{unsafe_path:?} must be rejected as an extract path"
+            );
+        }
+        let resolved = resolve_output_path(&workspace, "artifacts/page.txt", "extract").unwrap();
+        assert!(resolved.starts_with(workspace.cwd()));
+        assert!(resolved.ends_with("artifacts/page.txt"));
+    }
+
+    #[test]
+    fn extract_artifact_reads_back_from_nested_cwd_and_second_root() {
+        let base = tempfile::tempdir().expect("base");
+        let cwd = base.path().join("work").join("project");
+        let shared = base.path().join("shared");
+        let scratch = base.path().join("scratch");
+        for dir in [&cwd, &shared, &scratch] {
+            std::fs::create_dir_all(dir).expect("directory");
+        }
+        let workspace = WorkspaceRoots::new(&cwd, [&shared]).expect("workspace");
+        assert_eq!(workspace.roots().len(), 2);
+        let shared_root = workspace.roots()[1].clone();
+        let supplied = "../../shared/extract-artifact.txt";
+        let output = resolve_output_path(&workspace, supplied, "extract").expect("extract target");
+        assert_eq!(output, shared_root.join("extract-artifact.txt"));
+
+        #[cfg(target_os = "linux")]
+        let platform = HostPlatform::Linux;
+        #[cfg(target_os = "macos")]
+        let platform = HostPlatform::Macos;
+        #[cfg(target_os = "windows")]
+        let platform = HostPlatform::Windows;
+        let snapshot_revision = pi_sandbox::PolicyRevision::new(1).expect("revision");
+        let scratch_revision = pi_sandbox::PolicyRevision::new(1).expect("revision");
+        let scratch_path = pi_sandbox::AbsolutePath::parse(scratch).expect("scratch path");
+        let policy = pi_sandbox::SandboxPolicy::danger_full_access(
+            pi_sandbox::CredentialPolicy::new(Vec::new()).expect("credentials"),
+        )
+        .expect("danger policy");
+        let snapshot = Arc::new(
+            pi_sandbox::PolicySnapshot::new(snapshot_revision, platform, policy)
+                .expect("snapshot"),
+        );
+        let capabilities = crate::fs::CapabilityFs::new().expect("capabilities");
+        let scratch_root = crate::fs::PolicyScratchRoot::acquire(
+            scratch_revision,
+            &capabilities,
+            scratch_path.clone(),
+            scratch_path,
+        )
+        .expect("scratch authority");
+        let fs = PolicyFs::new(
+            snapshot,
+            pi_sandbox::AbsolutePath::parse(cwd).expect("cwd"),
+            capabilities,
+            scratch_root,
+        )
+        .expect("policy filesystem");
+
+        let text = format!("HEAD-MARKER\n{}\nTAIL-MARKER\n", "full-body-".repeat(2048));
+        save_output_bytes(&fs, &output, text.as_bytes().to_vec()).expect("artifact write");
+        let read_path =
+            crate::tools::paths::resolve_read_path(supplied, &workspace).expect("read path");
+        assert_eq!(PathBuf::from(&read_path), output);
+        assert_eq!(
+            fs.read_bounded(Path::new(&read_path), 64 * 1024)
+                .expect("artifact must read back"),
+            text.as_bytes()
+        );
+        let derived = workspace
+            .roots()
+            .iter()
+            .find_map(|root| output.strip_prefix(root).ok())
+            .expect("root-stripped display");
+        let wrong = PathBuf::from(
+            crate::tools::paths::resolve_read_path(&derived.to_string_lossy(), &workspace)
+                .expect("wrong read path"),
+        );
+        assert_ne!(wrong, output);
+        assert!(
+            fs.read_bounded(&wrong, 64 * 1024).is_err(),
+            "root-stripped display must not be reported as the readable artifact path"
         );
     }
 }

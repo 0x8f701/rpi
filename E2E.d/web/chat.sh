@@ -473,7 +473,7 @@ const EXPECTED_BOOLEAN_KEYS = [
   'routeMounted', 'emptyWorkspaceHero', 'emptyWorkspaceMobile', 'emptyProjectHero', 'inviteLanHint',
   'wrongTokenRejected', 'tokenTwoStepRecovered', 'twoRealRunnersConnected',
   'durableReloadRestored', 'channelSharedLog', 'channelTwoRunnersOneProject', 'channelMentionTargeted',
-  'channelLogReloadRestored',
+  'channelLogReloadRestored', 'pagehidePageshowOriginalSession',
   'independentReconnect', 'samePortRecovery',
   'projectSessionIdentityIsolated', 'projectSessionCwdIsolated', 'mappingReloadRecovered',
   'deletionPersisted', 'mappedSessionCleanup', 'tokenRedaction', 'relativeLocalSubmitOnce',
@@ -689,7 +689,7 @@ const assertions = {
   emptyProjectHero: true, inviteLanHint: true, wrongTokenRejected: true, tokenTwoStepRecovered: true,
   twoRealRunnersConnected: true, durableReloadRestored: true, channelSharedLog: true,
   channelTwoRunnersOneProject: true, channelMentionTargeted: true,
-  channelLogReloadRestored: true, independentReconnect: true,
+  channelLogReloadRestored: true, pagehidePageshowOriginalSession: true, independentReconnect: true,
   samePortRecovery: true, projectSessionIdentityIsolated: true, projectSessionCwdIsolated: true,
   mappingReloadRecovered: true, deletionPersisted: true, mappedSessionCleanup: true,
   tokenRedaction: true, relativeLocalSubmitOnce: true, relativeZeroRunnerCreates: true,
@@ -837,7 +837,7 @@ chat_lane_deadline_hit() { # <deadline>
 main() {
     case "${1:-run}" in
         list|--list|--dry-run)
-            printf '%s\n' 'web-chat - /chat durable add/auth probe/reconnect/delete against two real isolated rpi listeners with backend assertions and screenshots (PLAYWRIGHT-ONLY, hard gate; Playwright stages only — the shell commits the run dir + current pointer after ALL gates pass)'
+            printf '%s\n' 'web-chat - /chat durable add/auth probe/reconnect/delete against two real isolated rpi listeners, plus browser pagehide/pageshow survival of the original mapped session and its /goal command (not an installed iPad app-switch proof), with backend assertions and screenshots (PLAYWRIGHT-ONLY, hard gate; Playwright stages only — the shell commits the run dir + current pointer after ALL gates pass)'
             return 0
             ;;
         run|all) ;;
@@ -948,6 +948,7 @@ main() {
     printf '%s\n' "$TOKEN_A" >"$root_a/token"
     printf '%s\n' "$TOKEN_B" >"$root_b/token"
     printf 'runner-a-workspace\n' >"$root_a/workspace/runner-a.txt"
+    web_prepare_dist "$WORK_ROOT/web-dist"
     local pid_a fd_a stdin_a pid_b fd_b stdin_b url_a url_b chat_url b_port
     chat_defer_signals 'spawn_chat_runner "$root_a" "$evidence_a" "$mock_port" >"$root/runner-a.handle"'
     read -r pid_a fd_a stdin_a <"$root/runner-a.handle"

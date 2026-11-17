@@ -74,6 +74,10 @@ pub struct ApplicationWorkflowRuntimeFactory {
     managed_root: PathBuf,
     runtime_factory: Arc<dyn ApplicationRuntimeFactory>,
     session_options: SessionOptions,
+    /// Live parent model source: a `/model` selected after the providerless
+    /// startup reaches every workflow child spawn without a factory rebuild or
+    /// process restart.
+    live_model: Arc<dyn Fn() -> Option<pi_ai::Model> + Send + Sync>,
     max_concurrency: usize,
     generation_capture: crate::application::generation::GenerationCaptureFn,
     global_concurrency: OrchestrationConcurrencyGate,
@@ -130,6 +134,7 @@ impl ApplicationWorkflowRuntimeFactory {
         managed_root: impl Into<PathBuf>,
         runtime_factory: Arc<dyn ApplicationRuntimeFactory>,
         session_options: SessionOptions,
+        live_model: Arc<dyn Fn() -> Option<pi_ai::Model> + Send + Sync>,
         max_concurrency: usize,
         global_concurrency: OrchestrationConcurrencyGate,
         generation_capture: crate::application::generation::GenerationCaptureFn,
@@ -142,6 +147,7 @@ impl ApplicationWorkflowRuntimeFactory {
             managed_root: managed_root.into(),
             runtime_factory,
             session_options,
+            live_model,
             max_concurrency,
             global_concurrency,
             generation_capture,
@@ -601,6 +607,7 @@ impl ApplicationWorkflowRuntimeFactory {
     fn runtime_options(&self, cwd: &TrustedWorkflowCwd) -> SessionOptions {
         let mut options = self.session_options.clone();
         options.cwd = cwd.path().to_path_buf();
+        options.model = (self.live_model)();
         options
     }
 
@@ -1383,7 +1390,7 @@ impl WorkflowRuntimeFactory for ApplicationWorkflowRuntimeFactory {
     async fn cancel(&self, snapshot: &WorkflowSnapshot) -> Result<WorkflowRuntimeUpdate> {
         let runtime = self.exact_runtime(snapshot)?;
         runtime.supervisor.cancel().await?;
-        runtime.backend.abort_application().await;
+        runtime.backend.abort_application().await?;
         Self::runtime_update(&runtime, snapshot.integration.clone())
     }
 
@@ -1529,6 +1536,7 @@ impl Application {
         };
         let max_concurrency = self.runtime_settings().orchestration_max_concurrency;
         let isolation = self.runtime_settings().orchestration_isolation;
+        let live_session = self.runtime().session.clone();
         let managed_root = worktree_lease.display_root().to_path_buf();
         // Isolation backend selection (`settings.orchestration.isolation`):
         // git worktree (default), overlayfs (source repo as the read-only
@@ -1559,6 +1567,7 @@ impl Application {
             managed_root,
             runtime_factory,
             session_options,
+            Arc::new(move || live_session.model()),
             max_concurrency,
             OrchestrationConcurrencyGate::new(max_concurrency)?,
             self.generation_capture_fn(),

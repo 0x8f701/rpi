@@ -308,7 +308,7 @@ mod tests {
         let session =
             crate::Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
                 crate::SessionOptions {
-                    model,
+                    model: Some(model),
                     cwd: cwd.to_path_buf(),
                     system_prompt: String::new(),
                     thinking_level: pi_agent::ThinkingLevel::Off,

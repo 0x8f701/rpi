@@ -800,6 +800,7 @@ const bSeedHash = unifiedHunkSha256('@@ -0,0 +1 @@', singleLine('+B-APPEND'));
 
 const snapshotPayload = () => ({
   comparisonLabel: 'HEAD→working tree',
+  repo: 'psy-node',
   snapshotId: 'snap-1',
   reviewId: 'rev-1',
   generation: 1,
@@ -3340,6 +3341,33 @@ const normalizeCodeReviewCommits = codeReviewModule.normalizeCodeReviewCommits;
         && toasts.length === commentToasts + 1 && toasts[toasts.length - 1].message === 'comment failed',
       JSON.stringify(toasts),
     );
+
+    // A comment projection that parses structurally is required for the
+    // success-only follow/draft/attachment cleanup. A successful RPC whose
+    // projection lacks the authoritative repo is NOT an accepted comment.
+    await act(async () => { submitButton()?.click(); await realTick(); });
+    const malformedCommand = deferreds.find((entry) => entry.type === 'code_review_comment' && !entry.settled);
+    check('the malformed-projection request is in flight', malformedCommand !== undefined);
+    if (malformedCommand) {
+      malformedCommand.settled = true;
+      malformedCommand.resolve({ ...snapshotPayload(), repo: '', snapshotId: 'snap-bad', comparisonLabel: 'BAD' });
+    }
+    await act(async () => { await realTick(); });
+    check(
+      'a structurally rejected comment response retains draft and attachments',
+      chips().length === 1 && composer()?.value === 'retry draft',
+      JSON.stringify({ chips: chips().length, draft: composer()?.value }),
+    );
+    check(
+      'a structurally rejected comment response never replaces the last-good snapshot',
+      mini.document.body.querySelector('.code-review__label')?.textContent === 'HEAD→working tree',
+      mini.document.body.querySelector('.code-review__label')?.textContent ?? 'absent',
+    );
+    check(
+      'a structurally rejected comment response surfaces the typed repo error',
+      toasts.at(-1)?.message === 'Code review: Invalid code-review snapshot repo',
+      JSON.stringify(toasts.at(-1)),
+    );
   } finally {
     await unmountPanel();
     if (previousFileReader === undefined) delete (globalThis as Record<string, unknown>).FileReader;
@@ -4294,6 +4322,12 @@ const normalizeCodeReviewCommits = codeReviewModule.normalizeCodeReviewCommits;
   check('TLDR action mounts', button() !== null);
   await act(async () => { button()!.click(); await realTick(); });
   check('TLDR dispatches once', countType('code_review_tldr') === 1);
+  const tldrPane = mini.document.body.querySelector('.code-review-tldr') as MiniNode | null;
+  check(
+    'TLDR citations carry the snapshot repo authority, not open args',
+    tldrPane?.getAttribute('data-review-repo') === 'psy-node',
+    tldrPane?.getAttribute('data-review-repo') ?? 'absent',
+  );
   await act(async () => {
     check('TLDR ACK settles', settleNext('code_review_tldr', { ok: true, state: 'running', tldrGeneration: 2 }));
     await realTick();
@@ -4546,6 +4580,11 @@ const normalizeCodeReviewCommits = codeReviewModule.normalizeCodeReviewCommits;
     threadOwnerNode?.getAttribute('data-session-id') === 'sess-cr',
     threadOwnerNode?.getAttribute('data-session-id') ?? 'absent',
   );
+  check(
+    'the thread carries the snapshot repo authority for citations',
+    threadOwnerNode?.getAttribute('data-review-repo') === 'psy-node',
+    threadOwnerNode?.getAttribute('data-review-repo') ?? 'absent',
+  );
   const thinkingOpened: Array<{ path: string; owner: MarkdownPathOwner }> = [];
   const thinkingChip = {
     textContent: 'src/lib.rs:12',
@@ -4573,6 +4612,45 @@ const normalizeCodeReviewCommits = codeReviewModule.normalizeCodeReviewCommits;
   await unmountPanel();
 }
 
+// ---- citation authority is the snapshot repo, never the open arguments ----
+{
+  const threadIdentity = {
+    snapshotId: 'snap-1',
+    path: 'a.txt',
+    oldStart: 0,
+    oldCount: 0,
+    newStart: 1,
+    newCount: 1,
+    contentHash: aFreshHash,
+  };
+  await mountPanel(
+    () => ({
+      ...snapshotPayload(),
+      repo: 'snap-repo',
+      threads: [{ identity: threadIdentity, comments: [], isStreaming: false }],
+    }),
+    'a.txt',
+    { openArgs: { repo: 'args-repo' } },
+  );
+  check(
+    'authority fixture page settles',
+    settleNext('code_review_file_diff', pagePayload('a.txt', '+FRESH-APPEND')),
+  );
+  await act(async () => { await realTick(); });
+  const authorityHunkHeader = mini.document.body.querySelector('.code-review__hunk-header') as MiniNode | null;
+  await act(async () => {
+    authorityHunkHeader?.click();
+    await realTick();
+  });
+  const authorityThread = mini.document.body.querySelector('.code-review__thread-content') as MiniNode | null;
+  check(
+    'snapshot repo wins the citation stamp over openArgs.repo',
+    authorityThread?.getAttribute('data-review-repo') === 'snap-repo',
+    authorityThread?.getAttribute('data-review-repo') ?? 'absent',
+  );
+  await unmountPanel();
+}
+
 
 {
   await mountPanel();
@@ -4582,16 +4660,38 @@ const normalizeCodeReviewCommits = codeReviewModule.normalizeCodeReviewCommits;
   });
   const firstHang = deferreds.filter((entry) => entry.type === 'code_review_snapshot' && !entry.settled);
   check('cadence starts a snapshot poll', firstHang.length > 0);
+  // Production single-flight: while the flight stays unsettled, every
+  // later cadence tick JOINS it — zero new snapshot RPCs.
   await act(async () => {
     advanceClock(1500);
     await realTick();
   });
-  const secondHang = deferreds.filter((entry) => entry.type === 'code_review_snapshot' && !entry.settled);
+  await act(async () => {
+    advanceClock(1500);
+    await realTick();
+  });
+  const duringHang = deferreds.filter((entry) => entry.type === 'code_review_snapshot' && !entry.settled);
   check(
-    'a hung snapshot poll does not block the next cadence',
-    secondHang.length >= firstHang.length + 1,
-    `first=${firstHang.length} second=${secondHang.length}`,
+    'singleflight: a hung poll joins the cadence — zero new RPCs while unsettled',
+    duringHang.length === firstHang.length,
+    `first=${firstHang.length} during=${duringHang.length}`,
   );
+  // Settlement releases the flight; the next tick resumes the cadence with
+  // exactly ONE fresh request.
+  await act(async () => {
+    for (const entry of duringHang) {
+      entry.settled = true;
+      entry.resolve(snapshotPayload());
+    }
+    await realTick();
+  });
+  await act(async () => {
+    advanceClock(1500);
+    await realTick();
+  });
+  const resumed = deferreds.filter((entry) => entry.type === 'code_review_snapshot' && !entry.settled);
+  check('singleflight: cadence resumes with one fresh request after the flight settles', resumed.length === 1,
+    `resumed=${resumed.length}`);
   await unmountPanel();
 }
 

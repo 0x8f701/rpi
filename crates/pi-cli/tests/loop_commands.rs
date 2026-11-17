@@ -27,7 +27,7 @@ async fn cli_loop_commands_drive_application_create_list_update_delete_and_cance
     });
     let cwd = tempfile::tempdir().expect("cwd");
     let session = Session::new(SessionOptions {
-        model,
+        model: Some(model),
         cwd: cwd.path().to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,

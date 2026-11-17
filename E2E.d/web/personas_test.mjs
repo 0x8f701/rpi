@@ -16,6 +16,7 @@
 import { chromium } from 'playwright';
 import fs from 'node:fs';
 import path from 'node:path';
+import { clickFeature } from './lib/feature-menu.mjs';
 
 const url = process.env.RPI_URL;
 const token = process.env.RPI_TOKEN || '';
@@ -71,7 +72,7 @@ async function main() {
     await waitFor(page, () => document.getElementById('send-btn')?.hasAttribute('disabled') !== true, 'WS never connected');
 
     // --- Personas panel ---
-    await page.click('#personas-toggle-btn');
+    await clickFeature(page, '#personas-toggle-btn');
     await waitFor(page, () => document.getElementById('personas-panel') !== null, 'personas panel did not open');
     // The panel fetches persona_list on mount, so WAIT for the seeded row.
     await waitFor(
@@ -192,7 +193,7 @@ async function main() {
     await page.click('#persona-run-start-mentor');
     // The spawned job must point at the persona agent: open the Subagents
     // panel and assert a job card carrying "(mentor)" and the task text.
-    await page.click('#subagents-toggle-btn');
+    await clickFeature(page, '#subagents-toggle-btn');
     await waitFor(page, () => document.getElementById('subagents-panel') !== null, 'subagents panel did not open');
     await waitFor(
       page,
@@ -212,13 +213,13 @@ async function main() {
     // --- Back to Personas: run again via the input's ENTER key (the
     // onKeyDown path — the mentor run above used the Start click) on the
     // oversized persona; the spawned job must bind to its agent name too. ---
-    await page.click('#personas-toggle-btn');
+    await clickFeature(page, '#personas-toggle-btn');
     await waitFor(page, () => document.getElementById('personas-panel') !== null, 'personas panel did not reopen');
     await page.click('[data-persona-name="big"] [data-action="run"]');
     await waitFor(page, () => document.querySelector('#persona-run-input-big') !== null, 'big run input never opened');
     await page.fill('#persona-run-input-big', 'persona-e2e: web-e2e-subagent verify the enter-key run path and report');
     await page.keyboard.press('Enter');
-    await page.click('#subagents-toggle-btn');
+    await clickFeature(page, '#subagents-toggle-btn');
     await waitFor(page, () => document.getElementById('subagents-panel') !== null, 'subagents panel did not reopen');
     await waitFor(
       page,
@@ -235,7 +236,7 @@ async function main() {
     );
 
     // --- Back to Personas: create -> catalog discoverable after config save ---
-    await page.click('#personas-toggle-btn');
+    await clickFeature(page, '#personas-toggle-btn');
     await waitFor(page, () => document.getElementById('personas-panel') !== null, 'personas panel did not reopen');
     await page.click('#personas-new-btn');
     await waitFor(page, () => document.querySelector('[data-persona-editor]') !== null, 'editor never opened');
@@ -373,7 +374,7 @@ async function main() {
     // Destructive persona ops fail while any persona job is live, and
     // reload will not rebuild the orchestration catalog until those jobs
     // settle (`begin_persona_destructive_operation`).
-    await page.click('#subagents-toggle-btn');
+    await clickFeature(page, '#subagents-toggle-btn');
     await waitFor(page, () => document.getElementById('subagents-panel') !== null, 'subagents panel did not reopen before remove');
     await waitFor(
       page,
@@ -401,7 +402,7 @@ async function main() {
       'persona jobs never left the Running filter after cancel',
       15000
     );
-    await page.click('#personas-toggle-btn');
+    await clickFeature(page, '#personas-toggle-btn');
     await waitFor(page, () => document.getElementById('personas-panel') !== null, 'personas panel did not reopen before remove');
 
     // --- Remove vs purge: confirmation dialog keeps the two semantics distinct ---

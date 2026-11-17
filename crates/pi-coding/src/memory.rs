@@ -2592,7 +2592,7 @@ mod tests {
             crate::SessionOptions {
                 cwd: cwd.to_path_buf(),
                 system_prompt: String::new(),
-                model: registration.model(None).expect("generation faux model"),
+                model: Some(registration.model(None).expect("generation faux model")),
                 thinking_level: pi_agent::ThinkingLevel::Off,
                 tools: Some(Vec::new()),
                 compaction: None,

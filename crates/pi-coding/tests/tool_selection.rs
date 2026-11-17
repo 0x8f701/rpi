@@ -19,7 +19,7 @@ fn model() -> Model {
 
 fn options(cwd: &std::path::Path) -> SessionOptions {
     SessionOptions {
-        model: model(),
+        model: Some(model()),
         cwd: cwd.to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,
@@ -246,7 +246,7 @@ async fn parent_session_can_execute_native_glob_tool() -> Result<()> {
     resource_options.disable_context_files = true;
     let resources = ResourceManager::new(resource_options)?;
     let mut session_options = options(cwd.path());
-    session_options.model = model;
+    session_options.model = Some(model);
     let session = Session::new_with_additional_tools_filtered_and_discovery(
         session_options,
         Vec::new(),

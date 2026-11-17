@@ -496,6 +496,78 @@ async function main() {
     });
     if (!viewerAfterError) fail('error host opened the viewer');
 
+    // 7. TWO valid mermaid blocks in ONE reply, the second opened with a
+    //    four-backtick run (the real-reply fence marker-run regression):
+    //    every host must settle independently — `data-mermaid="done"`, its own
+    //    SVG, and its own id namespace (no element id shared between hosts).
+    await sendPrompt(page, 'render four-backtick mermaid', 'desktop four-backtick prompt');
+    await waitFor(
+      page,
+      () => [...document.querySelectorAll('.msg--assistant')]
+        .some((row) => (row.textContent || '').includes('four-tick-mermaid-done')
+          && row.querySelectorAll('.md-mermaid-host').length === 2),
+      'four-backtick reply: expected two mermaid hosts in one reply',
+      45000
+    );
+    await waitFor(
+      page,
+      () => {
+        const row = [...document.querySelectorAll('.msg--assistant')]
+          .find((r) => (r.textContent || '').includes('four-tick-mermaid-done'));
+        if (!row) return false;
+        const hosts = [...row.querySelectorAll('.md-mermaid-host')];
+        return hosts.length === 2 && hosts.every((host) =>
+          host.getAttribute('data-mermaid') === 'done'
+          && host.classList.contains('md-mermaid-host--rendered')
+          && host.querySelector('.md-mermaid-viewport svg') !== null
+          && host.querySelectorAll('.md-mermaid-error__note').length === 0);
+      },
+      'four-backtick reply: not every host settled to a rendered SVG',
+      45000
+    );
+    const multi = await page.evaluate(() => {
+      const row = [...document.querySelectorAll('.msg--assistant')]
+        .find((r) => (r.textContent || '').includes('four-tick-mermaid-done'));
+      const hosts = [...row.querySelectorAll('.md-mermaid-host')];
+      const idSets = hosts.map((host) => [...host.querySelectorAll('[id]')].map((node) => node.id));
+      const allIds = idSets.flat();
+      return {
+        hostCount: hosts.length,
+        done: hosts.map((host) => host.getAttribute('data-mermaid')),
+        rendered: hosts.map((host) => host.classList.contains('md-mermaid-host--rendered')),
+        svgCount: hosts.map((host) => host.querySelectorAll('.md-mermaid-viewport svg').length),
+        viewBoxes: hosts.map(
+          (host) => host.querySelector('.md-mermaid-viewport svg')?.getAttribute('viewBox') || ''
+        ),
+        idCounts: idSets.map((ids) => ids.length),
+        idsShared: allIds.length !== new Set(allIds).size,
+        codeFences: row.querySelectorAll('.md-fence').length,
+      };
+    });
+    if (multi.hostCount !== 2) fail(`four-backtick reply: ${multi.hostCount} hosts (expected 2)`);
+    if (!multi.done.every((value) => value === 'done')) {
+      fail(`four-backtick hosts not all done: ${JSON.stringify(multi.done)}`);
+    }
+    if (!multi.rendered.every(Boolean)) {
+      fail(`four-backtick hosts not all rendered: ${JSON.stringify(multi.rendered)}`);
+    }
+    if (!multi.svgCount.every((count) => count === 1)) {
+      fail(`four-backtick hosts without exactly one SVG: ${JSON.stringify(multi.svgCount)}`);
+    }
+    if (multi.viewBoxes.some((viewBox) => viewBox.trim() === '')) {
+      fail(`four-backtick diagram has no viewBox: ${JSON.stringify(multi.viewBoxes)}`);
+    }
+    if (!multi.idCounts.every((count) => count > 0) || multi.idsShared) {
+      fail(`four-backtick diagrams lack independent id namespaces: ${JSON.stringify(multi)}`);
+    }
+    if (multi.codeFences !== 0) {
+      fail(`four-backtick mermaid degraded to code fences: ${multi.codeFences}`);
+    }
+    if (consoleProblems.length > 0) {
+      fail(`console/page problems during the four-backtick reply:\n${consoleProblems.join('\n')}`);
+    }
+    await page.screenshot({ path: `${evidence}/mermaid-desktop-four-tick.png`, fullPage: true });
+
     // ==================== Mobile 390x844 (touch) ====================
     const mobile = await browser.newContext({
       viewport: { width: 390, height: 844 },

@@ -206,7 +206,7 @@ async fn build_dispatcher(
 
     let session = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model: model.clone(),
+            model: Some(model.clone()),
             cwd: root.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -235,7 +235,7 @@ async fn build_dispatcher(
 
     let mut config =
         OrchestrationConfig::new(AgentCatalog::from_agents(vec![definition()]), root.path());
-    config.parent_model = model;
+    config.parent_model = Some(model);
     config.idle_ttl = None;
     let runtime = OrchestrationRuntime::new(
         config,
@@ -714,11 +714,11 @@ async fn rpc_todo_child_parent_cleanup_does_not_shutdown_service() {
 
     let session = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model: dispatcher
+            model: Some(dispatcher
                 .application()
                 .session()
                 .model()
-                .expect("second parent model"),
+                .expect("second parent model")),
             cwd: root.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,

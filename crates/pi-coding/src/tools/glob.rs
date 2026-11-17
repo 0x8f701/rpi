@@ -8,13 +8,14 @@
 //! exactly, including nested-repo boundaries and `.git` always being skipped.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
-use crate::application::generation::ApplicationGeneration;
+use crate::ApplicationGeneration;
 use crate::process::{
     GovernedProcessContext, GovernedProcessSpec, TrustedToolProbe, run_trusted_tool_probe,
 };
@@ -358,6 +359,11 @@ struct IgnoreSource {
 ///   apply, as do `.gitignore` files between the repo root and the search root.
 pub(crate) struct IgnoreStack {
     root: String,
+    /// Glob walk has loaded every visited directory from the pinned lease.
+    /// Pattern lookup then uses only that cache.
+    pinned: bool,
+    /// Walk-root `.git/info/exclude` already read from the pinned lease.
+    exclude_loaded: bool,
     fs: Option<Arc<crate::fs::PolicyFs>>,
     use_gitignore: bool,
     repo_root: String,
@@ -378,6 +384,8 @@ impl IgnoreStack {
         let mut s = IgnoreStack {
             fs: Some(generation.sandbox().fs().confined()?.clone()),
             root: root.to_string(),
+            pinned: false,
+            exclude_loaded: false,
             use_gitignore: false,
             repo_root: String::new(),
             boundaries: false,
@@ -385,7 +393,7 @@ impl IgnoreStack {
             loaded: HashMap::new(),
             git_dir: HashMap::new(),
         };
-        s.repo_root = s.find_repo_root(root);
+        s.repo_root = s.find_repo_root(root)?;
         s.use_gitignore = !require_git || !s.repo_root.is_empty();
         // Nested-repo boundaries only apply in git-aware mode (search root inside
         // a repo). Under `--no-require-git` outside a repo, fd ignores boundaries.
@@ -394,7 +402,7 @@ impl IgnoreStack {
             // Lowest precedence first; later sources win on conflicts.
             let g = global_excludes_path(generation, &s.repo_root).await;
             if !g.is_empty() {
-                if let Some(data) = s.read_optional(Path::new(&g)) {
+                if let Some(data) = s.read_global_excludes(Path::new(&g))? {
                     s.static_sources.push(IgnoreSource {
                         base_abs: s.repo_root.clone(),
                         pats: parse_gitignore(&data),
@@ -402,15 +410,34 @@ impl IgnoreStack {
                     });
                 }
             }
-            let info_exclude = format!("{}/.git/info/exclude", s.repo_root);
-            if let Some(data) = s.read_optional(Path::new(&info_exclude)) {
-                s.static_sources.push(IgnoreSource {
-                    base_abs: s.repo_root.clone(),
-                    pats: parse_gitignore(&data),
-                    boundary_exempt: false,
-                });
+            let fs = s
+                .fs
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("ignore stack has no filesystem"))?;
+            if let Some(directory) = fs.resolve_glob_target(Path::new(&s.repo_root))? {
+                if directory.entry_kind_relative(
+                    &fs,
+                    Path::new(&s.repo_root),
+                    Path::new(".git"),
+                )? == Some(crate::fs::EntryKind::Directory)
+                {
+                    if let Some(data) = directory.read_optional_relative(
+                        &fs,
+                        Path::new(&s.repo_root),
+                        Path::new(".git/info/exclude"),
+                        GITIGNORE_READ_LIMIT,
+                    )? {
+                        s.static_sources.push(IgnoreSource {
+                            base_abs: s.repo_root.clone(),
+                            pats: parse_gitignore(&data),
+                            boundary_exempt: false,
+                        });
+                    }
+                }
+                s.exclude_loaded = true;
             }
-            // .gitignore files in ancestors of the search root (repo root downward).
+            // Parents of the search root through the repo root. The walk root's
+            // own `.gitignore` is loaded only by `load_pinned_directory`.
             if s.root != s.repo_root {
                 let mut ancs: Vec<String> = Vec::new();
                 let mut dir = parent_dir(&s.root);
@@ -422,7 +449,24 @@ impl IgnoreStack {
                     dir = parent_dir(&dir);
                 }
                 for i in (0..ancs.len()).rev() {
-                    if let Some(data) = s.read_optional(&Path::new(&ancs[i]).join(".gitignore")) {
+                    let lexical = PathBuf::from(&ancs[i]);
+                    let directory = match fs.resolve_glob_target(&lexical) {
+                        Ok(Some(directory)) => directory,
+                        Ok(None) => continue,
+                        Err(error)
+                            if is_not_found(&error)
+                                || matches!(error, crate::fs::FsError::OutsideCapability) =>
+                        {
+                            continue;
+                        }
+                        Err(error) => return Err(anyhow::anyhow!(error)),
+                    };
+                    if let Some(data) = directory.read_optional_relative(
+                        &fs,
+                        &lexical,
+                        Path::new(".gitignore"),
+                        GITIGNORE_READ_LIMIT,
+                    )? {
                         s.static_sources.push(IgnoreSource {
                             base_abs: ancs[i].clone(),
                             pats: parse_gitignore(&data),
@@ -452,6 +496,8 @@ impl IgnoreStack {
         IgnoreStack {
             fs: None,
             root: root.to_string(),
+            pinned: false,
+            exclude_loaded: false,
             use_gitignore: false,
             repo_root: String::new(),
             boundaries: false,
@@ -461,18 +507,67 @@ impl IgnoreStack {
         }
     }
 
+
+    /// Nofollow: missing and symlink children are absent; other errors propagate.
+    pub(crate) fn load_pinned_directory(
+        &mut self,
+        fs: &Arc<crate::fs::PolicyFs>,
+        directory: &crate::fs::PolicyDirectory,
+        lexical: &Path,
+        relative: &Path,
+    ) -> Result<()> {
+        self.pinned = true;
+        if !self.use_gitignore {
+            return Ok(());
+        }
+        let rel_dir = relative.to_string_lossy().replace('\\', "/");
+        if !self.loaded.contains_key(&rel_dir) {
+            let patterns = match directory.read_optional_relative(
+                fs,
+                lexical,
+                Path::new(".gitignore"),
+                GITIGNORE_READ_LIMIT,
+            )? {
+                Some(data) => parse_gitignore(&data),
+                None => Vec::new(),
+            };
+            self.loaded.insert(rel_dir.clone(), patterns);
+        }
+        if !self.git_dir.contains_key(&rel_dir) {
+            let kind = directory.entry_kind_relative(fs, lexical, Path::new(".git"))?;
+            self.git_dir.insert(rel_dir.clone(), kind.is_some());
+            if rel_dir.is_empty()
+                && !self.exclude_loaded
+                && matches!(kind, Some(crate::fs::EntryKind::Directory))
+            {
+                if let Some(data) = directory.read_optional_relative(
+                    fs,
+                    lexical,
+                    Path::new(".git/info/exclude"),
+                    GITIGNORE_READ_LIMIT,
+                )? {
+                    self.static_sources.push(IgnoreSource {
+                        base_abs: self.root.clone(),
+                        pats: parse_gitignore(&data),
+                        boundary_exempt: false,
+                    });
+                }
+                self.exclude_loaded = true;
+            }
+        }
+        Ok(())
+    }
+
     /// Reports whether the root-relative dir contains a `.git` entry (a
     /// repository boundary). Results are cached.
     fn has_git_dir(&mut self, rel_dir: &str) -> bool {
         if let Some(&v) = self.git_dir.get(rel_dir) {
             return v;
         }
-        let abs = if rel_dir.is_empty() {
-            self.root.clone()
-        } else {
-            format!("{}/{}", self.root, rel_dir.replace('\\', "/"))
-        };
-        let v = self.metadata_exists(Path::new(&abs).join(".git").as_path());
+        if self.pinned {
+            return false;
+        }
+        let v = self.metadata_exists(&self.lexical(rel_dir).join(".git"));
         self.git_dir.insert(rel_dir.to_string(), v);
         v
     }
@@ -502,51 +597,111 @@ impl IgnoreStack {
     }
 
     /// Loads (lazily) the `.gitignore` in the given root-relative dir.
-    fn patterns_for(&mut self, rel_dir: &str) -> &Vec<IgnorePattern> {
-        let abs = if rel_dir.is_empty() {
-            self.root.clone()
-        } else {
-            format!("{}/{}", self.root, rel_dir.replace('\\', "/"))
-        };
+    fn patterns_for(&mut self, rel_dir: &str) -> Result<Vec<IgnorePattern>> {
+        if let Some(patterns) = self.loaded.get(rel_dir) {
+            return Ok(patterns.clone());
+        }
+        if self.pinned {
+            // The walk loads each directory before descent. A miss here is a
+            // directory this stack was not handed, not a swallowed read.
+            anyhow::bail!("pinned ignore directory was not loaded: {rel_dir}");
+        }
         let patterns = self
-            .read_optional(&Path::new(&abs).join(".gitignore"))
+            .try_read_optional(&self.lexical(rel_dir).join(".gitignore"))?
             .map(|data| parse_gitignore(&data))
             .unwrap_or_default();
-        let entry = self.loaded.entry(rel_dir.to_string()).or_insert(patterns);
-        entry
+        self.loaded.insert(rel_dir.to_string(), patterns.clone());
+        Ok(patterns)
+    }
+
+    fn lexical(&self, rel_dir: &str) -> PathBuf {
+        let relative = rel_dir.replace('\\', "/");
+        if relative.is_empty() {
+            PathBuf::from(&self.root)
+        } else {
+            PathBuf::from(&self.root).join(relative)
+        }
     }
 
     fn metadata_exists(&self, path: &Path) -> bool {
         self.fs.as_ref().is_some_and(|fs| fs.metadata(path).is_ok())
     }
 
-    fn read_optional(&self, path: &Path) -> Option<Vec<u8>> {
-        self.fs.as_ref()?.read_bounded(path, 8 * 1024 * 1024).ok()
+    fn try_read_optional(&self, path: &Path) -> Result<Option<Vec<u8>>> {
+        if self.pinned {
+            anyhow::bail!(
+                "pinned ignore file must be read from the opened directory: {}",
+                path.display()
+            );
+        }
+        let Some(fs) = &self.fs else {
+            return Ok(None);
+        };
+        match fs.read_bounded(path, GITIGNORE_READ_LIMIT) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if is_not_found(&error) => Ok(None),
+            Err(error) => Err(anyhow::anyhow!(error)),
+        }
     }
 
-    fn find_repo_root(&self, dir: &str) -> String {
+
+    fn read_global_excludes(&self, path: &Path) -> Result<Option<Vec<u8>>> {
+        let Some(fs) = &self.fs else {
+            return Ok(None);
+        };
+        match fs.read_bounded(path, GITIGNORE_READ_LIMIT) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error)
+                if is_not_found(&error)
+                    || matches!(
+                        error,
+                        crate::fs::FsError::OutsideCapability | crate::fs::FsError::Denied
+                    ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(anyhow::Error::new(error).context("reading global excludes")),
+        }
+    }
+
+    fn find_repo_root(&self, dir: &str) -> Result<String> {
+        let Some(fs) = self.fs.clone() else {
+            return Ok(String::new());
+        };
         let mut dir = dir.to_string();
         loop {
-            if self.metadata_exists(Path::new(&dir).join(".git").as_path()) {
-                return dir;
+            match fs.resolve_glob_target(Path::new(&dir)) {
+                Ok(Some(directory)) => {
+                    if directory
+                        .entry_kind_relative(&fs, Path::new(&dir), Path::new(".git"))?
+                        .is_some()
+                    {
+                        return Ok(dir);
+                    }
+                }
+                Ok(None) => {}
+                Err(error)
+                    if is_not_found(&error)
+                        || matches!(error, crate::fs::FsError::OutsideCapability) => {}
+                Err(error) => return Err(anyhow::anyhow!(error)),
             }
             let parent = parent_dir(&dir);
             if parent == dir {
-                return String::new();
+                return Ok(String::new());
             }
             dir = parent;
         }
     }
 
     /// Reports whether the path is ignored.
-    pub(crate) fn ignored(&mut self, abs: &str, rel: &str, is_dir: bool) -> bool {
+    pub(crate) fn ignored(&mut self, abs: &str, rel: &str, is_dir: bool) -> Result<bool> {
         let rel = rel.replace('\\', "/");
         // .git itself is always skipped.
         if Path::new(&rel).file_name().and_then(|s| s.to_str()) == Some(".git") {
-            return true;
+            return Ok(true);
         }
         if !self.use_gitignore {
-            return false;
+            return Ok(false);
         }
 
         let mut result = false;
@@ -579,15 +734,29 @@ impl IgnoreStack {
                     .unwrap_or(&rel)
                     .to_string()
             };
-            let pats = self.patterns_for(&dir).clone();
+            let pats = self.patterns_for(&dir)?;
             for p in &pats {
                 if gitignore_match(p, &rel_to_dir, is_dir) {
                     result = !p.negated;
                 }
             }
         }
-        result
+        Ok(result)
     }
+}
+
+const GITIGNORE_READ_LIMIT: u64 = 8 * 1024 * 1024;
+
+
+
+fn is_not_found(error: &crate::fs::FsError) -> bool {
+    matches!(
+        error,
+        crate::fs::FsError::System {
+            kind: io::ErrorKind::NotFound,
+            ..
+        }
+    )
 }
 
 fn parent_dir(dir: &str) -> String {
@@ -814,7 +983,7 @@ mod tests {
         let session =
             crate::Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
                 crate::SessionOptions {
-                    model,
+                    model: Some(model),
                     cwd: cwd.to_path_buf(),
                     system_prompt: String::new(),
                     thinking_level: pi_agent::ThinkingLevel::Off,
@@ -948,12 +1117,47 @@ mod tests {
             .await
             .expect("generation-bound ignore stack");
         // .git itself always skipped regardless of gitignore.
-        assert!(ig.ignored(&d.join(".git").to_string_lossy(), ".git", true));
-        // ignored by *.tmp
-        assert!(ig.ignored(&d.join("a.tmp").to_string_lossy(), "a.tmp", false));
-        // not ignored
-        assert!(!ig.ignored(&d.join("a.rs").to_string_lossy(), "a.rs", false));
+        assert!(ig.ignored(&d.join(".git").to_string_lossy(), ".git", true).unwrap());
+        assert!(ig.ignored(&d.join("a.tmp").to_string_lossy(), "a.tmp", false).unwrap());
+        assert!(!ig.ignored(&d.join("a.rs").to_string_lossy(), "a.rs", false).unwrap());
     }
+
+    #[tokio::test]
+    async fn global_excludes_over_read_limit_is_not_optional() {
+        let d = tmp();
+        let oversize = d.join("excludes");
+        let file = fs::File::create(&oversize).expect("create excludes");
+        file.set_len(GITIGNORE_READ_LIMIT + 1)
+            .expect("sparse oversize excludes");
+        drop(file);
+        let fixture = generation_fixture(&d).await;
+        let mut stack = IgnoreStack::without_gitignore(&d.to_string_lossy());
+        stack.fs = Some(
+            fixture
+                .generation
+                .sandbox()
+                .fs()
+                .confined()
+                .expect("policy fs")
+                .clone(),
+        );
+        let error = stack
+            .read_global_excludes(&oversize)
+            .expect_err("oversize global excludes must not be treated as absent");
+        assert!(
+            error
+                .downcast_ref::<crate::fs::FsError>()
+                .is_some_and(|fs| matches!(fs, crate::fs::FsError::ReadLimitExceeded { .. })),
+            "expected ReadLimitExceeded, got {error:#}"
+        );
+        fs::write(&oversize, b"*.log\n").unwrap();
+        let bytes = stack
+            .read_global_excludes(&oversize)
+            .expect("in-limit global excludes")
+            .expect("present file");
+        assert_eq!(bytes, b"*.log\n");
+    }
+
 
     #[tokio::test]
     async fn ignore_stack_grep_requires_git() {
@@ -969,22 +1173,18 @@ mod tests {
         )
         .await
         .expect("generation-bound ignore stack");
-        assert!(!ig.ignored(
-            &d.join("ignored.txt").to_string_lossy(),
-            "ignored.txt",
-            false
-        ));
+        assert!(!ig
+            .ignored(&d.join("ignored.txt").to_string_lossy(), "ignored.txt", false)
+            .unwrap());
         // Add a valid repository marker → now in a repo, gitignore applies.
         fs::create_dir(d.join(".git")).unwrap();
         fs::write(d.join(".git/HEAD"), b"ref: refs/heads/test\n").unwrap();
         let mut ig2 = IgnoreStack::new(fixture.generation, &d.to_string_lossy(), true, false)
             .await
             .expect("generation-bound repository ignore stack");
-        assert!(ig2.ignored(
-            &d.join("ignored.txt").to_string_lossy(),
-            "ignored.txt",
-            false
-        ));
+        assert!(ig2
+            .ignored(&d.join("ignored.txt").to_string_lossy(), "ignored.txt", false)
+            .unwrap());
     }
 
     #[tokio::test]
@@ -997,12 +1197,14 @@ mod tests {
         let mut ig = IgnoreStack::new(fixture.generation, &d.to_string_lossy(), false, true)
             .await
             .expect("generation-bound ignore stack");
-        assert!(ig.ignored(&d.join("a.log").to_string_lossy(), "a.log", false));
-        assert!(!ig.ignored(
-            &d.join("important.log").to_string_lossy(),
-            "important.log",
-            false
-        ));
+        assert!(ig.ignored(&d.join("a.log").to_string_lossy(), "a.log", false).unwrap());
+        assert!(!ig
+            .ignored(
+                &d.join("important.log").to_string_lossy(),
+                "important.log",
+                false
+            )
+            .unwrap());
     }
 
     fn b(s: &str) -> Vec<u8> {

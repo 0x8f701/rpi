@@ -111,7 +111,7 @@ const RECEIPT_STATUS: Record<TodoChildReceiptStatus, true> = {
   failed: true,
 };
 const AGENT_STATUS = new Set(['queued', 'running', 'idle', 'parked', 'aborted']);
-const JOB_STATUS = new Set(['queued', 'running', 'completed', 'failed', 'cancelled']);
+const JOB_STATUS = new Set(['queued', 'running', 'cancelling', 'completed', 'failed', 'cancelled']);
 const HUB_OUTCOME = new Set(['queued', 'woken', 'revived', 'processed', 'failed']);
 
 const STATUS_LABEL: Record<TodoChildStatus, string> = {

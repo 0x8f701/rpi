@@ -229,7 +229,7 @@ async fn build_application(
     };
     let resources = fx.resources(extension.as_ref().map(|(manifest, _, _)| manifest.clone()));
     let session = Session::new(SessionOptions {
-        model: fx.model.clone(),
+        model: Some(fx.model.clone()),
         cwd: fx.cwd.clone(),
         system_prompt: String::new(),
         thinking_level: pi_agent::ThinkingLevel::Off,
@@ -437,7 +437,7 @@ async fn startup_without_hook_surfaces_keeps_the_plain_decision() -> Result<()> 
     let fx = Fixture::new()?;
     let resources = fx.resources(None);
     let session = Session::new(SessionOptions {
-        model: fx.model.clone(),
+        model: Some(fx.model.clone()),
         cwd: fx.cwd.clone(),
         system_prompt: String::new(),
         thinking_level: pi_agent::ThinkingLevel::Off,

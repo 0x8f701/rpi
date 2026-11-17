@@ -6,6 +6,7 @@ import {
   closeFileConversationsDroppedBySlotPatch,
   fileExplorerCanonicalPath,
   fileExplorerSyncPageCacheWithSlots,
+  parseFileExplorerAmbiguity,
   readFileExplorerSlot,
   updateFileExplorerSlot,
   type FileExplorerSessionSlot,
@@ -450,6 +451,16 @@ export function chatMarkdownOpenFailureText(error: unknown, path: string): strin
   return markdownProbeErrorText(error);
 }
 
+/** Same citation already stored on this mapping: reopen Files, send nothing. */
+export function chatCitationChoicesForReopen(
+  slot: FileExplorerSessionSlot,
+  citation: string | null,
+): FileExplorerSessionSlot['citationChoices'] | null {
+  const stored = slot.citationChoices;
+  if (!citation || !stored || stored.path !== citation || stored.candidates.length < 2) return null;
+  return stored;
+}
+
 /** Monotonic markdown-open probe attempt gate. Each new probe claims the
  *  next generation; only the LATEST attempt's completion may commit state
  *  (toast clear/set, file-owner switch, drawer open), so a slower earlier
@@ -569,6 +580,7 @@ export function runChatMarkdownOpenProbe(args: {
   onProbeStarted: () => void;
   onOpened: (relative: string, openLine: number | undefined, kind: 'file' | 'directory') => void;
   onFailed: (error: unknown) => void;
+  onAmbiguous?: (citation: string, candidates: string[]) => void;
   completion?: string;
 }): void {
   const {
@@ -583,6 +595,7 @@ export function runChatMarkdownOpenProbe(args: {
     onProbeStarted,
     onOpened,
     onFailed,
+    onAmbiguous,
     completion,
   } = args;
   void markdownOpenValidatedPath(
@@ -604,6 +617,12 @@ export function runChatMarkdownOpenProbe(args: {
     },
     (error) => {
       if (!isCurrentAttempt()) return;
+      const choices = parseFileExplorerAmbiguity(error);
+      const citation = choices ? markdownWorkspaceRelativePath(path, workspaceCwd) : null;
+      if (choices && citation && onAmbiguous) {
+        onAmbiguous(citation, choices);
+        return;
+      }
       if (!shouldRetryMarkdownFileUnavailable(error, retried)) {
         onFailed(error);
         return;
@@ -719,48 +738,29 @@ export function createChatProjectPathComplete(
 }
 
 /** Shared epoch guarding the chat transport lifecycle. Each setup claims a
- *  new value; a deferred cleanup stop only fires when no newer setup (or
- *  pagehide stop) has claimed since. Lives on a ref so React 18 StrictMode's
- *  setup→cleanup→setup cycle on the same store instances can cancel the
- *  pending teardown between setups. */
+ *  new value; a deferred cleanup stop only fires when no newer setup has
+ *  claimed since. */
 export interface ChatTransportEpoch {
   current: number;
 }
 
-/** Mounts the chat transport stores and wires their terminal stop to the
- *  page lifecycle. Returns the React effect cleanup:
- *
- *  - `pagehide` stops synchronously (the page is going away; there is no
- *    later chance) and invalidates any pending deferred stop. `stop` must be
- *    idempotent — pagehide may already have fired when the cleanup runs.
- *  - The cleanup defers its stop by one microtask, guarded by the shared
- *    epoch: StrictMode's setup→cleanup→setup on the same stores claims a new
- *    epoch in the follow-up setup, cancelling the teardown between setups —
- *    disposed transports are not restartable. A real unmount has no
- *    follow-up setup, so the deferred stop runs and disposes everything.
- *  - Route hide keeps the component mounted, so the cleanup never runs on a
- *    hidden view. */
+/** Mounts the chat transport stores. StrictMode's setup, cleanup, setup must
+ *  not stop them between setups. A real unmount stops on the next microtask.
+ *  pagehide is not a stop: an app switch emits it, and stop permanently
+ *  disposes the registry. */
 export function mountChatTransports(
   epoch: ChatTransportEpoch,
   start: () => void,
   stop: () => void,
-  win: {
-    addEventListener(type: string, listener: () => void, options?: { once?: boolean }): void;
-    removeEventListener(type: string, listener: () => void): void;
-  } = window,
 ): () => void {
   epoch.current += 1;
   const epochAtSetup = epoch.current;
   start();
-  const stopAll = () => {
-    epoch.current += 1;
-    stop();
-  };
-  win.addEventListener('pagehide', stopAll, { once: true });
   return () => {
-    win.removeEventListener('pagehide', stopAll);
     queueMicrotask(() => {
-      if (epoch.current === epochAtSetup) stopAll();
+      if (epoch.current !== epochAtSetup) return;
+      epoch.current += 1;
+      stop();
     });
   };
 }
@@ -1026,7 +1026,6 @@ export function ChatApp() {
   const [formOpen, setFormOpen] = useState(false);
   const [projectFormOpen, setProjectFormOpen] = useState(false);
   const [gearOpen, setGearOpen] = useState(false);
-  const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false);
   const [runnerGearOpen, setRunnerGearOpen] = useState(false);
   const [runnerContextMenu, setRunnerContextMenu] = useState<RunnerContextMenuTarget | null>(null);
   const isAddingRef = useRef(false);
@@ -1085,8 +1084,6 @@ export function ChatApp() {
   const gearButtonRef = useRef<HTMLButtonElement | null>(null);
   const detailsButtonRef = useRef<HTMLButtonElement | null>(null);
   const gearMenuRef = useRef<HTMLDivElement | null>(null);
-  const workspaceMenuRef = useRef<HTMLDivElement | null>(null);
-  const workspaceMenuButtonRef = useRef<HTMLButtonElement | null>(null);
   const runnerGearMenuRef = useRef<HTMLDivElement | null>(null);
   const runnerContextMenuRef = useRef<HTMLDivElement | null>(null);
   const runnerMenuLongPressRef = useRef<{ pointerId: number; timer: number } | null>(null);
@@ -1319,11 +1316,6 @@ export function ChatApp() {
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return;
-      if (workspaceMenuOpen) {
-        setWorkspaceMenuOpen(false);
-        workspaceMenuButtonRef.current?.focus();
-        return;
-      }
       if (tmuxTerminal && !tmuxTerminal.hidden) return;
       if (runnerContextMenu) {
         setRunnerContextMenu(null);
@@ -1383,18 +1375,7 @@ export function ChatApp() {
     };
     document.addEventListener('keydown', onKeyDown, true);
     return () => document.removeEventListener('keydown', onKeyDown, true);
-  }, [closeProjectForm, confirmProjectDelete, confirmRunnerDelete, createSessionOpen, formOpen, gearOpen, projectFormOpen, runnerContextMenu, runnerFormOpen, runnerGearOpen, tabletContextOpen, tmuxTerminal, tokenFormRunnerId, workspaceMenuOpen]);
-
-  useEffect(() => {
-    if (!workspaceMenuOpen) return;
-    const onPointerDown = (event: PointerEvent) => {
-      const root = workspaceMenuRef.current;
-      if (!root || root.contains(event.target as Node)) return;
-      setWorkspaceMenuOpen(false);
-    };
-    document.addEventListener('pointerdown', onPointerDown);
-    return () => document.removeEventListener('pointerdown', onPointerDown);
-  }, [workspaceMenuOpen]);
+  }, [closeProjectForm, confirmProjectDelete, confirmRunnerDelete, createSessionOpen, formOpen, gearOpen, projectFormOpen, runnerContextMenu, runnerFormOpen, runnerGearOpen, tabletContextOpen, tmuxTerminal, tokenFormRunnerId]);
 
   useEffect(() => {
     if (!runnerContextMenu) return;
@@ -1513,6 +1494,22 @@ export function ChatApp() {
     const ownerBinding = sessionBindingForOwner(mapping.projects, runners, mapping.mappings, owner);
     if (!ownerKey || !ownerBinding) return;
     const attempt = beginMarkdownProbeAttempt(markdownProbeAttemptRef);
+    const storedChoices = chatCitationChoicesForReopen(
+      readFileExplorerSlot(fileExplorerByMappingId, ownerKey),
+      markdownWorkspaceRelativePath(path, ownerBinding.project.cwd),
+    );
+    if (storedChoices) {
+      setMarkdownProbeError('');
+      teamStore.selectProject(ownerBinding.project.id);
+      teamStore.setFileOwner(ownerBinding.project.id, ownerBinding.mapping.id);
+      teamStore.setContextPane(ownerBinding.project.id, 'files');
+      patchFileExplorer(ownerKey, (slot) => ({
+        ...applyDrawerMode(slot, 'open'),
+        activePath: null,
+        citationChoices: storedChoices,
+      }));
+      return;
+    }
     const isCurrentAttempt = attempt.isCurrent;
     runChatMarkdownOpenProbe({
       path,
@@ -1531,14 +1528,29 @@ export function ChatApp() {
         teamStore.selectProject(ownerBinding.project.id);
         teamStore.setFileOwner(ownerBinding.project.id, ownerBinding.mapping.id);
         teamStore.setContextPane(ownerBinding.project.id, 'files');
-        patchFileExplorer(ownerKey, (slot) => applyOpenPath(slot, relative, openLine, kind === 'directory' ? 'dir' : 'file'));
+        patchFileExplorer(ownerKey, (slot) => ({
+          ...applyOpenPath(slot, relative, openLine, kind === 'directory' ? 'dir' : 'file'),
+          citationChoices: undefined,
+        }));
       },
       onFailed: (error) => {
         if (!isCurrentAttempt()) return;
         setMarkdownProbeError(chatMarkdownOpenFailureText(error, path));
       },
+      onAmbiguous: (citation, candidates) => {
+        if (!isCurrentAttempt()) return;
+        setMarkdownProbeError('');
+        teamStore.selectProject(ownerBinding.project.id);
+        teamStore.setFileOwner(ownerBinding.project.id, ownerBinding.mapping.id);
+        teamStore.setContextPane(ownerBinding.project.id, 'files');
+        patchFileExplorer(ownerKey, (slot) => ({
+          ...applyDrawerMode(slot, 'open'),
+          activePath: null,
+          citationChoices: { path: citation, candidates },
+        }));
+      },
     });
-  }, [mapping, patchFileExplorer, registry, runners, selectedProjectId, teamStore]);
+  }, [fileExplorerByMappingId, mapping, patchFileExplorer, registry, runners, selectedProjectId, teamStore]);
   useEffect(() => subscribeMarkdownOpenPath(onMarkdownOpenPath), [onMarkdownOpenPath]);
 
   const openFileExplorer = useCallback(() => {
@@ -2108,35 +2120,18 @@ export function ChatApp() {
       <ReconnectOverlay visible={reconnectOverlayVisible(conversationTarget?.runner.state ?? 'off')} text={reconnectOverlayText(conversationTarget?.runner.state ?? 'off')} />
       <header className="chat-workspace-bar" id="chat-workspace-bar">
         <div className="brand">
-          rpi<span className="brand-sub">chat</span>
-        </div>
-        <div className="chat-workspace-bar__menu" ref={workspaceMenuRef}>
-          <button
-            ref={workspaceMenuButtonRef}
-            type="button"
-            id="chat-workspace-menu-btn"
-            className={workspaceMenuOpen ? 'panel-toggle panel-toggle--open' : 'panel-toggle'}
-            aria-pressed={workspaceMenuOpen}
-            aria-expanded={workspaceMenuOpen}
-            aria-controls="chat-workspace-menu"
-            title="Toggle the workspace menu"
-            aria-label={workspaceMenuOpen ? 'Close menu' : 'Open menu'}
-            onClick={() => setWorkspaceMenuOpen((open) => !open)}
-          >
-            ☰
-          </button>
-          {workspaceMenuOpen && (
-            <nav id="chat-workspace-menu" className="chat-workspace-menu" aria-label="Workspace menu">
-              <a
-                className="panel-toggle"
-                href="/web"
-                title="Open web"
-                aria-label="Open web"
-              >
-                Web
-              </a>
-            </nav>
-          )}
+          <span className="brand-name">rpi</span>
+          <nav className="brand-switch" aria-label="Page">
+            <a
+              id="web-console-link"
+              href="/web"
+              title="Open web"
+              aria-label="Open web"
+            >
+              Web
+            </a>
+            <span aria-current="page">Chat</span>
+          </nav>
         </div>
       </header>
       {projectFormOpen && (
@@ -2401,7 +2396,9 @@ export function ChatApp() {
               </a>
             ) : selectedRunnerError !== '' && conversationTarget !== null && conversationTarget.runner.state !== 'reconnecting' && conversationTarget.runner.state !== 'connecting' ? (
               <p className="chat-runner-error" role="status">{selectedRunnerError}</p>
-            ) : conversationTarget !== null && (conversationTarget.runner.state === 'reconnecting' || conversationTarget.runner.state === 'connecting') ? (
+            ) : conversationTarget !== null && conversationTarget.runner.state === 'connecting' ? (
+              <p className="chat-runner-error chat-runner-error--transient" role="status">Connecting…</p>
+            ) : conversationTarget !== null && conversationTarget.runner.state === 'reconnecting' ? (
               <p className="chat-runner-error chat-runner-error--transient" role="status">Reconnecting…</p>
             ) : null}
             {headerMappings.length > 0 && (
@@ -2573,6 +2570,7 @@ export function ChatApp() {
                   await teamStore.retryBroadcastTarget(selectedProject.id, runId, mappingId);
                 }}
                 onViewRunner={(mappingId) => selectTarget({ kind: 'runner', mappingId })}
+                onReplyActionError={reportSessionTransportError}
               />
             )}
           </div>

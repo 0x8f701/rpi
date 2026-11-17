@@ -18,6 +18,11 @@ export interface ChannelMessage {
   mappingId: string | null;
   author: string;
   text: string;
+  /** Real settled assistant wire END timestamp (epoch ms) of a runner reply.
+   *  Distinct from `at` (channel-log append/order clock); absent on legacy
+   *  rows and whenever the settled item carried no usable timestamp — never
+   *  fabricated from `at` or the local clock. */
+  generatedAt?: number;
 }
 
 export interface WakeBriefInput {
@@ -50,9 +55,12 @@ export function boundChannelMessage(message: ChannelMessage): ChannelMessage {
     author: message.author.length <= MAX_STORED_AUTHOR_CHARS
       ? message.author
       : message.author.slice(0, MAX_STORED_AUTHOR_CHARS),
-    text: message.text.length <= MAX_CHANNEL_MESSAGE_CHARS
+    text: message.kind === 'runner' || message.text.length <= MAX_CHANNEL_MESSAGE_CHARS
       ? message.text
       : `${message.text.slice(0, MAX_CHANNEL_MESSAGE_CHARS)}\n…`,
+    ...(typeof message.generatedAt === 'number' && Number.isInteger(message.generatedAt)
+      ? { generatedAt: message.generatedAt }
+      : {}),
   };
 }
 
@@ -193,6 +201,7 @@ function parseStoredChannelMessage(value: unknown): ChannelMessage | null {
     mappingId?: unknown;
     author?: unknown;
     text?: unknown;
+    generatedAt?: unknown;
   };
   if (typeof row.id !== 'string' || row.id.trim() === '' || row.id.length > MAX_STORED_ID_CHARS) return null;
   if (typeof row.at !== 'number' || !Number.isFinite(row.at)) return null;
@@ -200,6 +209,11 @@ function parseStoredChannelMessage(value: unknown): ChannelMessage | null {
   if (row.mappingId !== null && (typeof row.mappingId !== 'string' || row.mappingId.length > MAX_STORED_ID_CHARS)) return null;
   if (typeof row.author !== 'string' || row.author.trim() === '') return null;
   if (typeof row.text !== 'string') return null;
+  // A bad generatedAt must NEVER invalidate the whole log row: the reply text
+  // is valid, only the usable wire clock is lost (no `at` fallback).
+  const generatedAt = typeof row.generatedAt === 'number' && Number.isInteger(row.generatedAt)
+    ? row.generatedAt
+    : undefined;
   return boundChannelMessage({
     id: row.id,
     at: row.at,
@@ -207,5 +221,6 @@ function parseStoredChannelMessage(value: unknown): ChannelMessage | null {
     mappingId: row.mappingId,
     author: row.author,
     text: row.text,
+    ...(generatedAt === undefined ? {} : { generatedAt }),
   });
 }

@@ -85,7 +85,7 @@ async fn call_err(tool: &AgentTool, arguments: Value) -> String {
 
 fn session_options(cwd: &Path, model: Model) -> SessionOptions {
     SessionOptions {
-        model,
+        model: Some(model),
         cwd: cwd.to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,

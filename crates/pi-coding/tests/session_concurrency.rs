@@ -259,7 +259,7 @@ async fn concurrent_run_print_rejects_second_with_already_processing() {
     let model = provider.model();
     let cwd = tempfile::tempdir().expect("tempdir");
     let session = Session::new(SessionOptions {
-        model,
+        model: Some(model),
         cwd: cwd.path().to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,
@@ -335,7 +335,7 @@ async fn abort_settles_terminal_assistant_then_reuse() {
     let model = provider.model();
     let cwd = tempfile::tempdir().expect("tempdir");
     let session = Session::new(SessionOptions {
-        model,
+        model: Some(model),
         cwd: cwd.path().to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,
@@ -423,7 +423,7 @@ async fn recorder_persists_messages_to_resumed_temp_session() {
     let model = provider.model();
     let cwd = tempfile::tempdir().expect("tempdir");
     let session = Session::new(SessionOptions {
-        model,
+        model: Some(model),
         cwd: cwd.path().to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,
@@ -499,7 +499,7 @@ async fn foreground_bash_finishing_during_run_appends_after_assistant() {
     let model = provider.model();
     let cwd = tempfile::tempdir().expect("tempdir");
     let session = Session::new(SessionOptions {
-        model,
+        model: Some(model),
         cwd: cwd.path().to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,

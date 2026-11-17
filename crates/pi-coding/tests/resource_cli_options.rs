@@ -129,7 +129,7 @@ async fn global_coordinate_skill_expands_and_executes_once_in_attached_session()
 
     let session = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model,
+            model: Some(model),
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,

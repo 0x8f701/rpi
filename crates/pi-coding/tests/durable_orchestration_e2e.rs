@@ -5,7 +5,7 @@
 //!
 //! Contracts defended (observable public behavior only):
 //! - Existing sidecar survives bind and is recovered before any empty write
-//! - Fresh non-explicit Application attachment binds before parent JSONL creation
+//! - Fresh non-explicit attachment keeps the activated parent journal and adds only an empty sidecar
 //! - Child JSONL lives under `<parent-dir>/children/<parent-id>/` with
 //!   parentSession linkage; pathful and pathless revival append real turns
 //! - Interrupted agents recover as Queued for revival; unsettled jobs keep Running
@@ -100,6 +100,15 @@ fn test_model() -> Model {
     }
 }
 
+/// `recorded_cut_model` fail-closes unless the journal's provider/id is in the
+/// process catalog. Register this suite's stable faux pair once. Later calls
+/// overwrite the same key, so parallel tests keep one shared definition and
+/// nothing is unregistered.
+fn register_test_model() {
+    static REGISTERED: std::sync::Once = std::sync::Once::new();
+    REGISTERED.call_once(|| pi_ai::register_model(test_model()));
+}
+
 fn tool<'a>(tools: &'a [AgentTool], name: &str) -> &'a AgentTool {
     tools
         .iter()
@@ -141,7 +150,7 @@ fn quick_factory(response_text: &'static str) -> ChildSessionFactory {
             });
             Session::new_with_additional_tools_filtered_and_discovery(
                 SessionOptions {
-                    model: request.model,
+                    model: Some(request.model),
                     cwd: std::env::current_dir().expect("cwd"),
                     system_prompt: request.system_prompt,
                     thinking_level: ThinkingLevel::Off,
@@ -193,7 +202,7 @@ fn capturing_factory(
             });
             Session::new_with_additional_tools_filtered_and_discovery(
                 SessionOptions {
-                    model: request.model,
+                    model: Some(request.model),
                     cwd: std::env::current_dir().expect("cwd"),
                     system_prompt: request.system_prompt,
                     thinking_level: ThinkingLevel::Off,
@@ -241,7 +250,7 @@ fn blocking_factory(started: Arc<Notify>, release: CancellationToken) -> ChildSe
             });
             Session::new_with_additional_tools_filtered_and_discovery(
                 SessionOptions {
-                    model: request.model,
+                    model: Some(request.model),
                     cwd: std::env::current_dir().expect("cwd"),
                     system_prompt: request.system_prompt,
                     thinking_level: ThinkingLevel::Off,
@@ -265,7 +274,7 @@ fn blocking_factory(started: Arc<Notify>, release: CancellationToken) -> ChildSe
 
 fn config(artifacts: &Path, definitions: Vec<AgentDefinition>) -> OrchestrationConfig {
     let mut config = OrchestrationConfig::new(AgentCatalog::from_agents(definitions), artifacts);
-    config.parent_model = test_model();
+    config.parent_model = Some(test_model());
     config.idle_ttl = None;
     config
 }
@@ -287,7 +296,7 @@ fn parent_session(artifacts: &Path, session_dir: &Path) -> (Session, String, Pat
     let parent_path = recorder.path();
     let parent = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model: test_model(),
+            model: Some(test_model()),
             cwd: artifacts.to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -333,7 +342,7 @@ fn fresh_unmaterialized_parent_session(
     );
     let parent = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model: test_model(),
+            model: Some(test_model()),
             cwd: artifacts.to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -376,7 +385,7 @@ fn parent_session_with_id(
     let parent_path = recorder.path();
     let parent = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model: test_model(),
+            model: Some(test_model()),
             cwd: artifacts.to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -573,6 +582,7 @@ fn running_job(id: &str, agent_id: &str) -> JobSnapshot {
         created_at: 1_000,
         started_at: Some(1_050),
         finished_at: None,
+        cancellation_cause: None,
         result: None,
         soft_budget_exhausted: false,
     }
@@ -648,7 +658,7 @@ fn restarted_parent_session(parent: &Session) -> anyhow::Result<Session> {
         .ok_or_else(|| anyhow::anyhow!("parent recording is unavailable"))?;
     let restarted = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model: test_model(),
+            model: Some(test_model()),
             cwd: parent.cwd().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -981,7 +991,7 @@ async fn restart_reconciles_started_no_result_tool_without_replay() {
             tools.push(side_effect);
             Session::new_with_additional_tools_filtered_and_discovery(
                 SessionOptions {
-                    model: request.model,
+                    model: Some(request.model),
                     cwd: std::env::current_dir().expect("cwd"),
                     system_prompt: request.system_prompt,
                     thinking_level: ThinkingLevel::Off,
@@ -1223,7 +1233,7 @@ async fn concurrent_sends_claim_single_revival_job() {
             });
             Session::new_with_additional_tools_filtered_and_discovery(
                 SessionOptions {
-                    model: request.model,
+                    model: Some(request.model),
                     cwd: std::env::current_dir().expect("cwd"),
                     system_prompt: request.system_prompt,
                     thinking_level: ThinkingLevel::Off,
@@ -1398,6 +1408,11 @@ async fn persistence_failure_propagates_without_false_revived() {
 /// The mailbox commit precedes the revival claim. If the claim cannot be
 /// persisted, the truthful receipt remains Queued with an error and the
 /// already-durable message stays queued in both live and recovered state.
+///
+/// This runtime retains 4096 settled jobs. Worker recovers Idle with that
+/// many recent Completed jobs, so ordinary retention does not prune them and
+/// recovery starts no runner. The claim persist is the write that crosses the
+/// durable job cap.
 #[tokio::test]
 async fn revival_claim_failure_keeps_committed_mailbox_message() {
     let artifacts = tempfile::tempdir().expect("artifacts");
@@ -1405,6 +1420,10 @@ async fn revival_claim_failure_keeps_committed_mailbox_message() {
     let (parent, parent_id, parent_path) = parent_session(artifacts.path(), sessions.path());
     let child_root = child_root_for(&parent_path, &parent_id);
     let child_jsonl = plant_child_jsonl(&child_root, &parent_path, "claim-fail");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock")
+        .as_millis() as u64;
     let jobs = (0..4096)
         .map(|index| JobSnapshot {
             id: format!("settled-{index}"),
@@ -1416,9 +1435,10 @@ async fn revival_claim_failure_keeps_committed_mailbox_message() {
             workflow_id: None,
             workflow_generation: None,
             status: JobStatus::Completed,
-            created_at: index,
-            started_at: Some(index),
-            finished_at: Some(index),
+            created_at: now,
+            started_at: Some(now),
+            finished_at: Some(now),
+            cancellation_cause: None,
             result: None,
             soft_budget_exhausted: false,
         })
@@ -1428,7 +1448,7 @@ async fn revival_claim_failure_keeps_committed_mailbox_message() {
         artifacts.path(),
         vec![persisted_worker(
             "Worker",
-            AgentStatus::Parked,
+            AgentStatus::Idle,
             "retain committed mail",
             Some(&child_jsonl),
             Vec::new(),
@@ -1436,17 +1456,38 @@ async fn revival_claim_failure_keeps_committed_mailbox_message() {
         jobs,
     )
     .await;
-    let runtime = OrchestrationRuntime::new(
-        config(artifacts.path(), vec![task_definition()]),
-        quick_factory("must not launch"),
-    )
-    .expect("runtime");
+    let mut config = config(artifacts.path(), vec![task_definition()]);
+    config = config.with_job_retention(4096, Duration::from_secs(24 * 60 * 60));
+    let runtime = OrchestrationRuntime::new(config, quick_factory("must not launch"))
+        .expect("runtime");
     let _application = bind_then_recover_existing(&runtime, &parent).await;
+    let recovered = runtime.list("Main");
+    assert!(
+        recovered
+            .iter()
+            .any(|agent| agent.id == "Worker" && agent.status == AgentStatus::Parked),
+        "Idle Worker recovers Parked and claimable: {recovered:?}"
+    );
+    assert_eq!(
+        runtime
+            .jobs(None)
+            .iter()
+            .filter(|job| job.agent_id == "Worker" && job.status == JobStatus::Completed)
+            .count(),
+        4096,
+        "configured retention keeps the recent completed jobs"
+    );
 
     let receipts = runtime.send("Main", "Worker", "durably queued", None);
     assert_eq!(receipts.len(), 1);
     assert_eq!(receipts[0].outcome, DeliveryOutcome::Queued, "{receipts:?}");
-    assert!(receipts[0].error.is_some(), "{receipts:?}");
+    assert!(
+        receipts[0]
+            .error
+            .as_ref()
+            .is_some_and(|error| error.contains("4096")),
+        "{receipts:?}"
+    );
     assert!(
         runtime
             .inbox("Worker", true)
@@ -1456,6 +1497,10 @@ async fn revival_claim_failure_keeps_committed_mailbox_message() {
     );
 
     let state = load_sidecar(&parent_path, &parent_id);
+    assert_eq!(state.jobs.len(), 4096, "claim persist must not add a job");
+    assert!(state.jobs.iter().all(|job| {
+        job.agent_id == "Worker" && job.status == JobStatus::Completed
+    }));
     assert!(state.agents.iter().any(|agent| {
         agent.snapshot.id == "Worker"
             && agent
@@ -1464,7 +1509,10 @@ async fn revival_claim_failure_keeps_committed_mailbox_message() {
                 .any(|message| message.body == "durably queued")
     }));
     assert!(sidecar.is_file());
-    runtime.shutdown().await;
+    tokio::time::timeout(Duration::from_secs(5), runtime.shutdown())
+        .await
+        .expect("runtime shutdown bounded")
+        .expect("runtime shutdown");
 }
 
 /// Hub inbox drain must surface persistence failure and restore the mailbox.
@@ -2141,14 +2189,30 @@ async fn corrupt_sidecar_fails_closed_without_registry_mutation() {
 }
 
 /// Application attachment binds a fresh non-explicit recorder before its first
-/// prompt without materializing a misleading empty parent JSONL.
+/// prompt. `record` activates the pending recorder, so the parent JSONL is the
+/// ordinary header plus the recorded model and thinking level before
+/// orchestration is attached. Binding adds the empty sidecar and does not
+/// append a prompt or an assistant turn.
 #[tokio::test]
-async fn fresh_non_explicit_application_attach_binds_before_parent_jsonl_exists() {
+async fn fresh_non_explicit_application_attach_keeps_activated_parent_journal() {
     let artifacts = tempfile::tempdir().expect("artifacts");
     let sessions = tempfile::tempdir().expect("sessions");
     let (parent, parent_id, parent_path) =
         fresh_unmaterialized_parent_session(artifacts.path(), sessions.path());
     let child_root = child_root_for(&parent_path, &parent_id);
+    let activated = pi_coding::load_session_tree(&parent_path)
+        .expect("record activates the pending parent journal");
+    assert_eq!(activated.header.id, parent_id);
+    assert_eq!(activated.header.cwd, artifacts.path());
+    assert!(
+        activated.entries.iter().any(|entry| {
+            entry.entry_type == "model_change"
+                && entry.provider.as_deref() == Some(test_model().provider.as_str())
+                && entry.model_id.as_deref() == Some(test_model().id.as_str())
+        }),
+        "activated journal keeps the recorded model: {:?}",
+        activated.entries
+    );
     let runtime = OrchestrationRuntime::new(
         config(artifacts.path(), vec![task_definition()]),
         quick_factory("unused"),
@@ -2167,10 +2231,17 @@ async fn fresh_non_explicit_application_attach_binds_before_parent_jsonl_exists(
         runtime.is_durable(),
         "attachment binds durable orchestration"
     );
+    let parent_journal =
+        pi_coding::load_session_tree(&parent_path).expect("attached parent journal reloads");
+    assert_eq!(parent_journal.header.id, parent_id);
+    assert_eq!(parent_journal.entries.len(), activated.entries.len());
     assert!(
-        !parent_path.exists(),
-        "binding must not change ordinary pending-recorder persistence semantics: {}",
-        parent_path.display()
+        parent_journal
+            .entries
+            .iter()
+            .all(|entry| entry.message.is_none()),
+        "binding must not append a prompt or assistant turn: {:?}",
+        parent_journal.entries
     );
     let sidecar = child_root.join("orchestration-state.json");
     assert!(
@@ -3044,7 +3115,7 @@ fn target_session_with_message(
 fn resumed_session_at(path: &Path, cwd: &Path, session_dir: &Path) -> anyhow::Result<Session> {
     let session = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model: test_model(),
+            model: Some(test_model()),
             cwd: cwd.to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -3110,10 +3181,10 @@ fn rewrite_sidecar_version(sidecar: &Path, version: u32) {
 /// not abort with `parsing durable state sidecar`. A v1 sidecar holds no
 /// durable orchestration authority for the current generation, so the switch
 /// treats it as absent: the target transcript is restored and a fresh valid
-/// v3 sidecar is published with the live durable policy, group identity, and
-/// an empty roster.
+/// current-schema sidecar is published with the live durable policy, group
+/// identity, and an empty roster.
 #[tokio::test]
-async fn switch_session_with_legacy_v1_sidecar_restores_transcript_and_publishes_fresh_v3() {
+async fn switch_session_with_legacy_v1_sidecar_restores_transcript_and_publishes_current_schema() {
     let artifacts = tempfile::tempdir().expect("artifacts");
     let sessions = tempfile::tempdir().expect("sessions");
     let (old_parent, _old_id, _old_path) = parent_session(artifacts.path(), sessions.path());
@@ -3129,6 +3200,7 @@ async fn switch_session_with_legacy_v1_sidecar_restores_transcript_and_publishes
         .attach_orchestration(runtime.clone())
         .await
         .expect("attach switch orchestration");
+    register_test_model();
 
     let new_id = "legacy.v1.target";
     let new_path = target_session_with_message(
@@ -3153,20 +3225,21 @@ async fn switch_session_with_legacy_v1_sidecar_restores_transcript_and_publishes
         vec![],
     )
     .await;
-    let v3_bytes = std::fs::read(&sidecar).expect("read v3 sidecar");
-    let v3_value: serde_json::Value = serde_json::from_slice(&v3_bytes).expect("decode v3");
+    let current_bytes = std::fs::read(&sidecar).expect("read current sidecar");
+    let current_value: serde_json::Value =
+        serde_json::from_slice(&current_bytes).expect("decode current sidecar");
     assert!(
-        v3_value["durablePolicy"].is_object(),
-        "planted v3 sidecar carries durablePolicy"
+        current_value["durablePolicy"].is_object(),
+        "planted current sidecar carries durablePolicy"
     );
     assert!(
-        v3_value["groupId"].is_string(),
-        "planted v3 sidecar carries groupId"
+        current_value["groupId"].is_string(),
+        "planted current sidecar carries groupId"
     );
     demote_sidecar_to_legacy_v1(&sidecar);
     let v1_bytes = std::fs::read(&sidecar).expect("read legacy v1 sidecar");
     assert_ne!(
-        v3_bytes, v1_bytes,
+        current_bytes, v1_bytes,
         "demotion must drop durable authority fields"
     );
     let probe: serde_json::Value =
@@ -3208,40 +3281,40 @@ async fn switch_session_with_legacy_v1_sidecar_restores_transcript_and_publishes
     assert_eq!(switched_id, new_id);
     assert_eq!(switched_path, new_path);
 
-    // Fresh valid v3 publication: strict current-version parse succeeds and
-    // names the target parent with the live durable policy and group identity.
-    // The legacy v1 worker is never fabricated into authority.
-    let fresh = std::fs::read(&sidecar).expect("read published v3 sidecar");
+    // Fresh current-schema publication: strict current-version parse succeeds
+    // and names the target parent with the live durable policy and group
+    // identity. The legacy v1 worker is never fabricated into authority.
+    let fresh = std::fs::read(&sidecar).expect("read published current sidecar");
     let state: DurableState = serde_json::from_slice(&fresh)
         .expect("fresh sidecar must parse as strict current-version DurableState");
     assert_eq!(
         state.version, DURABLE_STATE_VERSION,
-        "fresh v3 sidecar replaces the legacy v1"
+        "fresh current sidecar replaces the legacy v1"
     );
     assert_eq!(state.parent_session_id, new_id);
     assert_eq!(
         state.parent_session_path,
         new_path.to_string_lossy(),
-        "fresh v3 sidecar keeps the exact switched parent path"
+        "fresh current sidecar keeps the exact switched parent path"
     );
     assert!(
         uuid::Uuid::parse_str(&state.group_id).is_ok(),
-        "fresh v3 group identity"
+        "fresh current group identity"
     );
     assert!(
         state.agents.is_empty(),
-        "legacy v1 agents must not leak into fresh v3"
+        "legacy v1 agents must not leak into the fresh current sidecar"
     );
     assert!(
         state.jobs.is_empty(),
-        "legacy v1 jobs must not leak into fresh v3"
+        "legacy v1 jobs must not leak into the fresh current sidecar"
     );
     assert_eq!(
         state.durable_policy,
         application
             .durable_policy_state()
             .expect("live generation durable policy"),
-        "fresh v3 sidecar carries the live generation durable policy"
+        "fresh current sidecar carries the live generation durable policy"
     );
 
     application.cleanup().await;
@@ -3272,6 +3345,7 @@ async fn switch_session_fails_closed_on_invalid_target_sidecars_and_retains_sour
     let old_sidecar_before =
         std::fs::read(child_root_for(&old_path, &old_id).join("orchestration-state.json"))
             .expect("read source sidecar before");
+    register_test_model();
 
     for case in 0..5usize {
         let new_id = format!("invalid-target-{case}");

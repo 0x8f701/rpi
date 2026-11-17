@@ -174,6 +174,9 @@ export function sessionRowMeta(row: Pick<SessionRowWire, 'displayTime' | 'messag
 
 const OTHER_SUBGROUP_LABEL = 'Other';
 const AGENT_SUBGROUP_LABEL = 'Agent sessions';
+/** Shared read-only empty intent: the resolved collapse state whenever the
+ *  stored intent was made under a different active identity. */
+const EMPTY_COLLAPSE_INTENT: ReadonlyMap<string, boolean> = new Map<string, boolean>();
 
 interface SessionSubgroup {
   key: string;
@@ -239,17 +242,6 @@ export function groupSessions(rows: SessionRowWire[]): SessionGroupNode[] {
     subgroupNode.sessions.push(row);
   }
   return roots;
-}
-
-function indexGroupNodes(
-  nodes: SessionGroupNode[],
-  into: Map<string, SessionGroupNode> = new Map(),
-): Map<string, SessionGroupNode> {
-  for (const node of nodes) {
-    into.set(node.key, node);
-    indexGroupNodes(node.children, into);
-  }
-  return into;
 }
 
 /** Resolve the active sidebar identity from `activeSessionId`. Duplicate
@@ -434,39 +426,55 @@ export function migrateSidebarCollapseIntent(
   return next;
 }
 
-/** Resolve effective collapsed keys. One rule for every node: an explicit
- *  `true` intent collapses it — including groups that hold the active or a
- *  loaded session. Agent sessions subgroups default collapsed and open
- *  on explicit `false`; an active search opens matching Agent subgroups for
- *  visibility. A provider collapse remains absolute above its subgroups. */
+/** Resolve effective collapsed keys. The default view collapses EVERY
+ *  provider root and subgroup except the ancestor path of the resolved
+ *  active session row (`resolveActiveSessionRow` over these rows); with no
+ *  active session every root defaults closed. Explicit intent wins over the
+ *  default at every node: `true` collapses even the active path, `false`
+ *  expands even a non-selected group. During an active search every node
+ *  without an explicit `true` intent opens so matches render — search never
+ *  writes intent, so clearing the query restores the prior tree. Agent
+ *  sessions subgroups keep their default-collapsed rule (opened by explicit
+ *  `false`, search, or active membership). A provider collapse remains
+ *  absolute above its subgroups. */
 export function collapsedSidebarGroupKeys(
   rows: SessionRowWire[],
   intent: ReadonlyMap<string, boolean>,
   searchActive = false,
+  activeSessionId: string | null | undefined,
 ): Set<string> {
   const collapsed = new Set<string>();
+  const activeRow = resolveActiveSessionRow(rows, activeSessionId);
+  let activeProviderKey: string | null = null;
+  let activeSubgroupKey: string | null = null;
+  if (activeRow) {
+    const provider = providerOf(activeRow);
+    if (provider) {
+      activeProviderKey = `provider::${provider}`;
+      activeSubgroupKey = subgroupOf(activeRow, provider).key;
+    }
+  }
   const groups = groupSessions(rows);
   for (const providerNode of groups) {
-    if (intent.get(providerNode.key) === true) collapsed.add(providerNode.key);
+    const providerIntent = intent.get(providerNode.key);
+    if (providerIntent === true) collapsed.add(providerNode.key);
+    else if (providerIntent === false) { /* explicit expansion wins over the default */ }
+    else if (!searchActive && providerNode.key !== activeProviderKey) collapsed.add(providerNode.key);
     for (const subgroup of providerNode.children) {
-      if (subgroup.subgroupKind !== 'agent') {
-        if (intent.get(subgroup.key) === true) collapsed.add(subgroup.key);
+      const subgroupIntent = intent.get(subgroup.key);
+      if (subgroupIntent === true) {
+        collapsed.add(subgroup.key);
         continue;
       }
-      if (intent.get(subgroup.key) === true) {
-        collapsed.add(subgroup.key);
-      } else if (searchActive && intent.get(subgroup.key) !== true) {
-        collapsed.delete(subgroup.key);
-      } else if (intent.get(subgroup.key) !== false) {
-        collapsed.add(subgroup.key);
-      }
+      if (subgroupIntent === false) continue;
+      if (!searchActive && subgroup.key !== activeSubgroupKey) collapsed.add(subgroup.key);
     }
   }
   return collapsed;
 }
 
 /** Flatten catalog rows into the exact `<li>` sequence the sidebar renders.
- * Group headers emit on first occurrence while rows retain reconciled order.
+ * Each provider/project owns a contiguous subtree in first-seen group order.
  * A collapsed group hides every descendant, including the active session. */
 export function flattenTree(
   rows: SessionRowWire[],
@@ -474,27 +482,14 @@ export function flattenTree(
   out: SessionTreeItem[],
   groups: SessionGroupNode[] = groupSessions(rows),
 ): void {
-  const byKey = indexGroupNodes(groups);
-  const emitted = new Set<string>();
-  for (const row of rows) {
-    const provider = providerOf(row);
-    if (!provider) continue;
-    const providerKey = `provider::${provider}`;
-    const providerNode = byKey.get(providerKey);
-    if (!providerNode) continue;
-    if (!emitted.has(providerKey)) {
-      out.push({ kind: 'group', node: providerNode, depth: 0, sessionCount: subtreeSessionCount(providerNode) });
-      emitted.add(providerKey);
+  for (const provider of groups) {
+    out.push({ kind: 'group', node: provider, depth: 0, sessionCount: subtreeSessionCount(provider) });
+    if (collapsed.has(provider.key)) continue;
+    for (const subgroup of provider.children) {
+      out.push({ kind: 'group', node: subgroup, depth: 1, sessionCount: subgroup.sessions.length });
+      if (collapsed.has(subgroup.key)) continue;
+      for (const row of subgroup.sessions) out.push({ kind: 'row', row, depth: 2 });
     }
-    if (collapsed.has(providerKey)) continue;
-    const subgroup = subgroupOf(row, provider);
-    const subgroupNode = byKey.get(subgroup.key);
-    if (subgroupNode && !emitted.has(subgroup.key)) {
-      out.push({ kind: 'group', node: subgroupNode, depth: 1, sessionCount: subtreeSessionCount(subgroupNode) });
-      emitted.add(subgroup.key);
-    }
-    if (collapsed.has(subgroup.key)) continue;
-    out.push({ kind: 'row', row, depth: subgroupNode ? 2 : 1 });
   }
 }
 
@@ -1182,9 +1177,9 @@ interface SessionSidebarProps {
   onLifecycleResult: (result: unknown) => Promise<unknown>;
   onSwitchSession: RequestSessionSwitch;
   activeSessionId: string | null;
+  isOpen: boolean;
   unreadBySessionId?: Record<string, number>;
   streamingBySessionId?: Record<string, boolean>;
-  featureNav?: React.ReactNode;
   onCollapse: () => void;
   onReopenRail: () => void;
   onOpenManage: () => void;
@@ -1305,7 +1300,7 @@ export function SessionSidebar({
   onSwitchSession,
   activeSessionId,
   unreadBySessionId,
-  featureNav,
+  isOpen,
   onCollapse,
   onReopenRail,
   onOpenManage,
@@ -1336,6 +1331,22 @@ export function SessionSidebar({
   );
   const activeCatalogRow = resolveActiveSessionRow(mergedSessions, activeSessionId);
   const activeRowKey = activeCatalogRow ? sessionRowKey(activeCatalogRow) : null;
+  const activeRowRef = useRef<HTMLButtonElement | null>(null);
+  const sessionListRef = useRef<HTMLUListElement | null>(null);
+  useLayoutEffect(() => {
+    const row = activeRowRef.current;
+    if (!isOpen || !row) return;
+    const list = sessionListRef.current;
+    if (!list) return;
+    const item = row.closest('li.session-sidebar__row');
+    if (!item) return;
+    const rowBounds = item.getBoundingClientRect();
+    const listBounds = list.getBoundingClientRect();
+    const viewportTop = listBounds.top + list.clientTop;
+    const viewportBottom = viewportTop + list.clientHeight;
+    if (rowBounds.top < viewportTop) list.scrollTop += Math.floor(rowBounds.top - viewportTop);
+    else if (rowBounds.bottom > viewportBottom) list.scrollTop += Math.ceil(rowBounds.bottom - viewportBottom);
+  }, [activeRowKey, lifecycleRowOverlay, isOpen, activeSessionId]);
 
 
   const [busy, setBusy] = useState(false);
@@ -1362,11 +1373,21 @@ export function SessionSidebar({
    *  load when the gate clears. Effects only request/flush it — the flag is
    *  the single authority, never mirrored into state. */
   const deferredCatalogRef = useRef(false);
-  /** Explicit group intent. `true` means collapsed; `false` records an
-   * explicit expansion of default-collapsed Agent sessions. Missing keys use
-   * the subgroup default. */
+  /** Explicit group intent, coalesced with the active identity it was made
+   * under: `true` means collapsed, `false` an explicit expansion. An
+   * identity switch RETIRES the stored map in the same render (conditional
+   * render-phase setState below — React re-renders before committing, so
+   * there is no effect and no first-frame flash of the old expansion); a
+   * refresh keeps the identity and therefore the intent. */
   const collapseIntentRef = useRef<Map<string, boolean>>(new Map());
-  const [collapseIntent, setCollapseIntent] = useState<Map<string, boolean>>(() => collapseIntentRef.current);
+  const [collapseIntentState, setCollapseIntentState] = useState<{ identity: string | null; intent: Map<string, boolean> }>(
+    () => ({ identity: activeRowKey, intent: collapseIntentRef.current }),
+  );
+  if (collapseIntentState.identity !== activeRowKey) {
+    const retired = new Map<string, boolean>();
+    collapseIntentRef.current = retired;
+    setCollapseIntentState({ identity: activeRowKey, intent: retired });
+  }
   /** Bounded client-side search query. Empty restores the default view. */
   const [searchQuery, setSearchQuery] = useState('');
   const [menu, setMenu] = useState<SidebarMenuState | null>(null);
@@ -1399,31 +1420,37 @@ export function SessionSidebar({
     [knownSessions, searchQuery, activeSessionId]
   );
 
+  /** Single resolved intent source for this render: the stored map while it
+   * was made under the current active identity, otherwise empty. */
   const groups = useMemo(() => groupSessions(visibleSessions), [visibleSessions]);
+  const collapseIntent = collapseIntentState.identity === activeRowKey
+    ? collapseIntentState.intent
+    : EMPTY_COLLAPSE_INTENT;
   const collapsedGroups = useMemo(() => collapsedSidebarGroupKeys(
     visibleSessions,
     collapseIntent,
     searchQuery.trim() !== '',
-  ), [visibleSessions, collapseIntent, searchQuery]);
+    activeSessionId,
+  ), [visibleSessions, collapseIntent, searchQuery, activeSessionId]);
   const treeItems = useMemo(() => {
     const out: SessionTreeItem[] = [];
     flattenTree(visibleSessions, collapsedGroups, out, groups);
     return out;
   }, [visibleSessions, groups, collapsedGroups]);
-
-
   const toggleGroup = useCallback((key: string) => {
-    setCollapseIntent((previous) => {
-      const next = new Map(previous);
+    setCollapseIntentState(({ identity, intent: previous }) => {
+      const base = identity === activeRowKey ? previous : EMPTY_COLLAPSE_INTENT;
+      const next = new Map(base);
       next.set(key, !collapsedSidebarGroupKeys(
         visibleSessions,
-        previous,
+        base,
         searchQuery.trim() !== '',
+        activeSessionId,
       ).has(key));
       collapseIntentRef.current = next;
-      return next;
+      return { identity: activeRowKey, intent: next };
     });
-  }, [searchQuery, visibleSessions]);
+  }, [activeRowKey, activeSessionId, searchQuery, visibleSessions]);
 
   /** Re-fetch the session catalog. Every load flows through the dedicated
    *  auxiliary catalog sender (`sendCatalogCommand`), so the App RPC layer
@@ -1511,10 +1538,10 @@ export function SessionSidebar({
     // Functional updater: a collapse/expand click that lands between the
     // session_list request and this commit must survive — migrating from a
     // ref snapshot here would silently discard the click's intent.
-    setCollapseIntent((current) => {
-      const nextCollapseIntent = migrateSidebarCollapseIntent(previousRows, listResult.sessions, current);
+    setCollapseIntentState((previous) => {
+      const nextCollapseIntent = migrateSidebarCollapseIntent(previousRows, listResult.sessions, previous.intent);
       collapseIntentRef.current = nextCollapseIntent;
-      return nextCollapseIntent;
+      return { identity: previous.identity, intent: nextCollapseIntent };
     });
     setSessions((current) => reconcileSessionRowOrder(current, listResult.sessions));
   }, [sendCatalogCommand, waitForReady, onToast]);
@@ -1691,16 +1718,7 @@ export function SessionSidebar({
       });
       try {
         const ok = await onSwitchSession(target, { origin: 'user' });
-        if (ok) {
-          void requestCatalogLoad({ waitForReady: false });
-          try {
-            const nativeSwitch = [...document.querySelectorAll('.session-sidebar__switch')]
-              .find((el) => el instanceof HTMLElement && el.dataset.sessionId === target.catalogSessionId);
-            nativeSwitch?.scrollIntoView({ block: 'nearest' });
-          } catch {
-            // Catalog refresh already dispatched; missing native row is non-fatal.
-          }
-        }
+        if (ok) void requestCatalogLoad({ waitForReady: false });
         return ok;
       } catch (err) {
         // An unexpected switch error is never silent: exactly one bounded
@@ -2340,19 +2358,40 @@ export function SessionSidebar({
 
   return (
     <aside id="session-sidebar" ref={sidebarRootRef} className="session-sidebar" aria-label="Sessions">
-      <div className="session-sidebar__head">
-        <span className="session-sidebar__title">Sessions</span>
-        {/* Desktop collapsed-rail reopen control (CSS hides it ≤720px;
-            the ☰ header menu owns mobile drawer open/close). */}
+      <div className="session-sidebar__search-box">
         <button
-          id="rail-reopen-btn"
+          id="session-sidebar-refresh-btn"
           type="button"
-          title="Expand the session sidebar"
-          aria-label="Expand the session sidebar"
-          onClick={onReopenRail}
+          className={`session-sidebar__refresh${catalogRefreshing ? ' session-sidebar__refresh--spinning' : ''}`}
+          title="Refresh sessions"
+          aria-label="Refresh sessions"
+          onClick={() => { void requestCatalogLoad({ waitForReady: false, userInitiated: true }); }}
         >
-          »
+          ⟳
         </button>
+        <span className="session-sidebar__search-field">
+          <input
+            id="session-sidebar-search"
+            className="session-sidebar__search"
+            type="search"
+            maxLength={120}
+            placeholder="Search sessions…"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            aria-label="Search sessions by title, project, provider, or session id"
+          />
+          {searchQuery !== '' && (
+            <button
+              id="session-sidebar-search-clear"
+              type="button"
+              className="session-sidebar__search-clear"
+              title="Clear search"
+              onClick={() => setSearchQuery('')}
+            >
+              ✕
+            </button>
+          )}
+        </span>
         <div className="session-sidebar__head-actions" role="toolbar" aria-label="Session actions">
           <button
             id="sidebar-collapse-btn"
@@ -2371,49 +2410,22 @@ export function SessionSidebar({
             «
           </button>
         </div>
+        {/* Desktop collapsed-rail reopen control; CSS hides it ≤720px and while the rail is open. */}
+        <button
+          id="rail-reopen-btn"
+          type="button"
+          title="Expand the session sidebar"
+          aria-label="Expand the session sidebar"
+          onClick={onReopenRail}
+        >
+          »
+        </button>
       </div>
-
       {catalogRefreshing && mergedSessions.length > 0 && (
         <div className="session-sidebar__refresh-bar" role="progressbar" aria-label="Refreshing sessions" />
       )}
 
-      {featureNav && <nav className="session-sidebar__nav">{featureNav}</nav>}
-
-      <div className="session-sidebar__search-box">
-        <input
-          id="session-sidebar-search"
-          className="session-sidebar__search"
-          type="search"
-          maxLength={120}
-          placeholder="Search sessions…"
-          value={searchQuery}
-          onChange={(e) => setSearchQuery(e.target.value)}
-          aria-label="Search sessions by title, project, provider, or session id"
-        />
-        {searchQuery !== '' && (
-          <button
-            id="session-sidebar-search-clear"
-            type="button"
-            className="session-sidebar__search-clear"
-            title="Clear search"
-            onClick={() => setSearchQuery('')}
-          >
-            ✕
-          </button>
-        )}
-        <button
-          id="session-sidebar-refresh-btn"
-          type="button"
-          className={`session-sidebar__refresh${catalogRefreshing ? ' session-sidebar__refresh--spinning' : ''}`}
-          title="Refresh sessions"
-          aria-label="Refresh sessions"
-          onClick={() => { void requestCatalogLoad({ waitForReady: false, userInitiated: true }); }}
-        >
-          ⟳
-        </button>
-      </div>
-
-      <ul className="session-sidebar__list">
+      <ul className="session-sidebar__list" ref={sessionListRef}>
         {catalogRefreshing && mergedSessions.length === 0 && catalogLoadShown && (
           <>
             {[0, 1, 2, 3, 4].map((index) => (
@@ -2483,6 +2495,7 @@ export function SessionSidebar({
             >
               <div className="session-sidebar__row-main">
               <button
+                ref={isActive ? activeRowRef : undefined}
                 type="button"
                 className="session-sidebar__switch"
                 data-session-id={row.sessionId}

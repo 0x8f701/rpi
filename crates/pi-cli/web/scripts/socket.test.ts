@@ -380,6 +380,7 @@ function simulate() {
 
 {
   check('connecting shows overlay', reconnectOverlayVisible('connecting') === true);
+  check('connecting during bootstrap still shows overlay', reconnectOverlayVisible('connecting', true) === true);
   check('reconnecting shows overlay', reconnectOverlayVisible('reconnecting') === true);
   check('offline shows overlay', reconnectOverlayVisible('offline') === true);
   check('authoritative on hides overlay', reconnectOverlayVisible('on') === false);

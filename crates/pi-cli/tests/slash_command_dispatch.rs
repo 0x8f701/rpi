@@ -186,7 +186,7 @@ impl Fixture {
             pi_coding::ResourceManager::new(resource_options).expect("resource manager");
 
         let session = Session::new(SessionOptions {
-            model: model.clone(),
+            model: Some(model.clone()),
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -1937,7 +1937,7 @@ impl RecordedFixture {
         }
         recorder.persist_now().expect("persist session");
         let session = Session::new(SessionOptions {
-            model,
+            model: Some(model),
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,

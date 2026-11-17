@@ -14,6 +14,7 @@
 //   P5  zero pageerror / console.error (favicon filtered)
 
 import { chromium } from 'playwright';
+import { clickFeature, openSessionsDrawer } from './lib/feature-menu.mjs';
 
 const url = process.env.RPI_URL;
 const token = process.env.RPI_TOKEN || '';
@@ -70,7 +71,7 @@ async function openProcessesPanel(page) {
     if (await rail.isVisible()) {
       await rail.click();
     } else {
-      await page.locator('#sidebar-toggle-btn').click();
+      await openSessionsDrawer(page);
     }
     await waitForDom(
       page,
@@ -83,7 +84,7 @@ async function openProcessesPanel(page) {
     () => document.getElementById('processes-toggle-btn') !== null,
     'P1: #processes-toggle-btn missing'
   );
-  await page.locator('#processes-toggle-btn').click({ force: true });
+  await clickFeature(page, '#processes-toggle-btn');
   await waitForDom(
     page,
     () => document.getElementById('processes-panel') !== null,

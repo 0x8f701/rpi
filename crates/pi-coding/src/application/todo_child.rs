@@ -1614,6 +1614,11 @@ impl TodoChildService {
                     kind: TodoChildKind::Todo,
                 };
                 let snapshot = parent.child_session_options_snapshot();
+                // A model-less parent cannot derive a runnable Todo child:
+                // reject before the child transcript/recorder is created.
+                let Some(child_model) = snapshot.model.clone() else {
+                    return Err(anyhow::Error::new(pi_agent::ModelNotConfigured));
+                };
                 let recorder =
                     create_durable_forked_child(fork, &storage.child_root, child_session_id)?;
                 let derivation = TodoChildDerivation {
@@ -1625,8 +1630,8 @@ impl TodoChildService {
                     parent_entry_id: entry.parent_entry_id.clone(),
                     parent_revision: entry.parent_revision,
                     runtime: TodoChildRuntimeDerivation {
-                        model_provider: snapshot.model.provider,
-                        model_id: snapshot.model.id,
+                        model_provider: child_model.provider,
+                        model_id: child_model.id,
                         retry_settings: snapshot.retry_settings,
                         retry_role: snapshot.retry_role,
                         thinking_level: snapshot.thinking_level,
@@ -2454,7 +2459,7 @@ impl TodoSupervisor {
         }
     }
 
-    async fn abort_application_turns(&self) {
+    async fn abort_application_turns(&self) -> Result<()> {
         {
             let state = self.state.lock();
             if let Some(task) = state.active_task_turn.as_ref() {
@@ -2464,7 +2469,8 @@ impl TodoSupervisor {
                 turn.abort();
             }
         }
-        self.application.abort().await;
+        self.application.abort().await?;
+        Ok(())
     }
 
     async fn join_execution_loops(&self) -> Result<()> {
@@ -2539,11 +2545,15 @@ impl TodoSupervisor {
             state.status = TodoChildStatus::Paused;
             state.last_error = None;
         }
-        self.abort_application_turns().await;
+        let abort_error = self.abort_application_turns().await.err();
         self.interrupt_running_receipts("pause")?;
         self.interrupt_running_task()?;
         self.join_execution_loops().await?;
-        self.persist_manifest_status().await
+        self.persist_manifest_status().await?;
+        if let Some(error) = abort_error {
+            return Err(error);
+        }
+        Ok(())
     }
 
     async fn resume(self: &Arc<Self>) -> Result<()> {
@@ -2756,8 +2766,11 @@ impl TodoSupervisor {
             }
         };
         self.state.lock().status = TodoChildStatus::Paused;
-        self.abort_application_turns().await;
+        let abort_error = self.abort_application_turns().await.err();
         let mut errors = Vec::new();
+        if let Some(error) = abort_error {
+            errors.push(format!("aborting application turns: {error:#}"));
+        }
         if let Err(error) = self.interrupt_running_receipts("host shutdown") {
             errors.push(format!("interrupting running receipts: {error:#}"));
         }
@@ -2800,8 +2813,11 @@ impl TodoSupervisor {
 
     async fn terminal_teardown(&self, operation: &str, queued_summary: &str) -> Result<()> {
         self.state.lock().status = TodoChildStatus::Stopped;
-        self.abort_application_turns().await;
+        let abort_error = self.abort_application_turns().await.err();
         let mut errors = Vec::new();
+        if let Some(error) = abort_error {
+            errors.push(format!("aborting application turns: {error:#}"));
+        }
         if let Err(error) = self.interrupt_running_receipts(operation) {
             errors.push(format!("interrupting running receipts: {error:#}"));
         }
@@ -3873,7 +3889,7 @@ async fn child_session_options(
     stream_options.stream.session_id = None;
     Ok((
         SessionOptions {
-            model,
+            model: Some(model),
             cwd: snapshot.workspace.cwd().to_path_buf(),
             system_prompt: todo_child_system_prompt(),
             thinking_level: durable.thinking_level,

@@ -13,8 +13,9 @@
 #   - screenshots per phase and zero console/page errors.
 #
 # Pre-fix CSS fails this lane: `.session-sidebar *:not(#rail-reopen-btn)` sets
-# pointer-events:none on `.session-sidebar__head`, so locator.click on the
-# visible » times out / never sets sidebarOpen=true.
+# pointer-events:none on `.session-sidebar__search-box` (the collapsed strip's
+# » host row), so locator.click on the visible » times out / never sets
+# sidebarOpen=true.
 #
 # Browser driver: playwright via npm (ephemeral install) with a system
 # Chrome/Chromium binary or playwright's bundled chromium. Missing node, a

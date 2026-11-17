@@ -180,6 +180,7 @@ fn job(id: &str, agent_id: &str, status: JobStatus) -> JobSnapshot {
         created_at: 1_000,
         started_at: (status != JobStatus::Queued).then_some(1_100),
         finished_at: status.is_settled().then_some(2_100),
+        cancellation_cause: None,
         result: None,
         soft_budget_exhausted: false,
     }

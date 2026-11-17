@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::LazyLock;
 
 use pi_agent::{AgentEvent, AgentToolResult};
 use pi_ai::{ContentBlock, Message, ToolResultMessage};
@@ -901,10 +902,8 @@ pub fn redact_value(value: &Value) -> Value {
     }
 }
 
-fn redact_text(text: &str) -> String {
-    // Strip common credential shapes from free text so debug/error views stay safe.
-    let mut out = text.to_owned();
-    for (pattern, replacement) in [
+static REDACTION_PATTERNS: LazyLock<Vec<(regex::Regex, &'static str)>> = LazyLock::new(|| {
+    [
         (
             r#"(?i)\b(AWS_(?:ACCESS_KEY_ID|SECRET_ACCESS_KEY|SESSION_TOKEN))\s*[:=]\s*(?:"[^"]*"|'[^']*'|\S+)"#,
             "$1=[REDACTED]",
@@ -920,10 +919,24 @@ fn redact_text(text: &str) -> String {
             r"(?i)\b(?:sk|pk|rk|ghp|gho|ghu|ghs|ghr|xox[baprs])[-_][A-Za-z0-9\-_]{8,}\b",
             "[REDACTED]",
         ),
-    ] {
-        if let Ok(re) = regex::Regex::new(pattern) {
-            out = re.replace_all(&out, replacement).into_owned();
-        }
+    ]
+    .into_iter()
+    .map(|(pattern, replacement)| {
+        (
+            regex::Regex::new(pattern).unwrap_or_else(|error| {
+                panic!("tool presentation redaction pattern {pattern:?} failed to compile: {error}")
+            }),
+            replacement,
+        )
+    })
+    .collect()
+});
+
+fn redact_text(text: &str) -> String {
+    // Strip common credential shapes from free text so debug/error views stay safe.
+    let mut out = text.to_owned();
+    for (pattern, replacement) in REDACTION_PATTERNS.iter() {
+        out = pattern.replace_all(&out, *replacement).into_owned();
     }
     out
 }
@@ -2133,5 +2146,42 @@ mod tests {
         let preview = bounded_text_preview(parts, 12);
         assert_eq!(preview, "012345678...");
         assert!(visited.get() <= 14, "visited {} chunks", visited.get());
+    }
+
+    #[test]
+    fn redaction_precedes_preview_truncation_at_budget_boundary() {
+        const BUDGET: usize = 40;
+        let token = ["sk", "-", "BoundaryAbCdEfGhIjKlMnOpQr"].concat();
+        let body = format!("{} {token}", "a".repeat(30));
+
+        let preview = bounded_text_preview([body.as_str()], BUDGET);
+        assert_eq!(preview.chars().count(), BUDGET);
+        assert!(
+            !preview.contains("sk-"),
+            "preview leaked credential prefix: {preview}"
+        );
+        assert!(
+            !preview.contains("Boundary"),
+            "preview leaked credential body: {preview}"
+        );
+        assert!(
+            preview.contains("[REDAC"),
+            "preview dropped the redaction marker: {preview}"
+        );
+
+        let summary = compact_tool_arguments_with_budget(&json!({ "command": body }), BUDGET);
+        assert_eq!(summary.chars().count(), BUDGET);
+        assert!(
+            !summary.contains("sk-"),
+            "summary leaked credential prefix: {summary}"
+        );
+        assert!(
+            !summary.contains("Boundary"),
+            "summary leaked credential body: {summary}"
+        );
+        assert!(
+            summary.contains("[REDAC"),
+            "summary dropped the redaction marker: {summary}"
+        );
     }
 }

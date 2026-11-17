@@ -210,7 +210,9 @@ body {
   flex: 1 1 auto;
   min-height: 0;
   height: 100%;
-  overflow: hidden;
+  /* Not a scroll container. overflow:hidden still honors focus scroll;
+   * clip keeps the 100dvh shell from moving the header. */
+  overflow: clip;
 }
 
 /* Dynamic viewport (mobile): the app shell tracks the browser chrome and the
@@ -404,6 +406,50 @@ header {
 }
 .brand .brand-sub { color: var(--accent); margin-left: 2px; font-weight: 400; }
 
+/* Page switch inside the brand lockup: one square, bordered frame with the
+ * current page in accent and the other page as a link. Both segments are
+ * 44px touch targets, so the control is usable wherever the header is. */
+.brand-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 2px;
+  border: 1px solid var(--border);
+  border-radius: 0;
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0.3px;
+}
+.brand-switch > span,
+.brand-switch > a {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: 0;
+  color: var(--muted);
+  text-decoration: none;
+}
+.brand-switch [aria-current="page"] {
+  color: var(--accent);
+  border-color: var(--border);
+}
+.brand-switch a:hover,
+.brand-switch a:focus-visible {
+  color: var(--fg);
+  background: var(--bg-hover);
+  border-color: var(--border-strong);
+}
+.brand-switch a:focus-visible {
+  border-color: var(--accent);
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
 @keyframes chat-slow-pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.35; }
@@ -467,12 +513,6 @@ header {
   animation: pulse 1.2s ease-in-out infinite;
 }
 [data-theme="light"] .badge { color: #ffffff; }
-
-.badge--compact {
-  background: var(--gold);
-  color: #1a1610;
-}
-[data-theme="light"] .badge--compact { color: #1a1610; }
 
 #send-btn.composer-action--busy:not(:disabled) {
   color: var(--gold);
@@ -1860,7 +1900,10 @@ button.tool-card__path:focus-visible {
 /* ------------------------------------------------------------------ *
  * Composer (pinned footer)
  * ------------------------------------------------------------------ */
-footer {
+/* Stacking belongs to the app composer only. A bare `footer` also matches
+ * `.session-sidebar__foot` and the chat tmux status line; giving those
+ * `z-index: 51` paints the New Session control above `.file-explorer` (46). */
+footer:not(.session-sidebar__foot):not(.chat-tmux-terminal__foot) {
   display: flex;
   gap: 8px;
   align-items: stretch;
@@ -1870,6 +1913,19 @@ footer {
   position: relative;
   z-index: 51;
   min-height: var(--app-footer-height);
+  flex-shrink: 0;
+}
+/* Files-open hides the ENTIRE main composer footer wrapper (prompt,
+ * slash picker, context meter, attachments, mic/live/Send): the file
+ * explorer owns the viewport bottom and the file Ask dock is the
+ * composer while Files is open. display:none — never an unmount — keeps
+ * the uncontrolled prompt draft and attachment state alive across
+ * close/restore; the height measure collapses --app-footer-height to 0
+ * so the drawer's flex body ends flush on the layout viewport bottom.
+ * Same :not() guards as the rule above — a bare extra selector would
+ * also hit .session-sidebar__foot. */
+footer.app-composer-hidden:not(.session-sidebar__foot):not(.chat-tmux-terminal__foot) {
+  display: none;
 }
 #prompt-input {
   flex: 1;
@@ -1976,7 +2032,7 @@ footer {
  * wraps; the total marker keeps the scale readable. */
 @media (max-width: 359px) {
   .composer-context__percent { display: none; }
-  .composer-context__bar { min-width: 24px; }
+  .composer-context__bar { min-width: 8px; }
 }
 
  /* Composer left column: attachment chips row + textarea. flex-basis must not
@@ -2166,7 +2222,7 @@ footer {
  * but never exceeds the viewport, so mobile keyboards don't crush it. */
 .command-picker__popover {
   position: absolute;
-  bottom: calc(100% + 6px);
+  bottom: calc(100% + 10px);
   left: 0;
   width: min(320px, 92vw);
   max-height: 300px;
@@ -2369,7 +2425,7 @@ footer {
  * drop zone with an accent border + a centered overlay hint. The overlay is
  * absolutely positioned over the footer (footer gains position: relative while
  * active) so it never displaces the textarea/buttons. */
-footer[data-drop-active="true"] {
+footer:not(.session-sidebar__foot):not(.chat-tmux-terminal__foot)[data-drop-active="true"] {
   position: relative;
   border-top: 2px dashed var(--accent);
   background: var(--bg-hover);
@@ -2395,9 +2451,10 @@ footer[data-drop-active="true"] {
 }
 [data-theme="light"] .composer-drop { background: rgba(84, 125, 167, 0.10); }
 [data-theme="light"] .composer-drop__hint { border-color: rgba(84, 125, 167, 0.7); color: var(--accent); }
-/* Compact icon buttons (paperclip / mic) beside Send. */
+/* Compact icon buttons (paperclip / hold-to-talk / live) beside Send. */
 #attach-btn,
-#mic-btn {
+#mic-btn,
+#live-btn {
   position: relative;
   width: 44px;
   height: 44px;
@@ -2412,14 +2469,17 @@ footer[data-drop-active="true"] {
   border-color: var(--border);
 }
 #attach-btn:hover:not(:disabled),
-#mic-btn:hover:not(:disabled) {
+#mic-btn:hover:not(:disabled),
+#live-btn:hover:not(:disabled) {
   color: var(--fg);
   border-color: var(--border-strong);
 }
-#mic-btn:disabled { opacity: 0.5; cursor: default; }
+#mic-btn:disabled,
+#live-btn:disabled { opacity: 0.5; cursor: default; }
 
-/* Recording indicator: pulsing red dot on the held mic button. */
-#mic-btn.recording {
+/* Recording indicator: pulsing red dot on the held mic or live button. */
+#mic-btn.recording,
+#live-btn.recording {
   color: var(--error);
   border-color: rgba(255, 71, 87, 0.6);
   background: rgba(255, 71, 87, 0.08);
@@ -2644,6 +2704,7 @@ footer[data-drop-active="true"] {
 body:has(#side-chat-panel) .panel-drawer-resizer {
   display: none !important;
 }
+body:has(.goal-panel) .panel-drawer-resizer { width: 380px; }
 .workflow-panel { width: 460px; }
 .todo-panel { width: min(720px, 94vw); }
 @media (min-width: 769px) {
@@ -2660,10 +2721,6 @@ body:has(#side-chat-panel) .panel-drawer-resizer {
     bottom: var(--app-footer-height, 0px);
     max-height: calc(100dvh - var(--app-header-height, 0px) - var(--app-footer-height, 0px));
     height: min(var(--panel-drawer-height, 90vh), calc(100dvh - var(--app-header-height, 0px) - var(--app-footer-height, 0px)));
-  }
-  .file-explorer,
-  .code-review-panel {
-    bottom: 0;
   }
 }
 
@@ -2706,8 +2763,7 @@ body:has(#side-chat-panel) .panel-drawer-resizer {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
-body:has(#subagents-panel) .panel-drawer-resizer,
-body:has(#subagents-panel) .file-explorer-resizer {
+body:has(#subagents-panel) .panel-drawer-resizer {
   display: none !important;
 }
 
@@ -3026,7 +3082,29 @@ body:has(#subagents-panel) .file-explorer-resizer {
 /* ------------------------------------------------------------------ *
  * Goal panel
  * ------------------------------------------------------------------ */
-.goal-panel { width: 380px; gap: 12px; }
+.goal-panel {
+  width: 380px;
+  gap: 12px;
+  /* Goal-local override of the shared drawer scroll (line ~2670): the head
+   * below is a fixed flex item and .goal-panel__body owns the only scroll
+   * surface, so the drawer itself must never scroll. */
+  overflow: hidden;
+}
+/* Goal-local override of the shared sticky-panel-head rule (line ~2791): a
+ * sticky head inside the padded drawer is clamped to the content box, so
+ * journal rows painted through the ~15px padding strip above it. Keeping the
+ * head a normal flex item above the body scroller removes the strip without
+ * margin or pseudo-element patches. Shared panels keep their sticky rule. */
+.goal-panel__head { position: static; }
+.goal-panel__body {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow-y: auto;
+}
 .goal-status {
   font-size: 11px;
   letter-spacing: 0.3px;
@@ -3046,7 +3124,7 @@ body:has(#subagents-panel) .file-explorer-resizer {
 .goal-create__budget { flex: 1 1 120px; }
 
 .goal-detail { display: flex; flex-direction: column; gap: 8px; }
-.goal-detail__objective { overflow-wrap: anywhere; font-size: 13px; }
+.goal-detail__objective { overflow-wrap: anywhere; white-space: pre-wrap; font-size: 13px; }
 .goal-detail__meta {
   display: flex;
   flex-wrap: wrap;
@@ -3120,7 +3198,16 @@ body:has(#subagents-panel) .file-explorer-resizer {
 }
 .goal-journal__time { color: var(--dim); flex: none; font-size: 11px; }
 .goal-journal__kind { color: var(--accent-dim); flex: none; }
-.goal-journal__objective { overflow-wrap: anywhere; }
+.goal-journal__objective { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.goal-journal__objective summary {
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.goal-journal__objective summary:hover { color: var(--fg); }
+.goal-journal__objective summary:focus-visible { outline: 1px solid var(--accent); }
+.goal-journal__objective-full { white-space: pre-wrap; overflow-wrap: anywhere; }
 
 /* ------------------------------------------------------------------ *
  * Side chat panel
@@ -3683,70 +3770,23 @@ body:has(#subagents-panel) .file-explorer-resizer {
   border-right: 1px solid var(--border-strong);
   background: var(--bg);
 }
-/* File explorer desktop: reserve the drawer width inside .app-main so
- * transcript / composer / Send sit left of the drawer instead of under it.
- * ONE width authority: --file-explorer-width (px, written on <html> by the
- * desktop resizer in App; fallback 506px pre-hydration = 440px + 15%).
- * The 70vw/900px/calc(100vw - 576px) guard
- * keeps the conversation column usable (min 576px) even when a stale stored
- * value outlives a viewport change until
- * the next interaction. Resizer and drawer repeat this exact min(...)
- * expression so all three places can never disagree.
- * Independent of activePanel. Collapsed keeps the same reserve so the strip
- * cannot cover Send. Overlay widths (≤935px and the App-computed
- * --files-overlay class) span the full viewport width (100vw). */
-@media (min-width: 936px) {
-  .app-layout--files-open .app-main,
-  .app-layout--files-collapsed .app-main {
-    padding-right: min(var(--file-explorer-width, 506px), 70vw, 900px, calc(100vw - 576px));
-  }
-}
-@media (max-width: 935px) {
-  .app-layout--files-open .app-main,
-  .app-layout--files-collapsed .app-main {
-    padding-right: 0;
-  }
-}
+
 
 .session-sidebar {
   flex: none;
-  width: 230px;
+  width: 195.5px;
   display: flex;
   flex-direction: column;
   gap: 6px;
   /* The panel edge is owned by .app-main's border-left (single strong line);
    * no border-right here to avoid a doubled 2px seam on desktop. The ≤720px
-   * drawer block re-adds a strong border-right for the off-canvas drawer. */
+   * drawer block re-adds a strong border-right for the off-canvas drawer.
+   * Bottom padding is 0 so .session-sidebar__foot ends flush on the viewport
+   * bottom like the composer footer (the ≤720px drawer and the collapsed rail
+   * re-declare their own paddings). */
   background: var(--bg);
-  padding: 8px;
-  overflow-y: auto;
-}
-/* No border-bottom here: the head stays visible in the collapsed 44px rail
- * (holding #rail-reopen-btn), so a divider would paint a stray line across
- * the strip right under the ». The panel edge is owned by .app-main. */
-.session-sidebar__head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 2px 2px 8px;
-  min-width: 0;
-  /* Neutralize the global <header> chrome: the head shares the sidebar's
-   * --bg surface (no --bg-panel box, no chrome divider, no header
-   * min-height / flex-wrap), so the rail reads as one unboxed column. The
-   * only vertical divider in the surface is .app-main's border-left. */
-  background: var(--bg);
-  border: none;
-  min-height: 0;
-  flex-wrap: nowrap;
-}
-.session-sidebar__title {
-  font-weight: 700;
-  font-size: 12px;
-  letter-spacing: 0.5px;
-  text-transform: uppercase;
-  color: var(--muted);
-  flex: none;
+  padding: 8px 8px 0;
+  overflow: hidden;
 }
 .session-sidebar__icon-btn {
   appearance: none;
@@ -3775,19 +3815,27 @@ body:has(#subagents-panel) .file-explorer-resizer {
 }
 .session-sidebar__search-box {
   position: relative;
-  margin: 6px 0 4px;
-  /* Search input + ⟳ refresh on ONE row: the input grows, the refresh
-   * button sits inline at the right edge (the ⟳ must not wrap below). */
+  height: 32px;
+  /* ONE row: ⟳ refresh → search input (grows) → «/» rail glyphs at the
+   * right edge (the ⟳ must not wrap below). The collapsed 44px rail hides
+   * everything but the » (see the min-width:721px block). */
   display: flex;
   align-items: center;
   gap: 4px;
 }
+.session-sidebar__search-field {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+}
 .session-sidebar__search {
   flex: 1;
-  width: auto;
+  width: 100%;
   min-width: 0;
   box-sizing: border-box;
   font-size: 12px;
+  height: 32px;
   padding: 4px 24px 4px 8px;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
@@ -3800,11 +3848,11 @@ body:has(#subagents-panel) .file-explorer-resizer {
 }
 .session-sidebar__search-clear {
   position: absolute;
-  /* The ⟳ refresh button sits inline right of the input in the same flex
-   * row — the ✕ anchors inside the INPUT, not over the refresh button. */
-  right: calc(4px + 28px);
+  /* The ✕ anchors inside the INPUT (right edge of the search-field), never
+   * over the ⟳ refresh button or the «/» glyphs. */
   top: 50%;
   transform: translateY(-50%);
+  right: 4px;
   border: none;
   background: transparent;
   color: var(--dim);
@@ -3819,6 +3867,9 @@ body:has(#subagents-panel) .file-explorer-resizer {
   margin: 0;
   padding: 0;
   display: flex;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
   flex-direction: column;
   gap: 4px;
 }
@@ -3846,14 +3897,19 @@ body:has(#subagents-panel) .file-explorer-resizer {
 }
 .session-sidebar__refresh {
   appearance: none;
-  background: transparent;
-  border: none;
+  background: var(--bg);
+  border: 1px solid var(--border);
   color: var(--muted);
   font: inherit;
   font-size: 13px;
-  padding: 2px 4px;
+  width: 32px;
+  height: 32px;
+  box-sizing: border-box;
+  padding: 0;
   cursor: pointer;
-  display: inline-block;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 .session-sidebar__refresh:hover { color: var(--fg); }
 .session-sidebar__refresh--spinning {
@@ -3990,19 +4046,41 @@ body:has(#subagents-panel) .file-explorer-resizer {
 .session-sidebar__meta { color: var(--dim); font-size: 11px; }
 .session-sidebar__foot {
   margin-top: auto;
-  padding-top: 8px;
-  border-top: 1px solid var(--border);
+  /* Sidebar inline padding is 8px, so a content-box border stops 8px
+   * short of each edge. Negative margin-inline pulls border-top out to
+   * the padding edge; matching padding-inline keeps the button on the
+   * original inset. Vertical padding stays 6px. The ≤720px drawer
+   * overrides this with its safe-area padding. The collapsed rail hides
+   * this foot (display:none), so the pull does not apply there. */
+  margin-inline: -8px;
+  padding-block: 6px;
+  padding-inline: 8px;
+  border-top: 1px solid var(--border-strong);
+  position: static;
+  z-index: auto;
+  /* Fixed-height band pinned to the sidebar bottom: it does NOT track
+   * --app-footer-height, so New Session stays at the same bottom position
+   * while the composer band grows (attachments, activity strip). The foot
+   * and composer footer border-top lines therefore sit on different Ys
+   * whenever the composer is taller — by design; the button keeps its own
+   * 44px box and the border-top still spans the full sidebar width. */
 }
 .session-sidebar__secondary-btn {
   width: 100%;
+  box-sizing: border-box;
   appearance: none;
   border: 1px solid transparent;
   background: transparent;
   color: var(--muted);
   font-size: 12px;
   font-weight: 500;
-  text-align: left;
-  padding: 8px 10px;
+  line-height: 14px;
+  text-align: center;
+  /* Same border-box height as #prompt-input. The ≤720px drawer block repeats 44px. */
+  height: 44px;
+  min-height: 44px;
+  max-height: 44px;
+  padding: 4px 10px;
   border-radius: var(--radius-sm);
   cursor: pointer;
 }
@@ -4125,18 +4203,33 @@ body:has(#subagents-panel) .file-explorer-resizer {
   outline: none;
   border-color: var(--accent);
 }
-/* Feature nav (panel toggles) lives in the sidebar/drawer, not the header. */
-.session-sidebar__nav {
+#feature-menu {
+  position: fixed;
+  top: calc(var(--app-header-height) + 1px);
+  right: 8px;
+  z-index: 56;
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 6px;
+  width: min(360px, calc(100vw - 16px));
+  max-height: max(0px, calc(100dvh - var(--app-header-height) - var(--app-footer-height) - 1px));
+  overflow-y: auto;
+  box-sizing: border-box;
   padding: 8px;
-  border-bottom: 1px solid var(--border);
+  border: 1px solid var(--border);
+  border-radius: 0;
+  background: var(--bg-panel);
 }
-.session-sidebar__nav > :last-child:nth-child(odd) {
-  grid-column: 1 / -1;
+#feature-menu[hidden] { display: none; }
+#feature-menu-btn {
+  display: inline-flex;
+  min-width: 44px;
+  min-height: 44px;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
 }
-.session-sidebar__nav .panel-toggle {
+#feature-menu .panel-toggle {
   width: 100%;
   min-width: 0;
   min-height: 44px;
@@ -4144,7 +4237,7 @@ body:has(#subagents-panel) .file-explorer-resizer {
   white-space: normal;
   overflow-wrap: anywhere;
 }
-.session-sidebar__nav a.panel-toggle {
+#feature-menu a.panel-toggle {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -4155,15 +4248,21 @@ body:has(#subagents-panel) .file-explorer-resizer {
   font: inherit;
   cursor: pointer;
 }
-.session-sidebar__nav a.panel-toggle:hover {
+#feature-menu a.panel-toggle:hover {
   background: var(--bg-hover);
   border-color: var(--border-strong);
   color: var(--fg);
 }
-/* Desktop collapsed rail: a narrow strip with a reopen control (the mobile
- * drawer keeps its own fixed-overlay behavior in the ≤720px media block). */
+/* Desktop collapsed rail: a narrow strip whose ONLY visible control is the
+ * #rail-reopen-btn (») hosted by the search-box row; the mobile drawer keeps
+ * its own fixed-overlay behavior in the ≤720px media block. */
 #rail-reopen-btn { display: none; }
 @media (min-width: 721px) {
+  .session-sidebar__meta {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
   .app-layout:not(.app-layout--drawer-open) .session-sidebar {
     width: 44px;
     min-width: 44px;
@@ -4171,26 +4270,30 @@ body:has(#subagents-panel) .file-explorer-resizer {
     padding: 0;
     align-items: center;
   }
-  .app-layout:not(.app-layout--drawer-open) .session-sidebar__head span,
   .app-layout:not(.app-layout--drawer-open) .session-sidebar__head-actions,
   .app-layout:not(.app-layout--drawer-open) #sidebar-collapse-btn,
-  .app-layout:not(.app-layout--drawer-open) .session-sidebar__search-box,
-  .app-layout:not(.app-layout--drawer-open) .session-sidebar__nav,
+  .app-layout:not(.app-layout--drawer-open) .session-sidebar__search-field,
+  .app-layout:not(.app-layout--drawer-open) .session-sidebar__refresh,
   .app-layout:not(.app-layout--drawer-open) .session-sidebar__list,
   .app-layout:not(.app-layout--drawer-open) .session-sidebar__foot {
     display: none;
   }
+  .app-layout:not(.app-layout--drawer-open) .session-sidebar__search-box {
+    height: auto;
+    justify-content: center;
+    padding: 8px 0;
+  }
   /* Descendants of the collapsed rail are inert so hidden controls cannot
    * steal clicks. pointer-events does not pierce a parent that is none, so
-   * the header ancestor AND the reopen button must be excluded from the
+   * the search-box host AND the reopen button must be excluded from the
    * blanket (and explicitly auto): excluding only #rail-reopen-btn still
-   * leaves .session-sidebar__head none and the visible » unclickable. The
-   * :not(#id) on the blanket outranks a class-only auto rule, which is why
-   * the head must be carved out of the none selector. */
-  .app-layout:not(.app-layout--drawer-open) .session-sidebar *:not(#rail-reopen-btn):not(.session-sidebar__head) {
+   * leaves .session-sidebar__search-box none and the visible » unclickable.
+   * The :not(#id) on the blanket outranks a class-only auto rule, which is
+   * why the search-box must be carved out of the none selector. */
+  .app-layout:not(.app-layout--drawer-open) .session-sidebar *:not(#rail-reopen-btn):not(.session-sidebar__search-box) {
     pointer-events: none;
   }
-  .app-layout:not(.app-layout--drawer-open) .session-sidebar__head,
+  .app-layout:not(.app-layout--drawer-open) .session-sidebar__search-box,
   .app-layout:not(.app-layout--drawer-open) #rail-reopen-btn {
     pointer-events: auto;
   }
@@ -4198,7 +4301,6 @@ body:has(#subagents-panel) .file-explorer-resizer {
     display: inline-block;
   }
 }
-
 /* Move session… dialog: a proper small dialog, NOT the squeezed inline
  * popup — wide enough for a full absolute path (clamped to the viewport),
  * monospace input that scrolls horizontally INSIDE itself, and a visible
@@ -4252,23 +4354,6 @@ body:has(#subagents-panel) .file-explorer-resizer {
 @media (prefers-reduced-motion: reduce) {
   .session-sidebar__menu--move { animation: none; }
 }
-/* The hamburger is desktop-hidden by default; the media rules below must come
- * AFTER this one (same specificity, later wins) so they can override. Desktop
- * (≥721px): always visible — it collapses the rail AND (via #rail-reopen-btn)
- * the rail reopens, so the desktop collapse contract is fully usable. Mobile:
- * toggles the fixed drawer. */
-#sidebar-toggle-btn,
-#chat-workspace-menu-btn { display: none; }
-@media (min-width: 721px) {
-  #sidebar-toggle-btn,
-  #chat-workspace-menu-btn {
-    display: inline-flex;
-    min-width: 44px;
-    min-height: 44px;
-    align-items: center;
-    justify-content: center;
-  }
-}
 
 /* Sidebar backdrop: mobile only (desktop sidebar is a rail, not a drawer). */
 @media (min-width: 721px) {
@@ -4289,7 +4374,7 @@ body:has(#subagents-panel) .file-explorer-resizer {
     top: var(--app-header-height);
     left: 0;
     right: 0;
-    bottom: var(--app-footer-height);
+    bottom: 0;
     width: auto;
     height: auto;
     max-height: none;
@@ -4300,44 +4385,52 @@ body:has(#subagents-panel) .file-explorer-resizer {
     box-shadow: none;
     transform: none;
     transition: none;
-    overflow-y: auto;
-    z-index: 50;
+    overflow: hidden;
+    z-index: 52;
     padding-top: calc(8px + env(safe-area-inset-top, 0px));
     padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px));
     padding-left: calc(8px + env(safe-area-inset-left, 0px));
     padding-right: calc(8px + env(safe-area-inset-right, 0px));
   }
-  .session-sidebar__head {
-    min-height: 0;
-    padding: 10px 2px 8px;
-  }
-  .session-sidebar__title {
-    line-height: 1.25;
-    display: block;
-  }
   .app-layout--drawer-open .session-sidebar {
     display: flex;
     transform: none;
+    /* Top sheet above the composer footer (51): while open, the drawer owns
+     * the viewport bottom and the composer is reached by closing it through
+     * the header feature menu, so the New Session foot at bottom: 0 is never
+     * under the composer band and never shifts when the composer grows. */
   }
-  /* Mobile: the ☰ header menu owns drawer open/close — the rail-reopen
-   * button stays display:none (its desktop-only rail-reopen role does not
-   * apply to the full-screen drawer). */
-  .app-layout--drawer-open footer {
-    position: relative;
-    z-index: 51;
-    background: var(--bg-panel);
-  }
-  .session-sidebar__nav .panel-toggle {
-    white-space: normal;
-    overflow-wrap: anywhere;
-  }
+  /* The header feature menu (Sessions entry) owns drawer open/close — the
+   * rail-reopen button stays display:none (its desktop-only rail-reopen role
+   * does not apply to the full-screen drawer). */
   .session-sidebar__icon-btn {
-    /* Mobile: the ☰ header menu owns open/close — the in-sidebar «
-     * collapse affordance is redundant and was reported as clutter. */
+    /* Mobile: the header feature menu (Sessions entry) owns open/close —
+     * the in-sidebar « collapse affordance is redundant and was reported
+     * as clutter. */
     display: none;
   }
   .session-sidebar__secondary-btn {
+    height: 44px;
     min-height: 44px;
+    max-height: 44px;
+  }
+  /* Drawer inline padding is 8px plus safe-area, not the flat 8px the
+   * desktop foot cancels. Match each side so border-top meets the drawer
+   * edges; padding-block stays 6px from the base rule. margin-bottom lifts
+   * the foot by the live --composer-buttons-band (App-measured buttons row
+   * + row gap − this foot's padding-top) so the New Session top aligns
+   * with #prompt-input at idle; desktop rules are untouched. */
+  .session-sidebar__foot {
+    margin-left: calc(-8px - env(safe-area-inset-left, 0px));
+    margin-right: calc(-8px - env(safe-area-inset-right, 0px));
+    margin-bottom: var(--composer-buttons-band, 0px);
+    padding-left: calc(8px + env(safe-area-inset-left, 0px));
+    padding-right: calc(8px + env(safe-area-inset-right, 0px));
+  }
+  /* Mobile head row is 44px tall: lift the search row to match without
+   * touching the desktop 32px sizing above. */
+  .session-sidebar__search-box {
+    height: 44px;
   }
   .composer-attachment__remove,
   .session-sidebar__search-clear,
@@ -4351,14 +4444,6 @@ body:has(#subagents-panel) .file-explorer-resizer {
   .tool-card__path {
     min-width: 44px;
     min-height: 44px;
-  }
-  #sidebar-toggle-btn,
-  #chat-workspace-menu-btn {
-    display: inline-flex;
-    min-width: 44px;
-    min-height: 44px;
-    align-items: center;
-    justify-content: center;
   }
 }
 .session-row__switch:hover:not(:disabled) {
@@ -4843,7 +4928,6 @@ body:has(#subagents-panel) .file-explorer-resizer {
   .goal-panel,
   .subagents-panel,
   .file-explorer,
-  .code-review-panel,
   #session-panel {
     width: 100vw;
     max-width: 100vw;
@@ -4932,6 +5016,9 @@ body:has(#subagents-panel) .file-explorer-resizer {
   .todo-child-actions button {
     min-height: 44px;
   }
+  .goal-pin { min-width: 0; }
+  .goal-pin__text { min-width: 0; }
+  .goal-pin__unpin { flex: none; min-width: 44px; min-height: 44px; }
   .subagent-details__action {
     min-height: 44px;
     min-width: 44px;
@@ -4950,6 +5037,7 @@ body:has(#subagents-panel) .file-explorer-resizer {
   #send-btn,
   #attach-btn,
   #mic-btn,
+  #live-btn,
   .panel-toggle,
   select,
   input:not([type]),
@@ -4996,6 +5084,13 @@ body:has(#subagents-panel) .file-explorer-resizer {
   .command-picker { order: 2; }
   #composer-row #prompt-input { order: 1; flex: 1 1 100%; min-width: 0; }
   #composer-buttons { order: 2; flex-wrap: nowrap; min-width: 0; flex: 1 1 auto; }
+  /* Mobile wraps the command button to a second row BELOW the textarea, so a
+   * button-anchored popup (bottom: calc(100% + 6px)) would cover the input.
+   * Re-anchor the composer popups to the whole row — its top IS the textarea
+   * row top. Scoped to the App composer row only; chat surfaces keep their
+   * own anchors, desktop keeps the button anchor. */
+  #composer-row { position: relative; }
+  #composer-row .command-picker { position: static; }
   .pill,
   .badge { min-height: 30px; }
   #toasts {
@@ -5018,7 +5113,7 @@ body:has(#subagents-panel) .file-explorer-resizer {
   /* Narrow viewports scale the rhythm down rather than flattening it: the
    * turn boundary stays legible on a phone where less content is on screen. */
   .transcript-content { padding: 12px 12px 16px; --turn-inner-gap: 8px; --turn-gap: 24px; }
-  footer {
+  footer:not(.session-sidebar__foot):not(.chat-tmux-terminal__foot) {
     padding: 8px 12px calc(8px + env(safe-area-inset-bottom));
     overflow: visible;
     scrollbar-gutter: stable;
@@ -5052,8 +5147,10 @@ body:has(#subagents-panel) .file-explorer-resizer {
     min-height: 44px;
   }
   .brand-sub { display: none; }
+  /* Phones keep the Web/Chat switch but drop the redundant brand name. */
+  .brand-name { display: none; }
   /* Header keeps model + thinking on one row; thinking stays readable
-   * while reconnecting; the sidebar toggle keeps margin-left auto. */
+   * while reconnecting; the feature menu stays pinned to the right edge. */
   #thinking-select {
     flex: 0 0 auto;
     min-width: 96px;
@@ -5064,15 +5161,9 @@ body:has(#subagents-panel) .file-explorer-resizer {
     min-width: 0;
     margin-left: 0;
   }
-  #sidebar-toggle-btn,
-  #chat-workspace-menu-btn {
-    display: inline-flex;
+  #feature-menu-btn {
     margin-left: auto;
     flex: none;
-    min-width: 44px;
-    min-height: 44px;
-    align-items: center;
-    justify-content: center;
   }
   .brand { font-size: 14px; flex: none; }
   .host-connection-chip { max-width: 28vw; }
@@ -5090,7 +5181,7 @@ body:has(#subagents-panel) .file-explorer-resizer {
   /* Keep exactly two composer rows at 320/375/430px. The toolbar stays
    * shrink-to-content beside the glyph-only Command control, never wrapping
    * into a third row or forcing horizontal page overflow. */
-  #composer-buttons { width: auto; flex: 1 1 auto; justify-content: flex-end; gap: 4px; flex-wrap: nowrap; }
+  #composer-buttons { width: auto; flex: 1 1 0px; justify-content: flex-end; gap: 4px; flex-wrap: nowrap; }
   #composer-buttons button { min-width: 44px; padding: 8px 10px; }
   #send-btn:disabled {
     color: var(--dim);
@@ -5337,6 +5428,7 @@ body:has(#subagents-panel) .file-explorer-resizer {
 }
 .subagent-job__status--queued { color: var(--warn); border-color: var(--warn); }
 .subagent-job__status--running { color: var(--accent); border-color: var(--accent); }
+.subagent-job__status--cancelling { color: var(--warn); border-color: var(--warn); }
 .subagent-job__status--completed { color: var(--ok); border-color: var(--ok); }
 .subagent-job__status--failed { color: var(--error); border-color: var(--error); }
 .subagent-job__status--cancelled { color: var(--muted); border-color: var(--muted); }
@@ -5370,13 +5462,22 @@ body:has(#subagents-panel) .file-explorer-resizer {
   font-size: 12px;
 }
 .subagent-job__error { color: var(--error); overflow-wrap: anywhere; }
-.subagent-job__output-text {
+.subagent-job__output-md {
   margin: 4px 0 0;
-  white-space: pre-wrap;
+  min-width: 0;
+  max-width: 100%;
   overflow-wrap: anywhere;
   max-height: 220px;
   overflow-y: auto;
 }
+/* Compact 12px pane: headings stay near body size; fences/tables reuse the
+ * shared .md-* layout (no new colors — the container only clamps geometry). */
+.subagent-job__output-md .md-h1 { font-size: 1.2em; }
+.subagent-job__output-md .md-h2 { font-size: 1.1em; }
+.subagent-job__output-md .md-h3,
+.subagent-job__output-md .md-h4,
+.subagent-job__output-md .md-h5,
+.subagent-job__output-md .md-h6 { font-size: 1em; }
 .subagent-job__refs { color: var(--muted); font-size: 11px; margin-top: 4px; overflow-wrap: anywhere; }
 .subagents-panel__toast {
   color: var(--ok);
@@ -5486,6 +5587,10 @@ body:has(#subagents-panel) .file-explorer-resizer {
   white-space: pre-wrap;
   position: static;
 }
+/* The Task description renders MarkdownBody, so it must keep normal flow;
+ * Personas' plain-text description (no data-details-description) keeps the
+ * base pre-wrap newlines. */
+[data-details-description].subagent-details__description { white-space: normal; }
 .subagent-details__activity {
   color: var(--muted);
   font-size: 12px;
@@ -5504,133 +5609,16 @@ body:has(#subagents-panel) .file-explorer-resizer {
   line-height: 1.45;
   color: var(--fg);
 }
+/* Live transcript: the main transcript's shared surface primitives render
+ * these rows, so only sheet-local geometry remains. The modal body is the
+ * single bounded scroller; the surface contributes row rhythm only. */
 .subagent-details__transcript {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 0;
-  background: var(--bash-bg);
-  border: 1px solid var(--border);
-  padding: 6px 8px;
-  font-size: 12px;
-  color: var(--fg);
+  max-width: none;
+  padding: 4px 0 0;
 }
-.subagent-details__history-row {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  width: 100%;
-  min-width: 0;
-  min-height: 0;
-  padding: 4px 0;
-}
-/* The row's first line: label + body + outcome + expand control. */
-.subagent-details__history-line {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  width: 100%;
-  min-width: 0;
-}
-@media (max-width: 768px) {
-  .subagent-details__history-row {
-    min-height: 44px;
-    padding: 8px 0;
-  }
-}
-/* Labeled Output control for call rows. */
-.subagent-details__history-output-toggle {
-  flex: none;
-  align-self: flex-start;
-  padding: 1px 8px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: transparent;
-  color: var(--muted);
-  font-size: 11px;
-  line-height: 1.4;
-  cursor: pointer;
-}
-.subagent-details__history-output-toggle:hover {
-  border-color: var(--border-strong);
-  background: var(--bg-hover);
-  color: var(--fg);
-}
-.subagent-details__history-output-toggle:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: -2px;
-}
-@media (max-width: 768px) {
-  .subagent-details__history-output-toggle {
-    min-height: 44px;
-    min-width: 44px;
-  }
-}
-.subagent-details__history-tag {
-  flex: none;
-  color: var(--muted);
-  font-size: 11px;
-}
-/* Tool outcome as reported by the core (`ok`/`error`; never an invented
- * state): muted chip, error accent from the shared error token. */
-.subagent-details__history-status {
-  flex: none;
-  align-self: flex-start;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 0 5px;
-  color: var(--muted);
-  font-size: 11px;
-  line-height: 1.4;
-}
-.subagent-details__history-status[data-history-status="error"] {
-  color: var(--error);
-  border-color: var(--error);
-}
-.subagent-details__history-status[data-history-status="ok"] {
-  color: var(--ok);
-  border-color: var(--ok);
-}
-/* Full target: monospace soft-wrap, never clamped or ellipsized. */
-.subagent-details__history-text {
-  flex: 1 1 auto;
-  min-width: 0;
-  overflow-wrap: anywhere;
-  white-space: pre-wrap;
-  font-family: var(--font-mono);
-  font-size: 12px;
-  line-height: 1.45;
-  color: var(--fg);
-}
-/* Prose renders full-height Markdown (the core bounds the payload). */
-.subagent-details__history-md {
-  flex: 1 1 auto;
-  min-width: 0;
-  overflow-wrap: anywhere;
-  word-break: break-word;
-  font-size: 12px;
-  line-height: 1.35;
-  color: var(--fg);
-}
-/* Row-edge margin guard, same as other markdown surfaces. */
-.subagent-details__history-md > :first-child { margin-top: 0; }
-.subagent-details__history-md > :last-child { margin-bottom: 0; }
-/* Bounded tool output preview (the producer caps lines/chars; this cap keeps
- * even a hostile-length preview inside the modal). */
-.subagent-details__history-output {
-  margin: 0;
-  max-height: 12em;
-  overflow-y: auto;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  background: var(--bg-deep);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 4px 6px;
-  font-size: 11px;
-  line-height: 1.4;
-  color: var(--fg);
-}
+.subagent-details__empty { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.subagent-details__truncation { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+
 
 /* Phones: the details sheet fills the screen edge-to-edge. These must live
  * AFTER the base rules above — same specificity, so an earlier media override
@@ -5651,7 +5639,7 @@ body:has(#subagents-panel) .file-explorer-resizer {
 }
 
 /* ------------------------------------------------------------------ *
- * Code review workspace — full-viewport review workspace: file list +
+ * Code review workspace — header-to-footer review workspace: file list +
  * diff stage + hunk thread dock; tabbed panes on mobile.
  * ------------------------------------------------------------------ */
 .code-review-panel {
@@ -5662,21 +5650,10 @@ body:has(#subagents-panel) .file-explorer-resizer {
   border-top: none;
   box-shadow: none;
   overflow: hidden;
-  padding: calc(10px + env(safe-area-inset-top)) 12px calc(10px + env(safe-area-inset-bottom));
-}
-@media (min-width: 769px) {
-  .code-review-panel {
-    inset: 0;
-    height: 100dvh;
-    max-height: 100dvh;
-  }
-}
-@media (max-width: 768px) {
-  .code-review-panel {
-    inset: var(--app-header-height) 0 var(--app-footer-height, 0px) 0;
-    height: auto;
-    max-height: none;
-  }
+  padding: 0;
+  inset: var(--app-header-height, 0px) 0 0 0;
+  height: auto;
+  max-height: none;
 }
 .code-review {
   /* Default thread/files widths; Review React overwrites via setProperty. */
@@ -5861,7 +5838,8 @@ body:has(#subagents-panel) .file-explorer-resizer {
     max-width: none;
   }
 }
-.code-review__focus-toggle {
+.code-review__focus-toggle,
+.file-explorer__focus-toggle {
   flex: none;
   min-width: 44px;
   min-height: 44px;
@@ -5876,18 +5854,22 @@ body:has(#subagents-panel) .file-explorer-resizer {
   box-shadow: none;
   cursor: pointer;
 }
-.code-review__focus-toggle:hover:not(:disabled) { color: var(--fg); border-color: var(--border); }
-.code-review__focus-toggle.is-active {
+.code-review__focus-toggle:hover:not(:disabled),
+.file-explorer__focus-toggle:hover:not(:disabled) { color: var(--fg); border-color: var(--border); }
+.code-review__focus-toggle.is-active,
+.file-explorer__focus-toggle.is-active {
   color: var(--accent);
   border-color: var(--accent);
   background: color-mix(in srgb, var(--accent) 12%, var(--bg));
 }
-.code-review__focus-toggle:focus-visible {
+.code-review__focus-toggle:focus-visible,
+.file-explorer__focus-toggle:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
 @media (prefers-reduced-motion: reduce) {
-  .code-review__focus-toggle { transition: none; }
+  .code-review__focus-toggle,
+  .file-explorer__focus-toggle { transition: none; }
 }
 .code-review__action--send:hover:not(:disabled) {
   background: var(--bg-hover);
@@ -5929,17 +5911,49 @@ body:has(#subagents-panel) .file-explorer-resizer {
   border-radius: var(--radius-sm);
   background: var(--bg-deep);
 }
-.file-explorer__body > .file-conversation {
-  flex: 1 1 240px;
-  width: auto;
-  min-width: 180px;
-  max-width: 360px;
+@media (min-width: 721px) {
+  .file-explorer__body:not([data-layout="content"]):not([data-layout="tree"]) > .file-conversation {
+    flex: 1 1 var(--file-explorer-ask-width, 360px);
+    width: auto;
+    min-width: 180px;
+    max-width: var(--file-explorer-ask-width, 360px);
+    height: 100%;
+  }
 }
 .file-conversation__context {
   flex: none;
   font-size: 11px;
   color: var(--dim);
   overflow-wrap: anywhere;
+}
+.file-conversation__scope {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+/* Quiet dock header reusing the CodeReview comments-head typography. */
+.file-conversation__scope-title {
+  font-weight: 600;
+  font-size: 12px;
+  color: var(--muted);
+  letter-spacing: 0.3px;
+}
+/* Active file path: single-line ellipsis; the full path rides the title. */
+.file-conversation__scope-path {
+  font-size: 11px;
+  color: var(--dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Quiet empty state for an empty, non-streaming conversation. */
+.file-conversation__empty {
+  flex: none;
+  color: var(--dim);
+  font-size: 12px;
+  padding: 8px 0;
 }
 
 .file-conversation__transcript {
@@ -7452,8 +7466,8 @@ body:has(#subagents-panel) .file-explorer-resizer {
   }
 }
 @media (max-width: 900px) {
-  /* width:auto (base override) + inset:0 already spans the viewport;
-   * 100vw here would reintroduce scrollbar-gutter overflow. */
+  /* width:auto plus the header/footer inset already spans the main
+   * column; 100vw here would reintroduce scrollbar-gutter overflow. */
   .code-review-panel { width: auto; }
   .code-review__label { max-width: 100%; }
   .code-review__tab-bar { display: flex; }
@@ -7698,74 +7712,52 @@ body:has(#subagents-panel) .file-explorer-resizer {
  * Append-only vs shared .panel-drawer.
  * ------------------------------------------------------------------ */
 .file-explorer {
-  /* Width authority: --file-explorer-width (px) written by the desktop outer
-   * resizer in App; the same min(...) expression guards .app-main's
-   * reservation and the resizer's right offset, keeping conversation usable
-   * (min 576px) independent of the stored
-   * value. */
-  width: min(var(--file-explorer-width, 506px), 70vw, 900px, calc(100vw - 576px));
+  /* Open Files fills the available app body on every side. The measured
+   * header and footer stay visible; there is no stored outer width. */
+  left: 0;
+  right: 0;
+  width: auto;
+  max-width: none;
   overflow: hidden;
   min-height: 0;
-  /* ONE top authority: the drawer's top edge is the SAME rounded integer
-   * header height (--app-header-height) the header itself is pinned to, so
-   * the seam under the header is 0px by construction. Height is auto: the
-   * drawer spans header bottom -> viewport bottom (the shared
-   * --panel-drawer-height is a persisted ordinary-panel preference the file
-   * explorer must not inherit). position/right/bottom come from the shared
-   * .panel-drawer base. */
   top: var(--app-header-height);
+  bottom: var(--app-footer-height, 0px);
   height: auto;
   max-height: none;
 }
-/* Outer drawer WIDTH resizer — App mounts it flush with the drawer's LEFT
- * edge (desktop only; ≤935px hides it — overlay mode below — and the drawer
- * itself spans the full viewport width). The right offset repeats the same
- * min(...) expression as the drawer width and .app-main's reservation, so
- * the 8px strip sits exactly on the seam between the reserved main column
- * and the drawer, inside the empty padding gutter (never over the transcript
- * scrollbar or the drawer). */
-.file-explorer-resizer {
-  position: fixed;
-  /* ONE top authority: the resizer spans the same header-bottom -> viewport
-   * bottom range as the drawer (top: var(--app-header-height), height: auto
-   * with bottom: 0), so the seam control always matches the drawer exactly. */
-  top: var(--app-header-height);
-  bottom: 0;
-  right: min(var(--file-explorer-width, 506px), 70vw, 900px, calc(100vw - 576px));
-  width: 8px;
-  height: auto;
-  cursor: col-resize;
-  touch-action: none;
-  z-index: 47;
-  background: transparent;
+/* Desktop: the drawer must cover the FULL body height including the
+ * bottom-left corner band where .session-sidebar__foot sits — with Files
+ * open the main composer footer is display:none (footer.app-composer-
+ * hidden) and --app-footer-height collapses to 0, so padding-bottom
+ * reserves nothing and the drawer's flex body ends flush on the layout
+ * viewport bottom: no extra outer whitespace band and no underlap. When
+ * Files closes, the footer measure restores the live band. Mobile (≤720)
+ * keeps its own bottom rule below; the sidebar foot is a hidden drawer
+ * there, so no corner leak exists. */
+@media (min-width: 721px) {
+  .file-explorer {
+    bottom: 0;
+    padding-bottom: var(--app-footer-height, 0px);
+  }
 }
-/* Visible standing grip: 2px line centered on the seam. Accent on hover /
- * keyboard focus so the ARIA separator stays discoverable. */
-.file-explorer-resizer::after {
-  content: '';
-  position: absolute;
-  top: 12%;
-  bottom: 12%;
-  left: 3px;
-  width: 2px;
-  border-radius: 1px;
-  background: var(--border-strong);
+.file-explorer--ask-focus .file-explorer__tree-viewport,
+.file-explorer--ask-focus [data-testid="file-explorer-ask-split"],
+.file-explorer--ask-focus .file-explorer__content-viewport,
+.file-explorer--ask-focus .file-explorer__divider {
+  display: none;
 }
-.file-explorer-resizer:hover::after,
-.file-explorer-resizer:focus-visible::after {
-  background: var(--accent);
+.file-explorer--ask-focus .file-explorer__body {
+  padding: 0;
 }
-.file-explorer-resizer:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 1px;
-}
-/* Collapsed strip is head-only (auto height ~50px): cap the resizer so the
- * pointer-capturing strip never floats over the transcript seam above the
- * strip. Open mode spans header bottom -> viewport bottom (top:
- * var(--app-header-height), height: auto). App still mounts this class when
- * a slot's leftover mode is 'collapsed'. */
-.app-layout--files-collapsed .file-explorer-resizer {
-  height: 72px;
+.file-explorer--ask-focus .file-explorer__body > .file-conversation,
+.file-explorer--ask-focus .file-explorer__body:not([data-layout="content"]):not([data-layout="tree"]) > .file-conversation {
+  flex: 1 1 auto;
+  width: 100%;
+  min-width: 0;
+  max-width: none;
+  height: 100%;
+  border: 0;
+  border-radius: 0;
 }
 
 
@@ -7845,10 +7837,6 @@ body:has(#subagents-panel) .file-explorer-resizer {
 }
 /* Static Files title. The drawer close is the header ×; the title is not
  * a button. */
-/* Full-app expand toggle (⛶) and trailing × close — SAME ROW as Files.
- * Expanded (is-active) ⛶ becomes the restore control; 44px touch target
- * on mobile (≤720px block below). */
-.file-explorer__expand-btn,
 .file-explorer__close {
   appearance: none;
   flex: none;
@@ -7864,17 +7852,10 @@ body:has(#subagents-panel) .file-explorer-resizer {
   border-radius: var(--radius-sm);
   cursor: pointer;
 }
-.file-explorer__expand-btn:hover,
 .file-explorer__close:hover {
   color: var(--fg);
   border-color: var(--border);
 }
-.file-explorer__expand-btn.is-active {
-  color: var(--accent);
-  border-color: var(--accent);
-  background: rgba(0, 180, 255, 0.08);
-}
-.file-explorer__expand-btn:focus-visible,
 .file-explorer__close:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
@@ -8130,9 +8111,9 @@ body:has(#subagents-panel) .file-explorer-resizer {
   overflow: hidden;
   padding: 8px;
   /* Inner tree/content split authority. Panel writes the live percent
-   * (bounded 22–55, default 34) as this var; CSS is the only width
+   * (bounded 22–55, fresh default 29) as this var; CSS is the only width
    * authority so tree, divider, and code pane cannot disagree. */
-  --file-explorer-tree-pct: 34%;
+  --file-explorer-tree-pct: 29%;
   --file-explorer-toolbar-h: 32px;
 }
 .file-explorer__tree-viewport,
@@ -8153,7 +8134,7 @@ body:has(#subagents-panel) .file-explorer-resizer {
   display: none;
 }
 .file-explorer__tree-viewport {
-  flex: 0 0 var(--file-explorer-tree-pct, 34%);
+  flex: 0 0 var(--file-explorer-tree-pct, 29%);
   min-width: 22%;
   max-width: 55%;
   overflow: hidden;
@@ -8258,6 +8239,28 @@ body:has(#subagents-panel) .file-explorer-resizer {
 .file-explorer__muted {
   color: var(--muted);
   font-size: 12px;
+}
+/* Full labeled path above the open file: the whole path is the visible
+ * text (never a basename); long paths wrap instead of widening the pane.
+ * `title` carries the same value for pointer/AT access. */
+.file-explorer__content-path {
+  flex: none;
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+.file-explorer__content-path-text {
+  display: block;
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 /* Right-click delete confirmation chip on the tree row. */
 .file-explorer__delete-toast {
@@ -8772,24 +8775,7 @@ body:has(#subagents-panel) .file-explorer-resizer {
 .file-explorer__line--meta,
 .file-explorer__line--hunk { color: var(--muted); font-style: italic; }
 .file-explorer__line--hunk { background: rgba(0, 180, 255, 0.08); }
-/* ≤935px overlay — Send-overlap guarantee: below the 936px side-by-side
- * breakpoint the drawer stops reserving main-column space (padding-right 0
- * above) and floats OVER the transcript instead: the full viewport width
- * (100vw). The drawer top is always --app-header-height (phone, tablet, and
- * desktop overlay), so the header hamburger stays clickable. The desktop
- * width resizer never renders in overlay mode. */
-@media (max-width: 935px) {
-  .file-explorer {
-    left: 0;
-    width: 100vw;
-    max-width: 100vw;
-    /* Above the ≤720px sidebar drawer (z-index 50) so Files opens over it. */
-    z-index: 52;
-  }
-  .file-explorer-resizer {
-    display: none !important;
-  }
-}
+
 @media (max-width: 720px) {
   .file-explorer {
     left: 0;
@@ -8801,17 +8787,26 @@ body:has(#subagents-panel) .file-explorer-resizer {
     bottom: var(--app-footer-height, 0px);
     border-left: none;
     border-top: none;
-    /* Above the ≤720px sidebar drawer (z-index 50) so Files opens over it. */
-    z-index: 52;
+    /* Above the ≤720px sidebar drawer (z-index 52) so Files opens over it. */
+    z-index: 53;
   }
   .file-explorer__body {
     flex-direction: column;
   }
+  /* Explorer's own bottom edge already sits on the footer top via `bottom`;
+   * zero outer padding so the flex body ends flush there. */
+  .file-explorer {
+    padding-bottom: 0;
+  }
+  /* The visible tree/content viewport owns the remaining height and keeps
+   * its internal scroll; the Ask dock below it is a bounded conversation
+   * dock (never a second equal main viewport, no shared min-height). */
   .file-explorer__tree-viewport,
   .file-explorer__content-viewport {
-    flex: 1 1 auto;
+    flex: 1 1 0;
     width: 100%;
     min-width: 0;
+    min-height: 0;
     max-width: none;
     max-height: none;
     padding-right: 0;
@@ -8822,6 +8817,33 @@ body:has(#subagents-panel) .file-explorer-resizer {
   .file-explorer__divider,
   .file-explorer__divider::after {
     display: none;
+  }
+  .file-explorer__body > .file-conversation {
+    flex: 0 0 min(280px, 45%);
+    width: 100%;
+    max-width: none;
+    min-width: 0;
+    height: auto;
+    min-height: 0;
+    max-height: 280px;
+  }
+  .file-explorer__body > .file-explorer__divider[data-testid="file-explorer-ask-split"] {
+    display: none;
+  }
+  /* ask-focus must EXPLICITLY lift the bounded-dock cap (not rely on rule
+   * order): the fullscreen dock fills the body again. */
+  .file-explorer--ask-focus .file-explorer__body > .file-conversation {
+    flex: 1 1 0;
+    width: 100%;
+    max-width: none;
+    min-width: 0;
+    height: 100%;
+    min-height: 0;
+    max-height: none;
+  }
+  /* Send/Stop stay touch-sized inside the bounded dock (local rule only). */
+  .file-conversation__action {
+    min-height: 44px;
   }
   .file-explorer__body:not(.file-explorer__body--tree-collapsed) .file-explorer__content-viewport {
     display: none;
@@ -8841,10 +8863,10 @@ body:has(#subagents-panel) .file-explorer-resizer {
   .file-explorer__surface-btn {
     min-height: 44px;
   }
-  .file-explorer__expand-btn,
   .file-explorer__close,
   .file-explorer__refresh-btn,
   .file-explorer__map-btn,
+  .file-explorer__focus-toggle,
   .file-explorer__tree-toggle {
     min-width: 44px;
     min-height: 44px;
@@ -8864,59 +8886,11 @@ body:has(#subagents-panel) .file-explorer-resizer {
   .file-explorer__body {
     --file-explorer-toolbar-h: 44px;
   }
-  /* Mobile: the drawer already spans the full viewport width — the
-   * outer width resizer must never render or capture pointers (desktop-only
-   * control). */
-  .file-explorer-resizer {
-    display: none !important;
-  }
+
  }
-/* Overlay flip (App's fileExplorerOverlayActive): the viewport cannot fit
- * sidebar + conversation minimum + the 360px drawer floor,
- * so the drawer floats OVER the transcript at ANY width (not just ≤935px —
- * e.g. 1000px with the open 230px rail). It spans the full viewport width
- * (100vw). The class-based rules repeat the
- * ≤935px overlay guarantees so the drawer, reservation, and resizer never
- * disagree with the App-computed flag. */
-.app-layout--files-overlay .app-main {
-  padding-right: 0;
-}
-.app-layout--files-overlay .file-explorer {
-  left: 0;
-  width: 100vw;
-  max-width: 100vw;
-}
-.app-layout--files-overlay .file-explorer-resizer {
-  display: none !important;
-}
-/* Full-app expand: ⛶ hides the app header, sidebar, and transcript.
- * Composer stays visible on mobile (≤768px) so it remains hit-testable;
- * desktop ≥769px still hides it. The header is a sibling of .app-layout,
- * so the hidden attribute is the hide; this rule only lifts the drawer. */
+
 header[hidden] {
   display: none;
-}
-.app-layout--files-expanded .session-sidebar {
-  display: none !important;
-}
-.app-layout--files-expanded .app-main #transcript {
-  display: none;
-}
-.app-layout--files-expanded .file-explorer {
-  left: 0;
-  top: 0;
-  width: 100vw;
-  max-width: 100vw;
-}
-.app-layout--files-expanded .file-explorer-resizer {
-  display: none !important;
-}
-
-@media (min-width: 769px) {
-  .app-layout--files-expanded footer,
-  .app-layout--code-review footer {
-    display: none;
-  }
 }
 
 /* ---- PathAutocomplete: combobox menu for workspace path inputs ---- */
@@ -9010,8 +8984,6 @@ html[data-desktop="true"] {
   --radius-md: 0;
   --radius-lg: 0;
 }
-html[data-desktop="true"] #chat-console-link,
-html[data-desktop="true"] .chat-workspace-bar__menu,
 html[data-desktop-actions~="settings"] #settings-toggle-btn,
 html[data-desktop-actions~="settings"] #chat-project-gear-btn,
 html[data-desktop-actions~="settings"] #chat-runner-gear-btn,
@@ -9031,4 +9003,302 @@ html[data-desktop="true"] .chat-project-header,
 html[data-desktop="true"] .chat-runner-header {
   background: var(--bg-panel);
   border-bottom: 1px solid var(--border);
+}
+
+/* ------------------------------------------------------------------ *
+ * Starred-reply minimap — reserved right rail inside the conversation
+ * body. The app wraps #transcript, its scroll-to-bottom overlay, and this
+ * rail in .conversation-with-minimap. The rail is never an overlay: it takes a
+ * fixed column beside the transcript, and the transcript keeps the
+ * remaining width (min-width 0 so long lines shrink instead of covering
+ * the rail). Empty starred sets render nothing, so an absent rail leaves
+ * the transcript full width.
+ * ------------------------------------------------------------------ */
+.conversation-with-minimap {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: row;
+  align-items: stretch;
+}
+.conversation-with-minimap > .transcript-scrollport {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  width: auto;
+  display: flex;
+  flex-direction: column;
+}
+.transcript-scrollport > #transcript {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  width: auto;
+}
+/* Code-review is a fixed full-viewport overlay: hide the whole scrollport
+ * (transcript + button) out of paint AND tab order; visibility keeps the
+ * scroll offsets alive, display would reset them. */
+.app-layout--code-review .transcript-scrollport { visibility: hidden; }
+/* Open Files is a full-body overlay exactly like code-review: the transcript
+ * it covers (star/copy/save strips, scroll-to-bottom) and the session rail
+ * must leave the TAB order too, or keyboard traversal keeps walking the
+ * covered background. visibility keeps layout boxes, scroll offsets, and the
+ * close transition intact; the header and the Files drawer stay interactive.
+ * Scoped to mode === 'open', so the collapsed narrow drawer is untouched. */
+.app-layout--files-open .conversation-with-minimap,
+.app-layout--files-open .session-sidebar { visibility: hidden; }
+/* Scroll-to-bottom overlay: 44px transparent circle anchored to the
+ * scrollport's bottom-right. `right: 24px` clears the transcript's native
+ * scrollbar gutter (14px WebKit desktop / 18px touch) without mirroring
+ * gutter width into state. Hidden by opacity only — the invisible 44px hit
+ * area stays hoverable; touch keeps it permanently visible. */
+.transcript-scroll-bottom {
+  position: absolute;
+  right: 24px;
+  bottom: 12px;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: 50%;
+  background: transparent;
+  color: var(--muted);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+button.transcript-scroll-bottom:hover:not(:disabled),
+.transcript-scroll-bottom:focus-visible {
+  opacity: 1;
+  background: transparent;
+  color: var(--fg);
+  border-color: var(--accent);
+}
+.transcript-scroll-bottom:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+@media (pointer: coarse), (hover: none) { .transcript-scroll-bottom { opacity: 1; } }
+.starred-reply-minimap {
+  flex: 0 0 180px;
+  width: 180px;
+  max-width: 180px;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  align-self: stretch;
+  overflow: hidden;
+  border-left: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--fg);
+}
+.starred-reply-minimap__expand {
+  display: none;
+}
+.starred-reply-minimap__list {
+  flex: 1 1 auto;
+  min-height: 0;
+  margin: 0;
+  padding: 8px 6px;
+  list-style: none;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+/* One 44px row per starred reply. The preview is the jump; the divided × is a
+ * separate 44x44 unstar that only toggles the star (it never jumps or hides
+ * the rail). Both hits stay thumb-sized on desktop and phone. */
+.starred-reply-minimap__item {
+  margin: 0;
+  min-width: 0;
+  min-height: 44px;
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+}
+.starred-reply-minimap__jump {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  min-height: 44px;
+  padding: 4px 6px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  font: 12px/1.35 var(--font-mono);
+  text-align: left;
+  cursor: pointer;
+}
+.starred-reply-minimap__mark {
+  flex: none;
+  color: var(--gold);
+  font-size: 16px;
+  line-height: 1;
+}
+.starred-reply-minimap__label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.starred-reply-minimap__jump:hover {
+  background: var(--bg-hover);
+  color: var(--fg);
+}
+.starred-reply-minimap__jump:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+  color: var(--fg);
+}
+.starred-reply-minimap__unstar {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-left-color: var(--border);
+  background: transparent;
+  color: var(--muted);
+  font: 16px/1 var(--font-mono);
+  cursor: pointer;
+}
+.starred-reply-minimap__unstar:hover {
+  background: var(--bg-hover);
+  color: var(--fg);
+}
+.starred-reply-minimap__unstar:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* App-owned reply action strip on a settled assistant reply: favorite,
+ * copy raw markdown, save raw markdown. Every viewport keeps the strip in
+ * the row's own left band, absolutely positioned at the row's top-left;
+ * the star keeps that top-left slot and copy/save stack under it. top
+ * stays 0: a negative offset would leave the row's content-visibility
+ * paint box. content-visibility itself is unchanged. The row padding-left
+ * is only the reserved band (26px, or 50px under the query below);
+ * .assistant-text keeps its own inset, so that distance is measured from
+ * the text box, not assumed from the padding. All three controls rest at
+ * opacity 1. The row reserves the strip's full height (:has) so a
+ * one-line reply can never let the next row's buttons overlap this one:
+ * 48px for copy+save, 72px once the star is present. The
+ * (pointer: coarse), (hover: none), (max-width: 720px) query uses 44px
+ * controls, a 50px band, and 88px/132px reserved heights. The visible
+ * star label is hidden at every viewport; the glyph stays visible and
+ * every button keeps its accessible name. */
+.msg--assistant {
+  position: relative;
+  padding-left: 26px;
+}
+.msg--assistant:has(.assistant-reply-action) {
+  min-height: 48px;
+}
+.msg--assistant:has(.assistant-star-toggle) {
+  min-height: 72px;
+}
+.msg--assistant__actions {
+  display: flex;
+  flex-direction: column;
+  position: absolute;
+  top: 0;
+  left: 0;
+  padding: 0;
+  margin: 0;
+}
+.assistant-star-toggle,
+.assistant-reply-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  min-width: 20px;
+  height: 24px;
+  padding: 0;
+  background: transparent;
+  color: var(--muted);
+  font: 13px/1 var(--font-mono);
+  cursor: pointer;
+  opacity: 1;
+}
+.assistant-star-toggle__label {
+  display: none;
+  font: 10px/1 var(--font-mono);
+  letter-spacing: 0.04em;
+}
+.assistant-star-toggle:hover,
+.assistant-reply-action:hover {
+  background: var(--bg-hover);
+  color: var(--fg);
+}
+.assistant-star-toggle:focus-visible,
+.assistant-reply-action:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+.assistant-star-toggle[aria-pressed="true"] {
+  color: var(--gold);
+}
+
+@media (pointer: coarse), (hover: none), (max-width: 720px) {
+  .msg--assistant { padding-left: 50px; }
+  .msg--assistant:has(.assistant-reply-action) { min-height: 88px; }
+  .msg--assistant:has(.assistant-star-toggle) { min-height: 132px; }
+  .assistant-star-toggle,
+  .assistant-reply-action {
+    width: 44px;
+    min-width: 44px;
+    height: 44px;
+    min-height: 44px;
+  }
+}
+
+@media (max-width: 720px) {
+  .starred-reply-minimap {
+    flex: 0 0 44px;
+    width: 44px;
+    max-width: 44px;
+  }
+  .starred-reply-minimap.is-collapsed .starred-reply-minimap__list {
+    display: none;
+  }
+  .starred-reply-minimap__expand {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    flex: none;
+    width: 100%;
+    min-width: 44px;
+    min-height: 44px;
+    padding: 4px;
+    border: none;
+    border-bottom: 1px solid var(--border);
+    background: transparent;
+    color: var(--gold);
+    font: 12px/1 var(--font-mono);
+    cursor: pointer;
+  }
+  .starred-reply-minimap__count {
+    color: var(--muted);
+  }
+  .starred-reply-minimap__expand:focus-visible {
+    outline: 1px solid var(--accent);
+    outline-offset: -2px;
+  }
+  .starred-reply-minimap:not(.is-collapsed) {
+    flex-basis: 140px;
+    width: 140px;
+    max-width: 140px;
+  }
 }

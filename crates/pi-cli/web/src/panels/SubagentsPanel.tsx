@@ -10,18 +10,24 @@
 //   task_spawn   -> { spawns }  (args mirror the `task` tool wire shape)
 //   hub_send     -> { receipts }
 //   job_cancel   -> { cancelled }
-//   job_output   -> { job }
-//   agent_history -> { agentId, text }  (bounded redacted child transcript)
+//   job_output   -> { job, assignment: {status:"available",text} |
+//                                          {status:"unavailable",reason} }
+//   agent_history -> { agentId, messages: [{ id?, message }], truncation }
+//                    (bounded, redacted structured child transcript)
 //
 // Live updates arrive as orchestration events over the same WS:
 //   job_updated / agent_updated / message_delivered
 // (ApplicationEvent::Orchestration, serde tag "type", snake_case).
 
-import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from 'react';
 import { safeText } from '../redact';
+import { messagesToItems, type Item } from '../transcript';
+import { MarkdownBody } from '../MarkdownBody';
+import { dispatchMarkdownPathClick } from '../markdown';
 import {
   elapsedMs,
   formatDuration,
+  isLiveJobStatus,
   SUBAGENT_FILTER_LABEL,
   subagentJobBucket,
   type JobStatus,
@@ -42,12 +48,17 @@ import {
   type MailboxMessageWire,
   type OrchestrationProjection,
 } from '../orchestrationProjection';
-import { SubagentHistoryList } from '../subagentHistory';
 
 
 export type { AgentWire, MailboxMessageWire } from '../orchestrationProjection';
-export type { HistoryTranscriptRow } from '../subagentHistory';
-export { historyTranscriptRows, SubagentHistoryList } from '../subagentHistory';
+
+/** Why the core dropped rows from the head of the child transcript. */
+export type AgentHistoryTruncationReason = 'none' | 'limit' | 'bytes' | 'limit_and_bytes';
+
+export interface AgentHistoryTruncation {
+  omittedRows: number;
+  reason: AgentHistoryTruncationReason;
+}
 
 interface SubagentsPanelProps {
   sendCommand: (command: Record<string, unknown>) => Promise<unknown>;
@@ -56,11 +67,16 @@ interface SubagentsPanelProps {
   connectionEpoch: number;
   initialPage?: 'jobs' | 'irc';
   onClose: () => void;
+  /** Renders restored transcript items with the App's shared SurfaceItems
+   *  (ToolCard / thinking / Markdown), injected to avoid a panel → App import
+   *  cycle. The panel owns the wire; the App owns the renderer. */
+  renderHistory: (items: Item[]) => ReactNode;
 }
 
 const STATUS_LABEL: Record<JobStatus, string> = {
   queued: 'queued',
   running: 'running',
+  cancelling: 'Cancelling',
   completed: 'completed',
   failed: 'failed',
   cancelled: 'cancelled',
@@ -69,13 +85,172 @@ const STATUS_LABEL: Record<JobStatus, string> = {
 /** Filter order for the segmented control (roving-tab order). */
 const JOB_FILTERS: SubagentJobFilter[] = ['running', 'completed'];
 
-/** Lines requested from the agent_history RPC: the core's hard cap
- *  (pi_coding::orchestration::MAX_HISTORY_LINES), so the modal reads as much
- *  of the child transcript as the wire allows — the payload stays bounded by
- *  the core's MAX_HISTORY_BYTES cap, not by this number. */
-const HISTORY_LINES = 200;
+/** Projected message rows requested from `agent_history`: the wire's hard cap
+ *  (1..=200, default 80). The response payload is bounded separately by the
+ *  core's byte cap and reports what it dropped in `truncation`. */
+const HISTORY_LIMIT = 200;
 /** Modal transcript poll cadence while the job is queued/running. */
 const POLL_MS = 2000;
+
+const TRUNCATION_REASONS: Readonly<Record<string, true>> = {
+  none: true,
+  limit: true,
+  bytes: true,
+  limit_and_bytes: true,
+};
+
+/** Runtime record guard for RPC payloads (`null`/arrays rejected). */
+function asWireRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+/** Display fields `public_history_message` always emits for one block. Unknown
+ *  block types fail closed; valid wire controls keep projecting. */
+function isHistoryBlock(block: unknown): boolean {
+  const b = asWireRecord(block);
+  if (b === null || typeof b.type !== 'string') return false;
+  switch (b.type) {
+    case 'text':
+      return typeof b.text === 'string';
+    case 'thinking':
+      return typeof b.thinking === 'string';
+    case 'image':
+      return typeof b.data === 'string' && typeof b.mimeType === 'string';
+    case 'toolCall':
+      return typeof b.id === 'string' && typeof b.name === 'string' && 'arguments' in b;
+    default:
+      return false;
+  }
+}
+
+/** Closed role + display contract: user/assistant/toolResult content is a
+ *  block array; bash command/output are strings; custom display is a boolean.
+ *  Any other role is a malformed row, never a silently empty history. */
+function isHistoryMessage(message: Record<string, unknown>): boolean {
+  switch (message.role) {
+    case 'user':
+    case 'assistant':
+    case 'toolResult':
+      return Array.isArray(message.content) && message.content.every(isHistoryBlock);
+    case 'bashExecution':
+      return typeof message.command === 'string' && typeof message.output === 'string';
+    case 'custom':
+      return typeof message.display === 'boolean';
+    default:
+      return false;
+  }
+}
+
+/** One `agent_history` row: `{ id?, message: { role, ... } }`. Mirrors the
+ *  mobile `parseAgentHistoryRow` contract; any malformed row fails the whole
+ *  payload so a half-valid list never replaces last-good history. */
+function projectAgentHistoryRows(
+  messages: unknown[],
+): Array<{ id?: string; message: Record<string, unknown> }> | null {
+  const rows: Array<{ id?: string; message: Record<string, unknown> }> = [];
+  for (const raw of messages) {
+    const row = asWireRecord(raw);
+    if (row === null) return null;
+    const message = asWireRecord(row.message);
+    if (message === null || !isHistoryMessage(message)) {
+      return null;
+    }
+    const id = row.id;
+    rows.push(typeof id === 'string' && id !== '' ? { id, message } : { message });
+  }
+  return rows;
+}
+
+/** Validate one `agent_history` success payload and project its rows through
+ *  the shared transcript projector. Throws on any shape violation — a
+ *  mismatched `agentId` or a missing `truncation` must never render as this
+ *  child's history. */
+export function projectAgentHistory(data: unknown, agentId: string): {
+  items: Item[];
+  truncation: AgentHistoryTruncation;
+} {
+  const payload = asWireRecord(data);
+  if (payload === null || payload.agentId !== agentId) {
+    const reported = payload !== null ? payload.agentId : undefined;
+    const got = typeof reported === 'string' && reported !== '' ? reported : 'nothing';
+    throw new Error(`agent_history returned history for ${got}`);
+  }
+  const messages = payload.messages;
+  if (!Array.isArray(messages)) {
+    throw new Error('agent_history returned no messages array');
+  }
+  const rows = projectAgentHistoryRows(messages);
+  if (rows === null) {
+    throw new Error('agent_history returned an invalid message row');
+  }
+  const truncation = asWireRecord(payload.truncation);
+  if (truncation === null) {
+    throw new Error('agent_history returned no truncation');
+  }
+  const omittedRows = truncation.omittedRows;
+  const reason = truncation.reason;
+  if (typeof omittedRows !== 'number' || !Number.isInteger(omittedRows) || omittedRows < 0) {
+    throw new Error('agent_history returned an invalid omittedRows');
+  }
+  if (typeof reason !== 'string' || TRUNCATION_REASONS[reason] !== true) {
+    throw new Error('agent_history returned an invalid truncation reason');
+  }
+  if (reason === 'none' && omittedRows !== 0) {
+    throw new Error('agent_history reported untruncated but omitted rows');
+  }
+  return {
+    items: messagesToItems(rows),
+    truncation: { omittedRows, reason: reason as AgentHistoryTruncationReason },
+  };
+}
+
+type DetailAssignment =
+  | { jobId: string; status: 'loading' }
+  | { jobId: string; status: 'available'; text: string }
+  | { jobId: string; status: 'unavailable'; reason: string }
+  | { jobId: string; status: 'error' };
+type LoadedAssignment = Extract<DetailAssignment, { status: 'available' | 'unavailable' }>;
+
+function projectJobAssignment(data: unknown, jobId: string): LoadedAssignment {
+  const payload = asWireRecord(data);
+  const job = payload === null ? null : asWireRecord(payload.job);
+  if (payload === null || job === null || job.id !== jobId) {
+    const got = job !== null && typeof job.id === 'string' && job.id !== '' ? job.id : 'nothing';
+    throw new Error(`job_output returned job ${got} for ${jobId}`);
+  }
+  const assignment = asWireRecord(payload.assignment);
+  if (assignment === null) throw new Error('job_output returned no assignment');
+  if (assignment.status === 'available') {
+    if (typeof assignment.text !== 'string') {
+      throw new Error('job_output available assignment has no text');
+    }
+    return { jobId, status: 'available', text: assignment.text };
+  }
+  if (assignment.status === 'unavailable') {
+    if (typeof assignment.reason !== 'string' || assignment.reason === '') {
+      throw new Error('job_output unavailable assignment has no reason');
+    }
+    return { jobId, status: 'unavailable', reason: assignment.reason };
+  }
+  throw new Error('job_output returned an unknown assignment status');
+}
+
+/** Human notice for dropped head rows; empty for an untruncated transcript. */
+function truncationNotice(truncation: AgentHistoryTruncation): string {
+  const rows = `${truncation.omittedRows} older message${truncation.omittedRows === 1 ? '' : 's'} hidden`;
+  switch (truncation.reason) {
+    case 'limit':
+      return `${rows} (message limit)`;
+    case 'bytes':
+      return `${rows} (size limit)`;
+    case 'limit_and_bytes':
+      return `${rows} (message and size limits)`;
+    default:
+      return '';
+  }
+}
 
 /** Mirror of job_card_adapter::progress_row_text. */
 function progressLine(job: JobWire, view: JobView, now: number): string {
@@ -93,17 +268,19 @@ function progressLine(job: JobWire, view: JobView, now: number): string {
 
 /** Aggregate row mirroring job_card_adapter::aggregate_row. */
 function aggregateLine(jobs: JobView[]): string {
-  const counts = { running: 0, queued: 0, completed: 0, failed: 0, cancelled: 0 };
+  const counts: Record<JobStatus, number> = {
+    queued: 0, running: 0, cancelling: 0, completed: 0, failed: 0, cancelled: 0,
+  };
   for (const view of jobs) counts[view.job.status] += 1;
   const parts: string[] = [];
-  for (const label of ['running', 'queued', 'completed', 'failed', 'cancelled'] as const) {
+  for (const label of ['running', 'cancelling', 'queued', 'completed', 'failed', 'cancelled'] as const) {
     if (counts[label] > 0) parts.push(`${counts[label]} ${label}`);
   }
   return `Jobs · ${parts.join(' · ')}`;
 }
 
 
-export function SubagentsPanel({ sendCommand, subscribeEvents, connectionEpoch, initialPage = 'jobs', onClose }: SubagentsPanelProps) {
+export function SubagentsPanel({ sendCommand, subscribeEvents, connectionEpoch, initialPage = 'jobs', onClose, renderHistory }: SubagentsPanelProps) {
   const [projection, setProjection] = useState<OrchestrationProjection>(initialOrchestrationProjection);
   const jobs = projection.jobs;
   const agents = projection.agents;
@@ -129,10 +306,20 @@ export function SubagentsPanel({ sendCommand, subscribeEvents, connectionEpoch, 
   const [messageDrafts, setMessageDrafts] = useState<Record<string, string>>({});
   const [outputJobId, setOutputJobId] = useState<string | null>(null);
   const outputJobsRef = useRef<Record<string, JobWire>>({});
-  // Details modal: job under inspection + bounded child transcript state.
+  // Details modal: job under inspection + bounded structured child transcript.
   const [detailsJobId, setDetailsJobId] = useState<string | null>(null);
-  const [historyText, setHistoryText] = useState('');
+  const [historyItems, setHistoryItems] = useState<Item[]>([]);
+  const [historyTruncation, setHistoryTruncation] = useState<AgentHistoryTruncation | null>(null);
+  const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState('');
+  // Authoritative full task body (independent of the history poller).
+  const [assignment, setAssignment] = useState<DetailAssignment | null>(null);
+  const [assignmentError, setAssignmentError] = useState<{ jobId: string; message: string } | null>(null);
+  const [assignmentRevision, setAssignmentRevision] = useState(0);
+  // Monotonic read sequence: a slower older snapshot never overwrites a newer
+  // one; `historyAgentRef` invalidates responses for a previously opened child.
+  const historySeqRef = useRef(0);
+  const historyAgentRef = useRef('');
   const detailsTriggerRef = useRef<HTMLElement | null>(null);
   const detailsCloseRef = useRef<HTMLButtonElement | null>(null);
   const detailsRef = useRef<HTMLDivElement | null>(null);
@@ -306,18 +493,34 @@ export function SubagentsPanel({ sendCommand, subscribeEvents, connectionEpoch, 
   // --- Details modal: bounded child transcript, polled while live. ---
   const detailsJob = detailsJobId ? jobs[detailsJobId] : null;
   const detailsLive =
-    !!detailsJob && (detailsJob.job.status === 'queued' || detailsJob.job.status === 'running');
+    !!detailsJob && isLiveJobStatus(detailsJob.job.status);
   const detailsElapsedMs = detailsJob ? elapsedMs(detailsJob.job, now) : null;
   const detailsElapsedLabel = detailsElapsedMs != null ? formatDuration(detailsElapsedMs) : '';
+  // Only the job on screen may paint: never the previous job's task body.
+  const detailAssignment =
+    detailsJob && assignment !== null && assignment.jobId === detailsJob.job.id
+      ? assignment
+      : null;
 
   const openDetails = (jobId: string) => {
     detailsTriggerRef.current = document.activeElement as HTMLElement | null;
-    setHistoryText('');
+    // Switching children clears the previous child immediately and invalidates
+    // its in-flight reads.
+    historyAgentRef.current = '';
+    historySeqRef.current += 1;
+    setHistoryItems([]);
+    setHistoryTruncation(null);
     setHistoryError('');
+    setHistoryLoading(true);
+    setAssignment({ jobId, status: 'loading' });
+    setAssignmentError(null);
     setDetailsJobId(jobId);
   };
 
   const closeDetails = () => {
+    historySeqRef.current += 1;
+    setAssignment(null);
+    setAssignmentError(null);
     setDetailsJobId(null);
     const trigger = detailsTriggerRef.current;
     detailsTriggerRef.current = null;
@@ -330,16 +533,37 @@ export function SubagentsPanel({ sendCommand, subscribeEvents, connectionEpoch, 
     let cancelled = false;
     let timer: number | null = null;
 
+    // A changed agent (not a live-status flip) starts from a clean transcript;
+    // keeps last-good rows for the SAME agent across polls.
+    if (historyAgentRef.current !== agentId) {
+      historyAgentRef.current = agentId;
+      historySeqRef.current += 1;
+      setHistoryItems([]);
+      setHistoryTruncation(null);
+      setHistoryError('');
+      setHistoryLoading(true);
+    }
+
     const fetchHistory = () => {
-      sendCommand({ type: 'agent_history', agentId, lines: HISTORY_LINES })
+      const seq = ++historySeqRef.current;
+      sendCommand({ type: 'agent_history', agentId, limit: HISTORY_LIMIT })
         .then((data) => {
-          if (cancelled) return;
-          const d = data as { text?: unknown };
-          setHistoryText(typeof d.text === 'string' ? d.text : '');
-          setHistoryError('');
+          if (cancelled || seq !== historySeqRef.current || historyAgentRef.current !== agentId) return;
+          try {
+            const history = projectAgentHistory(data, agentId);
+            setHistoryItems(history.items);
+            setHistoryTruncation(history.truncation);
+            setHistoryError('');
+          } catch (error: unknown) {
+            setHistoryError((error as Error).message || 'agent_history returned an invalid payload');
+          } finally {
+            setHistoryLoading(false);
+          }
         })
         .catch((error: unknown) => {
-          if (cancelled || isTransportError(error)) return;
+          if (cancelled || seq !== historySeqRef.current || historyAgentRef.current !== agentId) return;
+          setHistoryLoading(false);
+          if (isTransportError(error)) return;
           setHistoryError((error as Error).message || 'agent_history failed');
         });
     };
@@ -365,7 +589,45 @@ export function SubagentsPanel({ sendCommand, subscribeEvents, connectionEpoch, 
       unsubscribe();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [detailsJobId, detailsJob?.job.agentId, detailsLive, sendCommand, subscribeEvents]);
+  }, [detailsJobId, detailsJob?.job.agentId, detailsLive, connectionEpoch, sendCommand, subscribeEvents]);
+
+  // Full task body (independent of history); same-job last-good survives failures.
+  useEffect(() => {
+    if (!detailsJobId) return;
+    const jobId = detailsJobId;
+    let isCurrent = true;
+    const report = (message: string) => {
+      if (!isCurrent) return;
+      setAssignmentError({ jobId, message });
+      setAssignment((prev) => (
+        prev !== null && prev.jobId === jobId
+          && (prev.status === 'available' || prev.status === 'unavailable')
+          ? prev
+          : { jobId, status: 'error' }
+      ));
+    };
+    setAssignment((prev) => (
+      prev !== null && prev.jobId === jobId && prev.status !== 'error'
+        ? prev
+        : { jobId, status: 'loading' }
+    ));
+    void sendCommand({ type: 'job_output', jobId })
+      .then((data) => {
+        if (!isCurrent) return;
+        try {
+          setAssignment(projectJobAssignment(data, jobId));
+          setAssignmentError((prev) => (prev !== null && prev.jobId === jobId ? null : prev));
+        } catch (error: unknown) {
+          report((error as Error).message || 'job_output returned an invalid payload');
+        }
+      })
+      .catch((error: unknown) => {
+        report((error as Error).message || 'job_output failed');
+      });
+    return () => {
+      isCurrent = false;
+    };
+  }, [detailsJobId, connectionEpoch, assignmentRevision, sendCommand]);
 
   // Initial focus: land on the Close button when the modal opens.
   useEffect(() => {
@@ -546,7 +808,7 @@ export function SubagentsPanel({ sendCommand, subscribeEvents, connectionEpoch, 
                 {order.length === 0
                   ? 'No subagent jobs yet. Spawn one above, or ask the main agent to delegate (job_updated events refresh this panel live).'
                   : jobFilter === 'running'
-                    ? 'No active subagent jobs right now (queued/running). Settled jobs are listed under Completed.'
+                    ? 'No active subagent jobs right now (queued/running/cancelling). Settled jobs are listed under Completed.'
                     : 'No settled subagent jobs yet (completed/failed/cancelled). Active jobs are listed under Running.'}
               </div>
             )}
@@ -554,7 +816,7 @@ export function SubagentsPanel({ sendCommand, subscribeEvents, connectionEpoch, 
               const view = jobs[id];
               const job = view.job;
               const result = job.result;
-              const settled = job.status !== 'queued' && job.status !== 'running';
+              const settled = !isLiveJobStatus(job.status);
               return (
                 <section
                   key={job.id}
@@ -618,16 +880,21 @@ export function SubagentsPanel({ sendCommand, subscribeEvents, connectionEpoch, 
                     <div
                       className="subagent-job__output"
                       data-output-view
-                      onClick={(e) => e.stopPropagation()}
+                      onClick={(e) => {
+                        // Ownerless surface: relative <a href>/md-path clicks
+                        // are blocked from default navigation BEFORE the
+                        // stopPropagation that shields the card toggle (the
+                        // document-level dispatcher never sees this event).
+                        dispatchMarkdownPathClick(e);
+                        e.stopPropagation();
+                      }}
                     >
                       {result?.error ? (
                         <div className="subagent-job__error">{safeText(result.error)}</div>
                       ) : null}
-                      <pre className="subagent-job__output-text">
-                        {result && result.output.trim() !== ''
-                          ? safeText(result.output)
-                          : '(no delivered output yet)'}
-                      </pre>
+                      <div className="subagent-job__output-md" data-path-navigation="disabled">
+                        <MarkdownBody text={result?.output ?? ''} />
+                      </div>
                       {result && (result.artifactRef || result.historyRef || result.artifactUri) && (
                         <div className="subagent-job__refs">
                           {result.artifactRef && <div>agent://{safeText(result.artifactRef)}</div>}
@@ -670,7 +937,7 @@ export function SubagentsPanel({ sendCommand, subscribeEvents, connectionEpoch, 
         </>
       )}
 
-      {error && (
+      {error && !detailsJob && (
         <div className="subagents-panel__error" data-panel-error>
           {safeText(error)}
         </div>
@@ -703,8 +970,11 @@ export function SubagentsPanel({ sendCommand, subscribeEvents, connectionEpoch, 
                   type="button"
                   className="subagent-details__action"
                   data-details-refresh
-                  onClick={() => fetchHistoryRef.current?.()}
-                  title="Refetch the child transcript now"
+                  onClick={() => {
+                    setAssignmentRevision((revision) => revision + 1);
+                    fetchHistoryRef.current?.();
+                  }}
+                  title="Refetch the full task and child transcript now"
                 >
                   Refresh
                 </button>
@@ -722,12 +992,22 @@ export function SubagentsPanel({ sendCommand, subscribeEvents, connectionEpoch, 
               </div>
             </div>
             <div className="subagent-details__body">
+              {(error !== '' || assignmentError !== null) && (
+                <div className="subagent-details__error" data-details-panel-error>
+                  {error !== '' && <div>{safeText(error)}</div>}
+                  {assignmentError !== null && (
+                    <div data-details-assignment-error>
+                      {safeText(`job_output failed for ${assignmentError.jobId}: ${assignmentError.message}`)}
+                    </div>
+                  )}
+                </div>
+              )}
               <div className="subagent-details__meta" data-details-status>
                 <span
                   className={`subagent-job__status subagent-job__status--${detailsJob.job.status}`}
                   role="status"
                 >
-                  {detailsJob.job.status === 'running' && (
+                  {(detailsJob.job.status === 'running' || detailsJob.job.status === 'cancelling') && (
                     <span className="subagent-details__status-pulse" aria-hidden="true" />
                   )}
                   {STATUS_LABEL[detailsJob.job.status]}
@@ -736,8 +1016,22 @@ export function SubagentsPanel({ sendCommand, subscribeEvents, connectionEpoch, 
               </div>
               <div className="subagent-details__section" data-details-task-section>
                 <div className="subagent-details__label">Task</div>
-                <div className="subagent-details__description" data-details-description>
-                  {safeText(detailsJob.job.description || '(no task description)')}
+                <div
+                  className="subagent-details__description"
+                  data-details-description
+                  data-assignment-status={detailAssignment?.status ?? 'loading'}
+                  data-path-navigation="disabled"
+                  onClick={(e) => dispatchMarkdownPathClick(e)}
+                >
+                  {detailAssignment?.status === 'available' ? (
+                    <MarkdownBody text={detailAssignment.text} />
+                  ) : detailAssignment?.status === 'unavailable' ? (
+                    <span>Full task unavailable ({safeText(detailAssignment.reason)}).</span>
+                  ) : detailAssignment?.status === 'error' ? (
+                    <span>Full task not loaded. Refresh to retry.</span>
+                  ) : (
+                    <span>Loading full task…</span>
+                  )}
                 </div>
               </div>
               {detailsJob.activity != null && detailsJob.activity.trim() !== '' && (
@@ -755,7 +1049,36 @@ export function SubagentsPanel({ sendCommand, subscribeEvents, connectionEpoch, 
                     {safeText(historyError)}
                   </div>
                 )}
-                <SubagentHistoryList text={historyText} error={historyError} />
+                {historyTruncation !== null && historyTruncation.omittedRows > 0 && (
+                  <div
+                    className="subagent-details__truncation"
+                    data-details-truncation
+                    data-truncation-reason={historyTruncation.reason}
+                  >
+                    {truncationNotice(historyTruncation)}
+                  </div>
+                )}
+                {historyItems.length > 0 ? (
+                  <div
+                    className="transcript-content subagent-details__transcript"
+                    data-details-history
+                    // No session owner exists for the child: path chips and
+                    // relative markdown links are inert here (markdown.ts).
+                    data-path-navigation="disabled"
+                  >
+                    {renderHistory(historyItems)}
+                  </div>
+                ) : historyError !== '' ? null : historyLoading ? (
+                  <div className="subagent-details__empty" data-details-loading>
+                    Loading transcript…
+                  </div>
+                ) : (
+                  <div className="subagent-details__empty" data-details-empty>
+                    {historyTruncation !== null && historyTruncation.omittedRows > 0
+                      ? 'The child transcript exceeds the history size limit — no messages fit.'
+                      : 'No transcript yet — waiting for child activity.'}
+                  </div>
+                )}
               </div>
             </div>
           </div>

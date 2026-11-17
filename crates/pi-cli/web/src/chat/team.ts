@@ -20,7 +20,8 @@ import { safeText } from '../redact';
 import type { EventFrame, RpcResponse } from '../types';
 import type { StorageLike } from '../hostToken';
 import type { GoalLifecycle, GoalStateWire, GoalWire } from '../panels/GoalPanel';
-import type { JobStatus, JobWire } from '../jobCard';
+import { isLiveJobStatus, type JobStatus, type JobWire } from '../jobCard';
+import { sourceMarkdownFromBlocks } from '../replyMarkdown';
 import { runnerEventListenerCount, subscribeRunnerEvents } from './events';
 import { CHAT_INVITE_EMPTY } from './chatEmpty';
 import { resolveChannelRecipients, runnerMentionToken, type ChannelMentionMember } from './chatMentions';
@@ -429,6 +430,7 @@ export function deriveProjectAggregate(
   const jobCounts: Record<JobStatus, number> = {
     queued: 0,
     running: 0,
+    cancelling: 0,
     completed: 0,
     failed: 0,
     cancelled: 0,
@@ -448,7 +450,7 @@ export function deriveProjectAggregate(
     jobCounts,
     disconnectedCount,
     orchestrationDisabledCount,
-    activeJobCount: jobCounts.queued + jobCounts.running,
+    activeJobCount: jobCounts.queued + jobCounts.running + jobCounts.cancelling,
     failedJobCount: jobCounts.failed,
   };
 }
@@ -462,7 +464,7 @@ export function runnerActivityJobs(state: TeamSessionState): JobWire[] {
   const live: JobWire[] = [];
   const settled: JobWire[] = [];
   for (const view of Object.values(state.orchestration.jobs)) {
-    (view.job.status === 'queued' || view.job.status === 'running' ? live : settled).push(view.job);
+    (isLiveJobStatus(view.job.status) ? live : settled).push(view.job);
   }
   live.sort((left, right) => recency(right) - recency(left));
   settled.sort((left, right) => recency(right) - recency(left));
@@ -1505,16 +1507,28 @@ export class TeamStore {
     const card = run?.responses.find((response) => response.mappingId === reference.mappingId);
     const attempt = card?.attempts.find((row) => row.id === reference.attemptId);
     if (!run || !card || !attempt) return;
-    const text = assistantPlainText(attempt.transcript.items);
-    if (!text) return;
-    this.appendChannelMessage(reference.projectId, {
-      id: this.nextIdentity('msg'),
-      at: this.now(),
-      kind: 'runner',
-      mappingId: card.mappingId,
-      author: runnerMentionToken(card.runnerLabel),
-      text,
-    });
+    // ONE channel message per REAL assistant reply, so message boundaries and
+    // per-reply controls survive. `text` is the raw sourceMarkdownFromBlocks
+    // output (no trim, no separators); `generatedAt` is that settled item's
+    // real wire END timestamp; `at` remains the channel-log append clock.
+    const author = runnerMentionToken(card.runnerLabel);
+    for (const item of attempt.transcript.items) {
+      if (item.kind !== 'assistant') continue;
+      const text = sourceMarkdownFromBlocks(item.blocks);
+      if (text === '') continue;
+      const generatedAt = typeof item.timestamp === 'number' && Number.isInteger(item.timestamp)
+        ? item.timestamp
+        : undefined;
+      this.appendChannelMessage(reference.projectId, {
+        id: this.nextIdentity('msg'),
+        at: this.now(),
+        kind: 'runner',
+        mappingId: card.mappingId,
+        author,
+        text,
+        ...(generatedAt === undefined ? {} : { generatedAt }),
+      });
+    }
   }
 
   private maybeHandoff(projectId: string, runId: string): void {

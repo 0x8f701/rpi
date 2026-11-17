@@ -41,6 +41,11 @@ fn parse_segment(source: &str) -> StyledText {
     let mut offset = 0;
     while offset < source.len() {
         let rest = &source[offset..];
+        if let Some(escaped) = escaped_ascii_punctuation(rest) {
+            output.text.push(escaped);
+            offset += '\\'.len_utf8() + escaped.len_utf8();
+            continue;
+        }
         if rest.starts_with('`') {
             let ticks = rest.bytes().take_while(|byte| *byte == b'`').count();
             if let Some(close) = find_tick_close(rest, ticks) {
@@ -118,6 +123,10 @@ fn find_tick_close(rest: &str, ticks: usize) -> Option<usize> {
 fn find_emphasis_close(source: &str, mut offset: usize, delimiter: &str) -> Option<usize> {
     while offset + delimiter.len() <= source.len() {
         let tail = &source[offset..];
+        if escaped_ascii_punctuation(tail).is_some() {
+            offset += '\\'.len_utf8() + tail.chars().nth(1).expect("escaped punctuation").len_utf8();
+            continue;
+        }
         if tail.starts_with('`') {
             let ticks = tail.bytes().take_while(|byte| *byte == b'`').count();
             if let Some(close) = find_tick_close(tail, ticks) {
@@ -162,6 +171,16 @@ fn can_close(source: &str, offset: usize, delimiter_len: usize) -> bool {
             .next()
             .is_none_or(|character| !character.is_alphanumeric())
 }
+fn escaped_ascii_punctuation(rest: &str) -> Option<char> {
+    let mut chars = rest.chars();
+    if chars.next() != Some('\\') {
+        return None;
+    }
+    let escaped = chars.next()?;
+    escaped.is_ascii_punctuation().then_some(escaped)
+}
+
+
 
 fn wrap_styled(parsed: StyledText, width: usize) -> Vec<StyledText> {
     let width = width.max(1);
@@ -282,6 +301,40 @@ pub(crate) fn append_styled(output: &mut StyledText, source: &StyledText, range:
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{InlineStyle, parse_inline};
+
+    #[test]
+    fn escaped_ascii_punctuation_is_literal_and_code_keeps_backslash() {
+        let parsed = parse_inline(r"README\.md a\[b\] \*not bold\* \`not code\`");
+        assert_eq!(parsed.text, "README.md a[b] *not bold* `not code`");
+        assert!(parsed.styles.is_empty(), "{:?}", parsed.styles);
+        let code = parse_inline(r"`README\.md`");
+        assert_eq!(code.text, r"README\.md");
+        assert_eq!(code.styles.len(), 1);
+        assert_eq!(code.styles[0].style, InlineStyle::Code);
+        let nested = parse_inline(r"**keep \* inside** tail");
+        assert_eq!(nested.text, "keep * inside tail");
+        assert!(nested.styles.iter().any(|styled| styled.style == InlineStyle::Bold));
+        assert!(!nested.styles.iter().any(|styled| styled.style == InlineStyle::Italic));
+        let unicode = parse_inline("**a\\😀b**");
+        assert_eq!(unicode.text, "a\\😀b");
+        assert!(unicode.styles.iter().any(|styled| styled.style == InlineStyle::Bold));
+        let literal_star = parse_inline(r"**a\***");
+        assert_eq!(literal_star.text, "a*");
+        assert!(literal_star.styles.iter().any(|styled| styled.style == InlineStyle::Bold));
+        let even = parse_inline(r"**a\\***");
+        assert_eq!(even.text, "a\\*");
+        assert!(even.styles.iter().any(|styled| styled.style == InlineStyle::Bold));
+        let ticks = parse_inline(r"**a\`b**");
+        assert_eq!(ticks.text, "a`b");
+        assert!(ticks.styles.iter().any(|styled| styled.style == InlineStyle::Bold));
+        assert!(!ticks.styles.iter().any(|styled| styled.style == InlineStyle::Code));
+    }
+}
+
 
 pub(crate) fn shifted_styles(styles: &[InlineStyleRange], offset: usize) -> Vec<InlineStyleRange> {
     styles

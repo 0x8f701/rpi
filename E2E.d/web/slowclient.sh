@@ -10,19 +10,20 @@
 #   2. heavy-transcript amplification: with final KaTeX/mermaid messages in
 #      the transcript, a delta burst must not balloon main-thread work (the
 #      hot path must not re-render the whole transcript per delta).
-#   3. controlled reader stall: a synthetic main-thread busy loop overlapping
-#      a sustained delta flood must NOT produce a false 1008
-#      ("client is not reading messages") for a TRANSIENT (<=4s) stall; a
-#      SUSTAINED no-read stall must still surface the real 1008 with the
-#      server's reason. The lane records WS close code/reason,
-#      PerformanceObserver long tasks, wire-receive vs JS-handler message
-#      timestamps, and the renderer queue gap (JS-handler lag).
-#   4. accurate close cause: the 1008 close toast carries the server's reason
-#      and the pending command is drained in onclose — no mislabeled
-#      "send failed: connection replaced"/"command timed out" toast.
-#
-# The 1008 toast is NEVER suppressed: the lane asserts the app surfaces any
-# non-1000 close (including a genuine 1008) verbatim.
+#   3. controlled renderer stall: a synthetic main-thread busy loop
+#      overlapping a delta flood must NOT produce a false 1008. The 2.5s,
+#      4s, and 7s stalls are all below the 15s outbound grace and are JS
+#      stalls, not TCP no-read. Each turn completes; the 7s flood must
+#      preserve exact salted content and order. Dead-client eviction is
+#      owned by the Rust TCP/stall tests, not this browser lane.
+#   4. close surface: after the floods, the test opens /web through a
+#      test-owned ws reverse proxy, holds the real side_chat_list response
+#      with the browser's sent command id, and sends a server 1008 close.
+#      The lane proves that response stayed undelivered through the close
+#      handler and that the toast carries code 1008 and the controlled
+#      reason, with no timeout or connection-replaced toast. It does NOT
+#      observe the product pending-registry reject; that remains the
+#      existing pending unit test. This is not dead-client eviction.
 #
 # Browser driver: playwright via npm (ephemeral install in the scenario work
 # dir) with a system Chrome/Chromium binary or playwright's bundled chromium.
@@ -47,7 +48,7 @@ main() {
     case "${1:-run}" in
         list|--list|--dry-run)
             printf '%s\n' \
-                'web-slowclient - slow-client contract: burst calibration, heavy-transcript delta amplification, controlled main-thread stall vs delta flood (no false 1008), sustained no-read 1008 + accurate cause, 1008 toast never hidden (playwright, hard gate)'
+                'web-slowclient - slow-client contract: burst calibration, heavy-transcript delta amplification, renderer stalls including 7s complete without false 1008 and with exact salted content, controlled server 1008 close while side_chat_list is pending, accurate close cause (playwright, hard gate)'
             return 0
             ;;
         run|all) ;;

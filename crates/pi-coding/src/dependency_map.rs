@@ -2,12 +2,21 @@
 //!
 //! `extract_dependencies(path, source)` is a pure function over one file's
 //! text: no filesystem, no workspace walking, no RPC. Rust / TypeScript / TSX
-//! / JavaScript are parsed with the already-compiled tree-sitter grammars
-//! (same `ENABLED_LANGS` subset as `tools::ast_grep`); Solidity is tokenized
-//! with a small lexical scanner because `ast-grep-language`'s Solidity parser
-//! is an `unimplemented!()` stub with the `tree-sitter-solidity` feature off.
-//! Any other extension is reported as [`MapLanguage::Unsupported`] with no
-//! guessed edges.
+//! / JavaScript / Go are parsed with the already-compiled tree-sitter
+//! grammars (same `ENABLED_LANGS` subset as `tools::ast_grep`); Solidity is
+//! tokenized with a small lexical scanner because `ast-grep-language`'s
+//! Solidity parser is an `unimplemented!()` stub with the
+//! `tree-sitter-solidity` feature off. Any other extension is reported as
+//! [`MapLanguage::Unsupported`] with no guessed edges.
+//!
+//! Rust is recorded, never resolved: every `mod` item — inline
+//! (`mod name { … }`) or file-backed (`mod name;`) — becomes a
+//! [`ModuleDeclaration`] with its lexical inline lineage, the verbatim
+//! attribute run above it, and a conservative verdict for attributes that
+//! leave module existence undecidable. Each `mod`/`use` edge also carries the
+//! enclosing inline module context. `crate`/`self`/`super` use-groups expand
+//! into one edge per leaf; every other group keeps its raw text. A symbol is
+//! never inferred from a file name here.
 //!
 //! A tree-sitter ERROR or missing node, an undecodable specifier escape, or a
 //! malformed Solidity import reports [`ParseStatus::Incomplete`] and publishes
@@ -28,6 +37,7 @@ pub enum MapLanguage {
     TypeScript,
     Tsx,
     JavaScript,
+    Go,
     Solidity,
     Unsupported,
 }
@@ -47,13 +57,18 @@ pub enum ParseStatus {
 #[serde(rename_all = "snake_case")]
 pub enum EdgeKind {
     /// ESM/CJS `import … from "spec"` (including side-effect imports and
-    /// TS `import x = require("spec")`).
+    /// TS `import x = require("spec")`), or one Go `import` spec in any of its
+    /// grouped, aliased, blank, dot, or raw-string forms.
     Import,
     /// `export … from "spec"`.
     ExportFrom,
-    /// Rust `use …` declaration; `specifier` is the raw use-path text.
+    /// Rust `use …` declaration. A non-local path or a `std`/extern group
+    /// keeps its raw use-path text; a `crate`/`self`/`super` group expands into
+    /// one normalized leaf path per edge (aliases dropped, `*` kept).
     Use,
-    /// Rust `mod name;` (no body); `specifier` is the module name.
+    /// Rust `mod name;` (no body); `specifier` is the module name. Every `mod`
+    /// item, inline included, is also recorded in
+    /// [`SourceDependencies::module_declarations`].
     Mod,
     /// Solidity `import … "spec";` in one of its four validated forms:
     /// `import "P";`, `import "P" as I;`, `import * as I from "P";`,
@@ -66,6 +81,35 @@ pub enum EdgeKind {
 pub struct DependencyEdge {
     pub kind: EdgeKind,
     pub specifier: String,
+    pub line: usize,
+    /// Rust inline module names enclosing this occurrence, outermost first.
+    /// Empty at file scope and for every other language.
+    pub inline_module: Vec<String>,
+}
+
+/// One Rust `mod` item, file-backed (`mod name;`) or inline (`mod name { … }`).
+/// The extractor records every declaration so a later resolver can prove the
+/// module chain from `mod` items instead of guessing it from file names; this
+/// record never resolves anything.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ModuleDeclaration {
+    /// Declared module identifier, verbatim (raw identifiers keep `r#`).
+    pub name: String,
+    /// Enclosing inline module names, outermost first; empty at file scope.
+    pub lineage: Vec<String>,
+    /// `true` for `mod name { … }`: declared here, never a file edge.
+    pub inline: bool,
+    /// Verbatim `#[…]` items directly above the declaration. Comments may
+    /// interleave; the run stops at the first sibling that is neither.
+    pub attributes: Vec<String>,
+    /// The first `#[path …]` attribute verbatim. Its presence means the
+    /// filesystem convention must not be applied downstream.
+    pub path_attribute: Option<String>,
+    /// `true` when the attribute set leaves module existence or location
+    /// undecidable: `path`, `cfg`, `cfg_attr`, and anything outside the inert
+    /// set (`doc`, `allow`, `warn`, `deny`, `forbid`, `deprecated`,
+    /// `macro_use`, `macro_export`).
+    pub conservative: bool,
     pub line: usize,
 }
 
@@ -92,6 +136,9 @@ pub struct SourceDependencies {
     pub edges: Vec<DependencyEdge>,
     /// Empty when `parse` is not [`ParseStatus::Ok`].
     pub declarations: Vec<DeclarationEntry>,
+    /// Every Rust `mod` item in source order, inline and file-backed. Empty
+    /// for the other languages and when `parse` is not [`ParseStatus::Ok`].
+    pub module_declarations: Vec<ModuleDeclaration>,
     /// Dynamic `import()` / `require()` calls seen but not resolved as edges.
     pub dynamic_omitted: usize,
 }
@@ -113,6 +160,7 @@ fn empty(language: MapLanguage, parse: ParseStatus) -> SourceDependencies {
         parse,
         edges: Vec::new(),
         declarations: Vec::new(),
+        module_declarations: Vec::new(),
         dynamic_omitted: 0,
     }
 }
@@ -142,6 +190,8 @@ fn language_for_path(path: &str) -> MapLanguage {
         || name.ends_with(".jsx")
     {
         MapLanguage::JavaScript
+    } else if name.ends_with(".go") {
+        MapLanguage::Go
     } else if name.ends_with(".sol") {
         MapLanguage::Solidity
     } else {
@@ -159,11 +209,13 @@ fn extract_ast(language: MapLanguage, source: &str) -> SourceDependencies {
         MapLanguage::TypeScript => SupportLang::TypeScript,
         MapLanguage::Tsx => SupportLang::Tsx,
         MapLanguage::JavaScript => SupportLang::JavaScript,
+        MapLanguage::Go => SupportLang::Go,
         MapLanguage::Solidity | MapLanguage::Unsupported => unreachable!("handled by caller"),
     };
     let grep = support.ast_grep(source);
     let root = grep.root();
     let mut edges = Vec::new();
+    let mut module_declarations = Vec::new();
     let mut dynamic_omitted = 0usize;
     // Iterative preorder: nesting depth must not consume native stack frames.
     for node in root.dfs() {
@@ -179,6 +231,7 @@ fn extract_ast(language: MapLanguage, source: &str) -> SourceDependencies {
                     kind: EdgeKind::Import,
                     specifier: source,
                     line: node.start_pos().line() + 1,
+                    inline_module: Vec::new(),
                 });
             }
             "export_statement" => {
@@ -190,25 +243,81 @@ fn extract_ast(language: MapLanguage, source: &str) -> SourceDependencies {
                         kind: EdgeKind::ExportFrom,
                         specifier: source,
                         line: node.start_pos().line() + 1,
+                        inline_module: Vec::new(),
                     });
                 }
             }
-            "use_declaration" => {
-                if let Some(argument) = node.field("argument") {
+            "import_declaration" if language == MapLanguage::Go => {
+                let Some(specs) = go_import_specs(&node) else {
+                    return empty(language, ParseStatus::Incomplete);
+                };
+                for spec in specs {
+                    let Some(specifier) = go_import_path(&spec) else {
+                        return empty(language, ParseStatus::Incomplete);
+                    };
                     edges.push(DependencyEdge {
-                        kind: EdgeKind::Use,
-                        specifier: argument.text().into_owned(),
-                        line: node.start_pos().line() + 1,
+                        kind: EdgeKind::Import,
+                        specifier,
+                        line: spec.start_pos().line() + 1,
+                        inline_module: Vec::new(),
                     });
                 }
             }
-            // `mod name;` is a file edge candidate; `mod name { … }` is not.
-            "mod_item" if node.field("body").is_none() => {
-                if let Some(name) = node.field("name") {
+            "use_declaration" if language == MapLanguage::Rust => {
+                let Some(argument) = node.field("argument") else {
+                    return empty(language, ParseStatus::Incomplete);
+                };
+                let inline = inline_lineage(&node);
+                let line = node.start_pos().line() + 1;
+                match expand_rust_use(&argument) {
+                    UseForm::Single(specifier) => edges.push(DependencyEdge {
+                        kind: EdgeKind::Use,
+                        specifier,
+                        line,
+                        inline_module: inline,
+                    }),
+                    UseForm::Leaves(leaves) => {
+                        for specifier in leaves {
+                            edges.push(DependencyEdge {
+                                kind: EdgeKind::Use,
+                                specifier,
+                                line,
+                                inline_module: inline.clone(),
+                            });
+                        }
+                    }
+                    UseForm::Unsupported => {
+                        return empty(language, ParseStatus::Incomplete);
+                    }
+                }
+            }
+            // Every `mod` item is recorded so a later resolution step can prove
+            // the module chain from declarations. `mod name;` is a file edge
+            // candidate; `mod name { … }` never is.
+            "mod_item" if language == MapLanguage::Rust => {
+                let Some(name) = node.field("name") else {
+                    return empty(language, ParseStatus::Incomplete);
+                };
+                let name = name.text().into_owned();
+                let lineage = inline_lineage(&node);
+                let inline = node.field("body").is_some();
+                let (attributes, path_attribute, conservative) = module_attributes(&node);
+                let line = node.start_pos().line() + 1;
+                module_declarations.push(ModuleDeclaration {
+                    name: name.clone(),
+                    lineage: lineage.clone(),
+                    inline,
+                    attributes,
+                    path_attribute,
+                    conservative,
+                    line,
+                });
+                if !inline {
                     edges.push(DependencyEdge {
                         kind: EdgeKind::Mod,
-                        specifier: name.text().into_owned(),
-                        line: node.start_pos().line() + 1,
+                        specifier: name,
+                        line,
+                        inline_module: lineage,
                     });
                 }
             }
@@ -227,8 +336,332 @@ fn extract_ast(language: MapLanguage, source: &str) -> SourceDependencies {
         parse: ParseStatus::Ok,
         edges,
         declarations: top_level_declarations(&root, language),
+        module_declarations,
         dynamic_omitted,
     }
+}
+
+/// Enclosing inline module names for one node, outermost first.
+/// `Node::ancestors` yields nearest-first in ast-grep-core 0.45, so the filtered
+/// inline modules must be reversed into outer→inner order.
+fn inline_lineage(node: &TsNode<'_>) -> Vec<String> {
+    let mut lineage: Vec<String> = node
+        .ancestors()
+        .filter(|ancestor| ancestor.kind() == "mod_item" && ancestor.field("body").is_some())
+        .filter_map(|ancestor| ancestor.field("name").map(|name| name.text().into_owned()))
+        .collect();
+    lineage.reverse();
+    lineage
+}
+
+/// The attribute run directly above one `mod` item, plus its conservative
+/// verdict. `path`, `cfg`, `cfg_attr`, and unknown attributes are never inert:
+/// they can change whether or where the module exists.
+fn module_attributes(node: &TsNode<'_>) -> (Vec<String>, Option<String>, bool) {
+    let mut attributes = Vec::new();
+    let mut previous = node.prev();
+    while let Some(sibling) = previous {
+        match sibling.kind().as_ref() {
+            "attribute_item" => {
+                attributes.push(sibling.text().into_owned());
+                previous = sibling.prev();
+            }
+            // Comments are whitespace here: keep walking so a `#[path]` above
+            // a doc comment is never missed.
+            "comment" | "line_comment" | "block_comment" => {
+                previous = sibling.prev();
+            }
+            _ => break,
+        }
+    }
+    attributes.reverse();
+    let mut path_attribute = None;
+    let mut conservative = false;
+    for text in &attributes {
+        match attribute_head(text) {
+            Some(("path", remainder)) if is_attribute_arguments(remainder) => {
+                if path_attribute.is_none() {
+                    path_attribute = Some(text.clone());
+                }
+                conservative = true;
+            }
+            Some((head, remainder))
+                if is_attribute_arguments(remainder) && is_inert_attribute(head) => {}
+            _ => conservative = true,
+        }
+    }
+    (attributes, path_attribute, conservative)
+}
+
+/// Attribute path after `#[` plus the trimmed remainder after it. The path
+/// keeps `::`, but whitespace or a comment can still split a qualified name
+/// (`#[allow :: rewrite]`, `#[allow/*x*/::rewrite]`), so callers must also
+/// require the remainder to start the attribute's arguments.
+fn attribute_head(text: &str) -> Option<(&str, &str)> {
+    let rest = text.trim_start().strip_prefix("#[")?.trim_start();
+    let end = rest
+        .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == ':'))
+        .unwrap_or(rest.len());
+    if end == 0 {
+        return None;
+    }
+    Some((&rest[..end], rest[end..].trim_start()))
+}
+
+/// The remainder that makes a scanned head a complete attribute path: the next
+/// token is its argument list, `= value`, or the closing `]`. Anything else
+/// (another `::` segment, a comment, arbitrary tokens) leaves the attribute
+/// unknown and therefore conservative.
+fn is_attribute_arguments(remainder: &str) -> bool {
+    remainder.starts_with('(') || remainder.starts_with('=') || remainder.starts_with(']')
+}
+
+/// Attributes that cannot change whether or where a module exists.
+fn is_inert_attribute(head: &str) -> bool {
+    matches!(
+        head,
+        "doc"
+            | "allow"
+            | "warn"
+            | "deny"
+            | "forbid"
+            | "deprecated"
+            | "macro_use"
+            | "macro_export"
+    )
+}
+
+/// One Rust `use` argument expansion.
+enum UseForm {
+    /// Raw argument text, one edge (external groups, aliases, wildcards).
+    Single(String),
+    /// Normalized leaf paths, one edge each.
+    Leaves(Vec<String>),
+    /// The argument shape is not one this extractor understands.
+    Unsupported,
+}
+
+/// Expand a `use` argument only when a `crate`/`self`/`super` group is
+/// involved. Every other shape keeps its raw text so aliases and extern groups
+/// stay verbatim.
+fn expand_rust_use(argument: &TsNode<'_>) -> UseForm {
+    match argument.kind().as_ref() {
+        "scoped_use_list" | "use_list" => {
+            let mut leaves = Vec::new();
+            if collect_use_leaves(argument, None, &mut leaves).is_none() {
+                return UseForm::Unsupported;
+            }
+            if leaves.iter().all(|leaf| !is_local_use_path(leaf)) {
+                return UseForm::Single(argument.text().into_owned());
+            }
+            UseForm::Leaves(leaves)
+        }
+        _ => UseForm::Single(argument.text().into_owned()),
+    }
+}
+
+/// Comments are named tree-sitter extras; they never carry a use path.
+fn is_comment_kind(node: &TsNode<'_>) -> bool {
+    matches!(
+        node.kind().as_ref(),
+        "comment" | "line_comment" | "block_comment"
+    )
+}
+
+/// Collect every leaf of one use path or group in source order.
+fn collect_use_leaves(
+    node: &TsNode<'_>,
+    prefix: Option<&str>,
+    out: &mut Vec<String>,
+) -> Option<()> {
+    match node.kind().as_ref() {
+        "identifier" | "crate" | "self" | "super" | "scoped_identifier" | "metavariable" => {
+            out.push(join_use_leaf(prefix, &node.text()));
+            Some(())
+        }
+        "use_as_clause" => {
+            let path = node.field("path")?;
+            out.push(join_use_leaf(prefix, &path.text()));
+            Some(())
+        }
+        "use_wildcard" => {
+            // `crate::foo::{*}` has no named target: the wildcard applies to the
+            // group prefix itself. A comment is a named extra and is never the
+            // path.
+            let target = node
+                .children()
+                .find(|child| child.is_named() && !is_comment_kind(child));
+            let base = match target {
+                Some(target) => join_use_leaf(prefix, &target.text()),
+                None => match prefix {
+                    Some(prefix) => prefix.to_owned(),
+                    None => return None,
+                },
+            };
+            out.push(format!("{base}::*"));
+            Some(())
+        }
+        "scoped_use_list" => {
+            let base = join_use_leaf(prefix, &node.field("path")?.text());
+            collect_use_leaves(&node.field("list")?, Some(base.as_str()), out)
+        }
+        "use_list" => {
+            for child in node.children().filter(|child| child.is_named()) {
+                if is_comment_kind(&child) {
+                    continue;
+                }
+                collect_use_leaves(&child, prefix, out)?;
+            }
+            Some(())
+        }
+        _ => None,
+    }
+}
+
+/// Join one use path under its group prefix. `self` leaves name the prefix
+/// itself and `super` leaves name its parent, so a group such as
+/// `crate::store::{self, Session, inner::*}` never invents a `self` segment.
+fn join_use_leaf(prefix: Option<&str>, text: &str) -> String {
+    let (head, rest) = match text.split_once("::") {
+        Some((head, rest)) => (head, Some(rest)),
+        None => (text, None),
+    };
+    let base = match (head, prefix) {
+        ("self", Some(prefix)) => prefix.to_owned(),
+        ("self", None) => "self".to_owned(),
+        ("super", Some(prefix)) => prefix
+            .rsplit_once("::")
+            .map(|(head, _)| head.to_owned())
+            .unwrap_or_else(|| prefix.to_owned()),
+        ("super", None) => "super".to_owned(),
+        ("crate", _) => "crate".to_owned(),
+        (_, Some(prefix)) => format!("{prefix}::{head}"),
+        (_, None) => head.to_owned(),
+    };
+    match rest {
+        Some(rest) => format!("{base}::{rest}"),
+        None => base,
+    }
+}
+
+/// `crate`/`self`/`super` are the only roots a resolver can follow without a
+/// filesystem convention; `r#crate` is a raw identifier, not the keyword.
+fn is_local_use_path(path: &str) -> bool {
+    matches!(path.split("::").next(), Some("crate" | "self" | "super"))
+}
+
+/// Every `import_spec` of one Go import declaration, grouped or single.
+fn go_import_specs<'a>(node: &TsNode<'a>) -> Option<Vec<TsNode<'a>>> {
+    let mut specs = Vec::new();
+    // `Node::children` includes unnamed punctuation (`import`, `(`, `)`, `,`);
+    // only named nodes carry a spec. Comments are named and skipped explicitly.
+    for child in node.children().filter(|child| child.is_named()) {
+        match child.kind().as_ref() {
+            "import_spec" => specs.push(child.clone()),
+            "import_spec_list" => {
+                for spec in child.children().filter(|spec| spec.is_named()) {
+                    match spec.kind().as_ref() {
+                        "import_spec" => specs.push(spec.clone()),
+                        "comment" | "line_comment" | "block_comment" => {}
+                        _ => return None,
+                    }
+                }
+            }
+            "comment" | "line_comment" | "block_comment" => {}
+            _ => return None,
+        }
+    }
+    Some(specs)
+}
+
+/// Decoded import path of one Go `import_spec`; a bad literal rejects the file.
+fn go_import_path(spec: &TsNode<'_>) -> Option<String> {
+    let path = spec.field("path")?;
+    match path.kind().as_ref() {
+        "interpreted_string_literal" => decode_go_string(&path.text()),
+        "raw_string_literal" => decode_go_raw_string(&path.text()),
+        _ => None,
+    }
+}
+
+/// Decode one Go raw string literal: backticks delimit, carriage returns are
+/// discarded by the language, and nothing else is escaped.
+fn decode_go_raw_string(text: &str) -> Option<String> {
+    let body = text.trim().strip_prefix('`')?.strip_suffix('`')?;
+    if body.contains('`') {
+        return None;
+    }
+    Some(body.chars().filter(|ch| *ch != '\r').collect())
+}
+
+/// Decode one Go interpreted string literal. `\xNN` and octal escapes denote
+/// bytes, so the decoded value is assembled as bytes and validated as UTF-8
+/// once (`"\xc3\xa9"` is `é`, not `Ã©`); invalid UTF-8 or any unknown or
+/// truncated escape rejects the whole file instead of publishing raw text.
+fn decode_go_string(text: &str) -> Option<String> {
+    let bytes = text.trim().as_bytes();
+    if bytes.len() < 2 || bytes[0] != b'"' || bytes[bytes.len() - 1] != b'"' {
+        return None;
+    }
+    let body = &bytes[1..bytes.len() - 1];
+    let mut out: Vec<u8> = Vec::with_capacity(body.len());
+    let mut i = 0;
+    while i < body.len() {
+        let byte = body[i];
+        if byte == b'\n' || byte == b'\r' {
+            return None;
+        }
+        if byte != b'\\' {
+            // Literal source is valid UTF-8; copy the whole rune byte-for-byte.
+            let rest = std::str::from_utf8(&body[i..]).ok()?;
+            let width = rest.chars().next()?.len_utf8();
+            out.extend_from_slice(&body[i..i + width]);
+            i += width;
+            continue;
+        }
+        let escaped = *body.get(i + 1)?;
+        i += 2;
+        match escaped {
+            b'a' => out.push(0x07),
+            b'b' => out.push(0x08),
+            b'f' => out.push(0x0c),
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b't' => out.push(b'\t'),
+            b'v' => out.push(0x0b),
+            b'\\' => out.push(b'\\'),
+            b'"' => out.push(b'"'),
+            b'x' => out.push(read_hex(body, &mut i, 2)? as u8),
+            b'u' => push_go_rune(&mut out, read_hex(body, &mut i, 4)?)?,
+            b'U' => push_go_rune(&mut out, read_hex(body, &mut i, 8)?)?,
+            b'0'..=b'7' => {
+                let mut value = u32::from(escaped - b'0');
+                for _ in 0..2 {
+                    let digit = *body.get(i)?;
+                    if !(b'0'..=b'7').contains(&digit) {
+                        return None;
+                    }
+                    value = value * 8 + u32::from(digit - b'0');
+                    i += 1;
+                }
+                if value > 0xFF {
+                    return None;
+                }
+                out.push(value as u8);
+            }
+            _ => return None,
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Encode one `\u`/`\U` scalar as UTF-8 bytes; surrogates and out-of-range
+/// values are rejected, matching Go's rune-escape rules.
+fn push_go_rune(out: &mut Vec<u8>, value: u32) -> Option<()> {
+    let ch = char::from_u32(value)?;
+    let mut buffer = [0u8; 4];
+    out.extend_from_slice(ch.encode_utf8(&mut buffer).as_bytes());
+    Some(())
 }
 
 /// Decoded `source` of an import/export, including TS `import x = require(...)`.
@@ -337,6 +770,16 @@ fn read_hex(body: &[u8], i: &mut usize, digits: usize) -> Option<u32> {
 /// are tree-sitter "extra" nodes surfaced as root children. Consecutive docs
 /// accumulate; attributes and decorators keep the pending doc.
 fn top_level_declarations(root: &TsNode<'_>, language: MapLanguage) -> Vec<DeclarationEntry> {
+    // Only these grammars share the frozen node-kind mapping below. Go has its
+    // own declaration kinds (`func`/`type`/`var`/`const`) and its map record is
+    // imports only, so a same-named node kind (e.g. `function_declaration`) is
+    // never relabelled as a TypeScript declaration.
+    if !matches!(
+        language,
+        MapLanguage::Rust | MapLanguage::TypeScript | MapLanguage::Tsx | MapLanguage::JavaScript
+    ) {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     let mut pending_doc = String::new();
     for child in root.children() {
@@ -634,6 +1077,7 @@ fn extract_solidity(source: &str) -> SourceDependencies {
                                         kind: EdgeKind::SolImport,
                                         specifier: std::mem::take(&mut import_spec),
                                         line: edge_line,
+                                        inline_module: Vec::new(),
                                     });
                                 } else {
                                     return empty(MapLanguage::Solidity, ParseStatus::Incomplete);
@@ -732,6 +1176,7 @@ fn extract_solidity(source: &str) -> SourceDependencies {
         parse: ParseStatus::Ok,
         edges,
         declarations,
+        module_declarations: Vec::new(),
         dynamic_omitted: 0,
     }
 }
@@ -1170,6 +1615,7 @@ mod tests {
         assert_eq!(result.language, MapLanguage::Unsupported);
         assert_eq!(result.parse, ParseStatus::Unsupported);
         assert!(result.edges.is_empty());
+        assert!(result.module_declarations.is_empty());
         assert_eq!(result.dynamic_omitted, 0);
     }
 
@@ -1182,6 +1628,392 @@ mod tests {
         assert_eq!(language_for_path("a.mjs"), MapLanguage::JavaScript);
         assert_eq!(language_for_path("a.CJS"), MapLanguage::JavaScript);
         assert_eq!(language_for_path("a.SOL"), MapLanguage::Solidity);
+        assert_eq!(language_for_path("a.go"), MapLanguage::Go);
         assert_eq!(language_for_path("a.py"), MapLanguage::Unsupported);
+    }
+
+    #[test]
+    fn go_import_declarations_carry_grouped_alias_and_raw_specifiers() {
+        let source = concat!(
+            "package main\n",
+            "\n",
+            "import (\n",
+            "\t\"fmt\"\n",
+            "\tm \"example.com/acme/pkg/util\"\n",
+            "\t_ \"example.com/acme/pkg/blank\"\n",
+            "\t. \"strings\"\n",
+            "\t`example.com/acme/pkg/raw`\n",
+            ")\n",
+            "\n",
+            "func main() {}\n",
+        );
+        let result = extract_dependencies("main.go", source);
+        assert_eq!(result.language, MapLanguage::Go);
+        assert_eq!(result.parse, ParseStatus::Ok);
+        let specs: Vec<_> = result
+            .edges
+            .iter()
+            .map(|edge| (edge.kind, edge.specifier.as_str(), edge.line))
+            .collect();
+        assert_eq!(
+            specs,
+            vec![
+                (EdgeKind::Import, "fmt", 4),
+                (EdgeKind::Import, "example.com/acme/pkg/util", 5),
+                (EdgeKind::Import, "example.com/acme/pkg/blank", 6),
+                (EdgeKind::Import, "strings", 7),
+                (EdgeKind::Import, "example.com/acme/pkg/raw", 8),
+            ]
+        );
+        assert!(result.edges.iter().all(|edge| edge.inline_module.is_empty()));
+        assert_eq!(result.dynamic_omitted, 0);
+        assert!(result.declarations.is_empty());
+        assert!(result.module_declarations.is_empty());
+    }
+
+    #[test]
+    fn go_interpreted_escapes_decode_and_invalid_escape_is_incomplete() {
+        let decoded = extract_dependencies(
+            "a.go",
+            "package a\n\nimport \"example.com/\\x61/\\u0062\"\n",
+        );
+        assert_eq!(decoded.parse, ParseStatus::Ok);
+        assert_eq!(decoded.edges[0].specifier, "example.com/a/b");
+
+        let rejected = extract_dependencies("a.go", "package a\n\nimport \"bad\\q\"\n");
+        assert_eq!(rejected.parse, ParseStatus::Incomplete);
+        assert!(rejected.edges.is_empty());
+    }
+
+    #[test]
+    fn go_malformed_source_is_incomplete_with_no_edges() {
+        let result = extract_dependencies("a.go", "package a\n= = =\nimport \"fmt\"\n");
+        assert_eq!(result.parse, ParseStatus::Incomplete);
+        assert!(result.edges.is_empty());
+        assert!(result.module_declarations.is_empty());
+    }
+
+    #[test]
+    fn rust_module_declarations_record_lineage_inline_and_attributes() {
+        let source = concat!(
+            "#[path = \"alt/weird.rs\"]\n",
+            "mod weird;\n",
+            "\n",
+            "/// doc\n",
+            "mod plain;\n",
+            "\n",
+            "#[cfg(test)]\n",
+            "mod tests;\n",
+            "\n",
+            "#[allow(dead_code)]\n",
+            "mod allowed;\n",
+            "\n",
+            "mod outer { mod inner_file; mod inner_inline {} }\n",
+        );
+        let result = extract_dependencies("lib.rs", source);
+        assert_eq!(result.parse, ParseStatus::Ok);
+        let declarations: Vec<_> = result
+            .module_declarations
+            .iter()
+            .map(|declaration| {
+                (
+                    declaration.name.as_str(),
+                    declaration.lineage.clone(),
+                    declaration.inline,
+                    declaration.conservative,
+                    declaration.path_attribute.is_some(),
+                    declaration.line,
+                )
+            })
+            .collect();
+        assert_eq!(
+            declarations,
+            vec![
+                ("weird", vec![], false, true, true, 2),
+                ("plain", vec![], false, false, false, 5),
+                ("tests", vec![], false, true, false, 8),
+                ("allowed", vec![], false, false, false, 11),
+                ("outer", vec![], true, false, false, 13),
+                ("inner_file", vec!["outer".to_string()], false, false, false, 13),
+                ("inner_inline", vec!["outer".to_string()], true, false, false, 13),
+            ]
+        );
+        let mods: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::Mod)
+            .map(|edge| (edge.specifier.as_str(), edge.inline_module.clone()))
+            .collect();
+        assert_eq!(
+            mods,
+            vec![
+                ("weird", vec![]),
+                ("plain", vec![]),
+                ("tests", vec![]),
+                ("allowed", vec![]),
+                ("inner_file", vec!["outer".to_string()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn rust_local_use_groups_expand_and_nonlocal_groups_stay_raw() {
+        let source = concat!(
+            "use crate::store::{Session, Item as I};\n",
+            "use self::inner::{a, b::{c, d}};\n",
+            "use std::io::{Read, Write};\n",
+            "pub use self::inner::Thing as Alias;\n",
+            "use crate::all::*;\n",
+        );
+        let result = extract_dependencies("lib.rs", source);
+        assert_eq!(result.parse, ParseStatus::Ok);
+        let specs: Vec<_> = result
+            .edges
+            .iter()
+            .map(|edge| (edge.kind, edge.specifier.as_str(), edge.line))
+            .collect();
+        assert_eq!(
+            specs,
+            vec![
+                (EdgeKind::Use, "crate::store::Session", 1),
+                (EdgeKind::Use, "crate::store::Item", 1),
+                (EdgeKind::Use, "self::inner::a", 2),
+                (EdgeKind::Use, "self::inner::b::c", 2),
+                (EdgeKind::Use, "self::inner::b::d", 2),
+                (EdgeKind::Use, "std::io::{Read, Write}", 3),
+                (EdgeKind::Use, "self::inner::Thing as Alias", 4),
+                (EdgeKind::Use, "crate::all::*", 5),
+            ]
+        );
+    }
+
+    #[test]
+    fn rust_use_inside_inline_module_carries_inline_context() {
+        let source = "mod outer { use crate::x::Y; use self::z; }\n";
+        let result = extract_dependencies("lib.rs", source);
+        let specs: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::Use)
+            .map(|edge| (edge.specifier.as_str(), edge.inline_module.clone()))
+            .collect();
+        assert_eq!(
+            specs,
+            vec![
+                ("crate::x::Y", vec!["outer".to_string()]),
+                ("self::z", vec!["outer".to_string()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn rust_inline_lineage_is_outer_to_inner_across_levels() {
+        let source = "mod outer { mod inner { use crate::x; mod deep; } }\n";
+        let result = extract_dependencies("lib.rs", source);
+        let uses: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::Use)
+            .map(|edge| (edge.specifier.as_str(), edge.inline_module.clone()))
+            .collect();
+        assert_eq!(
+            uses,
+            vec![(
+                "crate::x",
+                vec!["outer".to_string(), "inner".to_string()],
+            )]
+        );
+        let mods: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::Mod)
+            .map(|edge| (edge.specifier.as_str(), edge.inline_module.clone()))
+            .collect();
+        assert_eq!(
+            mods,
+            vec![(
+                "deep",
+                vec!["outer".to_string(), "inner".to_string()],
+            )]
+        );
+        let declarations: Vec<_> = result
+            .module_declarations
+            .iter()
+            .map(|declaration| {
+                (
+                    declaration.name.as_str(),
+                    declaration.lineage.clone(),
+                    declaration.inline,
+                )
+            })
+            .collect();
+        assert_eq!(
+            declarations,
+            vec![
+                ("outer", vec![], true),
+                ("inner", vec!["outer".to_string()], true),
+                (
+                    "deep",
+                    vec!["outer".to_string(), "inner".to_string()],
+                    false,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn rust_use_group_keeps_self_and_wildcard_leaves() {
+        let source = "use crate::store::{self, Session, inner::*};\n";
+        let result = extract_dependencies("lib.rs", source);
+        assert_eq!(result.parse, ParseStatus::Ok);
+        let specs: Vec<_> = result
+            .edges
+            .iter()
+            .map(|edge| (edge.kind, edge.specifier.as_str()))
+            .collect();
+        assert_eq!(
+            specs,
+            vec![
+                (EdgeKind::Use, "crate::store"),
+                (EdgeKind::Use, "crate::store::Session"),
+                (EdgeKind::Use, "crate::store::inner::*"),
+            ]
+        );
+    }
+
+    #[test]
+    fn go_hex_escapes_decode_to_utf8_bytes() {
+        let decoded = extract_dependencies(
+            "a.go",
+            "package a\n\nimport \"example.com/\\xc3\\xa9\"\n",
+        );
+        assert_eq!(decoded.parse, ParseStatus::Ok);
+        assert_eq!(decoded.edges[0].specifier, "example.com/\u{e9}");
+
+        let rejected = extract_dependencies(
+            "a.go",
+            "package a\n\nimport \"example.com/\\xff\"\n",
+        );
+        assert_eq!(rejected.parse, ParseStatus::Incomplete);
+        assert!(rejected.edges.is_empty());
+    }
+
+    #[test]
+    fn rust_module_attributes_stay_raw_and_qualified_attributes_are_conservative() {
+        let source = concat!(
+            "/// doc\n",
+            "#[cfg(test)]\n",
+            "// plain comment\n",
+            "#[allow(dead_code)]\n",
+            "mod interleaved;\n",
+            "\n",
+            "#[allow::rewrite]\n",
+            "mod qualified;\n",
+        );
+        let result = extract_dependencies("lib.rs", source);
+        assert_eq!(result.parse, ParseStatus::Ok);
+        let declarations: Vec<_> = result
+            .module_declarations
+            .iter()
+            .map(|declaration| {
+                (
+                    declaration.name.as_str(),
+                    declaration.attributes.clone(),
+                    declaration.conservative,
+                    declaration.path_attribute.is_some(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            declarations,
+            vec![
+                (
+                    "interleaved",
+                    vec![
+                        "#[cfg(test)]".to_string(),
+                        "#[allow(dead_code)]".to_string(),
+                    ],
+                    true,
+                    false,
+                ),
+                (
+                    "qualified",
+                    vec!["#[allow::rewrite]".to_string()],
+                    true,
+                    false,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn rust_use_group_bare_wildcard_keeps_its_prefix() {
+        let source = concat!(
+            "use crate::foo::{*};\n",
+            "use crate::bar::{* /* why */};\n",
+        );
+        let result = extract_dependencies("lib.rs", source);
+        assert_eq!(result.parse, ParseStatus::Ok);
+        let specs: Vec<_> = result
+            .edges
+            .iter()
+            .map(|edge| (edge.kind, edge.specifier.as_str(), edge.line))
+            .collect();
+        assert_eq!(
+            specs,
+            vec![
+                (EdgeKind::Use, "crate::foo::*", 1),
+                (EdgeKind::Use, "crate::bar::*", 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn rust_spaced_or_commented_attribute_paths_are_conservative() {
+        let source = concat!(
+            "#[allow :: rewrite]\n",
+            "mod spaced;\n",
+            "#[allow/*x*/::rewrite]\n",
+            "mod commented;\n",
+            "#[allow(dead_code)]\n",
+            "mod plain;\n",
+        );
+        let result = extract_dependencies("lib.rs", source);
+        assert_eq!(result.parse, ParseStatus::Ok);
+        let declarations: Vec<_> = result
+            .module_declarations
+            .iter()
+            .map(|declaration| {
+                (
+                    declaration.name.as_str(),
+                    declaration.attributes.clone(),
+                    declaration.conservative,
+                    declaration.path_attribute.is_some(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            declarations,
+            vec![
+                (
+                    "spaced",
+                    vec!["#[allow :: rewrite]".to_string()],
+                    true,
+                    false,
+                ),
+                (
+                    "commented",
+                    vec!["#[allow/*x*/::rewrite]".to_string()],
+                    true,
+                    false,
+                ),
+                (
+                    "plain",
+                    vec!["#[allow(dead_code)]".to_string()],
+                    false,
+                    false,
+                ),
+            ]
+        );
     }
 }

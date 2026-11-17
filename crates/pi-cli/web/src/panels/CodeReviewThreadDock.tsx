@@ -35,6 +35,7 @@ import {
   type Ref,
 } from 'react';
 import { type ComposerAttachment } from '../attachments';
+import type { ReviewRepository } from '../codeReview';
 import { MarkdownBody } from '../MarkdownBody';
 import { thinkingSummaryHtml } from '../markdown';
 import { safeText } from '../redact';
@@ -70,9 +71,10 @@ export interface CodeReviewThreadDockProps {
    *  comment body resolve against an owner (the click dispatcher requires a
    *  non-empty `data-session-id` ancestor). */
   sessionId: string | null;
-  /** The reviewing repository override, stamped `data-review-repo` beside
-   *  every markdown owner stamp so repo-relative citations resolve. */
-  reviewRepo?: string;
+  /** Snapshot repository authority. `undefined` is not a review owner.
+   *  `null` is the session cwd, a string is a child root, and the unavailable
+   *  object disables citation navigation. */
+  reviewRepo?: ReviewRepository;
   snapshotId: string;
   /** Snapshot's validated per-hunk review findings; the dock derives the
    *  selected hunk's issue list from it (null = unreviewed). */
@@ -289,7 +291,7 @@ export function CodeReviewThreadDock({
               className="code-review__thread-content"
               ref={threadContentRef}
               data-session-id={ownerSessionId}
-              data-review-repo={reviewRepo}
+              {...reviewRepositoryStamp(reviewRepo)}
             >
               {selectedThread?.stale && (
                 <div className="code-review__thread-stale">
@@ -309,7 +311,7 @@ export function CodeReviewThreadDock({
                     comment.partial ? ' is-partial' : ''
                   }`}
                   data-session-id={ownerSessionId}
-                  data-review-repo={reviewRepo}
+                  {...reviewRepositoryStamp(reviewRepo)}
                 >
                   <span className="code-review__comment-role">
                     {safeText(commentRoleLabel(comment.role, comment.model))}
@@ -331,7 +333,7 @@ export function CodeReviewThreadDock({
                 <div
                   className="code-review__comment code-review__comment--assistant is-partial"
                   data-session-id={ownerSessionId}
-                  data-review-repo={reviewRepo}
+                  {...reviewRepositoryStamp(reviewRepo)}
                 >
                   <span className="code-review__comment-role">
                     {safeText(commentRoleLabel('assistant', streamingModel))}
@@ -347,7 +349,7 @@ export function CodeReviewThreadDock({
                 <div
                   className="code-review__comment code-review__comment--assistant is-partial"
                   data-session-id={ownerSessionId}
-                  data-review-repo={reviewRepo}
+                  {...reviewRepositoryStamp(reviewRepo)}
                 >
                   <span className="code-review__comment-role">
                     {safeText(commentRoleLabel('assistant', streamingModel))}
@@ -476,4 +478,13 @@ export function CodeReviewThreadDock({
       )}
     </div>
   );
+}
+
+export function reviewRepositoryStamp(
+  repo: ReviewRepository | undefined,
+): { 'data-review-scope': 'null' | 'child' | 'unavailable'; 'data-review-repo'?: string } | Record<string, never> {
+  if (repo === undefined) return {};
+  if (repo === null) return { 'data-review-scope': 'null' };
+  if (typeof repo === 'string') return { 'data-review-scope': 'child', 'data-review-repo': repo };
+  return { 'data-review-scope': 'unavailable' };
 }

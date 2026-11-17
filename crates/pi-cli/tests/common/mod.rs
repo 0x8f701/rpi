@@ -82,7 +82,7 @@ pub async fn faux_application(label: &str) -> FauxApp {
     let (model, registration) = faux_model(label);
     let cwd = tempfile::tempdir().expect("cwd");
     let session = Session::new(SessionOptions {
-        model,
+        model: Some(model),
         cwd: cwd.path().to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,

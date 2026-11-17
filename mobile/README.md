@@ -14,7 +14,13 @@ cd android && ./gradlew assembleRelease
 
 APK: `android/app/build/outputs/apk/release/rpi-chat-<versionName>.apk` (see `RELEASE.md` for artifact verification).
 
-The release APK contains its JS bundle and does not require Metro. The release variant is signed with the upload keystore from `android/keystore.properties`, not the debug certificate. It is for sideload installation, not store publication.
+The release APK contains its JS bundle and does not require Metro. Release signing is fail-closed: `android/keystore.properties` (untracked; key names are in `android/keystore.properties.example`) must supply `storeFile`, `keyAlias`, `storePassword`, and `keyPassword`, otherwise `assembleRelease` fails with a Gradle error and writes no APK. The checked-in `android/app/debug.keystore` is used by `debug` builds only and never signs a release. Verify a built APK's signer:
+
+```bash
+"${ANDROID_HOME:-$HOME/Android/Sdk}/build-tools/34.0.0/apksigner" verify --print-certs android/app/build/outputs/apk/release/rpi-chat-1.0.0.apk
+```
+
+In CI the four values come from the `ANDROID_RELEASE_*` secrets, and the published APK signer must equal the pinned `ANDROID_RELEASE_CERT_SHA256` repository variable. The APK is for sideload installation, not store publication.
 
 ## Install on a device or emulator
 

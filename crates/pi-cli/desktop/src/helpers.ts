@@ -550,7 +550,7 @@ export function errorPageHtml(failure: LoadFailure): string {
 <html lang="en"><head><meta charset="utf-8"><title>Runner unreachable</title><style>
 ${PAGE_STYLE}
 </style></head><body>
-<h1>rpi desktop could not load the runner</h1>
+<h1>rpi could not load the runner</h1>
 <p>Failing URL: <code>${escapeHtml(failure.failingUrl)}</code></p>
 <p>Failure: ${escapeHtml(failure.description)} <code>${failure.errorCode}</code></p>
 <ul>

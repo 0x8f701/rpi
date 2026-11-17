@@ -380,6 +380,138 @@ impl AgentToolResult {
     }
 }
 
+/// A tool failure that carries a structured [`AgentToolResult`] through an
+/// `anyhow::Error` instead of being flattened to a plain string.
+///
+/// Tools that need the model and the after-tool-call hook to see full
+/// `content` and `details` wrap their result with this error; the agent loop
+/// recognizes it, takes the owned result back, and marks the call failed.
+/// `Display` reuses the result's text content — never a JSON dump — and the
+/// original error stays reachable via [`std::error::Error::source`] so the
+/// chain is not lost.
+#[derive(Debug)]
+pub struct ToolExecutionError {
+    result: AgentToolResult,
+    source: anyhow::Error,
+}
+
+impl ToolExecutionError {
+    /// Wraps `result` as a failed tool call. `source` is the original error
+    /// (use `anyhow!` when the failure has no deeper cause); it is preserved
+    /// as the error chain and never reformatted into the displayed text.
+    pub fn new(result: AgentToolResult, source: anyhow::Error) -> Self {
+        Self { result, source }
+    }
+
+    /// Takes the owned tool result back without cloning.
+    #[must_use]
+    pub fn into_result(self) -> AgentToolResult {
+        self.result
+    }
+}
+
+impl std::fmt::Display for ToolExecutionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Streams the text blocks straight into the formatter — no
+        // intermediate allocation or copy. Separators go between blocks
+        // only: empty Text blocks keep their boundaries, non-Text blocks
+        // are skipped, and no trailing newline is ever emitted.
+        let mut first = true;
+        for block in &self.result.content {
+            let text = match block {
+                ContentBlock::Text { text, .. } => text,
+                _ => continue,
+            };
+            if !first {
+                f.write_str("\n")?;
+            }
+            f.write_str(text)?;
+            first = false;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ToolExecutionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+#[cfg(test)]
+mod tool_execution_error_tests {
+    use super::*;
+    use anyhow::anyhow;
+
+    #[test]
+    fn display_shows_text_content_not_json_and_keeps_the_source_chain() {
+        let result = AgentToolResult {
+            content: vec![
+                ContentBlock::Text {
+                    text: "git failed with exit code 128".to_owned(),
+                    text_signature: None,
+                },
+                ContentBlock::Image {
+                    data: "aGk=".to_owned(),
+                    mime_type: "image/png".to_owned(),
+                },
+                ContentBlock::Text {
+                    text: String::new(),
+                    text_signature: None,
+                },
+                ContentBlock::Text {
+                    text: "fatal: not a git repository".to_owned(),
+                    text_signature: None,
+                },
+            ],
+            details: serde_json::json!({ "exit_code": 128, "stream": "stderr" }),
+            ..AgentToolResult::default()
+        };
+        let error = ToolExecutionError::new(result, anyhow!("fatal: not a git repository"));
+
+        assert_eq!(
+            error.to_string(),
+            "git failed with exit code 128\n\nfatal: not a git repository",
+            "Display must stream text content with empty-Text boundaries kept and non-Text skipped, not JSON"
+        );
+        assert!(
+            !error.to_string().contains("exit_code"),
+            "Display must not leak the details JSON, got {error}"
+        );
+        let source = std::error::Error::source(&error)
+            .expect("the carried source must stay reachable")
+            .to_string();
+        assert_eq!(
+            source, "fatal: not a git repository",
+            "the original error chain must be preserved"
+        );
+    }
+
+    #[test]
+    fn owned_take_recovers_the_full_result_without_cloning() {
+        let mut result = AgentToolResult::text("too many open files");
+        result.details = serde_json::json!({ "fd": 1024 });
+        result.terminate = true;
+        let error = ToolExecutionError::new(result, anyhow!("rlimit hit"));
+
+        let result = error.into_result();
+        assert_eq!(
+            result.content.first().and_then(|block| match block {
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            }),
+            Some("too many open files"),
+            "the owned content must come back untouched"
+        );
+        assert_eq!(
+            result.details,
+            serde_json::json!({ "fd": 1024 }),
+            "the owned details must come back untouched"
+        );
+        assert!(result.terminate, "the owned terminate flag must come back untouched");
+    }
+}
+
 #[derive(Clone)]
 pub struct ToolCallContext {
     pub tool_call_id: String,

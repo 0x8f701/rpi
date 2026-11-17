@@ -110,7 +110,7 @@ fn selector_settings() -> SelectorSettings {
 fn parent_session(contexts: Arc<Mutex<Vec<Context>>>, tool_call_id: &'static str) -> Session {
     let calls = Arc::new(AtomicUsize::new(0));
     let session = Session::new(SessionOptions {
-        model: model(),
+        model: Some(model()),
         cwd: std::env::current_dir().expect("cwd"),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,
@@ -208,7 +208,7 @@ async fn conversational_glm_review_reaches_main_and_spawns_fresh_task_while_glm_
                 });
                 Ok(recorded_session(
                     Session::new(SessionOptions {
-                        model: request.model,
+                        model: Some(request.model),
                         cwd: std::env::current_dir().expect("cwd"),
                         system_prompt: request.system_prompt,
                         thinking_level: request.thinking_level.unwrap_or(ThinkingLevel::Off),
@@ -236,7 +236,7 @@ async fn conversational_glm_review_reaches_main_and_spawns_fresh_task_while_glm_
     )
     .with_selector_settings(selector_settings());
     config.default_agent = "writer".to_owned();
-    config.parent_model = model();
+    config.parent_model = Some(model());
     let runtime = OrchestrationRuntime::new(config, child_factory).expect("runtime");
 
     let _provider = register_nl_provider();

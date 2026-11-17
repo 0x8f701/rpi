@@ -142,6 +142,16 @@ const TRANSIENT_STATUS_TTL: std::time::Duration = std::time::Duration::from_secs
 /// id, so the prefix never has to be unambiguous (SHA-256 repos included).
 const COMMIT_PICKER_SHA_CHARS: usize = 7;
 
+/// Bounded lag-recovery cut attempts (initial cut + one restart retry).
+const LAG_RECOVERY_MAX_CUTS: usize = 2;
+
+/// Drain result for the lag-recovery event sweep.
+enum DrainOutcome {
+    Settled,
+    Restart,
+    Closed,
+}
+
 #[derive(Clone)]
 enum PanelValue {
     Model(Model),
@@ -1083,7 +1093,7 @@ pub async fn interactive(
             terminal.set_code_review_mouse_capture(false)?;
             state.cancel_extension_dialogs();
             state.shutdown_side_chat().await;
-            state.shutdown_code_review().await;
+            state.shutdown_code_review().await?;
             return Ok(TuiExit::Terminal);
         }
     }
@@ -1133,7 +1143,7 @@ pub async fn interactive(
                     terminal.set_code_review_mouse_capture(false)?;
                     state.cancel_extension_dialogs();
                     state.shutdown_side_chat().await;
-                    state.shutdown_code_review().await;
+                    state.shutdown_code_review().await?;
                     return Ok(());
                 };
                 match terminal_event? {
@@ -1220,7 +1230,7 @@ pub async fn interactive(
                                                 terminal.set_code_review_mouse_capture(false)?;
                                                 state.cancel_extension_dialogs();
                                                 state.shutdown_side_chat().await;
-                                                state.shutdown_code_review().await;
+                                                state.shutdown_code_review().await?;
                                                 return Ok(());
                                             }
                                         }
@@ -1242,7 +1252,7 @@ pub async fn interactive(
                                             terminal.set_code_review_mouse_capture(false)?;
                                             state.cancel_extension_dialogs();
                                             state.shutdown_side_chat().await;
-                                            state.shutdown_code_review().await;
+                                            state.shutdown_code_review().await?;
                                             return Ok(());
                                         }
                                     }
@@ -1254,7 +1264,7 @@ pub async fn interactive(
                                 terminal.set_code_review_mouse_capture(false)?;
                                 state.cancel_extension_dialogs();
                                 state.shutdown_side_chat().await;
-                                state.shutdown_code_review().await;
+                                state.shutdown_code_review().await?;
                                 return Ok(());
                             }
                     }
@@ -1263,7 +1273,7 @@ pub async fn interactive(
                             terminal.set_code_review_mouse_capture(false)?;
                             state.cancel_extension_dialogs();
                             state.shutdown_side_chat().await;
-                            state.shutdown_code_review().await;
+                            state.shutdown_code_review().await?;
                             return Ok(());
                         }
                         state.sync_extension_host_bindings();
@@ -1282,7 +1292,7 @@ pub async fn interactive(
                         terminal.resize_live_viewport(&state)?;
                     }
                     Event::Mouse(mouse) => {
-                        if handle_code_review_mouse(&mut state, mouse, &mut terminal)? {
+                        if handle_code_review_mouse(&mut state, mouse, &mut terminal).await? {
                             terminal.sync_code_review_mouse_capture(&state)?;
                         } else {
                             handle_transcript_mouse(&mut state, mouse);
@@ -1298,7 +1308,7 @@ pub async fn interactive(
                         // cwd/runtime. A runtime switch can move to a different
                         // repository, so the loaded snapshot, controller, and mouse
                         // capture must not survive into the new generation.
-                        state.close_code_review_panel(&mut terminal)?;
+                        state.close_code_review_panel(&mut terminal).await?;
                         state.pending_ask.take();
                         // A queued /move belongs to the session that was
                         // active when it was typed; a runtime switch replaces
@@ -1344,40 +1354,15 @@ pub async fn interactive(
                         maybe_run_pending_session_move(&application, &mut state).await;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
-                        state.refresh_job_projection(&application);
-                        state.workflow_snapshots = application
-                            .workflow_list()
-                            .iter()
-                            .map(|snapshot| TuiState::project_workflow_snapshot(&application, snapshot))
-                            .collect();
-                        if let Some(panel) = &mut state.workflow_panel {
-                            panel.replace(state.workflow_snapshots.clone());
-                        }
-                        let phases = application.todo_state().phases;
-                        let outcome = application.todo_dag_outcome();
-                        state.todo_phases = phases.clone();
-                        state.main_todo_status =
-                            MainTodoStatus::from_snapshot(&phases, outcome.status);
-                        if let Some(panel) = &mut state.todo_dag_panel {
-                            panel.update_main(
-                                phases,
-                                outcome.status,
-                                outcome.failure_reason,
-                                state.job_cards.cards_in_source_order(),
-                            );
-                            panel.update_main_delegation_context(
-                                state.job_cards.task_context_sections(),
-                            );
-                            panel.update_workflows(TuiState::todo_workflow_snapshots(&application));
-                        }
-                        state.push_status(format!("UI skipped {count} stale events"), true);
-                        state.reconcile_activity_from_application(&application).await;
+                        state
+                            .recover_from_application_lag(&application, &mut events, count)
+                            .await;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         terminal.set_code_review_mouse_capture(false)?;
                         state.cancel_extension_dialogs();
                         state.shutdown_side_chat().await;
-                        state.shutdown_code_review().await;
+                        state.shutdown_code_review().await?;
                         return Ok(());
                     }
                 }
@@ -1393,7 +1378,7 @@ pub async fn interactive(
                         terminal.set_code_review_mouse_capture(false)?;
                         state.cancel_extension_dialogs();
                         state.shutdown_side_chat().await;
-                        state.shutdown_code_review().await;
+                        state.shutdown_code_review().await?;
                         return Ok(());
                     }
                 }
@@ -1403,7 +1388,7 @@ pub async fn interactive(
                     terminal.set_code_review_mouse_capture(false)?;
                     state.cancel_extension_dialogs();
                     state.shutdown_side_chat().await;
-                    state.shutdown_code_review().await;
+                    state.shutdown_code_review().await?;
                     return Ok(());
                 };
                 if matches!(&background_event, BackgroundEvent::FooterRefresh(_)) {
@@ -1495,7 +1480,9 @@ pub async fn interactive(
         state.cancel_extension_dialogs();
         state.cancel_pending_ask_unchecked(&application);
         state.shutdown_side_chat().await;
-        state.shutdown_code_review().await;
+        if let Err(shutdown_error) = state.shutdown_code_review().await {
+            return Err(shutdown_error).context(error);
+        }
         return Err(error);
     }
     terminal.final_settled_flush(&mut state)?;
@@ -1503,7 +1490,7 @@ pub async fn interactive(
     state.cancel_extension_dialogs();
     state.cancel_pending_ask_unchecked(&application);
     state.shutdown_side_chat().await;
-    state.shutdown_code_review().await;
+    state.shutdown_code_review().await?;
     Ok(exit)
 }
 
@@ -3287,9 +3274,11 @@ struct TuiState {
     code_review_load_generation: u64,
     code_review_load_in_flight: Option<(u64, u64, PathBuf)>,
     code_review_scope: ReviewScope,
-    /// Resolved repository root for the open review (session cwd, or a
-    /// workspace-relative repository operand of `/review`); the snapshot
-    /// capture and the panel diff loads run against this root.
+    /// Resolved repository root for the open review (session cwd, a
+    /// workspace-relative `/review` repository, or the unique child
+    /// repository selected for a bare commit). Snapshot capture, panel
+    /// loads, and async snapshot acceptance all use this root — not the
+    /// session cwd, which stays the parent when the review is a child.
     code_review_root: Option<PathBuf>,
     /// Multi-tab side-chat container. Survives overlay close; cleaned on TUI exit.
     side_chat: Option<SideChatTabs>,
@@ -4476,6 +4465,176 @@ impl TuiState {
         self.sync_jobs_panel_messages(Some(runtime.delivered_messages()));
     }
 
+    /// Repair after the application-event broadcast receiver lagged: bounded
+    /// (2) authoritative cut attempts — reset, replay the cut, drain the
+    /// queued events through the epoch/barrier coverage rules, reconcile live
+    /// activity, refresh delivered mail, then `Recovered`. `Restart` retries
+    /// with a fresh cut; exhaustion/`Closed` report a bounded not-recovered
+    /// notice and never `Recovered`.
+    async fn recover_from_application_lag(
+        &mut self,
+        application: &Application,
+        events: &mut tokio::sync::broadcast::Receiver<ApplicationEvent>,
+        count: u64,
+    ) {
+        for _attempt in 0..LAG_RECOVERY_MAX_CUTS {
+            let snapshot = application.protocol_snapshot().await;
+            // The echoed prompt row survives the reset.
+            let echoed_prompt = self.pending_echo_entry();
+            self.replace_transcript_application(application, &snapshot.messages);
+            self.restore_pending_user_echo(&snapshot.messages, echoed_prompt);
+            match self.drain_application_events(application, &snapshot, events) {
+                DrainOutcome::Settled => {
+                    // Raced runtimes retry before the ghost-wiping refresh.
+                    if application.runtime_epoch() != snapshot.epoch {
+                        continue;
+                    }
+                    self.refresh_job_projection(application);
+                    let phases = application.todo_state().phases;
+                    let outcome = application.todo_dag_outcome();
+                    self.todo_phases = phases.clone();
+                    self.main_todo_status =
+                        MainTodoStatus::from_snapshot(&phases, outcome.status);
+                    if let Some(panel) = &mut self.todo_dag_panel {
+                        panel.update_main(
+                            phases,
+                            outcome.status,
+                            outcome.failure_reason,
+                            self.job_cards.cards_in_source_order(),
+                        );
+                        panel.update_main_delegation_context(
+                            self.job_cards.task_context_sections(),
+                        );
+                    }
+                    // Activity truth is the live application, never the cut's
+                    // cached flags.
+                    self.reconcile_activity_from_application(application).await;
+                    self.refresh_delivered_messages(application);
+                    if application.runtime_epoch() != snapshot.epoch {
+                        continue;
+                    }
+                    self.set_transient_status(format!(
+                        "Recovered UI after {count} lagged events"
+                    ));
+                    return;
+                }
+                DrainOutcome::Restart => continue,
+                DrainOutcome::Closed => break,
+            }
+        }
+        // Exhausted or closed: never report Recovered; the select loop
+        // continues on the last authoritative cut.
+        self.push_status(
+            format!("UI skipped {count} stale events; lag recovery did not settle"),
+            true,
+        );
+    }
+
+    /// Classify queued events against the cut: live-epoch mismatch →
+    /// Restart; foreign epoch → drop; covered barrier → drop; else apply.
+    /// `RuntimeChanged` → Restart; `MessageDelivered` → skip; `Lagged` →
+    /// resubscribe + Restart; `Empty` → Settled; `Closed` → propagate.
+    fn drain_application_events(
+        &mut self,
+        application: &Application,
+        snapshot: &pi_coding::ApplicationProtocolSnapshot,
+        events: &mut tokio::sync::broadcast::Receiver<ApplicationEvent>,
+    ) -> DrainOutcome {
+        loop {
+            match events.try_recv() {
+                Ok(ApplicationEvent::AgentPublished {
+                    event,
+                    epoch,
+                    barrier,
+                }) => {
+                    if application.runtime_epoch() != snapshot.epoch {
+                        return DrainOutcome::Restart;
+                    }
+                    if epoch != snapshot.epoch {
+                        continue;
+                    }
+                    if barrier <= snapshot.event_barrier {
+                        continue;
+                    }
+                    self.apply(ApplicationEvent::Agent(event));
+                }
+                Ok(ApplicationEvent::RuntimeChanged { .. }) => return DrainOutcome::Restart,
+                Ok(ApplicationEvent::Orchestration(
+                    pi_coding::OrchestrationEvent::MessageDelivered { .. },
+                )) => continue,
+                Ok(ApplicationEvent::Workflow(workflow)) => {
+                    if application.runtime_epoch() != snapshot.epoch {
+                        return DrainOutcome::Restart;
+                    }
+                    self.apply_workflow_event(application, workflow);
+                }
+                Ok(event) => {
+                    // No epoch on non-agent events: apply only while the
+                    // live runtime still matches the cut.
+                    if application.runtime_epoch() != snapshot.epoch {
+                        return DrainOutcome::Restart;
+                    }
+                    match event {
+                        // No per-event authority reads; the Settled refresh is the sole authority.
+                        ApplicationEvent::Orchestration(_) => self.apply(event),
+                        event => self.apply_live_application_event(application, event),
+                    }
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                    // Poisoned backlog: the fresh cut covers what persisted.
+                    *events = events.resubscribe();
+                    return DrainOutcome::Restart;
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                    return DrainOutcome::Closed;
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                    return DrainOutcome::Settled;
+                }
+            }
+        }
+    }
+
+    /// Last-writer delivered-mail refresh (no job-card/task-context clear).
+    fn refresh_delivered_messages(&mut self, application: &Application) {
+        self.sync_jobs_panel_messages(
+            application
+                .orchestration_runtime()
+                .map(|runtime| runtime.delivered_messages()),
+        );
+    }
+
+    /// The echoed-but-unconfirmed prompt row, if one is pending.
+    fn pending_echo_entry(&self) -> Option<TranscriptEntry> {
+        if !self.pending_user_echo {
+            return None;
+        }
+        self.transcript
+            .iter()
+            .rev()
+            .find(|entry| entry.kind == TranscriptKind::User)
+            .cloned()
+    }
+
+    /// Reconcile the captured pending echo against the cut: covered → the
+    /// flag clears (no duplicate row); else the row is re-pushed, flag armed.
+    fn restore_pending_user_echo(&mut self, messages: &[Message], echoed: Option<TranscriptEntry>) {
+        let Some(entry) = echoed else {
+            return;
+        };
+        let echoed_text = content_text(&entry.content);
+        let covered = messages.iter().any(|message| {
+            matches!(message, Message::User(_))
+                && message_text(message.clone()).is_some_and(|text| text == echoed_text)
+        });
+        if covered {
+            self.pending_user_echo = false;
+        } else {
+            self.pending_user_echo = true;
+            self.push_entry(entry);
+        }
+    }
+
     fn sync_jobs_panel_messages(&mut self, messages: Option<Vec<pi_coding::MailboxMessage>>) {
         let Some(panel) = &mut self.jobs_panel else {
             return;
@@ -4488,13 +4647,13 @@ impl TuiState {
         }
     }
 
-    fn open_jobs_panel(
+    async fn open_jobs_panel(
         &mut self,
         application: &Application,
         irc: bool,
         mouse: &mut impl CodeReviewMouseController,
     ) -> Result<()> {
-        self.close_code_review_panel(mouse)?;
+        self.close_code_review_panel(mouse).await?;
         self.panel = None;
         self.settings_panel = None;
         self.tree_panel = None;
@@ -4533,6 +4692,10 @@ impl TuiState {
         self.queued_follow_up = follow_up.len();
         self.queued_steering = steering.into_iter().filter_map(message_text).collect();
         self.is_streaming = application.is_streaming();
+        self.pending_ask = application
+            .pending_ask()
+            .map(|(id, prompt)| PendingAsk { id, prompt });
+        self.is_compacting = application.session().is_compacting();
         if self.is_streaming {
             if let Some(model) = application.active_turn_model() {
                 let active_turn_model = model_reference(&model);
@@ -5102,6 +5265,14 @@ impl TuiState {
     /// Reset ledger indices before replay so committed history from the old
     /// conversation can never index into the shorter replacement transcript.
     fn replace_transcript_from_application(&mut self, application: &Application) {
+        self.replace_transcript_application(application, &application.messages());
+    }
+
+    /// The message-source parameterization of the reset: lag recovery
+    /// replays the one authoritative protocol-snapshot cut instead of a
+    /// second live history read (the cut and the replay must describe the
+    /// same barrier).
+    fn replace_transcript_application(&mut self, application: &Application, messages: &[Message]) {
         let session = application.session();
         self.model = session.model().map_or_else(
             || "no model".to_owned(),
@@ -5146,7 +5317,7 @@ impl TuiState {
         self.composer_error_is_warning = false;
         self.pending_user_echo = false;
         self.pending_ask.take();
-        self.rebuild_prompt_history_from_messages(application.messages());
+        self.rebuild_prompt_history_from_messages(messages.iter().cloned());
         self.reset_tool_projection();
         self.refresh_job_projection(application);
         self.todo_phases = application.todo_state().phases;
@@ -5157,8 +5328,8 @@ impl TuiState {
             .iter()
             .map(WorkflowPanelSnapshot::from)
             .collect();
-        for message in application.messages() {
-            self.push_message(message);
+        for message in messages {
+            self.push_message(message.clone());
         }
         self.sync_jobs_panel_messages(
             application
@@ -6061,7 +6232,7 @@ impl TuiState {
                 let current = self.code_review_load_in_flight.as_ref()
                     == Some(&(controller_generation, generation, cwd.clone()))
                     && self.code_review_controller_generation == controller_generation
-                    && self.cwd_path == cwd
+                    && self.code_review_root.as_ref() == Some(&cwd)
                     && self.code_review_panel.is_some()
                     && self.code_review_controller.is_some();
                 if !current {
@@ -6154,7 +6325,7 @@ impl TuiState {
                     let current = self.code_review_load_in_flight.as_ref()
                         == Some(&(controller_generation, generation, cwd.clone()))
                         && self.code_review_controller_generation == controller_generation
-                        && self.cwd_path == cwd
+                        && self.code_review_root.as_ref() == Some(&cwd)
                         && self.code_review_panel.is_some();
                     debug_assert!(
                         !current,
@@ -6834,7 +7005,7 @@ impl TuiState {
         application: &Application,
         mouse: &mut impl CodeReviewMouseController,
     ) -> Result<()> {
-        self.close_code_review_panel(mouse)?;
+        self.close_code_review_panel(mouse).await?;
         let current = application.state().await.model;
         let models = available_models().await;
         self.panel = None;
@@ -6855,7 +7026,7 @@ impl TuiState {
         application: &Application,
         mouse: &mut impl CodeReviewMouseController,
     ) -> Result<()> {
-        self.close_code_review_panel(mouse)?;
+        self.close_code_review_panel(mouse).await?;
         let state = application.state().await;
         self.panel = Some(SelectorPanel {
             kind: SelectorPanelKind::Normal,
@@ -6884,7 +7055,7 @@ impl TuiState {
         application: &Application,
         mouse: &mut impl CodeReviewMouseController,
     ) -> Result<()> {
-        self.close_code_review_panel(mouse)?;
+        self.close_code_review_panel(mouse).await?;
         let current = application.session().recorder_info().map(|(_, path)| path);
         let rows = match load_cwd_resume_rows(application) {
             Ok(rows) => rows,
@@ -6906,7 +7077,7 @@ impl TuiState {
         &mut self,
         mouse: &mut impl CodeReviewMouseController,
     ) -> Result<()> {
-        self.close_code_review_panel(mouse)?;
+        self.close_code_review_panel(mouse).await?;
         let models = available_models().await;
         self.panel = None;
         self.side_chat_open = false;
@@ -6919,12 +7090,12 @@ impl TuiState {
         Ok(())
     }
 
-    fn open_settings_panel(
+    async fn open_settings_panel(
         &mut self,
         application: &Application,
         mouse: &mut impl CodeReviewMouseController,
     ) -> Result<()> {
-        self.close_code_review_panel(mouse)?;
+        self.close_code_review_panel(mouse).await?;
         self.panel = None;
         self.tree_panel = None;
         self.process_panel = None;
@@ -6964,12 +7135,12 @@ impl TuiState {
             )
     }
 
-    fn open_workflow_panel(
+    async fn open_workflow_panel(
         &mut self,
         application: &Application,
         mouse: &mut impl CodeReviewMouseController,
     ) -> Result<()> {
-        self.close_code_review_panel(mouse)?;
+        self.close_code_review_panel(mouse).await?;
         self.todo_dag_panel = None;
         self.panel = None;
         self.side_chat_open = false;
@@ -7031,7 +7202,7 @@ impl TuiState {
             .collect()
     }
 
-    fn begin_open_todo_child_panel(
+    async fn begin_open_todo_child_panel(
         &mut self,
         application: &Application,
         mouse: &mut impl CodeReviewMouseController,
@@ -7048,7 +7219,7 @@ impl TuiState {
             );
             return Ok(false);
         };
-        self.close_code_review_panel(mouse)?;
+        self.close_code_review_panel(mouse).await?;
         self.panel = None;
         self.settings_panel = None;
         self.jobs_panel = None;
@@ -7067,12 +7238,12 @@ impl TuiState {
         Ok(true)
     }
 
-    fn open_todo_dag_panel(
+    async fn open_todo_dag_panel(
         &mut self,
         application: &Application,
         mouse: &mut impl CodeReviewMouseController,
     ) -> Result<()> {
-        self.close_code_review_panel(mouse)?;
+        self.close_code_review_panel(mouse).await?;
         self.panel = None;
         self.settings_panel = None;
         self.jobs_panel = None;
@@ -7106,12 +7277,12 @@ impl TuiState {
     /// overlay owns both. The child list dispatch is skipped when no parent
     /// session is recorded, so bare `/todo` stays usable before recording
     /// starts. Tasks remains focused; Tab switches to Child sessions once it mounts.
-    fn open_unified_todo_panel(
+    async fn open_unified_todo_panel(
         &mut self,
         application: &Application,
         mouse: &mut impl CodeReviewMouseController,
     ) -> Result<()> {
-        self.open_todo_dag_panel(application, mouse)?;
+        self.open_todo_dag_panel(application, mouse).await?;
         // Side-mount the Child domain so one overlay owns both. Skip the
         // child list dispatch before the parent session is recorded: the
         // child handler would set a "Loading Todo child…" status with no
@@ -7122,12 +7293,12 @@ impl TuiState {
         Ok(())
     }
 
-    fn open_activity_panel(
+    async fn open_activity_panel(
         &mut self,
         application: &Application,
         mouse: &mut impl CodeReviewMouseController,
     ) -> Result<()> {
-        self.close_code_review_panel(mouse)?;
+        self.close_code_review_panel(mouse).await?;
         self.panel = None;
         self.settings_panel = None;
         self.jobs_panel = None;
@@ -7157,11 +7328,11 @@ impl TuiState {
         Ok(())
     }
 
-    fn dismiss_page_overlays_for_side_chat(
+    async fn dismiss_page_overlays_for_side_chat(
         &mut self,
         mouse: &mut impl CodeReviewMouseController,
     ) -> Result<()> {
-        self.close_code_review_panel(mouse)?;
+        self.close_code_review_panel(mouse).await?;
         self.panel = None;
         self.settings_panel = None;
         self.settings_value_input = None;
@@ -7189,7 +7360,7 @@ impl TuiState {
         initial_prompt: Option<&str>,
         mouse: &mut impl CodeReviewMouseController,
     ) -> Result<()> {
-        self.dismiss_page_overlays_for_side_chat(mouse)?;
+        self.dismiss_page_overlays_for_side_chat(mouse).await?;
         self.ensure_side_chat_container(application).await?;
         self.side_chat_open = true;
         if let Some(prompt) = initial_prompt
@@ -7263,7 +7434,7 @@ impl TuiState {
                     self.push_status(format!("Cannot create tab: {error:#}"), true);
                     return Ok(());
                 }
-                self.dismiss_page_overlays_for_side_chat(mouse)?;
+                self.dismiss_page_overlays_for_side_chat(mouse).await?;
                 self.ensure_side_chat_container(application).await?;
                 let Some(tabs) = self.side_chat.as_mut() else {
                     return Ok(());
@@ -7283,7 +7454,7 @@ impl TuiState {
                 }
             }
             "list" => {
-                self.dismiss_page_overlays_for_side_chat(mouse)?;
+                self.dismiss_page_overlays_for_side_chat(mouse).await?;
                 self.ensure_side_chat_container(application).await?;
                 if let Some(tabs) = self.side_chat.as_ref() {
                     let active = tabs.active_name();
@@ -7314,7 +7485,7 @@ impl TuiState {
                     self.push_status("No side chat open".to_owned(), true);
                     return Ok(());
                 }
-                self.dismiss_page_overlays_for_side_chat(mouse)?;
+                self.dismiss_page_overlays_for_side_chat(mouse).await?;
                 let Some(tabs) = self.side_chat.as_mut() else {
                     return Ok(());
                 };
@@ -7336,7 +7507,7 @@ impl TuiState {
             }
             _ => {
                 // Exact-name match wins (names are single words): instant switch.
-                self.dismiss_page_overlays_for_side_chat(mouse)?;
+                self.dismiss_page_overlays_for_side_chat(mouse).await?;
                 self.ensure_side_chat_container(application).await?;
                 if let Some(tabs) = self.side_chat.as_mut()
                     && tabs.contains(trimmed)
@@ -7566,8 +7737,17 @@ impl TuiState {
             self.status = "Detach from the PTY before opening code review".to_owned();
             return Ok(());
         }
-        let review_root = match crate::code_review::review_repository_root(application, repo.as_deref())
-        {
+        let revision = match &scope {
+            ReviewScope::Commit { commit, .. } => Some(commit.as_str()),
+            ReviewScope::WorkingTree
+            | ReviewScope::BaseToWorkingTree { .. }
+            | ReviewScope::Revisions { .. } => None,
+        };
+        let review_root = match crate::code_review::resolve_review_repository_root(
+            application,
+            repo.as_deref(),
+            revision,
+        ) {
             Ok(root) => root,
             Err(error) => {
                 self.push_status(format!("Cannot open code review: {error:#}"), true);
@@ -7576,7 +7756,7 @@ impl TuiState {
         };
         self.code_review_scope = scope;
         self.code_review_root = Some(review_root.clone());
-        self.shutdown_code_review().await;
+        self.shutdown_code_review().await?;
         self.code_review_controller_generation =
             self.code_review_controller_generation.wrapping_add(1);
         let controller = match CodeReviewController::fork_from(application).await {
@@ -7613,36 +7793,32 @@ impl TuiState {
         self.request_code_review_snapshot();
         if let Err(error) = mouse.set_code_review_mouse_capture(true) {
             self.code_review_panel = None;
-            self.shutdown_code_review().await;
+            if let Err(shutdown_error) = self.shutdown_code_review().await {
+                return Err(shutdown_error).context(error);
+            }
             return Err(error);
         }
         self.status = "Code review · c comment · [/] hunk · r refresh · Alt+R refork · Esc stop selected · q close".to_owned();
         Ok(())
     }
 
-    fn close_code_review_panel(
+    async fn close_code_review_panel(
         &mut self,
         mouse: &mut impl CodeReviewMouseController,
     ) -> Result<()> {
         let was_open = self.code_review_panel.is_some();
         mouse.set_code_review_mouse_capture(false)?;
-        self.code_review_panel = None;
-        self.code_review_load_generation = self.code_review_load_generation.wrapping_add(1);
-        self.code_review_load_in_flight = None;
-        if let Some(mut controller) = self.code_review_controller.take() {
-            self.code_review_cleanup = Some(tokio::spawn(async move {
-                controller.shutdown().await;
-            }));
-        }
+        self.shutdown_code_review().await?;
         if was_open {
             self.status = "Ready".to_owned();
         }
         Ok(())
     }
 
-    async fn shutdown_code_review(&mut self) {
-        if let Some(mut controller) = self.code_review_controller.take() {
-            controller.shutdown().await;
+    async fn shutdown_code_review(&mut self) -> Result<()> {
+        if let Some(controller) = self.code_review_controller.as_mut() {
+            controller.shutdown().await?;
+            self.code_review_controller = None;
         }
         if let Some(cleanup) = self.code_review_cleanup.take() {
             let _ = cleanup.await;
@@ -7650,6 +7826,7 @@ impl TuiState {
         self.code_review_panel = None;
         self.code_review_load_generation = self.code_review_load_generation.wrapping_add(1);
         self.code_review_load_in_flight = None;
+        Ok(())
     }
 
     async fn open_agents_panel(
@@ -7657,7 +7834,7 @@ impl TuiState {
         application: &Application,
         mouse: &mut impl CodeReviewMouseController,
     ) -> Result<()> {
-        self.close_code_review_panel(mouse)?;
+        self.close_code_review_panel(mouse).await?;
         let models = available_models().await;
         self.panel = None;
         self.side_chat_open = false;
@@ -7674,23 +7851,23 @@ impl TuiState {
         Ok(())
     }
 
-    fn open_tree_panel(
+    async fn open_tree_panel(
         &mut self,
         application: &Application,
         mouse: &mut impl CodeReviewMouseController,
     ) -> Result<()> {
-        self.open_session_tree_panel(application, TreePanelMode::Navigate, mouse)
+        self.open_session_tree_panel(application, TreePanelMode::Navigate, mouse).await
     }
 
-    fn open_fork_panel(
+    async fn open_fork_panel(
         &mut self,
         application: &Application,
         mouse: &mut impl CodeReviewMouseController,
     ) -> Result<()> {
-        self.open_session_tree_panel(application, TreePanelMode::Fork, mouse)
+        self.open_session_tree_panel(application, TreePanelMode::Fork, mouse).await
     }
 
-    fn open_session_tree_panel(
+    async fn open_session_tree_panel(
         &mut self,
         application: &Application,
         mode: TreePanelMode,
@@ -7698,7 +7875,7 @@ impl TuiState {
     ) -> Result<()> {
         match application.session_tree() {
             Ok(tree) => {
-                self.close_code_review_panel(mouse)?;
+                self.close_code_review_panel(mouse).await?;
                 // Dismiss every other page overlay so the tree panel is the
                 // single visible owner (mirrors `open_workflow_panel` and
                 // `dismiss_page_overlays_for_side_chat`). A non-capturing
@@ -7807,7 +7984,7 @@ impl TuiState {
     }
 
 
-    fn open_trust_panel(
+    async fn open_trust_panel(
         &mut self,
         application: &Application,
         mouse: &mut impl CodeReviewMouseController,
@@ -7815,7 +7992,7 @@ impl TuiState {
         let current = application
             .resource_snapshot()
             .map(|snapshot| snapshot.trust.decision);
-        self.close_code_review_panel(mouse)?;
+        self.close_code_review_panel(mouse).await?;
         self.side_chat_open = false;
         self.panel = Some(SelectorPanel {
             kind: SelectorPanelKind::Normal,
@@ -7852,12 +8029,12 @@ impl TuiState {
         Ok(())
     }
 
-    fn open_goal_panel(
+    async fn open_goal_panel(
         &mut self,
         application: &Application,
         mouse: &mut impl CodeReviewMouseController,
     ) -> Result<()> {
-        self.close_code_review_panel(mouse)?;
+        self.close_code_review_panel(mouse).await?;
         self.panel = None;
         self.settings_panel = None;
         self.tree_panel = None;
@@ -7998,7 +8175,7 @@ async fn handle_tree_panel_key(
                 if let Some((target_id, label)) = panel.finish_label_edit() {
                     match application.set_session_label(&target_id, label.as_deref()) {
                         Ok(()) => {
-                            state.open_session_tree_panel(application, panel.mode, mouse)?;
+                            state.open_session_tree_panel(application, panel.mode, mouse).await?;
                             return Ok(Some(false));
                         }
                         Err(error) => {
@@ -9122,7 +9299,7 @@ async fn handle_code_review_panel_key(
     let action = panel.handle_key(key);
     match action {
         CodeReviewPanelResult::Close => {
-            state.close_code_review_panel(terminal)?;
+            state.close_code_review_panel(terminal).await?;
         }
         CodeReviewPanelResult::SubmitComment => {
             state.status = code_review_submit_status(submit_code_review_comment(state));
@@ -9133,15 +9310,26 @@ async fn handle_code_review_panel_key(
                 .as_ref()
                 .and_then(CodeReviewPanel::selected_hunk_identity);
             if let Some(controller) = state.code_review_controller.as_mut() {
-                if let Some(identity) = identity {
-                    controller.abort_hunk(&identity).await;
-                    state.status = "Code review hunk stopped".to_owned();
+                if let Some(identity) = identity.clone() {
+                    let stop_error = match controller.abort_hunk(&identity).await {
+                        Ok(()) => None,
+                        Err(error) => Some(format!("{error:#}")),
+                    };
+                    if let Some(panel) = state.code_review_panel.as_mut() {
+                        panel.sync_controller(controller);
+                    }
+                    match stop_error {
+                        None => state.status = "Code review hunk stopped".to_owned(),
+                        Some(error) => state.push_status(
+                            format!("Code review stop failed: {error}"),
+                            true,
+                        ),
+                    }
                 } else {
-                    // No selected identity: full abort remains the close/shutdown path only.
                     state.status = "No selected hunk to stop".to_owned();
-                }
-                if let Some(panel) = state.code_review_panel.as_mut() {
-                    panel.sync_controller(controller);
+                    if let Some(panel) = state.code_review_panel.as_mut() {
+                        panel.sync_controller(controller);
+                    }
                 }
             }
         }
@@ -9214,6 +9402,26 @@ async fn handle_code_review_panel_key(
                 if let Some(panel) = state.code_review_panel.as_mut() {
                     panel.sync_controller(controller);
                 }
+            }
+        }
+        CodeReviewPanelResult::Summary => {
+            let language = state
+                .code_review_controller
+                .as_ref()
+                .and_then(|controller| controller.review_language_default().map(str::to_owned));
+            let mut start_error = None;
+            if let Some(controller) = state.code_review_controller.as_mut() {
+                if let Err(error) = controller.start_tldr(&snapshot, language.as_deref()) {
+                    start_error = Some(format!("Summary failed: {error:#}"));
+                } else {
+                    state.status = "Summary started".to_owned();
+                }
+                if let Some(panel) = state.code_review_panel.as_mut() {
+                    panel.sync_controller(controller);
+                }
+            }
+            if let Some(error) = start_error {
+                state.push_status(error, true);
             }
         }
         CodeReviewPanelResult::Stop(operation) => {
@@ -9298,7 +9506,7 @@ async fn handle_side_chat_key(state: &mut TuiState, key: KeyEvent) -> Result<Opt
     }
 }
 
-fn handle_code_review_mouse(
+async fn handle_code_review_mouse(
     state: &mut TuiState,
     mouse: MouseEvent,
     terminal: &mut TerminalGuard,
@@ -9311,7 +9519,7 @@ fn handle_code_review_mouse(
     }
     match panel.handle_mouse(mouse) {
         CodeReviewPanelResult::Close => {
-            state.close_code_review_panel(terminal)?;
+            state.close_code_review_panel(terminal).await?;
         }
         CodeReviewPanelResult::SubmitComment
         | CodeReviewPanelResult::AbortReview
@@ -9321,6 +9529,7 @@ fn handle_code_review_mouse(
         | CodeReviewPanelResult::Busy
         | CodeReviewPanelResult::AutoReview
         | CodeReviewPanelResult::Highlight
+        | CodeReviewPanelResult::Summary
         | CodeReviewPanelResult::Stop(_)
         | CodeReviewPanelResult::Unknown
         | CodeReviewPanelResult::Handled => {}
@@ -9468,7 +9677,7 @@ async fn handle_panel_key(
                 PanelValue::SettingsTheme => {
                     state.themes.cycle(1);
                     state.status = format!("Theme: {}", state.themes.active_name());
-                    state.open_settings_panel(application, terminal)?;
+                    state.open_settings_panel(application, terminal).await?;
                 }
                 PanelValue::SettingsAutoCompact => {
                     let enabled = !application.state().await.auto_compaction_enabled;
@@ -9477,7 +9686,7 @@ async fn handle_panel_key(
                         "Automatic compaction {}",
                         if enabled { "enabled" } else { "disabled" }
                     );
-                    state.open_settings_panel(application, terminal)?;
+                    state.open_settings_panel(application, terminal).await?;
                 }
                 PanelValue::Trust(decision) => {
                     match application.set_project_trust(decision).await {
@@ -10219,7 +10428,7 @@ async fn handle_agents_panel_key(
 async fn refresh_agents_panel_from_application(application: &Application, panel: &mut AgentsPanel) {
     let models = available_models().await;
     if let Some(snapshot) = application.resource_snapshot() {
-        let parent = application.session().model().unwrap_or_default();
+        let parent = application.session().model();
         let global_agents = application
             .session()
             .resource_manager()
@@ -10442,7 +10651,7 @@ async fn dispatch_pending_terminal_events(
             }
             Event::Resize(_, _) => terminal.resize_live_viewport(state)?,
             Event::Mouse(mouse) => {
-                if handle_code_review_mouse(state, mouse, terminal)? {
+                if handle_code_review_mouse(state, mouse, terminal).await? {
                     terminal.sync_code_review_mouse_capture(state)?;
                 } else {
                     handle_transcript_mouse(state, mouse);
@@ -10814,8 +11023,8 @@ async fn handle_key(
         if double {
             state.last_escape = None;
             match state.double_escape_action {
-                DoubleEscapeAction::Tree => state.open_tree_panel(application, terminal)?,
-                DoubleEscapeAction::Fork => state.open_fork_panel(application, terminal)?,
+                DoubleEscapeAction::Tree => state.open_tree_panel(application, terminal).await?,
+                DoubleEscapeAction::Fork => state.open_fork_panel(application, terminal).await?,
                 DoubleEscapeAction::None => {}
             }
             return Ok(false);
@@ -10968,13 +11177,21 @@ async fn dispatch_action(
                 application.abort_bash();
                 state.status = "Aborting bash command".to_owned();
             } else if state.is_streaming {
-                application.abort().await;
-                state.status = "Aborting".to_owned();
+                if let Err(error) = application.abort().await {
+                    state.push_status(format!("Abort failed: {error:#}"), true);
+                } else {
+                    state.status = "Aborting".to_owned();
+                }
+
             } else if state.is_compacting {
                 // Compaction runs on a background task; Escape cancels it via
                 // the compaction controller (abort_compaction inside abort()).
-                application.abort().await;
-                state.status = "Aborting compaction".to_owned();
+                if let Err(error) = application.abort().await {
+                    state.push_status(format!("Abort failed: {error:#}"), true);
+                } else {
+                    state.status = "Aborting compaction".to_owned();
+                }
+
             } else if state.editor.is_empty() && !state.pending_attachments.is_empty() {
                 state.pending_attachments.clear();
                 state.status = "Removed pending image attachments".to_owned();
@@ -10995,13 +11212,21 @@ async fn dispatch_action(
                 state.last_ctrl_c = None;
                 state.status = "Aborting bash command".to_owned();
             } else if state.is_streaming {
-                application.abort().await;
+                if let Err(error) = application.abort().await {
+                    state.push_status(format!("Abort failed: {error:#}"), true);
+                } else {
+                    state.status = "Aborting".to_owned();
+                }
                 state.last_ctrl_c = None;
-                state.status = "Aborting".to_owned();
+
             } else if state.is_compacting {
-                application.abort().await;
+                if let Err(error) = application.abort().await {
+                    state.push_status(format!("Abort failed: {error:#}"), true);
+                } else {
+                    state.status = "Aborting compaction".to_owned();
+                }
                 state.last_ctrl_c = None;
-                state.status = "Aborting compaction".to_owned();
+
             } else if handle_ctrl_c_clear_or_exit(state, std::time::Instant::now()) {
                 terminal.set_code_review_mouse_capture(false)?;
                 return Ok(true);
@@ -11011,7 +11236,9 @@ async fn dispatch_action(
             if state.editor.is_empty() && state.pending_attachments.is_empty() {
                 terminal.set_code_review_mouse_capture(false)?;
                 if state.is_streaming {
-                    application.abort().await;
+                    if let Err(error) = application.abort().await {
+                        state.push_status(format!("Abort failed: {error:#}"), true);
+                    }
                 }
                 return Ok(true);
             }
@@ -11136,8 +11363,8 @@ async fn dispatch_action(
             }
         }
         Action::SessionResume => state.open_session_panel(application, terminal).await?,
-        Action::SessionTree => state.open_tree_panel(application, terminal)?,
-        Action::SessionFork => state.open_fork_panel(application, terminal)?,
+        Action::SessionTree => state.open_tree_panel(application, terminal).await?,
+        Action::SessionFork => state.open_fork_panel(application, terminal).await?,
         Action::FileViewerOpen => state.open_or_toggle_file_viewer(application),
         Action::SessionToggleNamedFilter
         | Action::SessionTogglePath
@@ -11489,7 +11716,7 @@ enum TodoOverlayPage {
 /// [`pi_coding::TodoOp`]; any other argument is parsed as todo markdown and
 /// replaces the session plan. The TUI keeps the text list path for non-TUI
 /// callers (REPL/print/RPC).
-fn dispatch_todo_command(
+async fn dispatch_todo_command(
     application: &Application,
     state: &mut TuiState,
     mouse: &mut impl CodeReviewMouseController,
@@ -11498,11 +11725,11 @@ fn dispatch_todo_command(
     let argument = argument.unwrap_or("");
     match crate::todo_child_commands::parse_todo_command(argument) {
         Ok(TodoCommand::Open) => {
-            state.open_unified_todo_panel(application, mouse)?;
+            state.open_unified_todo_panel(application, mouse).await?;
             Ok(true)
         }
         Ok(TodoCommand::Child(command)) => {
-            dispatch_parsed_todo_child_command(application, state, mouse, command)?;
+            dispatch_parsed_todo_child_command(application, state, mouse, command).await?;
             Ok(true)
         }
         Ok(TodoCommand::Dag(operation)) => apply_todo_op(application, state, operation),
@@ -11675,14 +11902,14 @@ fn switch_todo_overlay_page(state: &mut TuiState, key: KeyEvent) -> bool {
 
 /// Child-domain verb routing for legacy internal callers. Unified `/todo`
 /// parses once and calls [`dispatch_parsed_todo_child_command`] directly.
-fn dispatch_todo_child_command(
+async fn dispatch_todo_child_command(
     application: &Application,
     state: &mut TuiState,
     mouse: &mut impl CodeReviewMouseController,
     argument: Option<&str>,
 ) -> Result<()> {
     match crate::todo_child_commands::parse_todo_child_command(argument.unwrap_or("list")) {
-        Ok(command) => dispatch_parsed_todo_child_command(application, state, mouse, command),
+        Ok(command) => dispatch_parsed_todo_child_command(application, state, mouse, command).await,
         Err(error) => {
             state.push_status(format!("/todo: {error}"), true);
             Ok(())
@@ -11690,7 +11917,7 @@ fn dispatch_todo_child_command(
     }
 }
 
-fn dispatch_parsed_todo_child_command(
+async fn dispatch_parsed_todo_child_command(
     application: &Application,
     state: &mut TuiState,
     mouse: &mut impl CodeReviewMouseController,
@@ -11714,7 +11941,7 @@ fn dispatch_parsed_todo_child_command(
         | TodoChildCommand::Cancel { child_session_id } => child_session_id.clone(),
         TodoChildCommand::New { .. } | TodoChildCommand::List => None,
     };
-    if !opens_page || state.begin_open_todo_child_panel(application, mouse)? {
+    if !opens_page || state.begin_open_todo_child_panel(application, mouse).await? {
         state.admit_todo_child_command(application, command, opens_page, detail_child_session_id);
     }
     state.todo_overlay_page = TodoOverlayPage::Child;
@@ -11990,7 +12217,7 @@ async fn dispatch_queue_command(
                 };
                 return;
             }
-            match application.send_queued_steering_now().await {
+            match application.send_queued_steering_now(None).await {
                 Ok(result) => {
                     state.status = if result.combined {
                         format!("Sent {} steering prompts together", result.sent)
@@ -12136,7 +12363,7 @@ async fn dispatch_workflow_command(
         {
             Ok(crate::workflow_commands::WorkflowCommandEffect::OpenPage)
             | Ok(crate::workflow_commands::WorkflowCommandEffect::Message(_)) => {
-                state.open_workflow_panel(application, terminal)?;
+                state.open_workflow_panel(application, terminal).await?;
                 if is_list {
                     state.status = "Workflows".to_owned();
                 }
@@ -12314,7 +12541,7 @@ async fn submit(
                     state.push_status(format!("Failed to start new session: {error:#}"), true)
                 }
             },
-            "settings" => state.open_settings_panel(application, terminal)?,
+            "settings" => state.open_settings_panel(application, terminal).await?,
             "workflow" => {
                 if !dispatch_workflow_command(application, state, arg, terminal).await? {
                     return Ok(false);
@@ -12374,8 +12601,8 @@ async fn submit(
             "sessions" => state.open_session_panel(application, terminal).await?,
             "scoped-models" => state.open_scoped_models_panel(terminal).await?,
             "resume" if arg.is_none() => state.open_session_panel(application, terminal).await?,
-            "branch" | "fork" => state.open_fork_panel(application, terminal)?,
-            "tree" => state.open_tree_panel(application, terminal)?,
+            "branch" | "fork" => state.open_fork_panel(application, terminal).await?,
+            "tree" => state.open_tree_panel(application, terminal).await?,
             "file" => match arg {
                 None => state.open_or_toggle_file_viewer(application),
                 Some(input) => {
@@ -12388,7 +12615,7 @@ async fn submit(
                     }
                 }
             },
-            "trust" => state.open_trust_panel(application, terminal)?,
+            "trust" => state.open_trust_panel(application, terminal).await?,
             "thinking" => match arg {
                 None => state.open_thinking_panel(application, terminal).await?,
                 Some(level) => {
@@ -12560,7 +12787,7 @@ async fn submit(
             // stays a REPL/CLI feature (`--prose` is a status hint here).
             "handoff" => dispatch_handoff_command(application, state, arg).await,
             "todo" => {
-                if !dispatch_todo_command(application, state, terminal, arg)? {
+                if !dispatch_todo_command(application, state, terminal, arg).await? {
                     return Ok(false);
                 }
             }
@@ -12737,9 +12964,9 @@ async fn submit(
                     Err(error) => state.push_status(format!("{error:#}"), true),
                 }
             }
-            "jobs" => state.open_jobs_panel(application, false, terminal)?,
-            "irc" => state.open_jobs_panel(application, true, terminal)?,
-            "activity" => state.open_activity_panel(application, terminal)?,
+            "jobs" => state.open_jobs_panel(application, false, terminal).await?,
+            "irc" => state.open_jobs_panel(application, true, terminal).await?,
+            "activity" => state.open_activity_panel(application, terminal).await?,
             "llama" if !state.is_streaming => {
                 let command = arg.unwrap_or("status").to_owned();
                 match crate::llama_commands::run_slash(&command, application).await {
@@ -12828,7 +13055,7 @@ async fn submit(
                 }
             }
             "ps" if arg.is_none() => {
-                state.close_code_review_panel(terminal)?;
+                state.close_code_review_panel(terminal).await?;
                 state.panel = None;
                 state.tree_panel = None;
                 state.session_selector = None;
@@ -12942,7 +13169,7 @@ async fn submit(
                     Err(error) => state.push_status(format!("{error:#}"), true),
                 }
             }
-            "goal" if arg.is_none() => state.open_goal_panel(application, terminal)?,
+            "goal" if arg.is_none() => state.open_goal_panel(application, terminal).await?,
             "goal" => {
                 if !dispatch_goal_command(application, state, arg).await {
                     return Ok(false);
@@ -13880,15 +14107,17 @@ fn running_tool_activity(state: &TuiState) -> Option<String> {
 
 /// Body-free delegated-work status for Main: `<display name> <stage> ·
 /// <elapsed>`. Child IRC/message bodies remain in explicit Todo/Activity/Jobs
-/// and IRC surfaces. When several jobs are active, running beats queued and
-/// the most recently started card breaks ties.
+/// and IRC surfaces. When several jobs are active, cancelling outranks
+/// running, running outranks queued, and the most recently started card
+/// breaks ties.
 fn running_subagent_activity(state: &TuiState) -> Option<String> {
     state
         .job_cards
         .cards_in_source_order()
         .into_iter()
-        .filter(|card| matches!(card.job_status, JobStatus::Queued | JobStatus::Running))
+        .filter(|card| !card.job_status.is_settled())
         .max_by_key(|card| match card.job_status {
+            JobStatus::Cancelling => 2,
             JobStatus::Running => 1,
             JobStatus::Queued => 0,
             _ => 0,
@@ -16126,7 +16355,7 @@ fn push_task_box_line(
 fn task_status_color(status: JobStatus, theme: Theme) -> Color {
     match status {
         JobStatus::Queued => theme.dim,
-        JobStatus::Running => theme.accent,
+        JobStatus::Running | JobStatus::Cancelling => theme.accent,
         JobStatus::Completed => theme.text,
         JobStatus::Failed => theme.error,
         JobStatus::Cancelled => theme.warning,
@@ -16138,7 +16367,7 @@ fn render_job_card(lines: &mut Vec<Line<'static>>, card: &TaskCardRows, theme: T
     let running = card
         .children
         .iter()
-        .any(|child| matches!(child.job_status, JobStatus::Queued | JobStatus::Running));
+        .any(|child| !child.job_status.is_settled());
     let border = if card
         .children
         .iter()
@@ -20195,7 +20424,7 @@ mod tests {
         };
         let session = Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
             pi_coding::SessionOptions {
-                model: faux.model(None).expect("faux model"),
+                model: Some(faux.model(None).expect("faux model")),
                 cwd: cwd.to_path_buf(),
                 system_prompt: String::new(),
                 thinking_level: ThinkingLevel::Off,
@@ -20364,6 +20593,8 @@ mod tests {
         );
         config.idle_ttl = None;
         config.max_tools_per_agent = 64;
+        // Explicit registered fixture parent for child model resolution.
+        config.parent_model = Some(session.model().expect("orchestration fixture model"));
         let factory: pi_coding::ChildSessionFactory = Arc::new(|_request| {
             Box::pin(async move { Err(anyhow!("child factory is not exercised")) })
         });
@@ -21463,6 +21694,7 @@ mod tests {
                         started_at: Some(index),
 
                         finished_at: None,
+                        cancellation_cause: None,
                         result: None,
                         soft_budget_exhausted: false,
                     },
@@ -24352,6 +24584,7 @@ mod tests {
                 created_at: 1,
                 started_at: Some(1),
                 finished_at: Some(2),
+                cancellation_cause: None,
                 result: None,
                 soft_budget_exhausted: false,
             },
@@ -29102,6 +29335,7 @@ mod tests {
         let mut mouse = TestCodeReviewMouse::default();
         state
             .open_goal_panel(&application, &mut mouse)
+            .await
             .expect("open goal");
         let panel = state.panel.as_ref().expect("goal panel");
         assert_eq!(panel.title, "Goal");
@@ -29280,6 +29514,11 @@ mod tests {
         );
         assert!(session.history().is_empty());
 
+        // Active goal work runs continuation turns until the goal reaches a
+        // terminal lifecycle, so the test must subscribe before the create
+        // dispatch, observe the first turn land for real, and pause the goal
+        // before waiting for idle.
+        let mut events = application.subscribe();
         assert!(
             dispatch_goal_command(
                 &application,
@@ -29356,7 +29595,40 @@ mod tests {
             crate::goal_commands::format_goal_pins(&application.goal_state())
         );
 
-        application.wait_for_idle().await;
+        let first_turn = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let turn_id = loop {
+                match events.recv().await {
+                    Ok(ApplicationEvent::TurnStarted { turn_id, .. }) => break turn_id,
+                    Ok(_) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(error) => panic!("application events closed: {error}"),
+                }
+            };
+            loop {
+                match events.recv().await {
+                    Ok(ApplicationEvent::TurnTerminal {
+                        turn_id: id,
+                        status,
+                        ..
+                    }) if id == turn_id => break status,
+                    Ok(_) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(error) => panic!("application events closed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("first goal turn must start and reach its terminal");
+        assert!(
+            matches!(first_turn, pi_coding::TurnTerminalStatus::Succeeded),
+            "first goal turn must succeed: {first_turn:?}"
+        );
+        application
+            .goal_pause()
+            .expect("pausing the active goal must end goal work");
+        tokio::time::timeout(std::time::Duration::from_secs(5), application.wait_for_idle())
+            .await
+            .expect("goal work must drain once the goal is paused");
         assert!(
             session
                 .history()
@@ -29433,6 +29705,7 @@ mod tests {
         let mut mouse = TestCodeReviewMouse::default();
         state
             .open_goal_panel(&application, &mut mouse)
+            .await
             .expect("open goal");
         assert!(
             state
@@ -30996,6 +31269,7 @@ mod tests {
                     created_at: 1,
                     started_at: Some(2),
                     finished_at: None,
+                    cancellation_cause: None,
                     result: None,
                     soft_budget_exhausted: false,
                 },
@@ -32057,8 +32331,12 @@ mod tests {
             }
         }
         state.is_compacting = true;
-        application.abort().await;
-        state.status = "Aborting compaction".to_owned();
+        if let Err(error) = application.abort().await {
+            state.push_status(format!("Abort failed: {error:#}"), true);
+        } else {
+            state.status = "Aborting compaction".to_owned();
+        }
+
 
         // The stalled provider observes the abort and the compaction reports
         // cancellation promptly instead of hanging the session.
@@ -32098,6 +32376,7 @@ mod tests {
         let mut mouse = TestCodeReviewMouse::default();
         state
             .open_todo_dag_panel(&application, &mut mouse)
+            .await
             .expect("open todo");
         assert!(state.todo_dag_panel.is_some());
         assert!(page_overlay_open(&state));
@@ -32213,7 +32492,7 @@ mod tests {
                     })
                 });
                 Session::new(pi_coding::SessionOptions {
-                    model: request.model,
+                    model: Some(request.model),
                     cwd: std::env::current_dir().expect("cwd"),
                     system_prompt: request.system_prompt,
                     thinking_level: ThinkingLevel::Off,
@@ -32257,7 +32536,7 @@ mod tests {
         );
         config.max_concurrency = max_concurrency;
         config.idle_ttl = None;
-        config.parent_model = parent_model;
+        config.parent_model = Some(parent_model);
         (
             pi_coding::OrchestrationRuntime::new(config, factory).expect("orchestration runtime"),
             releases,
@@ -32403,6 +32682,7 @@ mod tests {
         let mut mouse = TestCodeReviewMouse::default();
         state
             .open_todo_dag_panel(&application, &mut mouse)
+            .await
             .expect("open todo");
         assert_eq!(
             state.todo_dag_panel.as_ref().map(TodoDagPanel::surface),
@@ -32658,8 +32938,8 @@ mod tests {
             state.editor.set_text(command);
             assert!(
                 dispatch_todo_command(&application, &mut state, &mut mouse, Some(arg))
+                    .await
                     .expect("dispatch non-list"),
-                "{command} must be consumed by the unified /todo dispatch"
             );
             finish_submitted_slash_command(&mut state);
             assert!(
@@ -32768,8 +33048,8 @@ mod tests {
             state.editor.set_text(label);
             assert!(
                 dispatch_todo_command(&application, &mut state, &mut mouse, arg)
+                    .await
                     .expect("dispatch list"),
-                "{label} must be consumed by the unified /todo dispatch"
             );
             finish_submitted_slash_command(&mut state);
             assert!(
@@ -33174,6 +33454,7 @@ mod tests {
                 &mut mouse,
                 Some("START review the code")
             )
+            .await
             .expect("dispatch uppercase start")
         );
         assert_eq!(
@@ -33194,6 +33475,7 @@ mod tests {
                 &mut mouse,
                 Some("done review the code")
             )
+            .await
             .expect("dispatch done")
         );
         assert_eq!(
@@ -33214,6 +33496,7 @@ mod tests {
                 &mut mouse,
                 Some("drop ship the build")
             )
+            .await
             .expect("dispatch drop")
         );
         assert_eq!(
@@ -33228,6 +33511,7 @@ mod tests {
         // `/todo clear` removes every task through the application.
         assert!(
             dispatch_todo_command(&application, &mut state, &mut mouse, Some("clear"))
+                .await
                 .expect("dispatch clear")
         );
         assert!(
@@ -33281,6 +33565,7 @@ mod tests {
             state.composer_error = None;
             assert!(
                 dispatch_todo_command(&application, &mut state, &mut mouse, Some(argument))
+                    .await
                     .expect("dispatch malformed DAG verb")
             );
             assert_eq!(state.composer_error.as_deref(), Some(usage), "{argument}");
@@ -33303,6 +33588,7 @@ mod tests {
                 &mut mouse,
                 Some("frobnicate the plan")
             )
+            .await
             .expect("dispatch unknown")
         );
         assert!(
@@ -33316,6 +33602,7 @@ mod tests {
         state.composer_error = None;
         assert!(
             dispatch_todo_command(&application, &mut state, &mut mouse, Some("list extra"))
+                .await
                 .expect("dispatch malformed list")
         );
         assert!(
@@ -33337,6 +33624,7 @@ mod tests {
                 &mut mouse,
                 Some("# Replaced\n- [ ] markdown task"),
             )
+            .await
             .expect("dispatch markdown")
         );
         assert_eq!(application.todo_state().phases[0].name, "Replaced");
@@ -33354,6 +33642,7 @@ mod tests {
                 &mut mouse,
                 Some("block write the code")
             )
+            .await
             .expect("dispatch unknown block verb")
         );
         let note = state.composer_error.as_deref().expect("usage note");
@@ -33376,6 +33665,7 @@ mod tests {
                 &mut mouse,
                 Some("done no such task")
             )
+            .await
             .expect("dispatch missing task")
         );
         assert!(
@@ -33435,8 +33725,9 @@ mod tests {
         );
         state
             .close_code_review_panel(&mut mouse)
+            .await
             .expect("close review");
-        state.shutdown_code_review().await;
+        state.shutdown_code_review().await.expect("shutdown code review");
         assert!(state.code_review_panel.is_none());
         assert!(!page_overlay_open(&state));
     }
@@ -33464,7 +33755,7 @@ mod tests {
                 label: String::new(),
             }
         );
-        state.shutdown_code_review().await;
+        state.shutdown_code_review().await.expect("shutdown code review");
 
         // More than one operand is a usage error: no page opens and no git
         // commit/checkout path exists behind this command.
@@ -33557,7 +33848,7 @@ mod tests {
             }
         );
 
-        state.shutdown_code_review().await;
+        state.shutdown_code_review().await.expect("shutdown code review");
         application.cleanup().await;
     }
 
@@ -33568,6 +33859,7 @@ mod tests {
         let application = test_application(fixture.path()).await;
         let mut state = todo_test_state(Vec::new());
         state.cwd_path = cwd.clone();
+        state.code_review_root = Some(cwd.clone());
         let requested = ReviewScope::Commit {
             commit: "main".to_owned(),
             label: String::new(),
@@ -33618,7 +33910,75 @@ mod tests {
             "refresh must be bound to the accepted snapshot scope, not the requested ref"
         );
         assert!(state.code_review_load_in_flight.is_none());
-        state.shutdown_code_review().await;
+        state.shutdown_code_review().await.expect("shutdown code review");
+        application.cleanup().await;
+    }
+    #[tokio::test]
+    async fn child_repository_snapshot_is_accepted_when_session_cwd_is_parent() {
+        let parent = PathBuf::from("projects");
+        let child = PathBuf::from("projects/alpha");
+        let fixture = tempfile::tempdir().expect("app fixture");
+        let application = test_application(fixture.path()).await;
+        let mut state = todo_test_state(Vec::new());
+        state.cwd_path = parent;
+        state.code_review_root = Some(child.clone());
+        let requested = ReviewScope::Commit {
+            commit: "abc123def4".to_owned(),
+            label: String::new(),
+        };
+        state.code_review_panel = Some(CodeReviewPanel::loading(child.clone(), requested.clone()));
+        let controller = CodeReviewController::fork_from(&application)
+            .await
+            .expect("fork review controller");
+        state.code_review_controller = Some(controller);
+        state.code_review_scope = requested;
+        state.code_review_load_generation += 1;
+        let generation = state.code_review_load_generation;
+        let controller_generation = state.code_review_controller_generation;
+        state.code_review_load_in_flight = Some((controller_generation, generation, child.clone()));
+
+        let accepted = crate::code_review::ReviewSnapshot {
+            root: child.clone(),
+            scope: ReviewScope::Commit {
+                commit: "abc123def4".to_owned(),
+                label: "empty tree → abc123def4".to_owned(),
+            },
+            snapshot_id: "child-snapshot".to_owned(),
+            files: Vec::new(),
+            truncated: false,
+            total_insertions: 0,
+            total_deletions: 0,
+            summary_complete: true,
+            error: None,
+        };
+        state
+            .apply_background_async(BackgroundEvent::CodeReviewSnapshotLoaded {
+                controller_generation,
+                generation,
+                cwd: child.clone(),
+                snapshot: accepted,
+                paging: ReviewPagingState::default(),
+            })
+            .await;
+
+        assert_eq!(
+            state.code_review_scope,
+            ReviewScope::Commit {
+                commit: "abc123def4".to_owned(),
+                label: "empty tree → abc123def4".to_owned(),
+            },
+            "a child-root snapshot must land while the session cwd stays the parent"
+        );
+        assert!(state.code_review_load_in_flight.is_none());
+        assert!(
+            !state
+                .code_review_panel
+                .as_ref()
+                .expect("panel")
+                .is_snapshot_loading(),
+            "accepting the child snapshot must leave the loading state"
+        );
+        state.shutdown_code_review().await.expect("shutdown code review");
         application.cleanup().await;
     }
 
@@ -33676,7 +34036,7 @@ mod tests {
             "15 rows are below the cap, so truncation help stays hidden: {}",
             panel.help
         );
-        state.shutdown_code_review().await;
+        state.shutdown_code_review().await.expect("shutdown code review");
         application.cleanup().await;
     }
 
@@ -33905,6 +34265,7 @@ mod tests {
         // assertion below would trivially pass off a leftover panel.
         state
             .close_code_review_panel(&mut mouse)
+            .await
             .expect("close review panel the production way");
         assert!(state.code_review_panel.is_none());
         open_tree(&mut state);
@@ -33922,7 +34283,7 @@ mod tests {
         assert_eq!(panel.query, "a/");
         assert!(state.code_review_panel.is_none());
 
-        state.shutdown_code_review().await;
+        state.shutdown_code_review().await.expect("shutdown code review");
         application.cleanup().await;
     }
 
@@ -33939,12 +34300,13 @@ mod tests {
 
         let error = state
             .close_code_review_panel(&mut FailingCodeReviewMouse)
+            .await
             .expect_err("disable failure");
 
         assert!(error.to_string().contains("mouse sync failed"));
         assert!(state.code_review_panel.is_some());
         assert!(mouse.active);
-        state.shutdown_code_review().await;
+        state.shutdown_code_review().await.expect("shutdown code review");
     }
 
     #[test]
@@ -34471,6 +34833,7 @@ mod tests {
         let mut state = todo_test_state(Vec::new());
         let cwd = PathBuf::from("repo");
         state.cwd_path = cwd.clone();
+        state.code_review_root = Some(cwd.clone());
         state.code_review_panel = Some(CodeReviewPanel::loading(
             cwd.clone(),
             ReviewScope::WorkingTree,
@@ -34506,6 +34869,7 @@ mod tests {
         let mut state = todo_test_state(Vec::new());
         let cwd = PathBuf::from("repo");
         state.cwd_path = cwd.clone();
+        state.code_review_root = Some(cwd.clone());
         state.code_review_panel = Some(CodeReviewPanel::loading(
             cwd.clone(),
             ReviewScope::WorkingTree,
@@ -34569,6 +34933,7 @@ mod tests {
 
         state
             .open_settings_panel(&application, &mut mouse)
+            .await
             .expect("open settings");
         assert!(state.code_review_panel.is_none());
         assert!(state.settings_panel.is_some());
@@ -34579,7 +34944,7 @@ mod tests {
         assert!(enable < disable, "{output:?}");
         assert_eq!(mouse.transitions, vec![true, false]);
         assert!(!code_review_page_active(&state));
-        state.shutdown_code_review().await;
+        state.shutdown_code_review().await.expect("shutdown code review");
 
         application.cleanup().await;
     }
@@ -34602,6 +34967,7 @@ mod tests {
         // A RuntimeChanged event closes the overlay before rebinding cwd.
         state
             .close_code_review_panel(&mut mouse)
+            .await
             .expect("close review on runtime switch");
 
         assert!(
@@ -34619,7 +34985,7 @@ mod tests {
             "load generation must advance so late results are discarded"
         );
         assert!(!code_review_page_active(&state));
-        state.shutdown_code_review().await;
+        state.shutdown_code_review().await.expect("shutdown code review");
 
         application.cleanup().await;
     }
@@ -34725,6 +35091,7 @@ mod tests {
                             created_at: 1,
                             started_at: Some(2),
                             finished_at: None,
+                            cancellation_cause: None,
                             result: None,
                             soft_budget_exhausted: false,
                         },
@@ -34822,6 +35189,7 @@ mod tests {
             created_at: 1_000,
             started_at: None,
             finished_at: None,
+            cancellation_cause: None,
             result: None,
             soft_budget_exhausted: false,
         }
@@ -35076,6 +35444,7 @@ mod tests {
                     created_at: 1,
                     started_at: Some(2),
                     finished_at: None,
+                    cancellation_cause: None,
                     result: None,
                     soft_budget_exhausted: false,
                 },
@@ -35107,6 +35476,127 @@ mod tests {
             .and_then(|card| card.progress.as_ref())
             .and_then(|progress| progress.activity.as_deref());
         assert_eq!(activity, Some("status from child"));
+    }
+
+    #[test]
+    fn message_delivered_event_renders_once_and_dedupes_custom_message() {
+        let mut state = todo_test_state(Vec::new());
+        let job = |id: &str, agent: &str| pi_coding::JobSnapshot {
+            id: id.to_owned(),
+            agent_id: agent.to_owned(),
+            agent: "task".to_owned(),
+            parent_id: "Main".to_owned(),
+            description: Some("inspect".to_owned()),
+            todo_task_id: None,
+            workflow_id: None,
+            workflow_generation: None,
+            status: pi_coding::JobStatus::Running,
+            created_at: 1,
+            started_at: Some(2),
+            finished_at: None,
+            cancellation_cause: None,
+            result: None,
+            soft_budget_exhausted: false,
+        };
+        let delivered = |id: &str, from: &str, to: &str, body: &str| {
+            ApplicationEvent::Orchestration(pi_coding::OrchestrationEvent::MessageDelivered {
+                group_id: "group".to_owned(),
+                waiter_claimed: false,
+                message: pi_coding::MailboxMessage {
+                    id: id.to_owned(),
+                    from: from.to_owned(),
+                    to: to.to_owned(),
+                    body: body.to_owned(),
+                    timestamp: 3,
+                    reply_to: None,
+                },
+            })
+        };
+        state.apply(ApplicationEvent::Orchestration(
+            pi_coding::OrchestrationEvent::JobUpdated {
+                group_id: "group".to_owned(),
+                job: job("job-child", "Child"),
+            },
+        ));
+        state.apply(delivered("live-1", "Child", "Main", "status from child"));
+        // The same id arriving again with a different body, then the matching
+        // session custom message, must not paint Main or replace activity.
+        state.apply(delivered("live-1", "Child", "Main", "rewritten child body"));
+        state.apply(ApplicationEvent::Agent(AgentEvent::MessageEnd {
+            message: orchestration_custom("live-1", "Child", "Main", "status from child", None),
+        }));
+        assert!(
+            state.transcript.is_empty(),
+            "delivered and matching custom bodies stay off Main"
+        );
+        let cards = state.job_cards.cards_in_source_order();
+        let progress = cards
+            .iter()
+            .find(|card| card.job_id == "job-child")
+            .and_then(|card| card.progress.as_ref())
+            .expect("child job activity");
+        assert_eq!(progress.activity.as_deref(), Some("status from child"));
+        assert_eq!(
+            progress
+                .events
+                .iter()
+                .filter(|event| event.message_id.as_deref() == Some("live-1"))
+                .count(),
+            1,
+            "one delivered id renders exactly once: {:?}",
+            progress.events
+        );
+        state.apply(delivered("live-1b", "Child", "Main", "status from child"));
+        let cards = state.job_cards.cards_in_source_order();
+        let progress = cards
+            .iter()
+            .find(|card| card.job_id == "job-child")
+            .and_then(|card| card.progress.as_ref())
+            .expect("child job activity");
+        assert_eq!(
+            progress
+                .events
+                .iter()
+                .filter(|event| event.text == "status from child")
+                .count(),
+            2,
+            "a different id with the same body is a second event"
+        );
+
+        state.apply(ApplicationEvent::Orchestration(
+            pi_coding::OrchestrationEvent::JobUpdated {
+                group_id: "group".to_owned(),
+                job: job("job-peer", "Peer"),
+            },
+        ));
+        state.apply(delivered("live-2", "Peer", "Sibling", "peer status"));
+        state.apply(delivered(
+            "live-2",
+            "Peer",
+            "Sibling",
+            "rewritten peer body",
+        ));
+        state.apply(ApplicationEvent::Agent(AgentEvent::MessageEnd {
+            message: orchestration_custom("live-2", "Peer", "Sibling", "peer status", None),
+        }));
+        assert!(
+            state.transcript.is_empty(),
+            "peer delivery and matching custom body stay off Main"
+        );
+        let cards = state.job_cards.cards_in_source_order();
+        let peer = cards
+            .iter()
+            .find(|card| card.job_id == "job-peer")
+            .and_then(|card| card.progress.as_ref())
+            .expect("peer job activity");
+        assert_eq!(peer.activity.as_deref(), Some("peer status"));
+        assert_eq!(
+            peer.events
+                .iter()
+                .filter(|event| event.text == "peer status")
+                .count(),
+            1
+        );
     }
 
     fn hub_wait_cards(body: &str) -> (ToolCardRows, ToolCardRows) {
@@ -36095,6 +36585,7 @@ mod tests {
         let mut mouse = TestCodeReviewMouse::default();
         state
             .open_settings_panel(&application, &mut mouse)
+            .await
             .expect("open settings");
         assert!(state.settings_panel.is_some(), "settings panel must open");
         assert!(page_overlay_open(&state));
@@ -36157,6 +36648,7 @@ mod tests {
         let mut mouse = TestCodeReviewMouse::default();
         state
             .open_settings_panel(&application, &mut mouse)
+            .await
             .expect("open settings");
         let panel = state.settings_panel.as_mut().expect("settings panel");
         panel.set_search("thinkingBudgets.medium");
@@ -36298,6 +36790,7 @@ mod tests {
         let mut mouse = TestCodeReviewMouse::default();
         state
             .open_settings_panel(&application, &mut mouse)
+            .await
             .expect("open settings");
         let panel = state.settings_panel.as_mut().expect("settings panel");
         panel.set_search("transport");
@@ -36478,6 +36971,7 @@ mod tests {
         let mut mouse = TestCodeReviewMouse::default();
         state
             .open_settings_panel(&application, &mut mouse)
+            .await
             .expect("open settings");
         state.settings_panel.as_mut().unwrap().set_search("theme");
         handle_settings_panel_key(&application, &mut state, enter)
@@ -37269,6 +37763,7 @@ mod tests {
         // around the modal.
         state
             .open_settings_panel(&application, &mut mouse)
+            .await
             .expect("open settings");
         assert!(page_overlay_open(&state));
         let overlay = render_text(&mut terminal, &state);
@@ -37527,6 +38022,7 @@ mod tests {
         let mut mouse = TestCodeReviewMouse::default();
         state
             .open_settings_panel(&application, &mut mouse)
+            .await
             .expect("open settings");
         state
             .settings_panel
@@ -37861,6 +38357,7 @@ mod tests {
         let mut mouse = TestCodeReviewMouse::default();
         state
             .open_settings_panel(&application, &mut mouse)
+            .await
             .expect("open settings");
         let panel = state.settings_panel.as_mut().expect("settings panel");
         panel.set_search("retry.enabled");
@@ -38741,6 +39238,7 @@ mod tests {
             created_at: 1,
             started_at: Some(1),
             finished_at: None,
+            cancellation_cause: None,
             result: None,
             soft_budget_exhausted: false,
         };
@@ -41942,12 +42440,12 @@ mod tests {
                 definition("worker", vec!["read", "bash"], vec!["rust"]),
             ],
             &settings,
-            Model {
+            Some(Model {
                 provider: "openai".to_owned(),
                 id: "gpt-4.1".to_owned(),
                 name: "gpt-4.1".to_owned(),
                 ..Model::default()
-            },
+            }),
             vec![Model {
                 provider: "openai".to_owned(),
                 id: "gpt-4.1".to_owned(),
@@ -42024,12 +42522,12 @@ mod tests {
         let mut panel = AgentsPanel::new(
             definitions,
             &std::collections::BTreeMap::new(),
-            Model {
+            Some(Model {
                 provider: "openai".to_owned(),
                 id: "gpt-4.1".to_owned(),
                 name: "gpt-4.1".to_owned(),
                 ..Model::default()
-            },
+            }),
             vec![Model {
                 provider: "openai".to_owned(),
                 id: "gpt-4.1".to_owned(),
@@ -43643,6 +44141,7 @@ mod tests {
             created_at: 1,
             started_at: (status == pi_coding::JobStatus::Running).then_some(2),
             finished_at: None,
+            cancellation_cause: None,
             result: None,
             soft_budget_exhausted: false,
         };
@@ -44094,6 +44593,7 @@ mod tests {
                     created_at: 1,
                     started_at: Some(2),
                     finished_at: None,
+                    cancellation_cause: None,
                     result: None,
                     soft_budget_exhausted: false,
                 },
@@ -45857,5 +46357,887 @@ mod tests {
                 .as_deref()
                 .unwrap_or("no composer error")
         );
+    }
+
+    const LAG_PRUNED_WAIT: &str =
+        "orchestration job pruned or removed while waited: [\"job-a\"]";
+    const LAG_PROMPT: &str = "Run the authoritative child-owned hub campaign.";
+
+    fn lag_final_reply() -> pi_ai::AssistantMessage {
+        use pi_ai::{AssistantMessage, StopReason};
+
+        let mut reply = AssistantMessage::pending(&pi_ai::Model::default());
+        reply.content = vec![ContentBlock::text("pressure campaign complete")];
+        reply.stop_reason = StopReason::Stop;
+        reply
+    }
+
+    /// Authoritative conversation for the application-event lag regressions:
+    /// Main's real `hub` wait result (typed pruned error) and its final reply.
+    fn lag_authority_history() -> Vec<Message> {
+        use pi_ai::{AssistantMessage, StopReason, ToolCall, ToolResultMessage, now_millis};
+
+        let mut wait_call = AssistantMessage::pending(&pi_ai::Model::default());
+        wait_call.content = vec![ContentBlock::ToolCall(ToolCall {
+            id: "main-wait-jobs".to_owned(),
+            name: "hub".to_owned(),
+            arguments: serde_json::json!({"op": "wait", "ids": ["job-a"]}),
+            thought_signature: None,
+        })];
+        wait_call.stop_reason = StopReason::ToolUse;
+        vec![
+            Message::user_text(LAG_PROMPT, 1),
+            Message::Assistant(wait_call),
+            Message::ToolResult(ToolResultMessage {
+                tool_call_id: "main-wait-jobs".to_owned(),
+                tool_name: "hub".to_owned(),
+                content: vec![ContentBlock::text(LAG_PRUNED_WAIT)],
+                usage: None,
+                details: None,
+                added_tool_names: Vec::new(),
+                is_error: true,
+                timestamp: now_millis(),
+            }),
+            Message::Assistant(lag_final_reply()),
+        ]
+    }
+
+
+    /// Regression (application-event lag): the receiver can drop a terminal
+    /// `ToolExecutionEnd`/`MessageEnd` while the runtime authority keeps the
+    /// failed result. Lag recovery must replay the authoritative conversation:
+    /// re-projecting jobs and clearing busy is not enough, or the `hub` card
+    /// stays running forever and neither the typed failure nor the final reply
+    /// reaches the transcript (the pressure campaign the E2E waits for).
+    #[tokio::test]
+    async fn application_lag_recovery_replays_failed_hub_wait_from_authority() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let fixture = test_application(cwd.path()).await;
+        let (background_tx, _background_rx) = mpsc::unbounded_channel();
+        let mut state = TuiState::new(
+            &fixture,
+            ExtensionUiAdapter::default(),
+            background_tx,
+            None,
+            Vec::new(),
+            None,
+        );
+        // Applied before the gap: the wait started, its terminal events were
+        // part of the dropped run.
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionStart {
+            tool_call_id: "main-wait-jobs".to_owned(),
+            tool_name: "hub".to_owned(),
+            arguments: serde_json::json!({"op": "wait", "ids": ["job-a"]}),
+        }));
+        assert!(
+            running_tool_activity(&state).is_some(),
+            "a skipped terminal must leave live tool activity"
+        );
+        fixture
+            .application
+            .session()
+            .load_history(lag_authority_history())
+            .await
+            .expect("load authoritative history");
+
+        let mut rx = fixture.application.subscribe();
+        state
+            .recover_from_application_lag(&fixture.application, &mut rx, 48)
+            .await;
+
+        let card = state
+            .tool_cards
+            .projection()
+            .get("main-wait-jobs")
+            .expect("the authority owns the wait card");
+        assert_eq!(card.status, ToolCallViewStatus::Failed);
+        assert_eq!(
+            card.error_message.as_deref(),
+            Some(LAG_PRUNED_WAIT),
+            "typed pruned error must own the card error field"
+        );
+        let transcript = state
+            .transcript
+            .iter()
+            .map(|entry| content_text(&entry.content))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            transcript.contains("pressure campaign complete"),
+            "final reply missing: {transcript}"
+        );
+        assert!(running_tool_activity(&state).is_none());
+        assert!(
+            !state.has_active_animation(),
+            "a recovered lag must not keep the animation alive"
+        );
+        assert!(!state.is_streaming);
+        fixture.application.cleanup().await;
+    }
+
+    fn lag_assistant_reply(text: &str) -> pi_ai::AssistantMessage {
+        use pi_ai::{AssistantMessage, StopReason};
+
+        let mut reply = AssistantMessage::pending(&pi_ai::Model::default());
+        reply.content = vec![ContentBlock::text(text.to_owned())];
+        reply.stop_reason = StopReason::Stop;
+        reply
+    }
+
+    fn lag_published(epoch: u64, barrier: u64, event: AgentEvent) -> ApplicationEvent {
+        ApplicationEvent::AgentPublished {
+            event,
+            epoch,
+            barrier,
+        }
+    }
+
+    /// Transcript rows whose text contains `needle` — the per-identity row
+    /// counter for the lag coverage contracts.
+    fn lag_transcript_rows(state: &TuiState, needle: &str) -> usize {
+        state
+            .transcript
+            .iter()
+            .filter(|entry| content_text(&entry.content).contains(needle))
+            .count()
+    }
+
+    /// Shared lag-contract state: fixture-backed TUI projection.
+    fn lag_test_state(fixture: &TestApplicationFixture) -> TuiState {
+        let (background_tx, _background_rx) = mpsc::unbounded_channel();
+        TuiState::new(
+            fixture,
+            ExtensionUiAdapter::default(),
+            background_tx,
+            None,
+            Vec::new(),
+            None,
+        )
+    }
+
+    /// Shared lag-contract fixture: real application with the authoritative
+    /// hub history loaded.
+    async fn lag_fixture_with_history() -> (tempfile::TempDir, TestApplicationFixture) {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let fixture = test_application(cwd.path()).await;
+        fixture
+            .application
+            .session()
+            .load_history(lag_authority_history())
+            .await
+            .expect("load authoritative history");
+        (cwd, fixture)
+    }
+
+
+    /// Contract (lag replay coverage): the cut replays the authoritative
+    /// conversation once and the drain classifies each queued identity by the
+    /// cut's epoch/barrier coverage; a post-cut identity applies exactly once.
+    #[tokio::test]
+    async fn queued_events_after_authoritative_replay_follow_cut_coverage() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let fixture = test_application(cwd.path()).await;
+        let history = lag_authority_history();
+        fixture
+            .application
+            .session()
+            .load_history(history.clone())
+            .await
+            .expect("load authoritative history");
+        let mut state = lag_test_state(&fixture);
+        // Pre-cut echoes the cut must canonicalize: a running wait card and
+        // the just-submitted prompt (echoed, persisted, unconfirmed).
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionStart {
+            tool_call_id: "main-wait-jobs".to_owned(),
+            tool_name: "hub".to_owned(),
+            arguments: serde_json::json!({"op": "wait", "ids": ["job-a"]}),
+        }));
+        state.pending_user_echo = true;
+        state.push_lines("You", LAG_PROMPT.to_owned(), Color::Reset);
+
+        let cut = fixture.application.protocol_snapshot().await;
+        let echoed = state.pending_echo_entry().expect("pending echo");
+        state.replace_transcript_application(&fixture.application, &cut.messages);
+        state.restore_pending_user_echo(&cut.messages, Some(echoed));
+
+        let wait_call = match &history[1] {
+            Message::Assistant(message) => message.clone(),
+            other => panic!("unexpected authority message: {other:?}"),
+        };
+
+        // The 7 still-queued identities: agent identities are cut-covered
+        // `AgentPublished`s; the bare `AgentSettled` carries no epoch/barrier
+        // and flows through the epoch-guarded arm.
+        let covered =
+            |event| lag_published(cut.epoch, cut.event_barrier, event);
+        let queued: [(&str, ApplicationEvent); 7] = [
+            ("agent_settled", ApplicationEvent::AgentSettled),
+            (
+                "tool_execution_start",
+                covered(AgentEvent::ToolExecutionStart {
+                    tool_call_id: "main-wait-jobs".to_owned(),
+                    tool_name: "hub".to_owned(),
+                    arguments: serde_json::json!({"op": "wait", "ids": ["job-a"]}),
+                }),
+            ),
+            (
+                "tool_execution_update",
+                covered(AgentEvent::ToolExecutionUpdate {
+                    tool_call_id: "main-wait-jobs".to_owned(),
+                    tool_name: "hub".to_owned(),
+                    arguments: serde_json::json!({"op": "wait", "ids": ["job-a"]}),
+                    partial_result: pi_agent::AgentToolResult::text("partial"),
+                }),
+            ),
+            (
+                "tool_execution_end",
+                covered(AgentEvent::ToolExecutionEnd {
+                    tool_call_id: "main-wait-jobs".to_owned(),
+                    tool_name: "hub".to_owned(),
+                    result: pi_agent::AgentToolResult::text(LAG_PRUNED_WAIT),
+                    is_error: true,
+                }),
+            ),
+            (
+                "assistant_tool_call_message_end",
+                covered(AgentEvent::MessageEnd {
+                    message: Message::Assistant(wait_call),
+                }),
+            ),
+            (
+                "user_message_end",
+                covered(AgentEvent::MessageEnd {
+                    message: Message::user_text(LAG_PROMPT, 1),
+                }),
+            ),
+            (
+                "final_assistant_message_end",
+                covered(AgentEvent::MessageEnd {
+                    message: Message::Assistant(lag_final_reply()),
+                }),
+            ),
+        ];
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        for (_, event) in queued {
+            tx.send(event).expect("seed still-queued identity");
+        }
+        // One post-cut identity: published after the cut read, so the drain
+        // must apply it exactly once.
+        tx.send(lag_published(
+            cut.epoch,
+            cut.event_barrier + 1,
+            AgentEvent::MessageEnd {
+                message: Message::Assistant(lag_assistant_reply("post-cut identity row")),
+            },
+        ))
+        .expect("seed post-cut identity");
+
+        assert!(matches!(
+            state.drain_application_events(&fixture.application, &cut, &mut rx),
+            DrainOutcome::Settled
+        ));
+
+        assert_eq!(
+            lag_transcript_rows(&state, LAG_PROMPT),
+            1,
+            "one transcript row per covered user identity"
+        );
+        let card = state
+            .tool_cards
+            .projection()
+            .get("main-wait-jobs")
+            .expect("the authority owns the wait card");
+        assert_eq!(
+            card.error_message.as_deref(),
+            Some(LAG_PRUNED_WAIT),
+            "one covered tool identity owns the card error field"
+        );
+        assert_eq!(
+            lag_transcript_rows(&state, "pressure campaign complete"),
+            1,
+            "one transcript row per covered final reply"
+        );
+        assert_eq!(
+            lag_transcript_rows(&state, "post-cut identity row"),
+            1,
+            "a post-cut identity applies exactly once"
+        );
+        let status = state
+            .tool_cards
+            .projection()
+            .get("main-wait-jobs")
+            .expect("the authority owns the wait card")
+            .status;
+        assert_eq!(
+            status,
+            ToolCallViewStatus::Failed,
+            "covered tool start/update/end must leave the card terminal"
+        );
+        assert!(
+            running_tool_activity(&state).is_none(),
+            "a covered agent_start must not re-arm busy"
+        );
+        assert!(
+            !state.has_active_animation(),
+            "covered identities must not keep the animation alive"
+        );
+        assert!(!state.is_streaming);
+        assert!(
+            !state.pending_user_echo,
+            "a cut that contains the echoed prompt clears the pending echo"
+        );
+        fixture.application.cleanup().await;
+    }
+
+    /// Contract (recovery boundary): a tool still running at the cut recovers
+    /// `Running` with persisted arguments — no fabricated partial, terminal,
+    /// or draft; busy/animation truth comes from the live-activity reconcile.
+    #[tokio::test]
+    async fn lag_recovery_still_running_tool_without_continuation() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let fixture = test_application(cwd.path()).await;
+        // Cut mid-tool: the authority ends at the assistant tool call.
+        let mut history = lag_authority_history();
+        history.truncate(2);
+        fixture
+            .application
+            .session()
+            .load_history(history)
+            .await
+            .expect("load authoritative history");
+        let mut state = lag_test_state(&fixture);
+        // Applied before the gap: the wait started and streamed a partial.
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionStart {
+            tool_call_id: "main-wait-jobs".to_owned(),
+            tool_name: "hub".to_owned(),
+            arguments: serde_json::json!({"op": "wait", "ids": ["job-a"]}),
+        }));
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionUpdate {
+            tool_call_id: "main-wait-jobs".to_owned(),
+            tool_name: "hub".to_owned(),
+            arguments: serde_json::json!({"op": "wait", "ids": ["job-a"]}),
+            partial_result: pi_agent::AgentToolResult::text("pre-lag partial"),
+        }));
+        state.streaming_text = "pre-lag draft".to_owned();
+
+        let (tx, mut rx) = tokio::sync::broadcast::channel(4);
+        // A post-cut partial still applies: the tool is live again from the
+        // recovery's perspective.
+        tx.send(lag_published(
+            0,
+            u64::MAX,
+            AgentEvent::ToolExecutionUpdate {
+                tool_call_id: "main-wait-jobs".to_owned(),
+                tool_name: "hub".to_owned(),
+                arguments: serde_json::json!({"op": "wait", "ids": ["job-a"]}),
+                partial_result: pi_agent::AgentToolResult::text("post-cut partial"),
+            },
+        ))
+        .expect("seed post-cut partial");
+
+        state
+            .recover_from_application_lag(&fixture.application, &mut rx, 48)
+            .await;
+
+        assert_eq!(state.status, "Recovered UI after 48 lagged events");
+        let card = state
+            .tool_cards
+            .projection()
+            .get("main-wait-jobs")
+            .expect("the authority owns the wait card");
+        assert_eq!(
+            card.status,
+            ToolCallViewStatus::Running,
+            "no continuation: the card must not fabricate a terminal"
+        );
+        assert_eq!(
+            card.arguments,
+            serde_json::json!({"op": "wait", "ids": ["job-a"]}),
+            "arguments recover from the persisted assistant ToolCall"
+        );
+        let transcript = state
+            .transcript
+            .iter()
+            .map(|entry| content_text(&entry.content))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !transcript.contains("partial"),
+            "no fabricated partial content: {transcript}"
+        );
+        assert!(
+            !transcript.contains(LAG_PRUNED_WAIT),
+            "no fabricated terminal result: {transcript}"
+        );
+        assert!(
+            state.streaming_text.is_empty(),
+            "the stale pre-lag draft must not survive the cut as fabricated truth"
+        );
+        assert!(
+            running_tool_activity(&state).is_some(),
+            "the still-running wait stays live activity"
+        );
+        assert!(
+            state.has_active_animation(),
+            "busy truth comes from the live authority: the tool never settled"
+        );
+        assert!(
+            !state.is_streaming,
+            "streaming truth comes from the live application, not the cut cache"
+        );
+        fixture.application.cleanup().await;
+    }
+
+    /// Contract: a `Lagged` mid-drain is a true outer continue — resubscribe,
+    /// fresh cut, `Recovered` only after the fresh cut settles; two restarts
+    /// exhaust the bound → not-recovered notice, never `Recovered`, last cut.
+    #[tokio::test]
+    async fn lag_recovery_restart_takes_fresh_cut() {
+        let (cwd, fixture) = lag_fixture_with_history().await;
+        let mut state = lag_test_state(&fixture);
+        // Applied before the gap: the wait started; its terminal events were
+        // part of the dropped run the fresh cut must cover.
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionStart {
+            tool_call_id: "main-wait-jobs".to_owned(),
+            tool_name: "hub".to_owned(),
+            arguments: serde_json::json!({"op": "wait", "ids": ["job-a"]}),
+        }));
+
+        // Phase 1: a lagged backlog restarts the cut; the fresh cut covers
+        // the between-cuts (dropped) events from the persisted authority.
+        let (tx, mut rx) = tokio::sync::broadcast::channel(2);
+        for _ in 0..6 {
+            tx.send(ApplicationEvent::Agent(AgentEvent::AgentStart))
+                .expect("flood the backlog");
+        }
+        state
+            .recover_from_application_lag(&fixture.application, &mut rx, 48)
+            .await;
+        assert_eq!(
+            state.status,
+            "Recovered UI after 48 lagged events",
+            "Recovered is reported only after the fresh cut settled"
+        );
+        let card = state
+            .tool_cards
+            .projection()
+            .get("main-wait-jobs")
+            .expect("the authority owns the wait card");
+        assert_eq!(card.status, ToolCallViewStatus::Failed);
+        assert_eq!(
+            card.error_message.as_deref(),
+            Some(LAG_PRUNED_WAIT),
+            "typed pruned error must own the card error field"
+        );
+        assert_eq!(lag_transcript_rows(&state, "pressure campaign complete"), 1);
+        assert!(running_tool_activity(&state).is_none());
+        assert!(!state.has_active_animation());
+
+        // Phase 2: two restarts exhaust the bounded attempts. The queued
+        // `RuntimeChanged` events restart each drain; exhaustion must not
+        // report `Recovered` and must leave the projections at the last
+        // authoritative cut.
+        let (exhausted_tx, _exhausted_rx) = mpsc::unbounded_channel();
+        let mut exhausted = TuiState::new(
+            &fixture,
+            ExtensionUiAdapter::default(),
+            exhausted_tx,
+            None,
+            Vec::new(),
+            None,
+        );
+        exhausted.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionStart {
+            tool_call_id: "main-wait-jobs".to_owned(),
+            tool_name: "hub".to_owned(),
+            arguments: serde_json::json!({"op": "wait", "ids": ["job-a"]}),
+        }));
+        let (tx2, mut rx2) = tokio::sync::broadcast::channel(4);
+        tx2.send(ApplicationEvent::RuntimeChanged { epoch: 1 })
+            .expect("queue the first restart trigger");
+        tx2.send(ApplicationEvent::RuntimeChanged { epoch: 2 })
+            .expect("queue the second restart trigger");
+        exhausted
+            .recover_from_application_lag(&fixture.application, &mut rx2, 48)
+            .await;
+        assert_ne!(
+            exhausted.status,
+            "Recovered UI after 48 lagged events",
+            "exhaustion must never report Recovered"
+        );
+        let exhausted_error = exhausted.composer_error.as_deref().unwrap_or_default();
+        assert!(
+            exhausted_error.contains("did not settle"),
+            "bounded not-recovered notice missing: {exhausted_error}"
+        );
+        let exhausted_status = exhausted
+            .tool_cards
+            .projection()
+            .get("main-wait-jobs")
+            .expect("the authority owns the wait card")
+            .status;
+        assert_eq!(
+            exhausted_status,
+            ToolCallViewStatus::Failed,
+            "projections stay at the last authoritative cut"
+        );
+        assert_eq!(
+            lag_transcript_rows(&exhausted, "pressure campaign complete"),
+            1,
+            "projections stay at the last authoritative cut"
+        );
+        fixture.application.cleanup().await;
+    }
+
+    /// Two `RuntimeChanged` events spend both cuts. The adapter is snapshotted while the job is unsettled, then the child is released; recovery must rebind to Completed without reporting `Recovered`.
+    #[tokio::test]
+    async fn lag_recovery_exhaustion_rebinds_completed_job_without_reporting_recovered() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let fixture = test_application(cwd.path()).await;
+        let model = fixture.application.session().model().expect("model");
+        let (runtime, releases) = gated_todo_runtime(cwd.path(), 1, model);
+        fixture.application.attach_orchestration(runtime.clone()).await.expect("attach");
+        let (_abort, signal) = pi_agent::AbortController::new();
+        let pending = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                runtime.run_tasks("Main", 0, vec![pi_coding::TaskItem {
+                    id: "SettleWorker".to_owned(),
+                    agent: "task".to_owned(),
+                    assignment: "settle".to_owned(),
+                    ..Default::default()
+                }], signal).await
+            }
+        });
+        let job_id = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(job) = runtime
+                    .jobs(None)
+                    .into_iter()
+                    .find(|job| job.agent_id == "SettleWorker" && !job.status.is_settled())
+                {
+                    return job.id;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("unsettled authority job");
+        let mut state = lag_test_state(&fixture);
+        let adapter_status = |state: &TuiState| {
+            state
+                .job_cards
+                .cards_in_source_order()
+                .into_iter()
+                .find(|card| card.job_id == job_id)
+                .expect("card")
+                .job_status
+        };
+        let initial = adapter_status(&state);
+        assert!(!initial.is_settled(), "adapter must snapshot the unsettled job, got {initial:?}");
+        for token in releases.lock().expect("gates").values() {
+            token.cancel();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let completed = runtime
+                    .jobs(Some(std::slice::from_ref(&job_id)))
+                    .into_iter()
+                    .any(|job| job.status == pi_coding::JobStatus::Completed);
+                if completed {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("authority Completed");
+        pending.await.expect("join").expect("child");
+        assert_eq!(adapter_status(&state), initial, "completion must not reach the adapter before recover");
+        let (tx, mut rx) = tokio::sync::broadcast::channel(4);
+        tx.send(ApplicationEvent::RuntimeChanged { epoch: 1 }).expect("restart 1");
+        tx.send(ApplicationEvent::RuntimeChanged { epoch: 2 }).expect("restart 2");
+        state.recover_from_application_lag(&fixture.application, &mut rx, 48).await;
+        assert_eq!(adapter_status(&state), pi_coding::JobStatus::Completed);
+        assert_ne!(state.status, "Recovered UI after 48 lagged events");
+        assert!(state.composer_error.as_deref().is_some_and(|notice| notice.contains("did not settle")));
+        fixture.application.cleanup().await;
+    }
+
+    /// Contract: an epoch-N+1 agent event queued before its `RuntimeChanged`
+    /// was consumed is never applied as this cut's continuation (rule 1
+    /// restarts, rule 2 drops, no old-session state); `Closed` propagates.
+    #[tokio::test]
+    async fn lag_recovery_epoch_switch_before_runtime_changed() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let fixture = test_application(cwd.path()).await;
+        fixture
+            .application
+            .session()
+            .load_history(lag_authority_history())
+            .await
+            .expect("load authoritative history");
+        let mut state = lag_test_state(&fixture);
+        let cut = fixture.application.protocol_snapshot().await;
+        state.replace_transcript_application(&fixture.application, &cut.messages);
+
+        // Rule 1: the live runtime epoch no longer matches the cut — the
+        // queued next-generation event must not be applied as this cut's
+        // continuation; the recovery restarts with a fresh cut.
+        let mut stale_cut = cut.clone();
+        stale_cut.epoch += 1;
+        let (tx, mut rx) = tokio::sync::broadcast::channel(4);
+        tx.send(lag_published(
+            stale_cut.epoch,
+            stale_cut.event_barrier + 1,
+            AgentEvent::MessageEnd {
+                message: Message::Assistant(lag_assistant_reply("old session late row")),
+            },
+        ))
+        .expect("queue the next-generation event");
+        assert!(matches!(
+            state.drain_application_events(&fixture.application, &stale_cut, &mut rx),
+            DrainOutcome::Restart
+        ));
+        assert_eq!(
+            lag_transcript_rows(&state, "old session late row"),
+            0,
+            "a mismatched live epoch must not apply old-generation state"
+        );
+
+        // Rule 2: an event from the next generation, queued without a
+        // consumed `RuntimeChanged`, is dropped — not applied as this cut's
+        // continuation.
+        tx.send(lag_published(
+            cut.epoch + 1,
+            cut.event_barrier + 1,
+            AgentEvent::MessageEnd {
+                message: Message::Assistant(lag_assistant_reply("old session late row")),
+            },
+        ))
+        .expect("queue the next-generation event");
+        assert!(matches!(
+            state.drain_application_events(&fixture.application, &cut, &mut rx),
+            DrainOutcome::Settled
+        ));
+        assert_eq!(
+            lag_transcript_rows(&state, "old session late row"),
+            0,
+            "no old-session state may leak into this cut"
+        );
+
+        // Contrast: a current-generation post-cut event applies exactly once.
+        tx.send(lag_published(
+            cut.epoch,
+            cut.event_barrier + 1,
+            AgentEvent::MessageEnd {
+                message: Message::Assistant(lag_assistant_reply("current generation row")),
+            },
+        ))
+        .expect("queue the current-generation event");
+        assert!(matches!(
+            state.drain_application_events(&fixture.application, &cut, &mut rx),
+            DrainOutcome::Settled
+        ));
+        assert_eq!(lag_transcript_rows(&state, "current generation row"), 1);
+
+        // A closed channel propagates so the select loop can shut down.
+        drop(tx);
+        assert!(matches!(
+            state.drain_application_events(&fixture.application, &cut, &mut rx),
+            DrainOutcome::Closed
+        ));
+        fixture.application.cleanup().await;
+    }
+
+    /// Contract: a prompt echoed but not yet confirmed survives the lag cut —
+    /// the echoed row is kept, the queued `MessageEnd(User)` reconciles into
+    /// it exactly once.
+    #[tokio::test]
+    async fn lag_recovery_preserves_pending_user_echo() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let fixture = test_application(cwd.path()).await;
+        // No history: the cut is taken before the prompt was persisted.
+        let mut state = lag_test_state(&fixture);
+        state.pending_user_echo = true;
+        state.push_lines("You", "late prompt".to_owned(), Color::Reset);
+
+        let (tx, mut rx) = tokio::sync::broadcast::channel(4);
+        tx.send(ApplicationEvent::Agent(AgentEvent::MessageEnd {
+            message: Message::user_text("late prompt", 1),
+        }))
+        .expect("queue the pending confirmation");
+
+        state
+            .recover_from_application_lag(&fixture.application, &mut rx, 48)
+            .await;
+
+        assert_eq!(state.status, "Recovered UI after 48 lagged events");
+        assert_eq!(
+            lag_transcript_rows(&state, "late prompt"),
+            1,
+            "the echoed prompt survives the cut exactly once"
+        );
+        assert!(
+            !state.pending_user_echo,
+            "the queued confirmation consumed the pending echo"
+        );
+        fixture.application.cleanup().await;
+    }
+
+    /// Regression: a queued `JobUpdated` predates the cut. The drain must
+    /// reconcile against the live runtime — an id the authority does not
+    /// know is skipped (no phantom card), a live id applies the fresh
+    /// snapshot, and queued workflow events route through the panel path.
+    #[tokio::test]
+    async fn lag_drain_reconciles_job_updates_against_live_runtime() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let fixture = test_application_with_orchestration(cwd.path()).await;
+        let runtime = fixture
+            .application
+            .orchestration_runtime()
+            .expect("orchestration runtime")
+            .clone();
+        let spawned = runtime
+            .spawn_tasks(
+                "Main",
+                0,
+                vec![pi_coding::TaskItem {
+                    index: 0,
+                    id: "DrainWorker".to_owned(),
+                    agent: "task".to_owned(),
+                    assignment: "drain reconcile".to_owned(),
+                    todo_task_id: None,
+                    context: None,
+                    output_schema: None,
+                    schema_mode: None,
+                }],
+            )
+            .expect("spawn real job");
+        let job_id = spawned[0].job_id.clone();
+        let mut state = lag_test_state(&fixture);
+
+        let mut stale = runtime
+            .jobs(Some(std::slice::from_ref(&job_id)))
+            .into_iter()
+            .next()
+            .expect("spawned job snapshot");
+        stale.status = pi_coding::JobStatus::Running;
+        let mut ghost = stale.clone();
+        ghost.id = "ghost-job".to_owned();
+        let mut ghost_queued = ghost.clone();
+        ghost_queued.status = pi_coding::JobStatus::Queued;
+        ghost_queued.started_at = None;
+        let mut staler = stale.clone();
+        staler.status = pi_coding::JobStatus::Queued;
+        staler.started_at = None;
+        let group_id = runtime.group_id().to_owned();
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        tx.send(ApplicationEvent::Orchestration(
+            pi_coding::OrchestrationEvent::JobUpdated {
+                group_id: group_id.clone(),
+                job: ghost,
+            },
+        ))
+        .expect("queue stale foreign job");
+        tx.send(ApplicationEvent::Orchestration(
+            pi_coding::OrchestrationEvent::JobUpdated {
+                group_id: group_id.clone(),
+                job: stale,
+            },
+        ))
+        .expect("queue stale known job");
+        tx.send(ApplicationEvent::Orchestration(
+            pi_coding::OrchestrationEvent::JobUpdated {
+                group_id: group_id.clone(),
+                job: ghost_queued,
+            },
+        ))
+        .expect("queue unknown queued job");
+        tx.send(ApplicationEvent::Orchestration(
+            pi_coding::OrchestrationEvent::JobUpdated {
+                group_id,
+                job: staler,
+            },
+        ))
+        .expect("queue staler known job");
+        tx.send(ApplicationEvent::Workflow(pi_coding::WorkflowEvent::Removed {
+            workflow_id: pi_coding::WorkflowId::new("wf-drain"),
+            generation: 1,
+        }))
+        .expect("queue workflow event");
+
+        state
+            .recover_from_application_lag(&fixture.application, &mut rx, 48)
+            .await;
+        let cards = state.job_cards.cards_in_source_order();
+        assert!(
+            cards
+                .iter()
+                .all(|card| card.job_id != "ghost-job" && card.job_id != "ghost-queued"),
+            "a job the runtime does not know must not survive the refresh: {cards:?}"
+        );
+        let live = runtime
+            .jobs(Some(std::slice::from_ref(&job_id)))
+            .into_iter()
+            .next()
+            .expect("live snapshot");
+        let card = cards
+            .iter()
+            .find(|card| card.job_id == job_id)
+            .expect("the live job keeps its card");
+        assert_eq!(
+            card.job_status, live.status,
+            "the drain leaves the authoritative snapshot, not a queued copy"
+        );
+        assert_eq!(
+            card.job_status.is_settled(),
+            live.status.is_settled(),
+            "a queued stale publish must not flip the settled lifecycle: {cards:?}"
+        );
+        fixture.application.cleanup().await;
+    }
+
+    /// Regression: lag recovery reconciles a skipped `AskUser` — the live
+    /// session's pending question re-arms the composer ask row instead of
+    /// swallowing the next submitted line as a new prompt.
+    #[tokio::test]
+    async fn lag_recovery_reconciles_pending_ask_from_live_session() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let (fixture, tool) = ask_application(cwd.path()).await;
+        fixture.application.set_ask_interactive(true);
+        let mut events = fixture.application.subscribe();
+        let run = tokio::spawn(async move {
+            (tool.execute)(ask_tool_context(
+                serde_json::json!({ "question": "continue?" }),
+            ))
+            .await
+        });
+        let (id, prompt) = loop {
+            match events.recv().await.expect("application events") {
+                ApplicationEvent::Session(pi_coding::SessionEvent::AskUser { id, prompt }) => {
+                    break (id, prompt);
+                }
+                _ => continue,
+            }
+        };
+        let mut state = lag_test_state(&fixture);
+        // The AskUser event was among the dropped run: the composer shows no
+        // pending question before recovery reconciles it.
+        assert!(state.pending_ask.is_none());
+        state
+            .reconcile_activity_from_application(&fixture.application)
+            .await;
+        let ask = state.pending_ask.as_ref().expect("pending ask re-arms");
+        assert_eq!(ask.id, id);
+        assert_eq!(ask.prompt, prompt);
+        state.editor.set_text("yes please");
+        assert!(
+            submit_pending_ask(&fixture.application, &mut state).await,
+            "the re-armed ask must consume the submit"
+        );
+        assert!(state.pending_ask.is_none());
+        let result = run.await.expect("join").expect("ask succeeds");
+        assert_eq!(result.content, vec![ContentBlock::text("yes please")]);
+        fixture.application.cleanup().await;
     }
 }

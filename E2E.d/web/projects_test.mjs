@@ -86,6 +86,7 @@
 import { chromium } from 'playwright';
 import fs from 'node:fs';
 import path from 'node:path';
+import { clickFeature, openSessionsDrawer } from './lib/feature-menu.mjs';
 const url = process.env.RPI_URL;
 const token = process.env.RPI_TOKEN || '';
 const chromePath = process.env.RPI_CHROME || '';
@@ -334,6 +335,18 @@ async function main() {
       fail(`P0.2: non-provider top-level groups found: ${forbiddenProviders.join(', ')}`);
     }
     record('P0.2');
+    // P0.3 precondition: under the committed default active-path collapse
+    // only the ACTIVE session's project subgroup renders rows; project B's
+    // subgroup renders collapsed. Expand it with a real user click (never
+    // force/evaluate clicks, never search) before asserting its row.
+    const projectHeadB = page.locator('.session-sidebar__group-head[data-group-kind="project"]')
+      .filter({ hasText: PROJECT_B_LABEL });
+    if (await projectHeadB.count() !== 1) {
+      fail(`P0.3: expected exactly one project-B group head, got ${await projectHeadB.count()}`);
+    }
+    if (await projectHeadB.getAttribute('aria-expanded') === 'false') {
+      await projectHeadB.click();
+    }
 
     // P0.3: both seeded rows listed (ids are fixture-fixed).
     await waitFor(
@@ -394,7 +407,7 @@ async function main() {
       searchAllIds.length
     );
     /* ---------------- P1: active session is project A ---------------- */
-    await page.click('#session-toggle-btn');
+    await clickFeature(page, '#session-toggle-btn');
     await waitFor(page, () => document.getElementById('session-panel') !== null, 'P1.1: session panel did not open');
     await waitFor(
       page,
@@ -690,11 +703,17 @@ async function main() {
     if (bFiles.length !== 1 || !bFiles[0].includes('project-b-seed')) {
       fail(`P4.2: source B's encoded dir changed (${bFiles.join(', ')})`);
     }
-    await page.evaluate((sessionId) => {
-      const row = [...document.querySelectorAll('.session-sidebar__switch')]
-        .find((candidate) => candidate.dataset.sessionId === sessionId);
-      if (row) row.click();
-    }, sourceSessionId);
+    // P3.1's New-A switch re-collapsed B under the committed default active-path semantics; expand it, then real-click the source row.
+    const sourceHeadB = page.locator('.session-sidebar__group-head[data-group-kind="project"]')
+      .filter({ hasText: PROJECT_B_LABEL });
+    if (await sourceHeadB.count() !== 1) {
+      fail(`P4.2: expected exactly one project-B group head, got ${await sourceHeadB.count()}`);
+    }
+    if (await sourceHeadB.getAttribute('aria-expanded') === 'false') {
+      await sourceHeadB.click();
+    }
+    await page.locator(`.session-sidebar__switch[data-session-id="${sourceSessionId}"]`)
+      .click({ timeout: 30000 });
     await waitRowActive(page, sourceSessionId, 'P4.2');
     await waitFor(
       page,
@@ -1279,8 +1298,8 @@ async function main() {
         if (!mobileSource) {
           fail('P6 mobile: no active source session after boot');
         }
-        await mobile.click('#sidebar-toggle-btn');
-        await mobile.click('#session-toggle-btn');
+        await openSessionsDrawer(mobile);
+        await clickFeature(mobile, '#session-toggle-btn');
         await waitFor(mobile, () => document.getElementById('session-panel') !== null, 'P6 mobile: session panel did not open');
         // (1) New Session (explicit cwd project B): the fresh target under B
         // activates with exactly one new_session wire frame.
@@ -1320,7 +1339,7 @@ async function main() {
         // prompt, no panel refresh, no settling delay, no listbox.
         await mobile.click('#session-close-btn');
         await waitFor(mobile, () => document.getElementById('session-panel') === null, 'P6 mobile: session panel did not close before the fork');
-        await mobile.click('#sidebar-toggle-btn');
+        await openSessionsDrawer(mobile);
         await waitFor(
           mobile,
           () => document.querySelector('.app-layout')?.classList.contains('app-layout--drawer-open') === true,
@@ -1357,20 +1376,20 @@ async function main() {
         // The child's authoritative panel state: cwd == project B, file under
         // B's encoded dir (the panel remounts for the fork child). The fork's
         // onSwitchComplete closes the mobile drawer after the successful cut;
-        // wait for that close, then reopen the drawer to reach the panel
-        // toggle (a click while still open would CLOSE it).
+        // wait for that close, then reopen the drawer (a click while still open
+        // would CLOSE it). Session itself opens from the header feature menu.
         await waitFor(
           mobile,
           () => document.querySelector('.app-layout')?.classList.contains('app-layout--drawer-open') !== true,
           'P6 mobile: drawer never closed after the immediate fork cut'
         );
-        await mobile.click('#sidebar-toggle-btn');
+        await openSessionsDrawer(mobile);
         await waitFor(
           mobile,
           () => document.querySelector('.app-layout')?.classList.contains('app-layout--drawer-open') === true,
           'P6 mobile: drawer never reopened for the fork child panel'
         );
-        await mobile.click('#session-toggle-btn');
+        await clickFeature(mobile, '#session-toggle-btn');
         await waitFor(mobile, () => document.getElementById('session-panel') !== null, 'P6 mobile: session panel did not open for the fork child');
         await waitFor(
           mobile,

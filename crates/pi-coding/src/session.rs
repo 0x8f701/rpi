@@ -119,6 +119,24 @@ pub struct BeforeCompactionResult {
     pub compaction: Option<CompactionResult>,
 }
 
+/// Typed decline from a `before_compaction` hook cancel; preflight downcasts this to continue on last-good history.
+#[derive(Debug)]
+struct CompactionDeclined;
+
+impl fmt::Display for CompactionDeclined {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Compaction cancelled by extension")
+    }
+}
+
+impl std::error::Error for CompactionDeclined {}
+
+
+struct PreparedInitial {
+    messages: Vec<Message>,
+    reminder: bool,
+    pending_len: usize,
+}
 pub type BeforeAgentStartFn = pi_agent::BeforeAgentStartFn;
 pub type TransformMessageFn = pi_agent::TransformMessageFn;
 pub type TransformContextFn = pi_agent::TransformContextFn;
@@ -133,7 +151,10 @@ pub enum ResourceDiscovery {
 
 #[derive(Clone)]
 pub struct SessionOptions {
-    pub model: Model,
+    /// Absent until a model is selected (`/model`, ACP, RPC, SDK). Execution
+    /// entry points reject an absent model with
+    /// [`pi_agent::ModelNotConfigured`]; no default/faux model is substituted.
+    pub model: Option<Model>,
     pub cwd: PathBuf,
     pub system_prompt: String,
     pub thinking_level: ThinkingLevel,
@@ -149,7 +170,7 @@ pub struct SessionOptions {
 }
 
 struct SessionState {
-    model: Model,
+    model: Option<Model>,
     thinking_level: ThinkingLevel,
     api_key: String,
     messages: Vec<Message>,
@@ -1053,7 +1074,7 @@ fn transcript_rows_from_branch(
             crate::session_store::append_entry_message(&mut messages, entry);
             let message = messages.pop()?;
             match &message {
-                Message::BranchSummary(_) | Message::CompactionSummary(_) => None,
+                Message::BranchSummary(_) => None,
                 _ => Some(TranscriptRow {
                     id: Some(entry.id.clone()),
                     message,
@@ -1063,7 +1084,7 @@ fn transcript_rows_from_branch(
         .collect()
 }
 
-fn project_retained_transcript(
+pub(crate) fn project_retained_transcript(
     tree: &crate::SessionTree,
 ) -> Result<Vec<TranscriptRow>, TranscriptUnavailable> {
     let rows = transcript_rows_from_branch(tree, None);
@@ -1245,7 +1266,8 @@ impl ChildGenerationCapture {
 
 #[derive(Clone)]
 pub struct ChildSessionOptionsSnapshot {
-    pub model: Model,
+    /// Live parent selection; `None` while no model has been configured.
+    pub model: Option<Model>,
     pub workspace: crate::WorkspaceRoots,
     pub thinking_level: ThinkingLevel,
     pub api_key: String,
@@ -1625,7 +1647,12 @@ impl Session {
         let model = options.model;
         let api_key = options.api_key;
         let compaction = options.compaction;
-        let thinking_level = clamp_thinking_level(&model, options.thinking_level);
+        // An absent model has no capabilities to clamp against; the requested
+        // level is stored as-is and clamped by `set_model` once one is chosen.
+        let thinking_level = match model.as_ref() {
+            Some(model) => clamp_thinking_level(model, options.thinking_level),
+            None => options.thinking_level,
+        };
         let mut stream_options = options.stream_options;
         let session_id = stream_options
             .stream
@@ -1714,7 +1741,8 @@ impl Session {
                 {
                     return Err(anyhow!("injected Todo execution persist failure"));
                 }
-                if let Some(recorder) = persist_shared.recorder.lock().as_ref().cloned() {
+                let recorder = persist_shared.recorder.lock().as_ref().cloned();
+                if let Some(recorder) = recorder {
                     recorder.record_todo_snapshot_record(snapshot)?;
                 }
                 Ok(())
@@ -1730,14 +1758,14 @@ impl Session {
                 return HashMap::new();
             }
             let state = env_runtime.state.read();
-            let mut env = HashMap::from([
-                ("PI_PROVIDER".to_owned(), state.model.provider.clone()),
-                ("PI_MODEL".to_owned(), state.model.id.clone()),
-                (
-                    "PI_REASONING_LEVEL".to_owned(),
-                    thinking_level_name(state.thinking_level).to_owned(),
-                ),
-            ]);
+            let mut env = HashMap::from([(
+                "PI_REASONING_LEVEL".to_owned(),
+                thinking_level_name(state.thinking_level).to_owned(),
+            )]);
+            if let Some(model) = &state.model {
+                env.insert("PI_PROVIDER".to_owned(), model.provider.clone());
+                env.insert("PI_MODEL".to_owned(), model.id.clone());
+            }
             drop(state);
             if let Some(recorder) = env_runtime.recorder.lock().as_ref() {
                 env.insert("PI_SESSION_ID".to_owned(), recorder.id());
@@ -1833,7 +1861,12 @@ impl Session {
                 {
                     crate::resolve_model(&spec).map_err(|error| anyhow!("{error}"))?
                 } else {
-                    state.state.read().model.clone()
+                    state
+                        .state
+                        .read()
+                        .model
+                        .clone()
+                        .ok_or_else(|| anyhow::Error::new(pi_agent::ModelNotConfigured))?
                 };
                 // Credential and environment: resolve the model auth once so endpoint
                 // placeholders use the same environment staged into the generation policy;
@@ -2243,7 +2276,15 @@ impl Session {
 
     #[must_use]
     pub fn model(&self) -> Option<Model> {
-        Some(self.inner.shared.state.read().model.clone())
+        self.inner.shared.state.read().model.clone()
+    }
+
+    /// The configured model, or the typed [`pi_agent::ModelNotConfigured`]
+    /// error. Every execution boundary calls this before mutating history,
+    /// queues, recorders, or publishing a turn.
+    pub fn require_model(&self) -> Result<Model> {
+        self.model()
+            .ok_or_else(|| anyhow::Error::new(pi_agent::ModelNotConfigured))
     }
 
     #[must_use]
@@ -2369,7 +2410,10 @@ impl Session {
             return Ok(content);
         }
         let active_model = shared.state.read().model.clone();
-        if active_model.input.iter().any(|input| input == "image") {
+        if active_model
+            .as_ref()
+            .is_some_and(|model| model.input.iter().any(|input| input == "image"))
+        {
             return Ok(content);
         }
         // Live `None` is an explicit disable from `/settings set visionModel`
@@ -2615,7 +2659,8 @@ impl Session {
 
     pub fn set_session_name(&self, name: &str) -> Result<()> {
         let normalized = crate::session_store::normalize_session_name(name);
-        if let Some(recorder) = self.inner.shared.recorder.lock().as_ref().cloned() {
+        let recorder = self.inner.shared.recorder.lock().as_ref().cloned();
+        if let Some(recorder) = recorder {
             recorder.record_session_name(normalized.as_deref().unwrap_or_default())?;
         }
         *self.inner.shared.session_name.write() = normalized.clone();
@@ -2984,10 +3029,10 @@ impl Session {
         let mut classifier_error: Option<String> = None;
         let classifier = if settings.classifier.enabled {
             let state = self.inner.shared.state.read();
-            let resolved = resolve_classifier_model(&settings, &state.model);
+            let session_model = state.model.clone();
             drop(state);
-            match resolved {
-                Ok(model) => Some({
+            match session_model.map(|model| resolve_classifier_model(&settings, &model)) {
+                Some(Ok(model)) => Some({
                     let (_, abort) = AbortController::new();
                     crate::ProviderClassifier {
                         model,
@@ -2996,10 +3041,13 @@ impl Session {
                         abort,
                     }
                 }),
-                Err(error) => {
+                Some(Err(error)) => {
                     classifier_error = Some(error);
                     None
                 }
+                // No model is configured: no classifier provider, and the
+                // prompt itself is rejected at admission.
+                None => None,
             }
         } else {
             None
@@ -3327,11 +3375,12 @@ impl Session {
             let requested = state.thinking_level;
             let effective = clamp_thinking_level(&model, requested);
             state.thinking_level = effective;
-            state.model = model.clone();
+            state.model = Some(model.clone());
             state.api_key = api_key;
             thinking_level_change(&model, requested, effective)
         };
-        if let Some(recorder) = self.inner.shared.recorder.lock().as_ref() {
+        let recorder = self.inner.shared.recorder.lock().as_ref().cloned();
+        if let Some(recorder) = recorder {
             let _ = recorder.record_model_change(&model.provider, &model.id);
             if change.clamped {
                 let _ = recorder.record_thinking_level(thinking_level_name(change.effective));
@@ -3359,7 +3408,10 @@ impl Session {
             return Ok(self.set_model(model, auth.api_key));
         }
         let current = self.inner.shared.state.read();
-        if current.model.provider != model.provider {
+        let Some(current_model) = current.model.as_ref() else {
+            return Err(anyhow::Error::new(pi_agent::ModelNotConfigured));
+        };
+        if current_model.provider != model.provider {
             return Err(anyhow!(
                 "cannot switch extension model provider without an auth resolver"
             ));
@@ -3372,11 +3424,25 @@ impl Session {
     pub fn set_thinking_level(&self, level: ThinkingLevel) -> ThinkingLevelChange {
         let change = {
             let mut state = self.inner.shared.state.write();
-            let effective = clamp_thinking_level(&state.model, level);
-            state.thinking_level = effective;
-            thinking_level_change(&state.model, level, effective)
+            let change = match state.model.as_ref() {
+                Some(model) => {
+                    let effective = clamp_thinking_level(model, level);
+                    thinking_level_change(model, level, effective)
+                }
+                // No model capabilities to clamp against yet: store the
+                // requested level and let the next `set_model` re-clamp.
+                None => ThinkingLevelChange {
+                    requested: level,
+                    effective: level,
+                    clamped: false,
+                    message: format!("Thinking level: {}", thinking_level_name(level)),
+                },
+            };
+            state.thinking_level = change.effective;
+            change
         };
-        if let Some(recorder) = self.inner.shared.recorder.lock().as_ref() {
+        let recorder = self.inner.shared.recorder.lock().as_ref().cloned();
+        if let Some(recorder) = recorder {
             let _ = recorder.record_thinking_level(thinking_level_name(change.effective));
         }
         self.publish_session_event(SessionEvent::ThinkingLevelSelect {
@@ -3571,7 +3637,7 @@ impl Session {
             })
             .await?;
             if reduction.cancel {
-                return Err(anyhow!("Compaction cancelled by extension"));
+                return Err(CompactionDeclined.into());
             }
             if let Some(result) = reduction.compaction {
                 self.publish_session_event(SessionEvent::CompactionStart { reason });
@@ -4085,7 +4151,7 @@ impl Session {
                 let mut state = session.inner.shared.state.write();
                 state.messages = messages;
                 if let Some(model) = model {
-                    state.model = model;
+                    state.model = Some(model);
                 }
                 if let Some(api_key) = api_key {
                     state.api_key = api_key;
@@ -4250,7 +4316,7 @@ impl Session {
         let session_dir = self.inner.session_dir.read().clone();
         let recorder = crate::start_session_in(
             &self.inner.cwd,
-            Some(&state.model),
+            state.model.as_ref(),
             Some(thinking_level_name(state.thinking_level)),
             Some(&session_dir),
             None,
@@ -4446,7 +4512,7 @@ impl Session {
             let mut state = self.inner.shared.state.write();
             state.messages = messages;
             if let Some(model) = model {
-                state.model = model;
+                state.model = Some(model);
             }
             if let Some(api_key) = api_key {
                 state.api_key = api_key;
@@ -4536,7 +4602,7 @@ impl Session {
         let session_dir = self.inner.session_dir.read().clone();
         let recorder = crate::start_session_in(
             &self.inner.cwd,
-            Some(&state.model),
+            state.model.as_ref(),
             Some(thinking_level_name(state.thinking_level)),
             Some(&session_dir),
             None,
@@ -4551,7 +4617,7 @@ impl Session {
         let session_dir = self.inner.session_dir.read().clone();
         let recorder = crate::start_session_in_with_kind(
             &self.inner.cwd,
-            Some(&state.model),
+            state.model.as_ref(),
             Some(thinking_level_name(state.thinking_level)),
             Some(&session_dir),
             None,
@@ -4567,7 +4633,7 @@ impl Session {
         let session_dir = self.inner.session_dir.read().clone();
         let recorder = crate::start_session_in(
             &self.inner.cwd,
-            Some(&state.model),
+            state.model.as_ref(),
             Some(thinking_level_name(state.thinking_level)),
             Some(&session_dir),
             None,
@@ -4593,7 +4659,7 @@ impl Session {
         let state = self.inner.shared.state.read();
         let recorder = crate::start_durable_child_session_in(
             &self.inner.cwd,
-            Some(&state.model),
+            state.model.as_ref(),
             Some(thinking_level_name(state.thinking_level)),
             child_dir,
             None,
@@ -4612,7 +4678,7 @@ impl Session {
         let state = self.inner.shared.state.read();
         let recorder = crate::start_durable_child_session_in(
             &self.inner.cwd,
-            Some(&state.model),
+            state.model.as_ref(),
             Some(thinking_level_name(state.thinking_level)),
             child_dir,
             Some(child_id),
@@ -4631,7 +4697,7 @@ impl Session {
         let state = self.inner.shared.state.read();
         let recorder = crate::start_durable_child_session_in_with_kind(
             &self.inner.cwd,
-            Some(&state.model),
+            state.model.as_ref(),
             Some(thinking_level_name(state.thinking_level)),
             child_dir,
             None,
@@ -5194,12 +5260,10 @@ impl Session {
 
     #[must_use]
     pub fn recorder_info(&self) -> Option<(String, PathBuf)> {
-        self.inner
-            .shared
-            .recorder
-            .lock()
-            .as_ref()
-            .map(|recorder| (recorder.id(), recorder.path()))
+        // Clone the handle under the short shared-recorder lock, then read
+        // identity outside it — identity reads never take the writer lock.
+        let recorder = self.inner.shared.recorder.lock().as_ref().cloned()?;
+        Some((recorder.id(), recorder.path()))
     }
 
     pub fn recording_writer_info(
@@ -5235,9 +5299,10 @@ impl Session {
     }
 
     pub fn loader_drop_counts(&self) -> (usize, usize) {
+        // Last-successfully-loaded diagnostics from the recorder core —
+        // no journal reload, no writer lock, no fail-open on IO errors.
         self.recorder()
-            .and_then(|recorder| recorder.tree().ok())
-            .map(|tree| (tree.skipped_idless, tree.undecodable_messages))
+            .map(|recorder| recorder.loader_drop_counts())
             .unwrap_or((0, 0))
     }
 
@@ -5714,14 +5779,14 @@ impl Session {
         let shared = self.inner.shared.clone();
         Arc::new(move || {
             let state = shared.state.read();
-            let mut env = HashMap::from([
-                ("PI_PROVIDER".to_owned(), state.model.provider.clone()),
-                ("PI_MODEL".to_owned(), state.model.id.clone()),
-                (
-                    "PI_REASONING_LEVEL".to_owned(),
-                    thinking_level_name(state.thinking_level).to_owned(),
-                ),
-            ]);
+            let mut env = HashMap::from([(
+                "PI_REASONING_LEVEL".to_owned(),
+                thinking_level_name(state.thinking_level).to_owned(),
+            )]);
+            if let Some(model) = &state.model {
+                env.insert("PI_PROVIDER".to_owned(), model.provider.clone());
+                env.insert("PI_MODEL".to_owned(), model.id.clone());
+            }
             drop(state);
             if let Some(recorder) = shared.recorder.lock().as_ref() {
                 env.insert("PI_SESSION_ID".to_owned(), recorder.id());
@@ -5800,6 +5865,7 @@ impl Session {
         if prompt.trim().is_empty() && images.is_empty() {
             return Err(anyhow!("prompt must not be empty"));
         }
+        self.require_model()?;
         let mut messages = vec![Message::User(UserMessage {
             content: Vec::new(),
             timestamp: pi_ai::now_millis(),
@@ -5817,7 +5883,7 @@ impl Session {
             content,
             timestamp: pi_ai::now_millis(),
         });
-        let claim = self.begin_run("user").await?;
+        let mut claim = self.begin_run("user", None).await?;
         let agent_mention = Self::agent_mention_name(&messages);
         let mention_context =
             AgentMentionContextGuard::begin(self.inner.shared.clone(), agent_mention);
@@ -5833,8 +5899,10 @@ impl Session {
             })
             .await;
         let session = self.clone();
-        let mut operation =
-            Box::pin(async move { session.execute_with_retries(Some(messages)).await });
+        let boundary = &mut claim.before_count;
+        let mut operation = Box::pin(async move {
+            session.execute_with_retries(Some(messages), boundary).await
+        });
         let mut saw_text = false;
         let mut wrote_output = false;
         let mut ends_with_newline = true;
@@ -5874,11 +5942,14 @@ impl Session {
             }
         }
         drop(subscription);
+        drop(operation);
         let run_result = self.finish_run(claim, operation_result).await;
         // S-RACE-2: print mode settles the same way as run_messages — a steer
         // that landed in the post-final-drain window must be delivered by a
         // continuation instead of stranding until the next prompt.
-        self.deliver_queued_after_settle().await;
+        if !Self::is_typed_abort(&run_result) {
+            self.deliver_queued_after_settle().await;
+        }
         if let Some(error) = writer_error {
             return Err(error);
         }
@@ -5913,9 +5984,26 @@ impl Session {
     }
 
     pub async fn run_messages(&self, messages: Vec<Message>) -> Result<RunResult> {
+        self.run_messages_inner(messages, None).await
+    }
+
+    pub(crate) async fn run_goal_messages(
+        &self,
+        messages: Vec<Message>,
+        admission: crate::application::GoalRunAdmission<'_>,
+    ) -> Result<RunResult> {
+        self.run_messages_inner(messages, Some(admission)).await
+    }
+
+    async fn run_messages_inner(
+        &self,
+        messages: Vec<Message>,
+        admission: Option<crate::application::GoalRunAdmission<'_>>,
+    ) -> Result<RunResult> {
         if messages.is_empty() {
             return Err(anyhow!("messages must not be empty"));
         }
+        self.require_model()?;
         // Fail-closed image delegation BEFORE anything is recorded: errors
         // propagate here and no unprocessed prompt reaches the recorder or the
         // agent. The ORIGINAL messages (images intact) are what the run
@@ -5925,26 +6013,48 @@ impl Session {
         self.delegate_vision_messages(messages.clone()).await?;
         let agent_mention = Self::agent_mention_name(&messages);
         let messages = self.inject_selection_messages(messages).await;
-        let claim = self.begin_run("user").await?;
+        let mut claim = self.begin_run("user", admission).await?;
         let mention_context =
             AgentMentionContextGuard::begin(self.inner.shared.clone(), agent_mention);
-        let operation = self.execute_with_retries(Some(messages)).await;
+        let operation = self
+            .execute_with_retries(Some(messages), &mut claim.before_count)
+            .await;
         let result = self.finish_run(claim, operation).await;
         drop(mention_context);
-        self.deliver_queued_after_settle().await;
+        if !Self::is_typed_abort(&result) {
+            self.deliver_queued_after_settle().await;
+        }
         result
     }
 
     pub async fn continue_run(&self) -> Result<RunResult> {
         let result = self.continue_run_inner().await;
-        self.deliver_queued_after_settle().await;
+        if !Self::is_typed_abort(&result) {
+            self.deliver_queued_after_settle().await;
+        }
         result
     }
 
     async fn continue_run_inner(&self) -> Result<RunResult> {
-        let claim = self.begin_run("assistant").await?;
-        let operation = self.execute_with_retries(None).await;
+        self.require_model()?;
+        let mut claim = self.begin_run("assistant", None).await?;
+        let operation = self
+            .execute_with_retries(None, &mut claim.before_count)
+            .await;
         self.finish_run(claim, operation).await
+    }
+
+    /// True when the run settled with the typed abort stop: an intentional,
+    /// runtime-requested cancellation. The abort intent stops the run, and
+    /// queued messages belong to the caller's restore path (the orchestration
+    /// drain returns them to the mailbox), so the settle-queue drain must
+    /// never restart a provider turn from them. Real provider errors keep
+    /// continuation behavior.
+    fn is_typed_abort(result: &Result<RunResult>) -> bool {
+        result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.downcast_ref::<pi_agent::AbortError>().is_some())
     }
 
     /// Deliver steering/follow-up messages that arrived while the run was
@@ -6175,12 +6285,12 @@ impl Session {
         prepend_hindsight_memory(messages, &body)
     }
 
-    fn prepare_initial_messages(&self, mut messages: Vec<Message>) -> Vec<Message> {
-        if messages
+    fn prepare_initial_messages(&self, mut messages: Vec<Message>) -> PreparedInitial {
+        let reminder = messages
             .iter()
             .any(|message| matches!(message, Message::User(_)))
-            && self.inner.todo.take_reminder()
-        {
+            && self.inner.todo.take_reminder();
+        if reminder {
             let state = self.inner.todo.state();
             messages.insert(
                 0,
@@ -6197,11 +6307,129 @@ impl Session {
                 }),
             );
         }
-        messages.extend(self.inner.shared.pending_next_turn.lock().drain(..));
-        messages
+        let pending = std::mem::take(&mut *self.inner.shared.pending_next_turn.lock());
+        let pending_len = pending.len();
+        messages.extend(pending);
+        PreparedInitial {
+            messages,
+            reminder,
+            pending_len,
+        }
     }
 
-    async fn execute_with_retries(&self, initial: Option<Vec<Message>>) -> Result<()> {
+    /// Returns consumed one-shot messages ahead of anything queued during the failed turn.
+    fn restore_prepared(&self, mut prepared: PreparedInitial) {
+        if prepared.reminder {
+            self.inner.todo.schedule_reminder();
+        }
+        if prepared.pending_len > 0 {
+            let pending = prepared
+                .messages
+                .split_off(prepared.messages.len() - prepared.pending_len);
+            self.inner
+                .shared
+                .pending_next_turn
+                .lock()
+                .splice(0..0, pending);
+        }
+    }
+
+    /// Compacts under the existing run claim when live+incoming tokens already cross the threshold.
+    async fn preflight_compaction(
+        &self,
+        incoming: &[Message],
+        boundary: &mut usize,
+    ) -> Result<()> {
+        if self.inner.run_slot.lock().abort_requested {
+            return Err(pi_agent::AbortError.into());
+        }
+        let result = self
+            .preflight_compaction_inner(incoming, boundary)
+            .await;
+        if self.inner.run_slot.lock().abort_requested {
+            return Err(pi_agent::AbortError.into());
+        }
+        result
+    }
+
+    async fn preflight_compaction_inner(
+        &self,
+        incoming: &[Message],
+        boundary: &mut usize,
+    ) -> Result<()> {
+        let (queued_steering, queued_follow_up) = self.inner.agent.queued_messages().await;
+        let needed = {
+            let state = self.inner.shared.state.read();
+            let Some(settings) = *self.inner.shared.compaction.read() else {
+                return Ok(());
+            };
+            if !settings.enabled {
+                return Ok(());
+            }
+            let mut tokens = estimate_live_context_tokens(&state.messages);
+            for message in incoming
+                .iter()
+                .chain(&queued_steering)
+                .chain(&queued_follow_up)
+            {
+                tokens += estimate_message_tokens(message);
+            }
+            // No model means no context window to compact against; run
+            // admission rejects the request before any provider call.
+            let Some(model) = state.model.as_ref() else {
+                return Ok(());
+            };
+            if !should_compact(tokens, model.context_window, &settings) {
+                return Ok(());
+            }
+            let prefix_len = self
+                .inner
+                .shared
+                .compaction_runtime
+                .lock()
+                .prefix_len
+                .min(state.messages.len());
+            let cut = find_cut_point(
+                &state.messages,
+                prefix_len,
+                state.messages.len(),
+                settings.keep_recent_tokens,
+            );
+            cut.first_kept_index > prefix_len && cut.first_kept_index < state.messages.len()
+        };
+        if !needed {
+            return Ok(());
+        }
+        match self
+            .perform_compaction(CompactionReason::Threshold, false, None, None)
+            .await
+        {
+            Ok(_) => {
+                // recalibrate the run-result boundary to the compacted history length
+                *boundary = self.inner.shared.state.read().messages.len();
+                Ok(())
+            }
+            Err(error) => {
+                if self.inner.run_slot.lock().abort_requested {
+                    return Err(pi_agent::AbortError.into());
+                }
+                if error.downcast_ref::<CompactionDeclined>().is_some() {
+                    // typed decline: continue on last-good history
+                    Ok(())
+                } else {
+                    Err(error.context("threshold compaction before the first provider request"))
+                }
+            }
+        }
+    }
+
+    async fn execute_with_retries(
+        &self,
+        initial: Option<Vec<Message>>,
+        boundary: &mut usize,
+    ) -> Result<()> {
+        // Final provider-boundary defense below the public run paths.
+        self.require_model()?;
         self.inner
             .shared
             .overflow_recovery_attempted
@@ -6212,14 +6440,21 @@ impl Session {
         self.inner.shared.doom_loop.lock().reset();
         let mut operation = match initial {
             Some(messages) => {
-                self.settle_operation(
-                    self.inner
-                        .agent
-                        .prompt_messages(self.prepare_initial_messages(messages)),
-                )
-                .await
+                let prepared = self.prepare_initial_messages(messages);
+                if let Err(error) = self
+                    .preflight_compaction(&prepared.messages, boundary)
+                    .await
+                {
+                    self.restore_prepared(prepared);
+                    return Err(error);
+                }
+                self.settle_operation(self.inner.agent.prompt_messages(prepared.messages))
+                    .await
             }
-            None => self.settle_operation(self.inner.agent.continue_run()).await,
+            None => {
+                self.preflight_compaction(&[], boundary).await?;
+                self.settle_operation(self.inner.agent.continue_run()).await
+            }
         };
         let mut attempt = 0usize;
         loop {
@@ -6229,6 +6464,9 @@ impl Session {
                 return Err(anyhow!("{message}"));
             }
             let state = self.inner.agent.state().await;
+            let Some(model) = state.model.as_ref() else {
+                return Err(anyhow::Error::new(pi_agent::ModelNotConfigured));
+            };
             let Some(Message::Assistant(failure)) = state.messages.last().cloned() else {
                 self.finish_retry_success(attempt);
                 return operation;
@@ -6240,7 +6478,7 @@ impl Session {
                 self.finish_retry_success(attempt);
                 return operation;
             }
-            if is_context_overflow(&failure, state.model.context_window) {
+            if is_context_overflow(&failure, model.context_window) {
                 if self
                     .inner
                     .shared
@@ -6295,11 +6533,11 @@ impl Session {
             let retry_budget_exhausted = fallback_only || attempt >= settings.max_retries;
             if retry_budget_exhausted {
                 let current_selector = format_retry_fallback_selector(
-                    &state.model,
+                    model,
                     Some(thinking_level_name(state.thinking_level)),
                 );
                 let switched_model = if may_fallback {
-                    self.try_apply_retry_model_fallback(&current_selector, &state.model)
+                    self.try_apply_retry_model_fallback(&current_selector, model)
                         .await
                 } else {
                     false
@@ -6313,6 +6551,9 @@ impl Session {
                     let (next_model, next_thinking) = {
                         let shared = self.inner.shared.state.read();
                         (shared.model.clone(), shared.thinking_level)
+                    };
+                    let Some(next_model) = next_model else {
+                        return Err(anyhow::Error::new(pi_agent::ModelNotConfigured));
                     };
                     self.inner.agent.set_model(next_model).await;
                     self.inner.agent.set_thinking_level(next_thinking).await;
@@ -6523,7 +6764,10 @@ impl Session {
                 }
             } else {
                 let current = self.inner.shared.state.read();
-                if current.model.provider != model.provider {
+                let Some(current_model) = current.model.as_ref() else {
+                    continue;
+                };
+                if current_model.provider != model.provider {
                     continue;
                 }
                 current.api_key.clone()
@@ -6600,6 +6844,7 @@ impl Session {
     }
 
     pub async fn steer(&self, message: Message) -> Result<()> {
+        self.require_model()?;
         // Fail-closed delegation before enqueue; the ORIGINAL message (image
         // intact) is queued so history/UI keep the image, and the model-context
         // projection hits the delegation cache when the queue drains.
@@ -6647,6 +6892,7 @@ impl Session {
         self.inner.shared.ask.cancel_pending()
     }
     pub async fn follow_up(&self, message: Message) -> Result<()> {
+        self.require_model()?;
         // Fail-closed delegation before enqueue; the ORIGINAL message (image
         // intact) is queued so history/UI keep the image, and the model-context
         // projection hits the delegation cache when the queue drains.
@@ -6871,9 +7117,20 @@ impl Session {
         }
     }
 
-    async fn begin_run(&self, subject: &str) -> Result<ClaimedRun> {
+    async fn begin_run(
+        &self,
+        subject: &str,
+        admission: Option<crate::application::GoalRunAdmission<'_>>,
+    ) -> Result<ClaimedRun> {
+        // Final admission defense: an absent model must reject the run before
+        // any claim, lifecycle hook, history write, or recorder activity.
+        let model = self.require_model()?;
         // Claim first so lifecycle hooks only fire for runs that actually start.
-        let guard = self.claim_exclusive()?;
+        // A goal admission holds its slot lock across this claim only.
+        let guard = match admission {
+            Some(admission) => admission.claim(|| self.claim_exclusive())?,
+            None => self.claim_exclusive()?,
+        };
         if self
             .inner
             .shared
@@ -6890,11 +7147,10 @@ impl Session {
         self.fire_host_hook(crate::HookEvent::TurnStart, Some(subject), None)
             .await;
         let _ = &guard;
-        let (before_count, model, thinking_level, messages) = {
+        let (before_count, thinking_level, messages) = {
             let state = self.inner.shared.state.read();
             (
                 state.messages.len(),
-                state.model.clone(),
                 state.thinking_level,
                 state.messages.clone(),
             )
@@ -6931,7 +7187,10 @@ impl Session {
                         session.publish_queue_update().await;
                     }
                     if let AgentEvent::MessageEnd { message } = event {
-                        if let Some(recorder) = shared.recorder.lock().as_ref().cloned() {
+                        // Handle cloned under the short lock; the guard must
+                        // not live across the journal I/O below.
+                        let recorder = shared.recorder.lock().as_ref().cloned();
+                        if let Some(recorder) = recorder {
                             let id = match &message {
                                 Message::Custom(custom) => recorder.record_custom_message(custom),
                                 _ => recorder.record_message(&message),
@@ -6974,18 +7233,17 @@ impl Session {
         let messages = final_state.messages[new_start..].to_vec();
         self.fire_host_hook(crate::HookEvent::TurnEnd, Some("assistant"), None)
             .await;
+        let threshold_estimate = estimate_context_tokens_usage_aware(&final_state.messages);
         let threshold_compaction = operation.is_ok() && {
             let settings = self.inner.shared.compaction.read();
-            settings.is_some_and(|settings| {
-                should_compact(
-                    estimate_context_tokens_usage_aware(&final_state.messages),
-                    final_state.model.context_window,
-                    &settings,
-                )
+            final_state.model.as_ref().is_some_and(|model| {
+                settings.is_some_and(|settings| {
+                    should_compact(threshold_estimate, model.context_window, &settings)
+                })
             })
         };
         self.inner.shared.state.write().messages = final_state.messages;
-        let finalized = Ok(build_run_result(messages, final_state.error_message));
+        let finalized = build_run_result(messages, final_state.error_message);
         drop(claim.recorder_subscription.take());
         if threshold_compaction {
             let _ = self
@@ -6999,11 +7257,20 @@ impl Session {
         self.publish_queue_update().await;
         match (operation, flush_result) {
             (Err(error), _) => {
-                let _ = finalized;
-                Err(error)
+                let display_reason = error.to_string();
+                Err(error.context(RunFailureUsage {
+                    usage: finalized.usage.clone(),
+                    display_reason,
+                }))
             }
-            (Ok(()), Err(error)) => Err(error),
-            (Ok(()), Ok(())) => finalized,
+            (Ok(()), Err(error)) => {
+                let display_reason = error.to_string();
+                Err(error.context(RunFailureUsage {
+                    usage: finalized.usage.clone(),
+                    display_reason,
+                }))
+            }
+            (Ok(()), Ok(())) => Ok(finalized),
         }
     }
 }
@@ -7786,6 +8053,21 @@ fn merge_headers_case_insensitive(
     }
 }
 
+/// Preserves the usage already computed by `finish_run` on its error path.
+#[derive(Debug)]
+pub(crate) struct RunFailureUsage {
+    pub(crate) usage: pi_ai::Usage,
+    pub(crate) display_reason: String,
+}
+
+impl std::fmt::Display for RunFailureUsage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.display_reason)
+    }
+}
+
+impl std::error::Error for RunFailureUsage {}
+
 async fn auth_error_stream(model: &Model, message: String) -> pi_ai::AssistantMessageEventStream {
     let stream = pi_ai::new_assistant_message_event_stream();
     let mut error = pi_ai::AssistantMessage::pending(model);
@@ -8038,6 +8320,14 @@ async fn run_summary_provider_call(
             state.thinking_level,
             state.api_key.clone(),
         )
+    };
+    // Summarization is a provider call: absent model fails closed with the
+    // typed error instead of borrowing a default model.
+    let Some(model) = model else {
+        return SummaryAttemptOutcome::Failed {
+            message: pi_agent::ModelNotConfigured.to_string(),
+            retryable: false,
+        };
     };
     let reasoning = if model.reasoning {
         match thinking_level {
@@ -8396,7 +8686,10 @@ async fn recorded_cut_policy(
             Some(resolver(model.clone()).await?.api_key)
         } else {
             let current = shared.state.read();
-            if current.model.provider != model.provider {
+            let Some(current_model) = current.model.as_ref() else {
+                return Err(anyhow::Error::new(pi_agent::ModelNotConfigured));
+            };
+            if current_model.provider != model.provider {
                 return Err(anyhow!(
                     "cannot switch extension model provider without an auth resolver"
                 ));
@@ -8488,7 +8781,7 @@ fn test_generation_capture() -> crate::tools::GenerationCaptureFn {
             let registration = pi_ai::providers::register_faux_provider(Default::default());
             let session = Session::new_with_additional_tools_filtered_and_discovery(
                 SessionOptions {
-                    model: registration.model(None).expect("generation faux model"),
+                    model: Some(registration.model(None).expect("generation faux model")),
                     cwd: cwd.path().to_path_buf(),
                     system_prompt: String::new(),
                     thinking_level: ThinkingLevel::Off,
@@ -8554,28 +8847,30 @@ fn test_session_with_roots(
     mut options: SessionOptions,
     workspace: crate::WorkspaceRoots,
 ) -> Result<Session> {
-    if options.model.api.is_empty() || pi_ai::get_api_provider(&options.model.api).is_none() {
-        static FAUX_REGISTRATIONS: std::sync::LazyLock<
-            Mutex<Vec<pi_ai::providers::FauxProviderRegistration>>,
-        > = std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
-        let mut faux_model = options.model.clone();
-        let suffix = uuid::Uuid::now_v7();
-        let api = format!("session-test-api-{suffix}");
-        let provider = format!("session-test-provider-{suffix}");
-        faux_model.api = api.clone();
-        faux_model.provider = provider.clone();
-        faux_model.base_url = "http://localhost:0".to_owned();
-        let registration =
-            pi_ai::providers::register_faux_provider(pi_ai::providers::FauxProviderOptions {
-                api,
-                provider,
-                models: vec![faux_model.clone()],
-                chunk_size: 1,
-            });
-        options.model.api = faux_model.api;
-        options.model.provider = faux_model.provider;
-        options.model.base_url = faux_model.base_url;
-        FAUX_REGISTRATIONS.lock().push(registration);
+    if let Some(model) = options.model.as_mut() {
+        if model.api.is_empty() || pi_ai::get_api_provider(&model.api).is_none() {
+            static FAUX_REGISTRATIONS: std::sync::LazyLock<
+                Mutex<Vec<pi_ai::providers::FauxProviderRegistration>>,
+            > = std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+            let mut faux_model = model.clone();
+            let suffix = uuid::Uuid::now_v7();
+            let api = format!("session-test-api-{suffix}");
+            let provider = format!("session-test-provider-{suffix}");
+            faux_model.api = api.clone();
+            faux_model.provider = provider.clone();
+            faux_model.base_url = "http://localhost:0".to_owned();
+            let registration =
+                pi_ai::providers::register_faux_provider(pi_ai::providers::FauxProviderOptions {
+                    api,
+                    provider,
+                    models: vec![faux_model.clone()],
+                    chunk_size: 1,
+                });
+            model.api = faux_model.api;
+            model.provider = faux_model.provider;
+            model.base_url = faux_model.base_url;
+            FAUX_REGISTRATIONS.lock().push(registration);
+        }
     }
     Session::new_with_inherited_generation(
         options,
@@ -8745,7 +9040,7 @@ mod inherited_generation_workspace_tests {
             .expect("workspace roots");
         let session = test_session_with_roots(
             SessionOptions {
-                model: Model::default(),
+                model: Some(Model::default()),
                 cwd: cwd.path().to_path_buf(),
                 system_prompt: "child prompt".to_owned(),
                 thinking_level: ThinkingLevel::Off,
@@ -8800,7 +9095,7 @@ mod thinking_level_change_tests {
 
     fn session_with(model: Model) -> Session {
         test_session_with_discovery(SessionOptions {
-            model,
+            model: Some(model),
             cwd: std::env::temp_dir(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -8888,7 +9183,7 @@ mod session_directory_tests {
 
     fn test_session(cwd: &Path, session_dir: &Path) -> Session {
         let session = test_session_with_discovery(SessionOptions {
-            model: Model::default(),
+            model: Some(Model::default()),
             cwd: cwd.to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -9047,6 +9342,102 @@ mod session_directory_tests {
                 .and_then(|value| value.as_str()),
             Some("clean IRC parity body")
         );
+    }
+
+    /// Regression for the real Web restore path: `authoritative_transcript`
+    /// is the lossless retained history plus visible markers. A durable
+    /// compaction record must appear as a CompactionSummary row at its branch
+    /// position WITHOUT deleting the pre-cut history; the 7-message compacted
+    /// model context stays a separate `build_context` concern. BranchSummary
+    /// semantics are intentionally unchanged (still omitted).
+    #[tokio::test]
+    async fn authoritative_transcript_preserves_history_and_inserts_compaction_summary() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let sessions = tempfile::tempdir().expect("sessions");
+        let recorder = crate::start_session_in(
+            cwd.path(),
+            None,
+            None,
+            Some(sessions.path()),
+            Some("compaction-transcript"),
+            None,
+        )
+        .expect("recorder");
+
+        let mut history = Vec::new();
+        let mut entry_ids = Vec::new();
+        for index in 0..48i64 {
+            let message = if index % 2 == 0 {
+                Message::user_text(format!("history-{index:02}"), index)
+            } else {
+                let mut assistant = pi_ai::AssistantMessage::pending(&Model::default());
+                assistant.content = vec![ContentBlock::text(format!("history-{index:02}"))];
+                assistant.stop_reason = pi_ai::StopReason::Stop;
+                assistant.timestamp = index;
+                Message::Assistant(assistant)
+            };
+            entry_ids.push(
+                recorder
+                    .record_message(&message)
+                    .expect("record history message"),
+            );
+            history.push(message);
+        }
+        let compaction_id = recorder
+            .record_compaction_metadata(
+                "E2E-COMPACT-SUMMARY",
+                Some(entry_ids[44].as_str()),
+                3360,
+                &history[44..48],
+                None,
+                None,
+                None,
+            )
+            .expect("record compaction");
+        let prompt = Message::user_text("web-compact-prompt", 48);
+        recorder.record_message(&prompt).expect("record prompt");
+        let mut assistant = pi_ai::AssistantMessage::pending(&Model::default());
+        assistant.content = vec![ContentBlock::text("sessions-reply: web-compact-prompt")];
+        assistant.stop_reason = pi_ai::StopReason::Stop;
+        assistant.timestamp = 49;
+        let answer = Message::Assistant(assistant);
+        recorder.record_message(&answer).expect("record answer");
+        recorder.persist_now_durable().expect("persist");
+        let path = recorder.path();
+        drop(recorder);
+        let prepared = crate::PreparedSessionResume::prepare_path(&path).expect("prepare resume");
+        let context = prepared.build_context();
+        assert_eq!(context.messages.len(), 7, "model context must stay compacted");
+        let session = test_session(cwd.path(), sessions.path());
+        session
+            .resume_recording(
+                prepared.into_recorder().expect("resume recorder"),
+                context.messages,
+            )
+            .await
+            .expect("resume recording");
+        session.reset().await.expect("clear in-memory history");
+
+        let rows = session
+            .authoritative_transcript()
+            .expect("authoritative transcript");
+        assert_eq!(
+            rows.len(),
+            51,
+            "lossless history (48) + summary marker + prompt + answer: {rows:?}"
+        );
+        for (index, expected) in history.iter().enumerate() {
+            assert_eq!(&rows[index].message, expected);
+        }
+        let summary = match &rows[48].message {
+            Message::CompactionSummary(summary) => summary,
+            other => panic!("row 48 must be the compaction summary, got {other:?}"),
+        };
+        assert_eq!(rows[48].id.as_deref(), Some(compaction_id.as_str()));
+        assert_eq!(summary.summary, "E2E-COMPACT-SUMMARY");
+        assert_eq!(summary.tokens_before, 3360);
+        assert_eq!(rows[49].message, prompt);
+        assert_eq!(rows[50].message, answer);
     }
 
     #[tokio::test]
@@ -9725,7 +10116,7 @@ mod session_directory_tests {
         )
         .expect("source session");
         let session = test_session_with_discovery(SessionOptions {
-            model: model_a.clone(),
+            model: Some(model_a.clone()),
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Low,
@@ -9795,7 +10186,7 @@ mod session_directory_tests {
         let prepared =
             crate::PreparedSessionResume::prepare_path(&fork_path).expect("prepare child");
         let reopen = test_session_with_discovery(SessionOptions {
-            model: model_a.clone(),
+            model: Some(model_a.clone()),
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Low,
@@ -9904,7 +10295,7 @@ mod session_directory_tests {
         )
         .expect("source session");
         let session = test_session_with_discovery(SessionOptions {
-            model: model_a.clone(),
+            model: Some(model_a.clone()),
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::High,
@@ -10065,7 +10456,7 @@ mod session_directory_tests {
         )
         .expect("source session");
         let session = test_session_with_discovery(SessionOptions {
-            model: model_a.clone(),
+            model: Some(model_a.clone()),
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Low,
@@ -10167,7 +10558,7 @@ mod session_directory_tests {
         )
         .expect("source session");
         let session = test_session_with_discovery(SessionOptions {
-            model: model_a.clone(),
+            model: Some(model_a.clone()),
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Low,
@@ -10303,7 +10694,7 @@ mod todo_persistence_tests {
 
     fn test_session(cwd: &Path) -> Session {
         test_session_with_discovery(SessionOptions {
-            model: Model::default(),
+            model: Some(Model::default()),
             cwd: cwd.to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -10379,7 +10770,7 @@ mod bash_spill_lifecycle_tests {
 
     fn test_session(cwd: &Path) -> Session {
         test_session_with_discovery(SessionOptions {
-            model: Model::default(),
+            model: Some(Model::default()),
             cwd: cwd.to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -10452,7 +10843,7 @@ mod session_label_tests {
 
     fn test_session(cwd: &Path) -> Session {
         test_session_with_discovery(SessionOptions {
-            model: Model::default(),
+            model: Some(Model::default()),
             cwd: cwd.to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -10661,7 +11052,7 @@ mod host_hooks_firing_tests {
             chunk_size: 1,
         });
         let session = test_session_with_discovery(SessionOptions {
-            model,
+            model: Some(model),
             cwd: cwd.to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -11256,7 +11647,7 @@ mod memory_backend_tests {
             chunk_size: 1,
         });
         let session = test_session_with_discovery(SessionOptions {
-            model,
+            model: Some(model),
             cwd: cwd.to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -11850,7 +12241,7 @@ mod compact_timeout_tests {
 
     fn compactable_session(cwd: &std::path::Path) -> Session {
         test_session_with_discovery(SessionOptions {
-            model: Model::default(),
+            model: Some(Model::default()),
             cwd: cwd.to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -11954,7 +12345,7 @@ mod llm_compact_elision_tests {
             chunk_size: 1,
         });
         let session = test_session_with_discovery(SessionOptions {
-            model,
+            model: Some(model),
             cwd: cwd.to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -12091,7 +12482,7 @@ mod snap_compact_tests {
     fn snap_session(cwd: &std::path::Path, keep_turns: i64) -> (Session, Arc<AtomicUsize>) {
         let (stream_fn, count) = counting_stream_fn();
         let session = test_session_with_discovery(SessionOptions {
-            model: Model::default(),
+            model: Some(Model::default()),
             cwd: cwd.to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -12559,7 +12950,7 @@ mod session_stats_context_usage_tests {
 
     fn stats_session(cwd: &std::path::Path) -> Session {
         test_session_with_discovery(SessionOptions {
-            model: Model::default(),
+            model: Some(Model::default()),
             cwd: cwd.to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -12783,7 +13174,7 @@ mod ask_tool_round_trip_tests {
 
     fn ask_session(cwd: &std::path::Path) -> Session {
         test_session_with_discovery(SessionOptions {
-            model: Model::default(),
+            model: Some(Model::default()),
             cwd: cwd.to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -13016,7 +13407,7 @@ mod doom_loop_recovery_tests {
             chunk_size: 1,
         });
         let session = test_session_with_discovery(SessionOptions {
-            model,
+            model: Some(model),
             cwd: cwd.to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -13548,7 +13939,7 @@ mod rewind_tests {
 
     fn test_session(cwd: &Path) -> Session {
         test_session_with_discovery(SessionOptions {
-            model: Model::default(),
+            model: Some(Model::default()),
             cwd: cwd.to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -13603,7 +13994,7 @@ mod rewind_tests {
         let cwd = tempfile::tempdir().expect("cwd");
         let session_id = "rewind-chain-test".to_owned();
         let session = test_session_with_discovery(SessionOptions {
-            model: Model::default(),
+            model: Some(Model::default()),
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -13681,7 +14072,7 @@ mod rewind_tests {
         let cwd = tempfile::tempdir().expect("cwd");
         let session_id = "chain-drop-test".to_owned();
         let session = test_session_with_discovery(SessionOptions {
-            model: Model::default(),
+            model: Some(Model::default()),
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -13892,7 +14283,7 @@ mod queued_message_consumption_tests {
 
     /// Scripted provider: pops one assistant message per stream invocation, so
     /// the loop's turn count is deterministic.
-    fn scripted(
+    pub(super) fn scripted(
         messages: Vec<pi_ai::AssistantMessage>,
     ) -> (pi_agent::StreamFn, Arc<Mutex<Vec<String>>>) {
         let messages = Arc::new(Mutex::new(VecDeque::from(messages)));
@@ -13983,7 +14374,7 @@ mod queued_message_consumption_tests {
             assistant(vec![ContentBlock::text("three")], StopReason::Stop),
         ]);
         let session = test_session_with_discovery(SessionOptions {
-            model: Model::default(),
+            model: Some(Model::default()),
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -14094,7 +14485,7 @@ mod queued_message_consumption_tests {
             StopReason::Stop,
         )]);
         let session = test_session_with_discovery(SessionOptions {
-            model: Model::default(),
+            model: Some(Model::default()),
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -14148,7 +14539,7 @@ mod queued_message_consumption_tests {
             StopReason::Stop,
         )]);
         let resumed = test_session_with_discovery(SessionOptions {
-            model: Model::default(),
+            model: Some(Model::default()),
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -14208,7 +14599,7 @@ mod queued_message_consumption_tests {
         let cwd = tempfile::tempdir().expect("cwd");
         let sessions = tempfile::tempdir().expect("sessions");
         let session = test_session_with_discovery(SessionOptions {
-            model: Model::default(),
+            model: Some(Model::default()),
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -14280,7 +14671,7 @@ mod queued_message_consumption_tests {
             assistant(vec![ContentBlock::text("after steer")], StopReason::Stop),
         ]);
         let session = test_session_with_discovery(SessionOptions {
-            model: Model::default(),
+            model: Some(Model::default()),
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -14363,7 +14754,7 @@ mod queued_message_consumption_tests {
             assistant(vec![ContentBlock::text("after steer")], StopReason::Stop),
         ]);
         let session = test_session_with_discovery(SessionOptions {
-            model: Model::default(),
+            model: Some(Model::default()),
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -14412,6 +14803,194 @@ mod queued_message_consumption_tests {
                 .iter()
                 .any(|message| content_text_of(message) == "steer late"),
             "the queued steer must be delivered into the transcript"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborted_run_does_not_restart_from_settle_queue() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let stream_starts = starts.clone();
+        let stream_started = started.clone();
+        let stream_fn: pi_agent::StreamFn = Arc::new(move |_model, _context, options| {
+            let starts = stream_starts.clone();
+            let started = stream_started.clone();
+            Box::pin(async move {
+                let stream = pi_ai::new_assistant_message_event_stream();
+                let producer = stream.clone();
+                tokio::spawn(async move {
+                    starts.fetch_add(1, Ordering::SeqCst);
+                    // `notify_one` stores a permit when no waiter is
+                    // registered yet, so the gate cannot miss this signal.
+                    started.notify_one();
+                    let abort = options.stream.abort_signal.expect("stream abort signal");
+                    abort.cancelled().await;
+                    let mut message = pi_ai::AssistantMessage::pending(&pi_ai::Model::default());
+                    message.stop_reason = pi_ai::StopReason::Aborted;
+                    producer.end(Some(message)).await;
+                });
+                stream
+            })
+        });
+        let session = Session::new(SessionOptions {
+            model: Some(Model::default()),
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: Some(stream_fn),
+            auth_resolver: None,
+            auth_manager: None,
+        })
+        .expect("session");
+
+        let run = {
+            let session = session.clone();
+            tokio::spawn(async move { session.run("stream until aborted", Vec::new()).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
+            .await
+            .expect("provider stream started before abort");
+        // Steer mid-run so the settle-queue drain has a queued message it
+        // could (wrongly) restart a provider turn from.
+        session
+            .steer(Message::user_text("queued mid-run", 1))
+            .await
+            .expect("steer accepted mid-run");
+
+        session.abort().await;
+        let result = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("aborted run must settle, never restart from the queue")
+            .expect("run task joined");
+        assert!(
+            result.is_err(),
+            "aborted run must surface the abort, not settle ok"
+        );
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            1,
+            "an intentional abort must not start a second provider turn"
+        );
+        assert_eq!(
+            session.pending_message_count().await,
+            1,
+            "the queued steering stays queued for the caller's restore path"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_preflight_restores_pending_and_reminder() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let stream_calls = calls.clone();
+        let stream_fn: pi_agent::StreamFn = Arc::new(move |_model, _context, _options| {
+            let calls = stream_calls.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                pi_ai::new_assistant_message_event_stream()
+            })
+        });
+        let session = test_session_with_discovery(SessionOptions {
+            model: Some(Model {
+                context_window: 60,
+                ..Model::default()
+            }),
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: Some(crate::CompactionSettings {
+                enabled: true,
+                reserve_tokens: 10,
+                keep_recent_tokens: 4,
+                snap_keep_turns: 10,
+            }),
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: Some(stream_fn),
+            auth_resolver: None,
+            auth_manager: None,
+        });
+        session
+            .load_history(vec![
+                Message::user_text("older request ".repeat(20), 1),
+                Message::user_text("recent request", 2),
+            ])
+            .await
+            .expect("load history");
+        session.inner.todo.schedule_reminder();
+        session
+            .send_custom_message(
+                CustomMessage {
+                    custom_type: "pi.test.pending".to_owned(),
+                    content: "queued pending".into(),
+                    display: false,
+                    details: None,
+                    timestamp: 3,
+                },
+                MessageDelivery::NextTurn,
+                false,
+            )
+            .await
+            .expect("queue pending");
+        let hook_session = session.clone();
+        session.set_before_compaction(Some(Arc::new(move |_| {
+            let hook_session = hook_session.clone();
+            Box::pin(async move {
+                hook_session
+                    .send_custom_message(
+                        CustomMessage {
+                            custom_type: "pi.test.late".to_owned(),
+                            content: "late pending".into(),
+                            display: false,
+                            details: None,
+                            timestamp: 4,
+                        },
+                        MessageDelivery::NextTurn,
+                        false,
+                    )
+                    .await
+                    .expect("queue late pending");
+                Err(anyhow!("summary provider failed"))
+            })
+        })));
+        let error = session
+            .run("first normal request", Vec::new())
+            .await
+            .expect_err("hook error must fail the run");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("threshold compaction before the first provider request")
+                && rendered.contains("summary provider failed"),
+            "cause chain must survive: {rendered}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no provider request may start before the preflight succeeds"
+        );
+        let pending = session.inner.shared.pending_next_turn.lock().clone();
+        assert_eq!(pending.len(), 2, "restored + late pending: {pending:?}");
+        assert!(
+            matches!(&pending[0], Message::Custom(custom) if custom.custom_type == "pi.test.pending"),
+            "the restored pending must return ahead of the late enqueue: {pending:?}"
+        );
+        assert!(
+            matches!(&pending[1], Message::Custom(custom) if custom.custom_type == "pi.test.late"),
+            "the late enqueue must stay after the restored batch: {pending:?}"
+        );
+        assert!(
+            session.todo_reminder_pending(),
+            "the consumed todo reminder must be restored"
         );
     }
 
@@ -14468,7 +15047,7 @@ mod queued_message_consumption_tests {
             ),
         ]);
         let session = test_session_with_discovery(SessionOptions {
-            model: initial_model,
+            model: Some(initial_model),
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -14522,7 +15101,7 @@ mod queued_message_consumption_tests {
         );
     }
 
-    fn assistant(content: Vec<ContentBlock>, stop_reason: StopReason) -> pi_ai::AssistantMessage {
+    pub(super) fn assistant(content: Vec<ContentBlock>, stop_reason: StopReason) -> pi_ai::AssistantMessage {
         let mut message = pi_ai::AssistantMessage::pending(&Model::default());
         message.content = content;
         message.stop_reason = stop_reason;
@@ -14542,7 +15121,7 @@ mod todo_session_isolation_tests {
 
     fn test_session(cwd: &Path, sessions: &Path) -> Session {
         let session = test_session_with_discovery(SessionOptions {
-            model: Model::default(),
+            model: Some(Model::default()),
             cwd: cwd.to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -14717,7 +15296,7 @@ mod mcp_session_reset_tests {
 
     fn mcp_test_session(cwd: &Path, session_dir: &Path) -> Session {
         let session = test_session_with_discovery(SessionOptions {
-            model: Model::default(),
+            model: Some(Model::default()),
             cwd: cwd.to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -15096,7 +15675,7 @@ mod vision_delegation_tests {
         auth_resolver: Option<SessionAuthResolver>,
     ) -> Session {
         test_session_with_discovery(SessionOptions {
-            model: main_model,
+            model: Some(main_model),
             cwd: cwd.to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -16006,7 +16585,7 @@ mod fallback_error_routing_tests {
         });
         let cwd = tempfile::tempdir().expect("fallback cwd");
         let active = Session::new(SessionOptions {
-            model: primary.clone(),
+            model: Some(primary.clone()),
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -16406,7 +16985,7 @@ mod classifier_model_resolution_tests {
         });
         let cwd = tempfile::tempdir().expect("classifier cwd");
         let session = test_session_with_discovery(SessionOptions {
-            model: model.clone(),
+            model: Some(model.clone()),
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -16703,7 +17282,7 @@ mod hook_composition_regression_tests {
             });
         let session = Session::new_with_todo_and_additional_tools_filtered_and_discovery(
             SessionOptions {
-                model,
+                model: Some(model),
                 cwd: cwd.path().to_path_buf(),
                 system_prompt: String::new(),
                 thinking_level: ThinkingLevel::Off,
@@ -16774,7 +17353,7 @@ mod hook_composition_regression_tests {
         let new_post_hook = write_marker_hook(cwd.path(), "new-post.sh", &marker_new_post);
 
         let session = test_session_with_discovery(SessionOptions {
-            model: Model::default(),
+            model: Some(Model::default()),
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -16864,7 +17443,7 @@ mod hook_composition_regression_tests {
         let hook = write_marker_hook(cwd.path(), "pre-count.sh", &marker);
 
         let session = test_session_with_discovery(SessionOptions {
-            model: Model::default(),
+            model: Some(Model::default()),
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -16922,7 +17501,7 @@ mod hook_composition_regression_tests {
         let reducer_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         let session = test_session_with_discovery(SessionOptions {
-            model: Model::default(),
+            model: Some(Model::default()),
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -17020,7 +17599,7 @@ mod detached_workspace_stop_tests {
             chunk_size: 1,
         });
         let session = test_session_with_discovery(SessionOptions {
-            model,
+            model: Some(model),
             cwd: cwd.to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -17470,4 +18049,85 @@ mod detached_workspace_stop_tests {
         assert_eq!(classify_tool_error("connection refused"), ToolErrorClass::Recoverable);
     }
 
+}
+
+#[cfg(test)]
+mod recorder_lock_io_race_tests {
+    use super::*;
+    use super::queued_message_consumption_tests::{assistant, scripted};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn message_end_journal_io_does_not_block_get_state_reads() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let sessions = tempfile::tempdir().expect("sessions");
+        let (stream, _model_ids) = scripted(vec![assistant(
+            vec![ContentBlock::text("done")],
+            StopReason::Stop,
+        )]);
+        let session = test_session_with_discovery(SessionOptions {
+            model: Some(Model::default()),
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: Some(stream),
+            auth_resolver: None,
+            auth_manager: None,
+        });
+        session.set_session_dir(sessions.path().to_path_buf());
+        let _application = publish_test_application(&session, cwd.path()).await;
+        session.start_new_recording().expect("start recording");
+        session.persist_recording_now().expect("materialize journal");
+        let (recorder_id, recorder_path) = session.recorder_info().expect("recording attached");
+
+        let gate = crate::session_store::append_test_gate::AppendGate::arm(&recorder_path);
+
+        let run = tokio::spawn({
+            let session = session.clone();
+            async move { session.run("one turn", Vec::new()).await }
+        });
+        assert!(
+            gate.wait_entered(Duration::from_secs(10)),
+            "MessageEnd append must reach the gate while the run is live"
+        );
+
+        // Bounded, not proof-by-time: a regression can only time out here.
+        let (done_tx, done_rx) = mpsc::channel();
+        let reader_session = session.clone();
+        let reader = std::thread::spawn(move || {
+            let _ = done_tx.send((
+                reader_session.recorder_info(),
+                reader_session.loader_drop_counts(),
+            ));
+        });
+
+        let read_outcome = done_rx.recv_timeout(Duration::from_secs(10));
+        gate.release();
+        drop(gate);
+        reader.join().expect("reader thread must join");
+        let run_result = tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .expect("run resolves after gate release")
+            .expect("run task joins");
+        run_result.expect("run succeeds");
+
+        let (info, counts) = read_outcome.unwrap_or_else(|error| {
+            panic!(
+                "get_state reads (recorder_info/loader_drop_counts) blocked behind the MessageEnd journal I/O: {error}"
+            )
+        });
+        assert_eq!(
+            info,
+            Some((recorder_id, recorder_path)),
+            "get_state must observe the live recording while its append I/O is in flight"
+        );
+        assert_eq!(counts, (0, 0), "clean journal reports no loader drops");
+    }
 }

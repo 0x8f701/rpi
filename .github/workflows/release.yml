@@ -1,16 +1,19 @@
 name: Release
 # On tag push v*, validate the release identity, build the embedded web bundle
 # once, and publish three products:
-#   CLI: rpi-<version>-<target>.tar.gz for the four native targets
-#     (x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu,
-#     aarch64-apple-darwin, x86_64-apple-darwin).
-#   Desktop: Linux amd64/arm64 .deb and macOS arm64/x86_64 .zip. Each bundles
-#     the matching CLI binary. Packages are unsigned.
+#   CLI: rpi-<version>-<target>.tar.gz for the two Linux targets
+#     (x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu).
+#   Desktop: Linux amd64/arm64 .deb. Each bundles the matching CLI binary.
+#     Packages are unsigned.
 #   Mobile: one Android release APK, rpi-chat-<version>-android.apk, containing
-#     armeabi-v7a, arm64-v8a, x86, and x86_64. Signed with the checked-in debug
-#     keystore unless android/keystore.properties supplies another. iOS is not published.
-# Publication requires the static sandbox contracts plus Linux and macOS
-# runtime proofs, as well as every CLI, desktop, and Android asset.
+#     armeabi-v7a, arm64-v8a, x86, and x86_64. Release signing is mandatory and
+#     fail-closed: the job materializes keystore.properties from the
+#     ANDROID_RELEASE_* secrets, and the APK signer must equal the pinned
+#     ANDROID_RELEASE_CERT_SHA256 repository variable. A missing, debug-signed,
+#     or mismatched APK fails the release. iOS is not published.
+# macOS CLI and desktop artifacts are unavailable and are not published.
+# Publication requires the static sandbox contracts plus Linux runtime proofs,
+# as well as every CLI, desktop, and Android asset.
 
 on:
   push:
@@ -66,8 +69,8 @@ jobs:
       # crates/pi-cli/build.rs embeds crates/pi-cli/web/dist (vite-plugin-singlefile
       # output). dist/ is generated build output and not tracked by git, so the
       # bundle is built ONCE here from the clean checkout, stamped against the
-      # exact production inputs, and uploaded; build-linux and build-native
-      # download it into their workspaces before cargo build — every build job
+      # exact production inputs, and uploaded; build-linux downloads it into its
+      # workspace before cargo build — every build job
       # embeds the same deterministic bundle without repeating the npm install
       # (and without setup-node inside the Ubuntu 20.04 container).
       - name: Set up Node for Web build
@@ -268,147 +271,9 @@ jobs:
           path: ${{ env.ARCHIVE }}
           if-no-files-found: error
 
-  build-native:
-    name: build (${{ matrix.target }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: aarch64-apple-darwin
-            os: macos-15
-            expected_arch: arm64
-          - target: x86_64-apple-darwin
-            os: macos-15-intel
-            expected_arch: x86_64
-    runs-on: ${{ matrix.os }}
-    needs: [validate-release, build-web]
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          ref: ${{ github.sha }}
-
-      # The embedded Web bundle is built once by build-web (dist/ is not
-      # tracked by git); download it into the workspace before cargo build.
-      - name: Download embedded Web bundle
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
-        with:
-          name: web-dist
-          path: crates/pi-cli/web/dist
-
-      - name: Verify native runner architecture
-        shell: bash
-        run: |
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            actual_arch="$PROCESSOR_ARCHITECTURE"
-          else
-            actual_arch="$(uname -m)"
-          fi
-          echo "Native build architecture: $actual_arch"
-          if [ "$actual_arch" != "${{ matrix.expected_arch }}" ]; then
-            echo "Expected native ${{ matrix.expected_arch }} execution" >&2
-            exit 1
-          fi
-
-
-      - name: Install Rust 1.88.0
-        shell: bash
-        run: |
-          rustup toolchain install 1.88.0 --profile minimal
-          rustup default 1.88.0
-          rustup target add --toolchain 1.88.0 "${{ matrix.target }}"
-
-          rustc_version="$(rustc +1.88.0 --version)"
-          echo "$rustc_version"
-          case "$rustc_version" in
-            "rustc 1.88.0 "*) ;;
-            *)
-              echo "Expected rustc 1.88.0" >&2
-              exit 1
-              ;;
-          esac
-
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          key: ${{ matrix.target }}
-
-      # build-release.sh composes stable rustc --remap-path-prefix for the
-      # workspace, HOME, CARGO_HOME and RUSTUP_HOME roots (Cargo 1.88 rejects
-      # the unstable trim-paths profile key) and hands them to cargo via
-      # CARGO_ENCODED_RUSTFLAGS.
-      - name: Build rpi (release-dist, macOS)
-        env:
-          CARGO_TERM_COLOR: never
-        run: |
-          if ! bash E2E.d/release/build-release.sh +1.88.0 build --package pi-cli --bin rpi --profile release-dist --locked --target ${{ matrix.target }} > "$RUNNER_TEMP/rpi-build.log" 2>&1; then
-            { printf '%s\n' 'release build failed'; grep -am 9 '^error' "$RUNNER_TEMP/rpi-build.log"; } | grep -aviE 'api[_-]?key|authorization|bearer |sk-[a-z0-9]{8}|ghp_[a-z0-9]|gho_[a-z0-9]|password|private key' | head -n 10 | while IFS= read -r line; do printf '::error title=build::%s\n' "$line"; done
-            tail -n 40 "$RUNNER_TEMP/rpi-build.log" >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-
-      - name: Verify stripped release binary
-        shell: bash
-        run: |
-          src="target/${{ matrix.target }}/release-dist/rpi"
-          [ -f "$src" ] || { echo "rpi binary not found at $src" >&2; exit 1; }
-
-          bytes="$(wc -c < "$src" | tr -d '[:space:]')"
-          echo "release binary: $src ($bytes bytes; limit $MAX_RELEASE_BINARY_BYTES)"
-          if [ "$bytes" -gt "$MAX_RELEASE_BINARY_BYTES" ]; then
-            echo "release binary exceeds the 128 MiB distribution limit" >&2
-            exit 1
-          fi
-
-      # Fails on any count above zero; prints counts per category only, never
-      # the matching strings (the prefixes are builder paths).
-      - name: Verify no builder path leakage
-        shell: bash
-        run: |
-          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
-          rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
-          bash E2E.d/release/path-leak-check.sh \
-            "target/${{ matrix.target }}/release-dist/rpi" \
-            "HOME=$HOME" \
-            "WORKSPACE=$GITHUB_WORKSPACE" \
-            "CARGO_HOME=$cargo_home" \
-            "RUSTUP_HOME=$rustup_home"
-
-      - name: Smoke-test the native binary
-        shell: bash
-        run: target/${{ matrix.target }}/release-dist/rpi --version
-
-      - name: Package archive (tar.gz)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          version="${GITHUB_REF_NAME#v}"
-          archive="rpi-${version}-${{ matrix.target }}.tar.gz"
-          staging="$(mktemp -d)"
-          src="target/${{ matrix.target }}/release-dist/rpi"
-          [ -f LICENSE ] || { echo "LICENSE is required in release archives" >&2; exit 1; }
-          cp "$src" "$staging/rpi"
-          chmod 0755 "$staging/rpi"
-          cp LICENSE "$staging/"
-          [ ! -f NOTICE ] || cp NOTICE "$staging/"
-          tar -C "$staging" -czf "$archive" .
-          if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum "$archive"
-          else
-            shasum -a 256 "$archive"
-          fi
-          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: ${{ env.ARCHIVE }}
-          path: ${{ env.ARCHIVE }}
-          if-no-files-found: error
-
-
   package-desktop:
     name: package desktop (${{ matrix.asset_arch }})
-    needs: [validate-release, build-linux, build-native]
+    needs: [validate-release, build-linux]
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -424,16 +289,7 @@ jobs:
             kind: deb
             asset_arch: arm64
             expected_arch: aarch64
-          - os: macos-15
-            target: aarch64-apple-darwin
-            kind: mac
-            asset_arch: aarch64-apple-darwin
-            expected_arch: arm64
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-            kind: mac
-            asset_arch: x86_64-apple-darwin
-            expected_arch: x86_64
+
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -443,7 +299,7 @@ jobs:
       - name: Set up Node for the desktop shell
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Name the matching CLI archive
         shell: bash
@@ -453,7 +309,6 @@ jobs:
             ''|*' '*|*'/'*) echo "Release version is not a single path segment" >&2; exit 1 ;;
           esac
           ext="tar.gz"
-          if [ "${{ matrix.kind }}" = "win" ]; then ext="zip"; fi
           {
             echo "RELEASE_VERSION=$version"
             echo "CLI_ARCHIVE=rpi-${version}-${{ matrix.target }}.${ext}"
@@ -469,38 +324,37 @@ jobs:
         shell: bash
         run: |
           actual_arch="$(uname -m)"
-          if [ "${{ runner.os }}" = "Windows" ]; then actual_arch="$PROCESSOR_ARCHITECTURE"; fi
+          if [ "${{ matrix.kind }}" != "deb" ]; then
+            echo "Desktop packaging is Linux deb only (got ${{ matrix.kind }})" >&2
+            exit 1
+          fi
+          sudo apt-get update
+          sudo apt-get install -y file
           if [ "$actual_arch" != "${{ matrix.expected_arch }}" ]; then
             echo "Expected native ${{ matrix.expected_arch }} execution" >&2
             exit 1
           fi
-          if [ "${{ matrix.kind }}" = "deb" ]; then
-            sudo apt-get update
-            sudo apt-get install -y file unzip
-          fi
           mkdir -p target/release-dist
           archive="cli-archive/${CLI_ARCHIVE}"
           [ -f "$archive" ] || { echo "CLI archive missing: $archive" >&2; exit 1; }
-          if [ "${{ matrix.kind }}" = "win" ]; then
-            unzip -q "$archive" -d target/release-dist
-            [ -f target/release-dist/rpi.exe ] || { echo "Windows archive has no rpi.exe" >&2; exit 1; }
-          else
-            tar -xzf "$archive" -C target/release-dist
-            [ -f target/release-dist/rpi ] || { echo "Archive has no rpi" >&2; exit 1; }
-            chmod 0755 target/release-dist/rpi
-            case "${{ matrix.kind }}:${{ matrix.expected_arch }}" in
-              deb:x86_64) file target/release-dist/rpi | grep -q 'x86-64' ;;
-              deb:aarch64) file target/release-dist/rpi | grep -qi 'aarch64' ;;
-              mac:arm64) file target/release-dist/rpi | grep -q 'arm64' ;;
-              mac:x86_64) file target/release-dist/rpi | grep -q 'x86_64' ;;
-              *) echo "No binary architecture check for this desktop package" >&2; exit 1 ;;
-            esac
-          fi
+          tar -xzf "$archive" -C target/release-dist
+          [ -f target/release-dist/rpi ] || { echo "Archive has no rpi" >&2; exit 1; }
+          chmod 0755 target/release-dist/rpi
+          case "${{ matrix.expected_arch }}" in
+            x86_64) file target/release-dist/rpi | grep -q 'x86-64' ;;
+            aarch64) file target/release-dist/rpi | grep -qi 'aarch64' ;;
+            *) echo "No binary architecture check for this desktop package" >&2; exit 1 ;;
+          esac
 
       - name: Install desktop dependencies
         working-directory: crates/pi-cli/desktop
         shell: bash
         run: npm ci
+
+      - name: Install the Electron runtime
+        working-directory: crates/pi-cli/desktop
+        shell: bash
+        run: node node_modules/electron/install.js
 
       - name: Package Linux deb
         if: matrix.kind == 'deb'
@@ -513,16 +367,7 @@ jobs:
           sha256sum "$asset"
           echo "ARCHIVE=$asset" >> "$GITHUB_ENV"
 
-      - name: Package macOS zip
-        if: matrix.kind == 'mac'
-        shell: bash
-        run: |
-          export VERSION="$RELEASE_VERSION"
-          export RPI_BINARY="$GITHUB_WORKSPACE/target/release-dist/rpi"
-          asset="rpi-desktop-${RELEASE_VERSION}-${{ matrix.asset_arch }}.zip"
-          bash crates/pi-cli/desktop/package-mac.sh "$asset"
-          shasum -a 256 "$asset"
-          echo "ARCHIVE=$asset" >> "$GITHUB_ENV"
+
 
       - name: Upload desktop package
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
@@ -540,6 +385,120 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.sha }}
+
+      # Fail fast on missing signing material, before the npm/SDK install work.
+      # Secrets reach the process only through the environment; no value is
+      # printed, passed as an argument, or placed in a command line, and only
+      # fixed secret names are ever echoed on failure. Both files are created
+      # exclusively with mode 0600 (no overwrite, no symlink following, no
+      # world-readable window), and the properties values are serialized with
+      # the exact java.util.Properties escapes so a backslash, newline, leading
+      # space, '=', ':', '#' or '!' in a secret cannot inject or split a key.
+      - name: Materialize release signing material
+        working-directory: mobile/android
+        shell: bash
+        env:
+          ANDROID_RELEASE_KEYSTORE_BASE64: ${{ secrets.ANDROID_RELEASE_KEYSTORE_BASE64 }}
+          ANDROID_RELEASE_STORE_PASSWORD: ${{ secrets.ANDROID_RELEASE_STORE_PASSWORD }}
+          ANDROID_RELEASE_KEY_ALIAS: ${{ secrets.ANDROID_RELEASE_KEY_ALIAS }}
+          ANDROID_RELEASE_KEY_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEY_PASSWORD }}
+        run: |
+          python3 - <<'PY'
+          import base64
+          import binascii
+          import os
+          import sys
+
+          NAMES = (
+              "ANDROID_RELEASE_KEYSTORE_BASE64",
+              "ANDROID_RELEASE_STORE_PASSWORD",
+              "ANDROID_RELEASE_KEY_ALIAS",
+              "ANDROID_RELEASE_KEY_PASSWORD",
+          )
+
+          def escape_property(text):
+              """Serialize a value the way java.util.Properties.load reads it."""
+              out = []
+              for ch in text:
+                  if ch == "\\":
+                      out.append("\\\\")
+                  elif ch in "=:#!":
+                      out.append("\\" + ch)
+                  elif ch == " ":
+                      out.append("\\ ")
+                  elif ch == "\t":
+                      out.append("\\t")
+                  elif ch == "\n":
+                      out.append("\\n")
+                  elif ch == "\r":
+                      out.append("\\r")
+                  elif ch == "\f":
+                      out.append("\\f")
+                  elif " " <= ch <= "~":
+                      out.append(ch)
+                  else:
+                      units = ch.encode("utf-16-be")
+                      for index in range(0, len(units), 2):
+                          code = int.from_bytes(units[index:index + 2], "big")
+                          out.append("\\u%04X" % code)
+              return "".join(out)
+
+          def write_private(path, data):
+              flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+              try:
+                  fd = os.open(path, flags, 0o600)
+              except FileExistsError:
+                  print(
+                      path + " already exists; refusing to overwrite signing material",
+                      file=sys.stderr,
+                  )
+                  raise SystemExit(1)
+              except OSError as error:
+                  print("cannot create " + path + ": " + error.strerror, file=sys.stderr)
+                  raise SystemExit(1)
+              with os.fdopen(fd, "wb") as handle:
+                  handle.write(data)
+              mode = os.stat(path, follow_symlinks=False).st_mode & 0o777
+              if mode != 0o600:
+                  print("%s was created with mode %04o instead of 0600" % (path, mode), file=sys.stderr)
+                  raise SystemExit(1)
+
+          missing = [name for name in NAMES if not os.environ.get(name)]
+          if missing:
+              print(
+                  "Missing required Android signing secrets: " + " ".join(missing),
+                  file=sys.stderr,
+              )
+              raise SystemExit(1)
+
+          os.umask(0o077)
+          try:
+              keystore = base64.b64decode(os.environ[NAMES[0]], validate=True)
+          except (binascii.Error, ValueError):
+              print("ANDROID_RELEASE_KEYSTORE_BASE64 is not valid base64", file=sys.stderr)
+              raise SystemExit(1)
+          if not keystore:
+              print("ANDROID_RELEASE_KEYSTORE_BASE64 decoded empty", file=sys.stderr)
+              raise SystemExit(1)
+
+          entries = (
+              ("storeFile", "app/release.keystore"),
+              ("keyAlias", os.environ["ANDROID_RELEASE_KEY_ALIAS"]),
+              ("storePassword", os.environ["ANDROID_RELEASE_STORE_PASSWORD"]),
+              ("keyPassword", os.environ["ANDROID_RELEASE_KEY_PASSWORD"]),
+          )
+          lines = []
+          for key, value in entries:
+              escaped = escape_property(value)
+              if not escaped.isascii():
+                  print(key + " cannot be written to keystore.properties", file=sys.stderr)
+                  raise SystemExit(1)
+              lines.append(key + "=" + escaped)
+
+          write_private("app/release.keystore", keystore)
+          write_private("keystore.properties", ("\n".join(lines) + "\n").encode("ascii"))
+          print("Release signing material written to exclusive 0600 files")
+          PY
 
       - name: Set up Node for the Android bundle
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -599,12 +558,50 @@ jobs:
           sha256sum "$asset"
           echo "ARCHIVE=rpi-chat-${version}-android.apk" >> "$GITHUB_ENV"
 
+      # Authoritative gate: the artifact must be signed, and its signer must be
+      # the pinned release certificate — never the public debug keystore. The
+      # Gradle signing gate already refused an unsigned build, so this also
+      # covers a mismatched or swapped keystore.
+      - name: Verify the release APK signer
+        working-directory: mobile/android
+        shell: bash
+        env:
+          EXPECTED_CERT_SHA256: ${{ vars.ANDROID_RELEASE_CERT_SHA256 }}
+          DEBUG_CERT_SHA256: "FA:C6:17:45:DC:09:03:78:6F:B9:ED:E6:2A:96:2B:39:9F:73:48:F0:BB:6F:89:9B:83:32:66:75:91:03:3B:9C"
+        run: |
+          normalize() { printf '%s' "$1" | tr -d ':' | tr 'a-f' 'A-F'; }
+          fail() { echo "$1" >&2; exit 1; }
+          [ -n "$EXPECTED_CERT_SHA256" ] || fail "vars.ANDROID_RELEASE_CERT_SHA256 is not set; refusing to publish an unverified APK"
+          apksigner="$ANDROID_SDK_ROOT/build-tools/34.0.0/apksigner"
+          [ -x "$apksigner" ] || fail "apksigner is missing from build-tools 34.0.0"
+          built="$(find app/build/outputs/apk/release -maxdepth 1 -type f -name 'rpi-chat-*.apk' | sort | sed -n '1p')"
+          [ -n "$built" ] && [ -s "$built" ] || fail "No nonempty release APK to verify"
+          staged="$GITHUB_WORKSPACE/rpi-chat-${GITHUB_REF_NAME#v}-android.apk"
+          [ -f "$staged" ] || fail "Staged release asset is missing: $staged"
+          cmp "$built" "$staged" || fail "Staged asset differs from the built APK"
+          for apk in "$built" "$staged"; do
+            "$apksigner" verify "$apk" >/dev/null || fail "APK is not correctly signed: $apk"
+            actual="$("$apksigner" verify --print-certs "$apk" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | sed -n '1p')"
+            [ -n "$actual" ] || fail "Could not read the APK signer certificate: $apk"
+            [ "$(normalize "$actual")" != "$(normalize "$DEBUG_CERT_SHA256")" ] || fail "APK is signed with the public debug keystore: $apk"
+            [ "$(normalize "$actual")" = "$(normalize "$EXPECTED_CERT_SHA256")" ] || fail "APK signer $actual does not match ANDROID_RELEASE_CERT_SHA256: $apk"
+            echo "Verified signer for $(basename "$apk"): $actual"
+          done
+
       - name: Upload Android APK
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: ${{ env.ARCHIVE }}
           path: ${{ env.ARCHIVE }}
           if-no-files-found: error
+
+      # Always drop the materialized key material, including when an earlier
+      # step failed. The runner is ephemeral, but the files never outlive the job.
+      - name: Remove materialized signing material
+        if: always()
+        working-directory: mobile/android
+        shell: bash
+        run: rm -f app/release.keystore keystore.properties
 
   sandbox-static-release:
     name: sandbox static release gates
@@ -630,11 +627,11 @@ jobs:
       - name: Run sandbox static release gates
         shell: bash
         run: |
-          cargo +1.88.0 test --locked -p pi-coding --test raw_spawn_gate
-          cargo +1.88.0 test --locked -p pi-coding --test sandbox_spawn_families
-          cargo +1.88.0 test --locked -p pi-coding --test policy_fs
-          cargo +1.88.0 test --locked -p pi-coding --test host_network
-          cargo +1.88.0 test --locked -p pi-coding --test application_generation
+          cargo +1.88.0 test --release --locked -p pi-coding --test raw_spawn_gate
+          cargo +1.88.0 test --release --locked -p pi-coding --test sandbox_spawn_families
+          cargo +1.88.0 test --release --locked -p pi-coding --test policy_fs
+          cargo +1.88.0 test --release --locked -p pi-coding --test host_network
+          cargo +1.88.0 test --release --locked -p pi-coding --test application_generation
 
   sandbox-linux-release:
     name: sandbox Linux release proof (${{ matrix.arch }})
@@ -728,98 +725,26 @@ jobs:
       - name: Run Linux sandbox release proofs
         shell: bash
         run: |
-          cargo +1.88.0 test --locked -p pi-sandbox --test linux_backend
-          cargo +1.88.0 test --locked -p pi-sandbox --lib spawn::tests::owned_spawn_parts_are_consumed_exactly_once -- --nocapture
-          cargo +1.88.0 test --locked -p pi-sandbox --lib unix::tests::wrapper_exec_preserves_only_declared_transport_fds -- --nocapture
-          cargo +1.88.0 test --locked -p pi-sandbox --lib prepare::linux::tests::every_bwrap_argv_fd_survives_wrapper_exec -- --nocapture
-          cargo +1.88.0 test --locked -p pi-sandbox --lib child::tests::linux_descriptor_exec_uses_prepared_inode_after_path_replacement -- --nocapture
-          cargo +1.88.0 test --locked -p pi-sandbox --lib child::tests::all_governed_mappings_survive_and_sources_close_after_install -- --nocapture
-          cargo +1.88.0 test --locked -p pi-sandbox --lib child::tests::status_eof_follows_exec_armed_frame_and_target_exec -- --nocapture
-          cargo +1.88.0 test --locked -p pi-sandbox --lib unix::tests::wrapper_and_child_error_channels_have_distinct_close_owners -- --nocapture
-          cargo +1.88.0 test --locked -p pi-sandbox --lib unix::tests::unrelated_fd_does_not_cross_wrapper_or_target_exec -- --nocapture
-          cargo +1.88.0 test --locked -p pi-sandbox --lib spawn::tests::browser_target_fd_contract_is_exact -- --nocapture
-          cargo +1.88.0 test --locked -p pi-sandbox --lib prepare::linux::tests::target_resolution_pins_inode -- --nocapture
-          cargo +1.88.0 test --locked -p pi-sandbox --lib prepare::linux::tests::current_binary_uses_proc_self_exe_fd -- --nocapture
-          cargo +1.88.0 test --locked -p pi-sandbox --lib bwrap::tests::argv_has_empty_root_and_literal_order -- --nocapture
-          cargo +1.88.0 test --locked -p pi-sandbox --lib bwrap::tests::every_mount_source_is_fd_backed -- --nocapture
-          cargo +1.88.0 test --locked -p pi-sandbox --lib launcher::tests::exec_uses_opened_bwrap_identity -- --nocapture
-          cargo +1.88.0 test --locked -p pi-sandbox --lib prepare::linux::tests::prepared_plan_owns_duplicated_launcher -- --nocapture
-          cargo +1.88.0 test --locked -p pi-sandbox --lib child::tests::child_request_rejects_zero_and_above_default_limits -- --nocapture
-          cargo +1.88.0 test --locked -p pi-sandbox --lib child::tests::hidden_child_applies_limits_nnp_seccomp_then_exec -- --nocapture
-          cargo +1.88.0 test --locked -p pi-sandbox --test pty_launcher -- --nocapture
-          cargo +1.88.0 test --locked -p pi-coding --test browser_native_sandbox governed_debugging_pipe_returns_browser_version -- --nocapture
-
-  sandbox-macos-release:
-    name: sandbox macOS release proof (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-15, macos-15-intel]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          ref: ${{ github.sha }}
-
-      - name: Install Rust 1.88.0
-        shell: bash
-        run: |
-          rustup toolchain install 1.88.0 --profile minimal
-          rustc_version="$(rustc +1.88.0 --version)"
-          echo "$rustc_version"
-          case "$rustc_version" in
-            "rustc 1.88.0 "*) ;;
-            *) echo "Expected rustc 1.88.0" >&2; exit 1 ;;
-          esac
-          test -x /usr/bin/sandbox-exec
-
-
-      - name: Set up Node for Chromium
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: 20
-
-      - name: Install Playwright Chromium
-        shell: bash
-        run: |
-          playwright_dir="$RUNNER_TEMP/sandbox-playwright"
-          mkdir -p "$playwright_dir"
-          cd "$playwright_dir"
-          npm install --no-save --no-audit --no-fund playwright@1.55.0
-          npx playwright install --with-deps chromium
-          chrome_path="$(node -e "process.stdout.write(require('playwright').chromium.executablePath())")"
-          [ -x "$chrome_path" ]
-          echo "CHROME_PATH=$chrome_path" >> "$GITHUB_ENV"
-
-      - name: Run macOS sandbox release proofs
-        shell: bash
-        run: |
-          set +e
-          failed=0
-          while IFS= read -r spec; do
-            [ -z "$spec" ] && continue
-            if ! cargo +1.88.0 test --locked $spec -- --nocapture > "$RUNNER_TEMP/proof.log" 2>&1; then
-              {
-                printf '%s\n' "$spec"
-                awk '/^error(\[|:)/ {print; want=2; next} want > 0 && /^  *--> / {print; want=0; next} want > 0 {want--} /panicked at/ {print; pmsg=3; next} pmsg > 0 {print; pmsg--}' "$RUNNER_TEMP/proof.log"
-                printf '%s\n' '--- failing tests ---'
-                awk '/^failures:$/ {f=1; next} f && NF > 0 {print; count++} count >= 4 {exit}' "$RUNNER_TEMP/proof.log"
-                printf '%s\n' '--- last lines ---'
-                tail -n 5 "$RUNNER_TEMP/proof.log"
-              } | grep -aviE 'api[_-]?key[ =:]|authorization[ =:]|bearer [a-z0-9]|sk-[a-z0-9]{16}|ghp_[a-z0-9]|gho_[a-z0-9]|github_pat_|password[ =:]|BEGIN [A-Z]+ PRIVATE' > "$RUNNER_TEMP/proof-report.txt" || true
-              head -n 9 "$RUNNER_TEMP/proof-report.txt" | while IFS= read -r line; do printf '::error title=macos proof::%s\n' "$line"; done
-              cat "$RUNNER_TEMP/proof-report.txt" >> "$GITHUB_STEP_SUMMARY"
-              failed=1
-            fi
-          done <<'PROOFS'
-          -p pi-sandbox --test macos_backend
-          -p pi-sandbox --lib prepare::macos::tests::pinned_target_fd_survives_sandbox_exec_and_path_replacement
-          -p pi-sandbox --lib seatbelt::tests::descriptor_process_exec_representation_is_exact
-          -p pi-sandbox --lib unix::tests::wrapper_and_child_error_channels_have_distinct_close_owners
-          -p pi-coding --test browser_native_sandbox governed_debugging_pipe_returns_browser_version
-          PROOFS
-          exit "$failed"
+          cargo +1.88.0 test --release --locked -p pi-sandbox --test linux_backend
+          cargo +1.88.0 test --release --locked -p pi-sandbox --lib spawn::tests::owned_spawn_parts_are_consumed_exactly_once -- --nocapture
+          cargo +1.88.0 test --release --locked -p pi-sandbox --lib unix::tests::wrapper_exec_preserves_only_declared_transport_fds -- --nocapture
+          cargo +1.88.0 test --release --locked -p pi-sandbox --lib prepare::linux::tests::every_bwrap_argv_fd_survives_wrapper_exec -- --nocapture
+          cargo +1.88.0 test --release --locked -p pi-sandbox --lib child::tests::linux_descriptor_exec_uses_prepared_inode_after_path_replacement -- --nocapture
+          cargo +1.88.0 test --release --locked -p pi-sandbox --lib child::tests::all_governed_mappings_survive_and_sources_close_after_install -- --nocapture
+          cargo +1.88.0 test --release --locked -p pi-sandbox --lib child::tests::status_eof_follows_exec_armed_frame_and_target_exec -- --nocapture
+          cargo +1.88.0 test --release --locked -p pi-sandbox --lib unix::tests::wrapper_and_child_error_channels_have_distinct_close_owners -- --nocapture
+          cargo +1.88.0 test --release --locked -p pi-sandbox --lib unix::tests::unrelated_fd_does_not_cross_wrapper_or_target_exec -- --nocapture
+          cargo +1.88.0 test --release --locked -p pi-sandbox --lib spawn::tests::browser_target_fd_contract_is_exact -- --nocapture
+          cargo +1.88.0 test --release --locked -p pi-sandbox --lib prepare::linux::tests::target_resolution_pins_inode -- --nocapture
+          cargo +1.88.0 test --release --locked -p pi-sandbox --lib prepare::linux::tests::current_binary_uses_proc_self_exe_fd -- --nocapture
+          cargo +1.88.0 test --release --locked -p pi-sandbox --lib bwrap::tests::argv_has_empty_root_and_literal_order -- --nocapture
+          cargo +1.88.0 test --release --locked -p pi-sandbox --lib bwrap::tests::every_mount_source_is_fd_backed -- --nocapture
+          cargo +1.88.0 test --release --locked -p pi-sandbox --lib launcher::tests::exec_uses_opened_bwrap_identity -- --nocapture
+          cargo +1.88.0 test --release --locked -p pi-sandbox --lib prepare::linux::tests::prepared_plan_owns_duplicated_launcher -- --nocapture
+          cargo +1.88.0 test --release --locked -p pi-sandbox --lib child::tests::child_request_rejects_zero_and_above_default_limits -- --nocapture
+          cargo +1.88.0 test --release --locked -p pi-sandbox --lib child::tests::hidden_child_applies_limits_nnp_seccomp_then_exec -- --nocapture
+          cargo +1.88.0 test --release --locked -p pi-sandbox --test pty_launcher -- --nocapture
+          cargo +1.88.0 test --release --locked -p pi-coding --test browser_native_sandbox governed_debugging_pipe_returns_browser_version -- --nocapture --include-ignored
 
   release:
     name: publish GitHub Release
@@ -827,11 +752,9 @@ jobs:
       - validate-release
       - sandbox-static-release
       - build-linux
-      - build-native
       - package-desktop
       - package-android
       - sandbox-linux-release
-      - sandbox-macos-release
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -843,7 +766,7 @@ jobs:
       # Download every CLI, desktop, and Android release file. `web-dist`
       # (the embedded web bundle shared into the build jobs) must NOT land in
       # the release staging dir. The exact-inventory check below requires the
-      # nine product files and nothing else.
+      # five product files and nothing else.
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           path: dist
@@ -864,21 +787,17 @@ jobs:
             *)   echo "IS_PRERELEASE=false" >> "$GITHUB_ENV" ;;
           esac
           expected=(
-            "rpi-${version}-aarch64-apple-darwin.tar.gz"
             "rpi-${version}-aarch64-unknown-linux-gnu.tar.gz"
-            "rpi-${version}-x86_64-apple-darwin.tar.gz"
             "rpi-${version}-x86_64-unknown-linux-gnu.tar.gz"
-            "rpi-desktop-${version}-aarch64-apple-darwin.zip"
             "rpi-desktop-${version}-amd64.deb"
             "rpi-desktop-${version}-arm64.deb"
-            "rpi-desktop-${version}-x86_64-apple-darwin.zip"
             "rpi-chat-${version}-android.apk"
           )
 
           printf '%s\n' "${expected[@]}" | LC_ALL=C sort > "$RUNNER_TEMP/expected-assets.txt"
           find . -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort > "$RUNNER_TEMP/actual-assets.txt"
           if ! diff -u "$RUNNER_TEMP/expected-assets.txt" "$RUNNER_TEMP/actual-assets.txt"; then
-            echo "Local release inventory is not exactly the nine expected product files" >&2
+            echo "Local release inventory is not exactly the five expected product files" >&2
             exit 1
           fi
 
@@ -946,23 +865,25 @@ jobs:
 
             ### CLI
 
-            Platforms: Linux x86_64, Linux aarch64, macOS arm64, macOS x86_64.
+            Platforms: Linux x86_64, Linux aarch64.
+
+            macOS CLI and desktop artifacts are unavailable and are not published in this release.
 
             Archives are `rpi-<version>-<target-triple>.tar.gz`. Each contains `rpi` plus `LICENSE`.
 
             ```sh
-            # macOS / Linux — installer source pinned to this release commit; candidate pinned to this release tag
+            # Linux — installer source pinned to this release commit; candidate pinned to this release tag
             curl -fsSL https://raw.githubusercontent.com/0x8f701/rpi/${{ github.sha }}/install.sh | bash -s -- --version ${{ github.ref_name }}
             ```
             ### Desktop
 
-            Platforms: Linux amd64 `.deb`, Linux arm64 `.deb`, macOS arm64 `.zip`, macOS x86_64 `.zip`.
+            Platforms: Linux amd64 `.deb`, Linux arm64 `.deb`.
 
-            Each desktop package bundles the CLI binary for that same platform. Linux: `dpkg -i rpi-desktop-<version>-amd64.deb` or `dpkg -i rpi-desktop-<version>-arm64.deb`. macOS: unzip `rpi-desktop-<version>-aarch64-apple-darwin.zip` or the x86_64 zip and open `rpi-desktop.app`. These desktop packages are not code-signed or notarized.
+            Each desktop package bundles the CLI binary for that same platform. Linux: `dpkg -i rpi-desktop-<version>-amd64.deb` or `dpkg -i rpi-desktop-<version>-arm64.deb`. These desktop packages are not code-signed or notarized.
 
             ### Mobile
 
-            Android: `rpi-chat-<version>-android.apk` is one sideload APK containing `armeabi-v7a`, `arm64-v8a`, `x86`, and `x86_64`. It is a release build signed with the checked-in debug keystore. The application id is `com.rpichat`, versionName `1.0.0`, versionCode `5`. iOS is not published.
+            Android: `rpi-chat-<version>-android.apk` is one sideload APK containing `armeabi-v7a`, `arm64-v8a`, `x86`, and `x86_64`. It is a release build whose signing certificate is pinned by the build: the workflow refuses to publish an APK that is unsigned, signed by the public debug keystore, or signed by any certificate other than the pinned release certificate. Signature checking happens before the asset is uploaded. Installing this APK over an earlier build signed with the debug keystore requires uninstalling that build first. The application id is `com.rpichat`, versionName `1.0.0`, versionCode `5`. iOS is not published.
 
       - name: Verify remote draft inventory
         env:
@@ -972,14 +893,10 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           expected=(
             SHA256SUMS
-            "rpi-${version}-aarch64-apple-darwin.tar.gz"
             "rpi-${version}-aarch64-unknown-linux-gnu.tar.gz"
-            "rpi-${version}-x86_64-apple-darwin.tar.gz"
             "rpi-${version}-x86_64-unknown-linux-gnu.tar.gz"
-            "rpi-desktop-${version}-aarch64-apple-darwin.zip"
             "rpi-desktop-${version}-amd64.deb"
             "rpi-desktop-${version}-arm64.deb"
-            "rpi-desktop-${version}-x86_64-apple-darwin.zip"
             "rpi-chat-${version}-android.apk"
           )
           release_id="${{ steps.draft_release.outputs.id }}"
@@ -993,16 +910,16 @@ jobs:
 
           if ! jq -e --arg tag "$GITHUB_REF_NAME" --arg ispre "$IS_PRERELEASE" \
             '(.tag_name == $tag) and (.draft == true) and (.prerelease == ($ispre == "true")) and
-             (.assets | length == 12) and all(.assets[]; .size > 0)' \
+             (.assets | length == 6) and all(.assets[]; .size > 0)' \
             <<< "$release_json" >/dev/null; then
-            echo "Remote release is not a draft with twelve nonempty assets" >&2
+            echo "Remote release is not a draft with six nonempty assets" >&2
             exit 1
           fi
 
           printf '%s\n' "${expected[@]}" | LC_ALL=C sort > "$RUNNER_TEMP/expected-remote-assets.txt"
           jq -r '.assets[].name' <<< "$release_json" | LC_ALL=C sort > "$RUNNER_TEMP/actual-remote-assets.txt"
           if ! diff -u "$RUNNER_TEMP/expected-remote-assets.txt" "$RUNNER_TEMP/actual-remote-assets.txt"; then
-            echo "Remote draft inventory is not exactly the nine product files plus SHA256SUMS" >&2
+            echo "Remote draft inventory is not exactly the five product files plus SHA256SUMS" >&2
             exit 1
           fi
 

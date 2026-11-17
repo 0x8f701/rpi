@@ -14,6 +14,16 @@ Commands use a snake-case `type` discriminator and an optional string `id`. Most
 
 A response contains `type: "response"`, `command`, and `success`. It includes `id` when provided, optional `sessionId`, optional `data`, and optional `error`. A successful command response is not by itself proof that a streamed model turn has finished.
 
+## Assistant streaming events
+
+A turn also streams `message_start`, `message_update`, and `message_end` records on the same lines.
+
+`message_update.message` is assistant **metadata only**: `role`, `api`, `provider`, `model`, `responseModel`, `responseId`, `diagnostics`, `usage`, `stopReason`, `errorMessage`, `rawStopReason`, and `timestamp`. It never carries `content` and is never a partial snapshot; there is no compatibility payload that also sends the accumulated message. Optional fields (`responseModel`, `responseId`, `errorMessage`, `rawStopReason`) and an empty `diagnostics` are omitted rather than sent as null or `[]`.
+
+Each `message_update` record carries exactly one nested `assistantMessageEvent`. Its `type` is `start`, `text_start`, `text_delta`, `text_end`, `thinking_start`, `thinking_delta`, `thinking_end`, `toolcall_start`, `toolcall_delta`, `toolcall_end`, `done`, or `error`. Block events name the block with `content_index`; a `*_delta` adds a `delta` fragment; `text_end` and `thinking_end` carry the block's complete `content`; `toolcall_end` carries `tool_call`; `done` carries the full assistant `message` and `error` carries it as `error` (both with `content`).
+
+Clients must accumulate deltas themselves, appending each `delta` to the block at `content_index` and treating `*_end` as that block's settled content. `message_end` carries the authoritative full message for the reply, so a client that missed deltas converges there.
+
 ## Conversation and model control
 
 | Command | Fields in addition to `type` and optional `id` |

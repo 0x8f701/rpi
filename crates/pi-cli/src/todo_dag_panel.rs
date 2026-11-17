@@ -1528,6 +1528,7 @@ fn job_status(status: JobStatus) -> &'static str {
     match status {
         JobStatus::Queued => "queued",
         JobStatus::Running => "running",
+        JobStatus::Cancelling => "Cancelling",
         JobStatus::Completed => "completed",
         JobStatus::Failed => "failed",
         JobStatus::Cancelled => "cancelled",
@@ -1536,7 +1537,7 @@ fn job_status(status: JobStatus) -> &'static str {
 fn job_color(status: JobStatus, theme: Theme) -> ratatui::style::Color {
     match status {
         JobStatus::Queued => theme.muted,
-        JobStatus::Running => theme.accent,
+        JobStatus::Running | JobStatus::Cancelling => theme.accent,
         JobStatus::Completed => theme.success,
         JobStatus::Failed => theme.error,
         JobStatus::Cancelled => theme.dim,
@@ -2218,11 +2219,13 @@ mod tests {
                     at: 500,
                     kind: crate::job_card_adapter::JobEventKind::Job,
                     text: "started".to_owned(),
+                    message_id: None,
                 },
                 crate::job_card_adapter::JobEventLogEntry {
                     at: 12_100,
                     kind: crate::job_card_adapter::JobEventKind::Message,
                     text: "read tools.rs".to_owned(),
+                    message_id: None,
                 },
             ],
             history_ref: Some("history://agent-a".to_owned()),
@@ -2578,11 +2581,13 @@ mod tests {
                     at: 500,
                     kind: crate::job_card_adapter::JobEventKind::Job,
                     text: secret_field("job event"),
+                    message_id: None,
                 },
                 crate::job_card_adapter::JobEventLogEntry {
                     at: 12_100,
                     kind: crate::job_card_adapter::JobEventKind::Message,
                     text: secret_field("message event"),
+                    message_id: None,
                 },
             ],
             history_ref: Some(format!("history://{SECRET_SENTINEL}")),

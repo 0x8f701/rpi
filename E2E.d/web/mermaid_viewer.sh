@@ -18,9 +18,13 @@
 #        image/svg+xml, sanitized content (no script/foreignObject/embed,
 #        no on* handlers, no non-local URL attributes)
 #     6. the error diagram host has no controls and never opens the viewer
+#     7. TWO valid diagrams in ONE reply, the second opened with a
+#        four-backtick fence (real-reply fence marker-run regression): every
+#        host settles (data-mermaid=done, its own SVG) with independent
+#        element ids and zero console/page errors
 #   Mobile 390x844 (touch):
-#     7. viewer controls are >=44px touch targets
-#     8. the explicit View tap (NOT a dbltap) opens the viewer, the viewer
+#     8. viewer controls are >=44px touch targets
+#     9. the explicit View tap (NOT a dbltap) opens the viewer, the viewer
 #        fits the viewport with no page overflow, and single-finger pan works
 #   Zero console errors / page errors across both pages; inline + viewer
 #   screenshots captured for desktop and mobile.
@@ -47,7 +51,7 @@ main() {
     case "${1:-run}" in
         list|--list|--dry-run)
             printf '%s\n' \
-                'web-mermaid-viewer - real-browser mermaid viewer: host toolbar, one aria-modal singleton (View/dblclick), Fit/zoom/wheel/drag, Escape/Close focus restore, sanitized SVG download, mobile 390px 44px controls + View tap + fit + pan, error host has no controls (playwright, hard gate)'
+                'web-mermaid-viewer - real-browser mermaid viewer: host toolbar, one aria-modal singleton (View/dblclick), Fit/zoom/wheel/drag, Escape/Close focus restore, sanitized SVG download, two diagrams in ONE reply incl. a four-backtick fence settle independently with unique ids, mobile 390px 44px controls + View tap + fit + pan, error host has no controls (playwright, hard gate)'
             return 0
             ;;
         run|all) ;;

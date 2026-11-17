@@ -1,10 +1,10 @@
 import React from 'react';
-import { Clipboard, StyleSheet, Text } from 'react-native';
+import { Clipboard, Image, StyleSheet, Text } from 'react-native';
 import renderer, { act } from 'react-test-renderer';
 import { MarkdownBody } from '../src/MarkdownBody';
 import { humanToolTitle, TranscriptItemView } from '../src/TranscriptItemView';
 import { normalizeThinkingNewlines } from '../src/markdown';
-import type { TranscriptItem } from '../src/transcriptItems';
+import { messagesToItems } from '../src/transcriptItems';
 import { DARK } from '../src/ui';
 
 const TOOL_RESULT_LINE_LIMIT = 8;
@@ -230,5 +230,77 @@ describe('markdown tables', () => {
     expect(styleOf(tree, 'alice').textAlign).toBe('left');
     expect(styleOf(tree, '30').textAlign).toBe('right');
     await unmount(tree);
+  });
+});
+
+describe('history projection', () => {
+  it('pairs tool results to calls by toolCallId and names rebuilt cards stably', () => {
+    const rows = [
+      { id: 'a1', message: { role: 'assistant', content: [
+        { type: 'thinking', thinking: 'plan' },
+        { type: 'toolCall', id: 'call-1', name: 'bash', arguments: { cmd: 'ls' } },
+      ] } },
+      { message: { role: 'toolResult', toolCallId: 'call-1', toolName: 'bash', content: [{ type: 'text', text: 'files' }], isError: false } },
+    ];
+    expect(messagesToItems(rows)[0]).toMatchObject({ kind: 'tool', id: 'tool-call:call-1', toolCallId: 'call-1', result: 'files', status: 'done' });
+    const assistant = messagesToItems(rows)[1];
+    expect(assistant).toMatchObject({ kind: 'assistant', id: 'a1', blocks: [{ type: 'thinking', thinking: 'plan' }] });
+    // The same rebuild names the card identically: poll-driven history
+    // refreshes never remount a card's fold and copy state.
+    expect(messagesToItems(rows)[0]).toMatchObject({ kind: 'tool', id: 'tool-call:call-1' });
+  });
+
+  it('keeps an orphan tool result as a rendered read-only notice instead of dropping it', async () => {
+    const items = messagesToItems([
+      { message: { role: 'toolResult', toolCallId: 'call-9', toolName: 'grep', content: [{ type: 'text', text: 'leftover output' }] } },
+    ]);
+    expect(items).toHaveLength(1);
+    expect(items[0].kind).toBe('notice');
+    if (items[0].kind !== 'notice') return;
+    expect(items[0].text).toContain('grep result without its call in the loaded history');
+    expect(items[0].text).toContain('leftover output');
+    const tree = await mount(<TranscriptItemView item={items[0]} palette={DARK} />);
+    expect(renderedText(tree)).toContain('leftover output');
+    await unmount(tree);
+  });
+
+  it('keeps image blocks in projected assistant content untouched', () => {
+    const items = messagesToItems([
+      { id: 'a1', message: { role: 'assistant', content: [
+        { type: 'image', data: 'abcd', mimeType: 'image/png' },
+        { type: 'text', text: 'diagram' },
+      ] } },
+    ]);
+    expect(items[0].kind).toBe('assistant');
+    if (items[0].kind !== 'assistant') return;
+    expect(items[0].blocks).toEqual([
+      { type: 'image', data: 'abcd', mimeType: 'image/png' },
+      { type: 'text', text: 'diagram' },
+    ]);
+  });
+
+  it('renders an allowlisted image block as a bounded RN image and refuses other MIME strings', async () => {
+    const tree = await mount(<TranscriptItemView item={{
+      kind: 'assistant',
+      id: 'a-img',
+      status: 'final',
+      blocks: [{ type: 'image', data: 'abcd', mimeType: 'image/png' }],
+    }} palette={DARK} />);
+    const image = tree.root.findByType(Image);
+    expect(image.props.source).toEqual({ uri: 'data:image/png;base64,abcd' });
+    expect(image.props.resizeMode).toBe('contain');
+    const style = StyleSheet.flatten(image.props.style) as Record<string, unknown>;
+    expect(typeof style.width).toBe('number');
+    expect(typeof style.height).toBe('number');
+    await unmount(tree);
+
+    const refused = await mount(<TranscriptItemView item={{
+      kind: 'assistant',
+      id: 'a-bad',
+      status: 'final',
+      blocks: [{ type: 'image', data: 'abcd', mimeType: 'image/svg+xml' }],
+    }} palette={DARK} />);
+    expect(refused.root.findAllByType(Image)).toHaveLength(0);
+    await unmount(refused);
   });
 });

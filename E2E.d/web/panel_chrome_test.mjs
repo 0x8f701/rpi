@@ -6,6 +6,7 @@
 import { createRequire } from 'node:module';
 import fs from 'node:fs';
 import path from 'node:path';
+import { clickFeature } from './lib/feature-menu.mjs';
 
 const require = createRequire(import.meta.url);
 const { chromium } = require('playwright');
@@ -75,7 +76,7 @@ try {
   observeBrowserErrors(page);
 
   await connectPage(page, { width: 1440, height: 900 });
-  await page.click('#loop-toggle-btn');
+  await clickFeature(page, '#loop-toggle-btn');
   await page.waitForSelector('#loop-panel', { timeout: 5000 });
   await page.waitForTimeout(400);
 

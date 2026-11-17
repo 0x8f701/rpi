@@ -127,6 +127,39 @@ fn resolved_mode(cli: &Cli, settings: &Settings) -> ApprovalMode {
         .map(Into::into)
         .unwrap_or_else(|| settings.approval_mode())
 }
+fn published_agent_event(event: pi_coding::ApplicationEvent) -> Option<pi_agent::AgentEvent> {
+    match event {
+        pi_coding::ApplicationEvent::AgentPublished { event, .. } => Some(event),
+        _ => None,
+    }
+}
+fn tool_result_text(result: &pi_agent::AgentToolResult) -> String {
+    result
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+fn bounded_tool_error(is_error: bool, body: &str) -> String {
+    const LIMIT: usize = 240;
+    let mut bounded = String::new();
+    for character in body.chars() {
+        if bounded.chars().count() == LIMIT {
+            bounded.push('\u{2026}');
+            break;
+        }
+        bounded.push(if character == '\n' || character == '\r' {
+            ' '
+        } else {
+            character
+        });
+    }
+    format!("is_error={is_error} body={bounded:?}")
+}
 fn prepare_session_store(session: &Session, cwd: &std::path::Path) {
     let session_dir = cwd.join("sessions");
     std::fs::create_dir_all(&session_dir).expect("session directory");
@@ -449,7 +482,7 @@ async fn application_tool_turn_fail_closed_under_write_and_ask() {
             empty_permission_rules(),
         );
         let session = Session::new(SessionOptions {
-            model,
+            model: Some(model),
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -474,36 +507,32 @@ async fn application_tool_turn_fail_closed_under_write_and_ask() {
         let mut saw_blocked_tool = false;
         while tokio::time::Instant::now() < deadline {
             match tokio::time::timeout_at(deadline, events.recv()).await {
-                Ok(Ok(pi_coding::ApplicationEvent::Agent(
-                    pi_agent::AgentEvent::ToolExecutionEnd {
+                Ok(Ok(event)) => match published_agent_event(event) {
+                    Some(pi_agent::AgentEvent::ToolExecutionEnd {
                         tool_name: name,
                         is_error,
                         result,
                         ..
-                    },
-                ))) if name == tool_name => {
-                    assert!(is_error, "{mode:?}/{tool_name} must end as error");
-                    let body = result
-                        .content
-                        .iter()
-                        .filter_map(|block| match block {
-                            ContentBlock::Text { text, .. } => Some(text.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    assert!(
-                        body.contains("no interactive confirmation adapter")
-                            || body.contains("blocked")
-                            || body.contains("denied")
-                            || body.contains("Tool execution"),
-                        "{mode:?}/{tool_name} body: {body}"
-                    );
-                    saw_blocked_tool = true;
-                    break;
-                }
-                Ok(Ok(pi_coding::ApplicationEvent::AgentSettled)) if saw_blocked_tool => break,
-                Ok(Ok(_)) => continue,
+                    }) if name == tool_name => {
+                        let body = tool_result_text(&result);
+                        assert!(
+                            is_error,
+                            "{mode:?}/{tool_name} must end as error: {}",
+                            bounded_tool_error(is_error, &body)
+                        );
+                        assert!(
+                            body.contains("no interactive confirmation adapter")
+                                || body.contains("blocked")
+                                || body.contains("denied")
+                                || body.contains("Tool execution"),
+                            "{mode:?}/{tool_name} {}",
+                            bounded_tool_error(is_error, &body)
+                        );
+                        saw_blocked_tool = true;
+                        break;
+                    }
+                    _ => continue,
+                },
                 Ok(Err(_)) => break,
                 Err(_) => break,
             }
@@ -555,7 +584,7 @@ async fn application_interactive_allow_executes_read_tool() {
         empty_permission_rules(),
     );
     let session = Session::new(SessionOptions {
-        model,
+        model: Some(model),
         cwd: cwd.path().to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,
@@ -580,37 +609,48 @@ async fn application_interactive_allow_executes_read_tool() {
     let mut saw_success = false;
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout_at(deadline, app_events.recv()).await {
-            Ok(Ok(pi_coding::ApplicationEvent::Agent(
-                pi_agent::AgentEvent::ToolExecutionEnd {
+            Ok(Ok(event)) => match published_agent_event(event) {
+                Some(pi_agent::AgentEvent::ToolExecutionEnd {
                     tool_name,
                     is_error,
                     result,
                     ..
-                },
-            ))) if tool_name == "read" => {
-                assert!(!is_error, "allowed read must succeed");
-                let body = result
-                    .content
-                    .iter()
-                    .filter_map(|block| match block {
-                        ContentBlock::Text { text, .. } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                assert!(
-                    body.contains("visible-content"),
-                    "tool body missing fixture: {body}"
-                );
-                saw_success = true;
-                break;
-            }
-            Ok(Ok(_)) => continue,
+                }) if tool_name == "read" => {
+                    let body = tool_result_text(&result);
+                    assert!(
+                        !is_error,
+                        "allowed read must succeed: {}",
+                        bounded_tool_error(is_error, &body)
+                    );
+                    assert!(
+                        body.contains("visible-content"),
+                        "tool body missing fixture: {}",
+                        bounded_tool_error(is_error, &body)
+                    );
+                    saw_success = true;
+                    break;
+                }
+                Some(pi_agent::AgentEvent::TurnEnd { message, .. }) => {
+                    if message.stop_reason == StopReason::Error
+                        || message.error_message.is_some()
+                    {
+                        panic!(
+                            "allowed read turn failed: {:?}",
+                            message.error_message.as_deref().unwrap_or("provider error")
+                        );
+                    }
+                }
+                Some(pi_agent::AgentEvent::AgentEnd { .. }) => break,
+                _ => continue,
+            },
             Ok(Err(_)) | Err(_) => break,
         }
     }
     responder.await.expect("responder");
-    assert!(saw_success, "allowed read tool never completed");
+    assert!(
+        saw_success,
+        "allowed read tool never completed; no tool error event arrived"
+    );
     application.cleanup().await;
     registration.unregister();
 }
@@ -698,7 +738,7 @@ fn settings_file_round_trips_approval_mode_and_rejects_project_override_path() {
     let manager = SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("load");
     assert_eq!(manager.settings().approval_mode(), ApprovalMode::Write);
 
-    let project = cwd.path().join(".pi");
+    let project = cwd.path().join(pi_coding::CONFIG_DIR_NAME);
     std::fs::create_dir_all(&project).expect("project");
     std::fs::write(project.join("settings.json"), r#"{"approvalMode":"yolo"}"#).expect("project");
     let error = manager
@@ -783,7 +823,7 @@ async fn session_path_rules_deny_ask_and_allow_on_live_tool_turns() {
         Arc::new(move || rules.clone()),
     );
     let session = Session::new(SessionOptions {
-        model,
+        model: Some(model),
         cwd: cwd.path().to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,
@@ -810,40 +850,29 @@ async fn session_path_rules_deny_ask_and_allow_on_live_tool_turns() {
     let mut outcomes = std::collections::HashMap::new();
     while tokio::time::Instant::now() < deadline && outcomes.len() < 3 {
         match tokio::time::timeout_at(deadline, events.recv()).await {
-            Ok(Ok(pi_coding::ApplicationEvent::Agent(
-                pi_agent::AgentEvent::ToolExecutionStart {
+            Ok(Ok(event)) => match published_agent_event(event) {
+                Some(pi_agent::AgentEvent::ToolExecutionStart {
                     tool_call_id,
                     arguments,
                     ..
-                },
-            ))) => {
-                if let Some(path) = arguments.get("path").and_then(serde_json::Value::as_str) {
-                    calls.insert(tool_call_id, path.to_owned());
+                }) => {
+                    if let Some(path) = arguments.get("path").and_then(serde_json::Value::as_str) {
+                        calls.insert(tool_call_id, path.to_owned());
+                    }
                 }
-            }
-            Ok(Ok(pi_coding::ApplicationEvent::Agent(
-                pi_agent::AgentEvent::ToolExecutionEnd {
+                Some(pi_agent::AgentEvent::ToolExecutionEnd {
                     tool_call_id,
                     is_error,
                     result,
                     ..
-                },
-            ))) => {
-                let Some(path) = calls.remove(&tool_call_id) else {
-                    continue;
-                };
-                let body = result
-                    .content
-                    .iter()
-                    .filter_map(|block| match block {
-                        ContentBlock::Text { text, .. } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                outcomes.insert(path, (is_error, body));
-            }
-            Ok(Ok(_)) => continue,
+                }) => {
+                    let Some(path) = calls.remove(&tool_call_id) else {
+                        continue;
+                    };
+                    outcomes.insert(path, (is_error, tool_result_text(&result)));
+                }
+                _ => continue,
+            },
             Ok(Err(_)) | Err(_) => break,
         }
     }

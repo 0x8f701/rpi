@@ -28,6 +28,7 @@ import { chromium } from 'playwright';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createFreshSessionViaManage } from './lib/session-lifecycle.mjs';
+import { clickFeature } from './lib/feature-menu.mjs';
 
 const url = process.env.RPI_URL;
 const token = process.env.RPI_TOKEN || '';
@@ -197,7 +198,7 @@ async function main() {
     await primeTurn(page, 'prime fallback session turn', 'phase-1-prime');
 
     // ==================== Session panel ====================
-    await page.click('#session-toggle-btn');
+    await clickFeature(page, '#session-toggle-btn');
     await waitFor(page, () => document.getElementById('session-panel') !== null, 'session panel did not open');
     await waitFor(
       page,
@@ -334,7 +335,7 @@ async function main() {
     record('fallback.app-close-session');
 
     // ==================== Goal panel ====================
-    await page.click('#goal-panel-btn');
+    await clickFeature(page, '#goal-panel-btn');
     await waitFor(page, () => document.getElementById('goal-panel') !== null, 'goal panel did not open');
     await waitFor(
       page,
@@ -378,7 +379,7 @@ async function main() {
     record('fallback.app-close-goal');
 
     // ==================== Side chat panel ====================
-    await page.click('#sidechat-toggle-btn');
+    await clickFeature(page, '#sidechat-toggle-btn');
     await waitFor(page, () => document.querySelector('.side-chat') !== null, 'side chat panel did not open');
     await waitFor(
       page,

@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 
 fn session_options(cwd: &Path, model: Model) -> SessionOptions {
     SessionOptions {
-        model,
+        model: Some(model),
         cwd: cwd.to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,

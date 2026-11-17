@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -28,8 +28,8 @@ use crate::fs::{
 use crate::{Session, Skill};
 
 use super::{
-    AgentCatalog, AgentDefinition, CapabilityCeiling, JobClock, JobManager, JobRetention,
-    JobSnapshot, JobSoftBudget, JobStatus, PreparedJobRecords, TaskSpawn,
+    AgentCatalog, AgentDefinition, CancellationCause, CapabilityCeiling, JobClock, JobManager,
+    JobRetention, JobSnapshot, JobSoftBudget, JobStatus, PreparedJobRecords, TaskSpawn,
 };
 
 pub const DEFAULT_MAILBOX_CAPACITY: usize = 100;
@@ -63,10 +63,19 @@ const MAX_SIBLING_ROSTER_ENTRIES: usize = 64;
 const MAX_SIBLING_ROSTER_BYTES: usize = MAX_AUTOLOAD_PROMPT_BYTES / 64;
 const MAX_ROSTER_AGENT_CHARS: usize = 80;
 const CHILD_ABORT_GRACE: Duration = Duration::from_secs(2);
+/// Exact runner reservation. Keyed in `active` by agent id, but removal matches
+/// `job_id` so a newer reservation for the same agent cannot be dropped by an
+/// older runner finishing.
+struct ActiveOwner {
+    job_id: String,
+    token: CancellationToken,
+}
 const MAX_HISTORY_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 pub type AgentSelectorFn = Arc<dyn Fn(&str, &[AgentDefinition]) -> Option<String> + Send + Sync>;
-pub type ParentModelProvider = Arc<dyn Fn() -> pi_ai::Model + Send + Sync>;
+/// Live parent-model source. Returns `None` when the parent session has no
+/// configured model yet — never a defaulted placeholder model.
+pub type ParentModelProvider = Arc<dyn Fn() -> Option<pi_ai::Model> + Send + Sync>;
 pub type ChildSessionFactory =
     Arc<dyn Fn(ChildSessionRequest) -> BoxFuture<Result<Session>> + Send + Sync>;
 
@@ -247,7 +256,12 @@ pub struct OrchestrationConfig {
     pub preferred_agent: Option<String>,
     selector_settings: Option<crate::SelectorSettings>,
     pub agent_settings: BTreeMap<String, crate::AgentRuntimeSettings>,
-    pub parent_model: pi_ai::Model,
+    /// Parent session model used as the last fallback for child resolution.
+    /// `None` means no model is configured; a spawn then fails with the typed
+    /// [`pi_agent::ModelNotConfigured`] unless a settings/definition model applies.
+    pub parent_model: Option<pi_ai::Model>,
+    /// Live model source, authoritative over `parent_model` when installed so
+    /// `/model` switches reach child spawns without rebuilding the runtime.
     parent_model_provider: Option<ParentModelProvider>,
     pub idle_ttl: Option<Duration>,
     pub max_retained_jobs: usize,
@@ -507,7 +521,13 @@ impl OrchestrationRuntime {
                     tool.name != "yield" && !disallowed.contains(tool.name.as_str())
                 }));
                 tools.push(super::tools::yield_tool(request.yield_state.clone()));
-                let api_key = if request.model.provider == snapshot.model.provider {
+                // A providerless parent has no provider to inherit from; the
+                // auth resolver (or the explicit same-provider match) decides.
+                let parent_provider = snapshot
+                    .model
+                    .as_ref()
+                    .map(|model| model.provider.as_str());
+                let api_key = if parent_provider == Some(request.model.provider.as_str()) {
                     snapshot.api_key
                 } else if let Some(resolver) = &snapshot.auth_resolver {
                     resolver(request.model.clone())
@@ -525,7 +545,7 @@ impl OrchestrationRuntime {
                         request.model.provider,
                         request.model.id,
                         request.model.provider,
-                        snapshot.model.provider,
+                        parent_provider,
                     );
                 };
                 let context_files = snapshot
@@ -536,7 +556,7 @@ impl OrchestrationRuntime {
                 let primary_model = request.model.clone();
                 let child = Session::new_with_inherited_generation(
                     crate::SessionOptions {
-                        model: primary_model.clone(),
+                        model: Some(primary_model.clone()),
                         cwd: snapshot.workspace.cwd().to_path_buf(),
                         system_prompt: format!("{}{context_section}", request.system_prompt),
                         thinking_level: request.thinking_level.unwrap_or(snapshot.thinking_level),
@@ -631,7 +651,7 @@ impl OrchestrationConfig {
             preferred_agent: None,
             selector_settings: None,
             agent_settings: BTreeMap::new(),
-            parent_model: pi_ai::Model::default(),
+            parent_model: None,
             parent_model_provider: None,
             idle_ttl: Some(Duration::from_secs(DEFAULT_IDLE_TTL_SECS)),
             max_retained_jobs: DEFAULT_MAX_RETAINED_JOBS,
@@ -737,7 +757,7 @@ impl OrchestrationConfig {
     }
 
     #[must_use]
-    pub fn with_parent_model(mut self, model: pi_ai::Model) -> Self {
+    pub fn with_parent_model(mut self, model: Option<pi_ai::Model>) -> Self {
         self.parent_model = model;
         self
     }
@@ -761,10 +781,11 @@ impl OrchestrationConfig {
         self
     }
 
-    fn current_parent_model(&self) -> pi_ai::Model {
-        self.parent_model_provider
-            .as_ref()
-            .map_or_else(|| self.parent_model.clone(), |provider| provider())
+    fn current_parent_model(&self) -> Option<pi_ai::Model> {
+        match &self.parent_model_provider {
+            Some(provider) => provider(),
+            None => self.parent_model.clone(),
+        }
     }
 
     fn runtime_equivalent(&self, other: &Self) -> bool {
@@ -1175,7 +1196,7 @@ struct RuntimeInner {
     storage: OrchestrationStorage,
     semaphore: Arc<Semaphore>,
     shutdown: CancellationToken,
-    active: Mutex<HashMap<String, CancellationToken>>,
+    active: Mutex<HashMap<String, ActiveOwner>>,
     active_changed: Notify,
     park_timers: Mutex<HashMap<String, JoinHandle<()>>>,
     jobs: JobManager,
@@ -1224,6 +1245,32 @@ struct RuntimeInner {
             std::sync::Arc<std::sync::atomic::AtomicBool>,
         )>,
     >,
+    /// Test-only gate for the cancellation regression: notified after
+    /// `child.abort()` settles but before the abort drain awaits the run
+    /// future (run_one cancellation path), so the test proves the real
+    /// provider error is consumed by the drain and not by the
+    /// normal-completion branch. `None` in production.
+    #[cfg(test)]
+    abort_drain_entered: Option<Arc<tokio::sync::Notify>>,
+    /// Test-only gate notified after a `hub wait` interest is registered on
+    /// an agent mailbox. `None` outside the waiting-child shutdown test.
+    #[cfg(test)]
+    message_wait_registered: Option<Arc<tokio::sync::Notify>>,
+    /// Test-only park for the prestart cancellation regression: the run
+    /// future (run_one and run_revival) notifies `entered` and then awaits
+    /// `release` before it may reach `Session::run`, so the test can select
+    /// the runtime cancel branch while the child Session run has never
+    /// begun. `None` in production.
+    #[cfg(test)]
+    run_start_park: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    /// Test-only gate for the prestart cancellation regression: notified at
+    /// the top of the `cancel` select arm before any drain decision, so the
+    /// test proves the cancel branch won while the run future is still
+    /// parked. Deliberately separate from `abort_drain_entered`, which stays
+    /// inside the drain for the real-provider-error contract. `None` in
+    /// production.
+    #[cfg(test)]
+    cancel_arm_entered: Option<Arc<tokio::sync::Notify>>,
     /// Role selected with `/role <name> --select`; consulted as the default
     /// agent for child task spawns that do not name an agent explicitly.
     preferred_agent: RwLock<Option<String>>,
@@ -1574,6 +1621,19 @@ impl OrchestrationRuntime {
                 restart_checkpoint_count: AtomicUsize::new(0),
                 #[cfg(test)]
                 restart_checkpoint_error: Mutex::new(None),
+                /// Test-only gate for the cancellation regression: notified
+                /// after `child.abort()` settles but before the abort drain
+                /// awaits the run future, so the test proves the real
+                /// provider error is consumed by the drain and not by the
+                /// normal-completion branch. `None` in production.
+                #[cfg(test)]
+                abort_drain_entered: None,
+                #[cfg(test)]
+                message_wait_registered: None,
+                #[cfg(test)]
+                run_start_park: Mutex::new(None),
+                #[cfg(test)]
+                cancel_arm_entered: None,
                 generation_capture: Mutex::new(None),
                 persona_lifecycle_blocks: Mutex::new(std::collections::BTreeSet::new()),
                 rebind_reserved: AtomicBool::new(false),
@@ -1702,8 +1762,13 @@ impl OrchestrationRuntime {
             .filter(|agent| {
                 let settings = self.inner.config.agent_settings.get(&agent.name);
                 settings.map_or(true, crate::AgentRuntimeSettings::is_enabled)
-                    && crate::agent_compatibility_error(agent, settings, &parent_model, &available)
-                        .is_none()
+                    && crate::agent_compatibility_error(
+                        agent,
+                        settings,
+                        parent_model.as_ref(),
+                        &available,
+                    )
+                    .is_none()
             })
             .collect()
     }
@@ -1747,7 +1812,7 @@ impl OrchestrationRuntime {
                 crate::agent_compatibility_error(
                     agent,
                     self.inner.config.agent_settings.get(&agent.name),
-                    &parent_model,
+                    parent_model.as_ref(),
                     &available,
                 )
                 .map(|error| error.to_string())
@@ -1828,6 +1893,113 @@ impl OrchestrationRuntime {
             );
         }
         self.inner.jobs.remove_settled(job_id);
+    }
+
+    /// Reserve `(agent_id, job_id)` before the runner is scheduled.
+    ///
+    /// An existing reservation is left in place. The caller must not spawn a
+    /// replacement until the outer guard for that job drops.
+    fn reserve_owner(&self, agent_id: &str, job_id: &str, token: CancellationToken) -> bool {
+        let mut active = self.inner.active.lock();
+        if active.contains_key(agent_id) {
+            return false;
+        }
+        active.insert(
+            agent_id.to_owned(),
+            ActiveOwner {
+                job_id: job_id.to_owned(),
+                token,
+            },
+        );
+        drop(active);
+        self.inner.active_changed.notify_waiters();
+        true
+    }
+
+    fn release_owner(&self, agent_id: &str, job_id: &str) {
+        let mut active = self.inner.active.lock();
+        let matches = active
+            .get(agent_id)
+            .is_some_and(|owner| owner.job_id == job_id);
+        if matches {
+            active.remove(agent_id);
+        }
+        drop(active);
+        if matches {
+            self.inner.active_changed.notify_waiters();
+        }
+    }
+
+    fn owner_job_ids(&self) -> HashSet<String> {
+        self.inner
+            .active
+            .lock()
+            .values()
+            .map(|owner| owner.job_id.clone())
+            .collect()
+    }
+
+    /// Persist cancellation intent, commit it, then return the tokens that
+    /// belong to jobs that actually entered `Cancelling`.
+    ///
+    /// `ownerless` must already be proven under the spawn lock and
+    /// `durable_mutation`: no active owner and no pending registration for
+    /// those job ids. A persist error leaves records and tokens untouched.
+    fn commit_cancellation_intent(
+        &self,
+        ids: &[String],
+        cause: CancellationCause,
+        ownerless: &HashSet<String>,
+    ) -> Result<(Vec<CancellationToken>, Vec<JobSnapshot>)> {
+        let mut prepared = self
+            .inner
+            .jobs
+            .prepare_cancellation(ids, cause, ownerless);
+        let tokens = prepared
+            .cancelling_ids()
+            .iter()
+            .filter_map(|id| self.inner.jobs.cancellation_token(id))
+            .collect::<Vec<_>>();
+        if self.inner.durable_bound.load(Ordering::Acquire) {
+            let durable = self.inner.durable.lock().clone().ok_or_else(|| {
+                anyhow!("durable orchestration binding is unavailable")
+            })?;
+            let jobs = prepared.take_snapshots();
+            let cancelling = prepared.cancelling_ids().to_vec();
+            let mut agents = self.collect_persisted_agents();
+            if cause == CancellationCause::Shutdown {
+                let cancelling_agents = jobs
+                    .iter()
+                    .filter(|job| cancelling.binary_search(&job.id).is_ok())
+                    .map(|job| job.agent_id.clone())
+                    .collect::<HashSet<_>>();
+                for agent in &mut agents {
+                    if cancelling_agents.contains(&agent.snapshot.id) {
+                        agent.snapshot.status = AgentStatus::Aborted;
+                        agent.snapshot.last_activity = now_millis();
+                    }
+                }
+            }
+            durable.persist(&super::persistence::build_state(
+                self.group_id(),
+                durable.parent_session_id(),
+                durable.parent_session_path(),
+                self.durable_policy_state()?,
+                self.collect_main_mailbox(),
+                self.delivered_messages(),
+                agents,
+                jobs,
+            ))?;
+        } else {
+            prepared.take_snapshots();
+        }
+        let committed = self.inner.jobs.commit_cancellation(prepared);
+        let mut publish_ids =
+            Vec::with_capacity(committed.cancelling_ids.len() + committed.immediate_ids.len());
+        publish_ids.extend(committed.cancelling_ids);
+        publish_ids.extend(committed.immediate_ids);
+        let snapshots = self.inner.jobs.snapshots(Some(&publish_ids));
+        Ok((tokens, snapshots))
     }
 
     fn prune_retained_jobs(&self) {
@@ -2491,7 +2663,7 @@ impl OrchestrationRuntime {
         let resolved = match crate::resolve_agent_model(
             &definition,
             self.inner.config.agent_settings.get(&definition.name),
-            &parent_model,
+            parent_model.as_ref(),
             &available,
         ) {
             Ok(resolved) => resolved,
@@ -2548,7 +2720,15 @@ impl OrchestrationRuntime {
         job_id: String,
     ) {
         let runtime = self.clone();
+        let owner_agent = agent_id.clone();
+        let owner_job = job_id.clone();
         tokio::spawn(async move {
+            let _owner = ActiveChildGuard {
+                inner: runtime.inner.clone(),
+                id: owner_agent,
+                job_id: owner_job.clone(),
+                group_id: runtime.group_id().to_owned(),
+            };
             let result = runtime
                 .run_revival(agent_id, request, session_path, assignment, cancel, &job_id)
                 .await;
@@ -2607,11 +2787,21 @@ impl OrchestrationRuntime {
         let Some(durable) = self.inner.durable.lock().clone() else {
             return;
         };
+        let _durable_mutation = self.inner.durable_mutation.lock();
+        if self.inner.rebind_reserved.load(Ordering::Acquire) {
+            return;
+        }
         for job in self.inner.jobs.snapshots(None) {
-            if job.status.is_settled() {
+            if !matches!(job.status, JobStatus::Queued | JobStatus::Running) {
                 continue;
             }
-            if self.inner.active.lock().contains_key(&job.agent_id) {
+            if self
+                .inner
+                .active
+                .lock()
+                .get(&job.agent_id)
+                .is_some_and(|owner| owner.job_id == job.id)
+            {
                 continue;
             }
             let Some(entry) = self.inner.registry.get(self.group_id(), &job.agent_id) else {
@@ -2689,10 +2879,9 @@ impl OrchestrationRuntime {
                 );
                 continue;
             };
-            self.inner
-                .active
-                .lock()
-                .insert(job.agent_id.clone(), cancel.clone());
+            if !self.reserve_owner(&job.agent_id, &job.id, cancel.clone()) {
+                continue;
+            }
             self.spawn_revival_runner(
                 job.agent_id.clone(),
                 request,
@@ -2787,6 +2976,7 @@ impl OrchestrationRuntime {
             started_at: None,
             finished_at: None,
             result: None,
+            cancellation_cause: None,
             soft_budget_exhausted: false,
         };
         if let Err(error) = self.inner.jobs.insert(job_snapshot.clone(), cancel.clone()) {
@@ -2798,13 +2988,19 @@ impl OrchestrationRuntime {
             );
             return Err(error);
         }
-        self.inner
-            .active
-            .lock()
-            .insert(target.to_owned(), cancel.clone());
+        if !self.reserve_owner(target, &job_id, cancel.clone()) {
+            self.inner.jobs.remove(&job_id);
+            let _ = self.inner.registry.compare_status(
+                self.group_id(),
+                target,
+                AgentStatus::Queued,
+                previous_status,
+            );
+            bail!("orchestration agent {target:?} still has an unsettled owner");
+        }
         if let Err(error) = self.persist_state() {
             self.inner.jobs.remove(&job_id);
-            self.inner.active.lock().remove(target);
+            self.release_owner(target, &job_id);
             let _ = self.inner.registry.compare_status(
                 self.group_id(),
                 target,
@@ -2845,11 +3041,6 @@ impl OrchestrationRuntime {
         cancel: CancellationToken,
         job_id: &str,
     ) -> TaskResult {
-        let _active_guard = ActiveChildGuard {
-            inner: self.inner.clone(),
-            id: agent_id.clone(),
-            group_id: self.group_id().to_owned(),
-        };
         let definition = request.definition.clone();
         let durable = { self.inner.durable.lock().clone() };
         let durable = match durable {
@@ -2894,12 +3085,12 @@ impl OrchestrationRuntime {
                     "orchestration semaphore closed",
                 ),
             },
-            () = cancel.cancelled() => return self.failed_result(
-                &TaskItem { index: 0, id: agent_id.clone(), agent: request.definition.name.clone(), assignment: assignment.clone(), todo_task_id: None, ..Default::default() },
-                job_id,
-                AgentStatus::Aborted,
-                "task cancelled before start",
-            ),
+            () = cancel.cancelled() => {
+                return self.cancelled_result(
+                    &TaskItem { index: 0, id: agent_id.clone(), agent: request.definition.name.clone(), assignment: assignment.clone(), todo_task_id: None, ..Default::default() },
+                    job_id,
+                )
+            }
         };
         let durable_mutation = self.inner.durable_mutation.lock();
         if self.inner.rebind_reserved.load(Ordering::Acquire) {
@@ -3264,7 +3455,23 @@ impl OrchestrationRuntime {
             }
         }
 
+        // Per-run entered flag (local, no allocation): set just before the
+        // Session run begins, read by the cancel arm to skip a run that was
+        // cancelled before it ever started.
+        let run_entered = AtomicBool::new(false);
         let mut run = Box::pin(async {
+            // Test-only prestart park: hold the revived run before
+            // `Session::run` can begin so the cancel branch can be selected
+            // first. `None` in production.
+            #[cfg(test)]
+            {
+                let park = self.inner.run_start_park.lock().clone();
+                if let Some((entered, release)) = park {
+                    entered.notify_one();
+                    release.notified().await;
+                }
+            }
+            run_entered.store(true, Ordering::Relaxed);
             if session_path.is_some() && (child.can_continue_without_input() || !pre_run.is_empty())
             {
                 child.continue_run().await
@@ -3291,36 +3498,65 @@ impl OrchestrationRuntime {
 
         let outcome = loop {
             tokio::select! {
-                result = &mut run => break result.map_err(|error| error.to_string()),
+                result = &mut run => {
+                    break aborted_run_result(result)
+                }
                 message = delivery_rx.recv() => {
                     match message {
                         Some(message) => {
                             if let Err(error) = child.steer(&message).await {
-                                break Err(format!("failed to deliver message {}: {error:#}", message.id));
+                                break Err(ChildRunStop::Failed(format!(
+                                    "failed to deliver message {}: {error:#}",
+                                    message.id
+                                )));
                             }
                             if let Err(error) = self.acknowledge_delivery(&agent_id, &message.id) {
-                                break Err(format!("acknowledging delivered message {}: {error:#}", message.id));
+                                break Err(ChildRunStop::Failed(format!(
+                                    "acknowledging delivered message {}: {error:#}",
+                                    message.id
+                                )));
                             }
                         }
-                        None => break Err("active child delivery bridge closed".to_owned()),
+                        None => {
+                            break Err(ChildRunStop::Failed(
+                                "active child delivery bridge closed".to_owned(),
+                            ))
+                        }
                     }
                 }
                 () = cancel.cancelled() => {
+                    // Test-only prestart gate: proves the cancel branch was
+                    // selected while the run future is still parked; separate
+                    // from the drain-entry gate used by the real-error test.
+                    #[cfg(test)]
+                    if let Some(entered) = self.inner.cancel_arm_entered.as_ref() {
+                        entered.notify_one();
+                    }
                     {
                         let _durable_mutation = self.inner.durable_mutation.lock();
                         self.inner.registry.unregister_active_delivery(self.group_id(), &agent_id);
                     }
+                    // A cancel that wins before the run future ever began
+                    // must not start it: the never-polled future is dropped
+                    // and the job settles as an intentional cancel. A run
+                    // that already entered `Session::run` keeps the abort
+                    // drain (real provider errors surface verbatim).
+                    if !run_entered.load(Ordering::Relaxed) {
+                        break Err(ChildRunStop::Cancelled);
+                    }
                     let drain = async {
                         child.abort().await;
-                        let _ = (&mut run).await;
+                        (&mut run).await
                     };
-                    break if tokio::time::timeout(CHILD_ABORT_GRACE, drain).await.is_err() {
-                        Err(format!(
+                    // The drain consumes the withheld run future: a provider
+                    // that still settles with a real error must surface it
+                    // verbatim; only a clean abort classifies as intentional.
+                    break match tokio::time::timeout(CHILD_ABORT_GRACE, drain).await {
+                        Err(_) => Err(ChildRunStop::Failed(format!(
                             "task cancellation timed out after {}s",
                             CHILD_ABORT_GRACE.as_secs()
-                        ))
-                    } else {
-                        Err("task cancelled".to_owned())
+                        ))),
+                        Ok(result) => aborted_run_result(result),
                     };
                 }
                 () = async {
@@ -3332,19 +3568,21 @@ impl OrchestrationRuntime {
                     }
                     let drain = async {
                         child.abort().await;
-                        let _ = (&mut run).await;
+                        (&mut run).await
                     };
                     let timeout_secs = definition.timeout_secs.unwrap_or_default();
-                    break if tokio::time::timeout(CHILD_ABORT_GRACE, drain).await.is_err() {
-                        Err(format!(
+                    break match tokio::time::timeout(CHILD_ABORT_GRACE, drain).await {
+                        Err(_) => Err(ChildRunStop::Failed(format!(
                             "role `{}` exceeded its timeout contract of {timeout_secs}s and did not settle after abort",
                             definition.name,
-                        ))
-                    } else {
-                        Err(format!(
+                        ))),
+                        Ok(Err(error)) if error.downcast_ref::<pi_agent::AbortError>().is_none() => {
+                            Err(ChildRunStop::Failed(format!("{error:#}")))
+                        }
+                        Ok(_) => Err(ChildRunStop::Failed(format!(
                             "role `{}` exceeded its timeout contract of {timeout_secs}s",
                             definition.name,
-                        ))
+                        ))),
                     };
                 }
             }
@@ -3374,7 +3612,7 @@ impl OrchestrationRuntime {
         restore_errors.extend(unrestorable);
         drop(local_permit);
 
-        let status = if cancel.is_cancelled() {
+        let status = if cancel.is_cancelled() || matches!(outcome, Err(ChildRunStop::Cancelled)) {
             AgentStatus::Aborted
         } else {
             AgentStatus::Idle
@@ -3385,14 +3623,22 @@ impl OrchestrationRuntime {
             || contract_state
                 .max_tool_calls_triggered
                 .load(Ordering::Acquire);
+        let intentional_cancel = matches!(outcome, Err(ChildRunStop::Cancelled));
         let (output, error, usage) =
             self.settle_child_outcome(outcome, &child, &yield_state, execution_ceiling_reached);
-        let structured_output = super::tools::validate_delivered_output(
-            &output,
-            output_schema.as_ref(),
-            schema_mode.as_deref(),
-            error.as_deref(),
-        );
+        // Same contract as run_one: an intentionally cancelled run without a
+        // delivered candidate payload has no outputSchema contract to
+        // validate; real errors short-circuit inside the validator.
+        let structured_output = if intentional_cancel && yield_state.payload().is_none() {
+            None
+        } else {
+            super::tools::validate_delivered_output(
+                &output,
+                output_schema.as_ref(),
+                schema_mode.as_deref(),
+                error.as_deref(),
+            )
+        };
         let artifact_body = if output.is_empty() {
             error.as_deref().unwrap_or("(no output)").to_owned()
         } else {
@@ -3624,6 +3870,12 @@ impl OrchestrationRuntime {
             .filter(|agent| agent.definition.kind == super::AgentDefinitionKind::Persona)
             .map(|agent| (agent.snapshot.id.clone(), agent.definition.name.clone()))
             .collect::<HashMap<_, _>>();
+        let interrupted = state
+            .jobs
+            .iter()
+            .filter(|job| job.status == JobStatus::Cancelling)
+            .map(|job| job.agent_id.clone())
+            .collect::<HashSet<_>>();
         let job_snapshots = state
             .jobs
             .into_iter()
@@ -3632,6 +3884,16 @@ impl OrchestrationRuntime {
                 super::persistence::recovery_job_with_persona(job, now, persona)
             })
             .collect::<Vec<_>>();
+        for agent in &mut agents {
+            if interrupted.contains(&agent.snapshot.id) {
+                agent.snapshot.status = AgentStatus::Aborted;
+            }
+        }
+        for (id, entry) in &entries {
+            if interrupted.contains(id) {
+                entry.snapshot.lock().status = AgentStatus::Aborted;
+            }
+        }
         let jobs = self.inner.jobs.prepare_replacement(job_snapshots);
         Ok(PreparedRecoveredState {
             main_mailbox,
@@ -4089,7 +4351,7 @@ impl OrchestrationRuntime {
                                         outcome: DeliveryOutcome::Queued,
                                         requested: requested_alias.clone(),
                                         message_id: Some(message.id.clone()),
-                                        error: Some(error.to_string()),
+                                        error: Some(format!("{error:#}")),
                                     });
                                 }
                             }
@@ -4249,7 +4511,8 @@ impl OrchestrationRuntime {
                 }
             }
         }));
-        self.inner
+        let guard = self
+            .inner
             .registry
             .register_message_waiter(
                 self.group_id(),
@@ -4258,7 +4521,12 @@ impl OrchestrationRuntime {
                 reply_to.map(str::to_owned),
                 republish,
             )
-            .ok_or_else(|| anyhow!("unknown orchestration agent {agent_id:?}"))
+            .ok_or_else(|| anyhow!("unknown orchestration agent {agent_id:?}"))?;
+        #[cfg(test)]
+        if let Some(registered) = self.inner.message_wait_registered.as_ref() {
+            registered.notify_waiters();
+        }
+        Ok(guard)
     }
 
     pub(crate) fn send_with_reply_waiter(
@@ -4419,40 +4687,25 @@ impl OrchestrationRuntime {
         match (timeout, abort) {
             (Some(timeout), Some(abort)) => tokio::select! {
                 message = tokio::time::timeout(timeout, wait) => message.unwrap_or(Ok(None)),
-                () = abort.cancelled() => Err(anyhow!("message wait aborted")),
-                () = self.inner.shutdown.cancelled() => Err(anyhow!("orchestration shut down")),
+                () = abort.cancelled() => Err(anyhow::Error::from(pi_agent::AbortError).context("message wait aborted")),
+                () = self.inner.shutdown.cancelled() => Err(anyhow::Error::from(pi_agent::AbortError).context("orchestration shut down")),
             },
             (Some(timeout), None) => tokio::select! {
                 message = tokio::time::timeout(timeout, wait) => message.unwrap_or(Ok(None)),
-                () = self.inner.shutdown.cancelled() => Err(anyhow!("orchestration shut down")),
+                () = self.inner.shutdown.cancelled() => Err(anyhow::Error::from(pi_agent::AbortError).context("orchestration shut down")),
             },
             (None, Some(abort)) => tokio::select! {
                 message = wait => message,
-                () = abort.cancelled() => Err(anyhow!("message wait aborted")),
-                () = self.inner.shutdown.cancelled() => Err(anyhow!("orchestration shut down")),
+                () = abort.cancelled() => Err(anyhow::Error::from(pi_agent::AbortError).context("message wait aborted")),
+                () = self.inner.shutdown.cancelled() => Err(anyhow::Error::from(pi_agent::AbortError).context("orchestration shut down")),
             },
             (None, None) => tokio::select! {
                 message = wait => message,
-                () = self.inner.shutdown.cancelled() => Err(anyhow!("orchestration shut down")),
+                () = self.inner.shutdown.cancelled() => Err(anyhow::Error::from(pi_agent::AbortError).context("orchestration shut down")),
             },
         }
     }
 
-    pub fn cancel(&self, ids: &[String]) -> Vec<String> {
-        let _durable_mutation = self.inner.durable_mutation.lock();
-        if self.inner.rebind_reserved.load(Ordering::Acquire) {
-            return Vec::new();
-        }
-        let active = self.inner.active.lock();
-        let mut cancelled = Vec::new();
-        for id in ids {
-            if let Some(token) = active.get(id) {
-                token.cancel();
-                cancelled.push(id.clone());
-            }
-        }
-        cancelled
-    }
 
     pub fn park(&self, id: &str) -> Result<()> {
         let _durable_mutation = self.inner.durable_mutation.lock();
@@ -4709,10 +4962,10 @@ impl OrchestrationRuntime {
             let resolved_model = crate::resolve_agent_model(
                 &definition,
                 agent_settings,
-                &parent_model,
+                parent_model.as_ref(),
                 &available_models,
             )
-            .map_err(|error| crate::agent_model_error(&item.agent, &error))?;
+            .map_err(|error| crate::agent_model_error(&item.agent, error))?;
             prepared.push((item, definition, resolved_model));
         }
 
@@ -4758,6 +5011,7 @@ impl OrchestrationRuntime {
                 started_at: None,
                 finished_at: None,
                 result: None,
+                cancellation_cause: None,
                 soft_budget_exhausted: false,
             };
             launches.push((
@@ -4848,12 +5102,19 @@ impl OrchestrationRuntime {
                     return Err(error);
                 }
             };
-            self.publish_agent(agent_snapshot.clone());
-            self.publish_job(job_snapshot.clone());
-            self.inner
-                .active
-                .lock()
-                .insert(item.id.clone(), cancel.clone());
+            if !self.reserve_owner(&item.id, &job_snapshot.id, cancel.clone()) {
+                for (_, _, _, _, job) in &launches {
+                    self.release_owner(&job.agent_id, &job.id);
+                    self.inner.jobs.remove(&job.id);
+                }
+                self.inner
+                    .registry
+                    .unregister_batch(self.group_id(), &registered_ids);
+                bail!(
+                    "orchestration agent {:?} still has an unsettled owner",
+                    item.id
+                );
+            }
             spawns.push(TaskSpawn {
                 index: item.index,
                 job_id: job_snapshot.id,
@@ -4875,12 +5136,9 @@ impl OrchestrationRuntime {
             }
         }
         if let Err(error) = self.persist_state() {
-            for (_, _, cancel, _, job) in &launches {
-                cancel.cancel();
+            for (_, _, _, _, job) in &launches {
+                self.release_owner(&job.agent_id, &job.id);
                 self.inner.jobs.remove(&job.id);
-            }
-            for id in &registered_ids {
-                self.inner.active.lock().remove(id);
             }
             self.inner
                 .registry
@@ -4888,9 +5146,29 @@ impl OrchestrationRuntime {
             return Err(error).context("persisting durable child spawn");
         }
 
+        for (item, _, _, agent_snapshot, job_snapshot) in &launches {
+            self.publish_agent(agent_snapshot.clone());
+            if let Some(job) = self
+                .inner
+                .jobs
+                .snapshots(Some(std::slice::from_ref(&job_snapshot.id)))
+                .into_iter()
+                .next()
+            {
+                self.publish_job(job);
+            }
+        }
+
         for (item, request, cancel, _, job_snapshot) in launches {
             let runtime = self.clone();
+            let owner_job = job_snapshot.id.clone();
             tokio::spawn(async move {
+                let _owner = ActiveChildGuard {
+                    inner: runtime.inner.clone(),
+                    id: item.id.clone(),
+                    job_id: owner_job,
+                    group_id: runtime.group_id().to_owned(),
+                };
                 let result = runtime
                     .run_one(item, request, cancel, &job_snapshot.id)
                     .await;
@@ -4933,10 +5211,28 @@ impl OrchestrationRuntime {
             .iter()
             .map(|spawn| spawn.job_id.clone())
             .collect::<Vec<_>>();
-        self.inner
+        let settled = self
+            .inner
             .jobs
-            .wait_all_results(&ids, abort, self.inner.shutdown.clone())
-            .await
+            .wait_all_results(&ids, abort.clone(), self.inner.shutdown.clone())
+            .await;
+        if settled.is_err() && abort.is_aborted() {
+            self.cancel_jobs_result(&ids)
+                .context("persisting task abort cancellation")?;
+            let snapshots = self
+                .inner
+                .jobs
+                .wait(&ids, None, None, self.inner.shutdown.clone())
+                .await
+                .context("waiting for task abort cancellation to settle")?;
+            let mut results = snapshots
+                .into_iter()
+                .filter_map(|snapshot| snapshot.result)
+                .collect::<Vec<_>>();
+            results.sort_by_key(|result| result.index);
+            return Ok(results);
+        }
+        settled
     }
 
     /// Build the per-turn stop hook implementing this runtime's soft budget for
@@ -5098,13 +5394,20 @@ impl OrchestrationRuntime {
     /// Soft-budget and contract-limited stops are untouched (no warning): the
     /// host cut the run short, so the partial text stands as-is. Error paths
     /// keep the error text and never project a payload.
+    ///
+    /// Intentional cancellation (`ChildRunStop::Cancelled`) settles with
+    /// `error: None` — the typed contract: the cause is durable on the job
+    /// snapshot and no error is manufactured. A withheld/aborted provider
+    /// that still delivers a real error settles as
+    /// [`ChildRunStop::Failed`] and keeps that error verbatim.
     fn settle_child_outcome(
         &self,
-        outcome: Result<crate::RunResult, String>,
+        outcome: Result<crate::RunResult, ChildRunStop>,
         child: &ChildSession,
         yield_state: &YieldState,
         execution_ceiling_reached: bool,
     ) -> (String, Option<String>, pi_ai::Usage) {
+        let intentional_cancel = matches!(outcome, Err(ChildRunStop::Cancelled));
         let (mut output, error, usage) = match outcome {
             Ok(result) => {
                 // An unrecovered final tool failure is authoritative: when
@@ -5129,7 +5432,12 @@ impl OrchestrationRuntime {
                     result.usage,
                 )
             }
-            Err(error) => (
+            Err(ChildRunStop::Cancelled) => (
+                child.last_assistant_text(),
+                None,
+                pi_ai::Usage::default(),
+            ),
+            Err(ChildRunStop::Failed(error)) => (
                 child.last_assistant_text(),
                 Some(error),
                 pi_ai::Usage::default(),
@@ -5138,7 +5446,9 @@ impl OrchestrationRuntime {
         if error.is_none() {
             if let Some(payload) = yield_state.payload() {
                 output = payload;
-            } else if !execution_ceiling_reached {
+            } else if !execution_ceiling_reached && !intentional_cancel {
+                // An intentionally cancelled run without a delivered payload
+                // is a host-cut stop, not a missing-yield contract breach.
                 append_missing_yield_warning(&mut output);
             }
         }
@@ -5152,11 +5462,6 @@ impl OrchestrationRuntime {
         cancel: CancellationToken,
         job_id: &str,
     ) -> TaskResult {
-        let _active_guard = ActiveChildGuard {
-            inner: self.inner.clone(),
-            id: item.id.clone(),
-            group_id: self.group_id().to_owned(),
-        };
         let definition = request.definition.clone();
         let artifact_ref = format!("agent://{}", item.id);
         let history_ref = history_reference(&definition, &item.id);
@@ -5176,7 +5481,7 @@ impl OrchestrationRuntime {
                 Ok(permit) => permit,
                 Err(_) => return self.failed_result(&item, job_id, AgentStatus::Aborted, "orchestration semaphore closed"),
             },
-            () = cancel.cancelled() => return self.failed_result(&item, job_id, AgentStatus::Aborted, "task cancelled before start"),
+            () = cancel.cancelled() => return self.cancelled_result(&item, job_id),
         };
         let global_gate = self.inner.global_concurrency.lock().clone();
         let global_permit = if let Some(gate) = global_gate {
@@ -5185,7 +5490,7 @@ impl OrchestrationRuntime {
                     Ok(permit) => permit,
                     Err(_) => return self.failed_result(&item, job_id, AgentStatus::Aborted, "workflow orchestration global semaphore closed"),
                 },
-                () = cancel.cancelled() => return self.failed_result(&item, job_id, AgentStatus::Aborted, "task cancelled before start"),
+                () = cancel.cancelled() => return self.cancelled_result(&item, job_id),
             })
         } else {
             None
@@ -5229,7 +5534,7 @@ impl OrchestrationRuntime {
                 Ok(session) => session,
                 Err(error) => return self.failed_result(&item, job_id, AgentStatus::Idle, &error.to_string()),
             },
-            () = cancel.cancelled() => return self.failed_result(&item, job_id, AgentStatus::Aborted, "task cancelled during child session creation"),
+            () = cancel.cancelled() => return self.cancelled_result(&item, job_id),
         };
         let generation_capture = { self.inner.generation_capture.lock().clone() };
         if let Some(generation_capture) = generation_capture {
@@ -5402,42 +5707,96 @@ impl OrchestrationRuntime {
                 );
             }
         }
-        let mut run = Box::pin(child.run(&item.assignment));
+        // Per-run entered flag (local, no allocation): set just before the
+        // Session run begins, read by the cancel arm to skip a run that was
+        // cancelled before it ever started.
+        let run_entered = AtomicBool::new(false);
+        let mut run = Box::pin(async {
+            // Test-only prestart park: hold the run before `Session::run`
+            // can begin so the cancel branch can be selected first.
+            // `None` in production.
+            #[cfg(test)]
+            {
+                let park = self.inner.run_start_park.lock().clone();
+                if let Some((entered, release)) = park {
+                    entered.notify_one();
+                    release.notified().await;
+                }
+            }
+            run_entered.store(true, Ordering::Relaxed);
+            child.run(&item.assignment).await
+        });
         let run_deadline = definition
             .timeout_secs
             .map(|seconds| tokio::time::Instant::now() + Duration::from_secs(seconds));
         let outcome = loop {
             tokio::select! {
-                result = &mut run => break result.map_err(|error| error.to_string()),
+                result = &mut run => {
+                    break aborted_run_result(result)
+                }
                 message = delivery_rx.recv() => {
                     match message {
                         Some(message) => {
                             if let Err(error) = child.steer(&message).await {
-                                break Err(format!("failed to deliver message {}: {error:#}", message.id));
+                                break Err(ChildRunStop::Failed(format!(
+                                    "failed to deliver message {}: {error:#}",
+                                    message.id
+                                )));
                             }
                             if let Err(error) = self.acknowledge_delivery(&item.id, &message.id) {
-                                break Err(format!("acknowledging delivered message {}: {error:#}", message.id));
+                                break Err(ChildRunStop::Failed(format!(
+                                    "acknowledging delivered message {}: {error:#}",
+                                    message.id
+                                )));
                             }
                         }
-                        None => break Err("active child delivery bridge closed".to_owned()),
+                        None => {
+                            break Err(ChildRunStop::Failed(
+                                "active child delivery bridge closed".to_owned(),
+                            ))
+                        }
                     }
                 }
                 () = cancel.cancelled() => {
+                    // Test-only prestart gate: proves the cancel branch was
+                    // selected while the run future is still parked; separate
+                    // from the drain-entry gate used by the real-error test.
+                    #[cfg(test)]
+                    if let Some(entered) = self.inner.cancel_arm_entered.as_ref() {
+                        entered.notify_one();
+                    }
                     {
                         let _durable_mutation = self.inner.durable_mutation.lock();
                         self.inner.registry.unregister_active_delivery(self.group_id(), &item.id);
                     }
+                    // A cancel that wins before the run future ever began
+                    // must not start it: the never-polled future is dropped
+                    // and the job settles as an intentional cancel. A run
+                    // that already entered `Session::run` keeps the abort
+                    // drain (real provider errors surface verbatim).
+                    if !run_entered.load(Ordering::Relaxed) {
+                        break Err(ChildRunStop::Cancelled);
+                    }
                     let drain = async {
                         child.abort().await;
-                        let _ = (&mut run).await;
+                        // Test-only drain-entry gate: the exact point after
+                        // the child abort settled, before the drain awaits
+                        // the run future. `None` in production.
+                        #[cfg(test)]
+                        if let Some(entered) = self.inner.abort_drain_entered.as_ref() {
+                            entered.notify_one();
+                        }
+                        (&mut run).await
                     };
-                    break if tokio::time::timeout(CHILD_ABORT_GRACE, drain).await.is_err() {
-                        Err(format!(
+                    // The drain consumes the withheld run future: a provider
+                    // that still settles with a real error must surface it
+                    // verbatim; only a clean abort classifies as intentional.
+                    break match tokio::time::timeout(CHILD_ABORT_GRACE, drain).await {
+                        Err(_) => Err(ChildRunStop::Failed(format!(
                             "task cancellation timed out after {}s",
                             CHILD_ABORT_GRACE.as_secs()
-                        ))
-                    } else {
-                        Err("task cancelled".to_owned())
+                        ))),
+                        Ok(result) => aborted_run_result(result),
                     };
                 }
                 () = async {
@@ -5449,19 +5808,21 @@ impl OrchestrationRuntime {
                     }
                     let drain = async {
                         child.abort().await;
-                        let _ = (&mut run).await;
+                        (&mut run).await
                     };
                     let timeout_secs = definition.timeout_secs.unwrap_or_default();
-                    break if tokio::time::timeout(CHILD_ABORT_GRACE, drain).await.is_err() {
-                        Err(format!(
+                    break match tokio::time::timeout(CHILD_ABORT_GRACE, drain).await {
+                        Err(_) => Err(ChildRunStop::Failed(format!(
                             "role `{}` exceeded its timeout contract of {timeout_secs}s and did not settle after abort",
                             definition.name,
-                        ))
-                    } else {
-                        Err(format!(
+                        ))),
+                        Ok(Err(error)) if error.downcast_ref::<pi_agent::AbortError>().is_none() => {
+                            Err(ChildRunStop::Failed(format!("{error:#}")))
+                        }
+                        Ok(_) => Err(ChildRunStop::Failed(format!(
                             "role `{}` exceeded its timeout contract of {timeout_secs}s",
                             definition.name,
-                        ))
+                        ))),
                     };
                 }
             }
@@ -5490,7 +5851,7 @@ impl OrchestrationRuntime {
         restore_errors.extend(unrestorable);
         drop(global_permit);
         drop(local_permit);
-        let status = if cancel.is_cancelled() {
+        let status = if cancel.is_cancelled() || matches!(outcome, Err(ChildRunStop::Cancelled)) {
             AgentStatus::Aborted
         } else {
             AgentStatus::Idle
@@ -5501,14 +5862,23 @@ impl OrchestrationRuntime {
             || contract_state
                 .max_tool_calls_triggered
                 .load(Ordering::Acquire);
+        let intentional_cancel = matches!(outcome, Err(ChildRunStop::Cancelled));
         let (output, error, usage) =
             self.settle_child_outcome(outcome, &child, &yield_state, execution_ceiling_reached);
-        let structured_output = super::tools::validate_delivered_output(
-            &output,
-            output_schema.as_ref(),
-            schema_mode.as_deref(),
-            error.as_deref(),
-        );
+        // Strict-schema validation projects a delivered candidate payload; an
+        // intentionally cancelled run without one has no payload contract to
+        // validate. A real provider error still short-circuits validation
+        // inside `validate_delivered_output` via the error argument.
+        let structured_output = if intentional_cancel && yield_state.payload().is_none() {
+            None
+        } else {
+            super::tools::validate_delivered_output(
+                &output,
+                output_schema.as_ref(),
+                schema_mode.as_deref(),
+                error.as_deref(),
+            )
+        };
         let artifact_body = if output.is_empty() {
             error.as_deref().unwrap_or("(no output)").to_owned()
         } else {
@@ -5608,6 +5978,25 @@ impl OrchestrationRuntime {
         status: AgentStatus,
         error: &str,
     ) -> TaskResult {
+        self.persisted_stop_result(item, job_id, status, Some(error))
+    }
+
+    /// Intentional cancellation before the child ever ran. Typed per the
+    /// intentional-stop contract: `AgentStatus::Aborted` with `error: None` —
+    /// the durable cause lives on the job snapshot's `cancellation_cause` and
+    /// no error is manufactured. A real artifact/persist failure still
+    /// surfaces as `Some`.
+    fn cancelled_result(&self, item: &TaskItem, job_id: &str) -> TaskResult {
+        self.persisted_stop_result(item, job_id, AgentStatus::Aborted, None)
+    }
+
+    fn persisted_stop_result(
+        &self,
+        item: &TaskItem,
+        job_id: &str,
+        status: AgentStatus,
+        error: Option<&str>,
+    ) -> TaskResult {
         let artifact_ref = format!("agent://{}", item.id);
         let history_ref = self.inner.config.catalog.get(&item.agent).map_or_else(
             || format!("history://{}", item.id),
@@ -5630,10 +6019,11 @@ impl OrchestrationRuntime {
             .config
             .artifact_dir
             .join(format!("{}-{job_id}.history.json", item.id));
+        let artifact_body = error.unwrap_or("task cancelled");
         let artifact_error = write_new_artifact(
             &self.inner.storage.artifacts,
             &artifact_path,
-            error.as_bytes(),
+            artifact_body.as_bytes(),
         )
         .err();
         let artifact_written = artifact_error.is_none();
@@ -5641,8 +6031,11 @@ impl OrchestrationRuntime {
             write_new_artifact(&self.inner.storage.artifacts, &history_path, b"[]").err();
         let history_written = history_error.is_none();
         let mut final_error = match artifact_error.or(history_error) {
-            Some(write_error) => format!("{error}; {write_error}"),
-            None => error.to_owned(),
+            Some(write_error) => Some(match error {
+                Some(error) => format!("{error}; {write_error}"),
+                None => write_error.to_string(),
+            }),
+            None => error.map(str::to_owned),
         };
         if let Err(persist_error) = self.finish_agent(
             &item.id,
@@ -5650,7 +6043,10 @@ impl OrchestrationRuntime {
             artifact_written.then_some(artifact_path),
             history_written.then_some(history_path),
         ) {
-            final_error = format!("{final_error}; {persist_error}");
+            final_error = Some(match final_error {
+                Some(error) => format!("{error}; {persist_error:#}"),
+                None => format!("{persist_error:#}"),
+            });
         }
         TaskResult {
             index: item.index,
@@ -5658,7 +6054,7 @@ impl OrchestrationRuntime {
             agent: item.agent.clone(),
             status,
             output: String::new(),
-            error: Some(final_error),
+            error: final_error,
             usage: pi_ai::Usage::default(),
             soft_budget_exhausted: false,
             structured_output: None,
@@ -6392,6 +6788,20 @@ impl OrchestrationRuntime {
         Ok(cap_history_bytes(redacted))
     }
 
+    /// Structured, display-safe read of one child agent's retained transcript
+    /// for the `agent_history` RPC. Reuses the `resolve_history_file`
+    /// capability boundary (never a client-supplied path), the 64 MiB read
+    /// cap, and the main transcript's authoritative retained-branch
+    /// projection. Returns the latest `limit` rows (callers validate the
+    /// bound) with their head-drop count and every displayed string redacted.
+    /// Parse failures and loader drops propagate as errors — never a
+    /// fabricated empty history.
+    pub fn read_child_transcript(&self, agent_id: &str, limit: usize) -> Result<ChildTranscript> {
+        let file = self.resolve_history_file(agent_id)?;
+        read_transcript_rows(&file, limit)
+            .with_context(|| format!("reading structured history for agent {agent_id:?}"))
+    }
+
     fn resolve_persona_archive(&self, agent_id: &str) -> Result<RetainedHistoryFile> {
         let relative = Path::new("sessions").join(format!("{agent_id}.jsonl"));
         let mut matches = Vec::new();
@@ -6608,6 +7018,32 @@ impl OrchestrationRuntime {
         self.inner.jobs.snapshots(ids)
     }
 
+    /// Full durable assignment for one job, bound exactly to the job's
+    /// agent, group, and parent. The single authoritative source for the
+    /// Web details surface: the redacted FULL assignment from the child's
+    /// persisted spawn request. A missing or mismatched durable request
+    /// reports `unavailable` instead of guessing.
+    #[must_use]
+    pub fn job_assignment(&self, job: &JobSnapshot) -> JobAssignmentWire {
+        let unavailable = || JobAssignmentWire::Unavailable {
+            reason: "request_unavailable",
+        };
+        let Some(entry) = self.inner.registry.get(self.group_id(), &job.agent_id) else {
+            return unavailable();
+        };
+        let Some(info) = entry.durable_info.lock().clone() else {
+            return unavailable();
+        };
+        let bound =
+            info.request.child_id == job.agent_id && info.request.parent_id == job.parent_id;
+        if !bound {
+            return unavailable();
+        }
+        JobAssignmentWire::Available {
+            text: redacted_text(&info.request.assignment),
+        }
+    }
+
     pub async fn wait_jobs(
         &self,
         ids: &[String],
@@ -6651,60 +7087,43 @@ impl OrchestrationRuntime {
     }
 
     pub fn cancel_jobs_result(&self, ids: &[String]) -> Result<Vec<String>> {
-        let (cancelled, snapshots) =
-            {
-                let _durable_mutation = self.inner.durable_mutation.lock();
-                if self.inner.rebind_reserved.load(Ordering::Acquire) {
-                    bail!("durable orchestration rebind is in progress");
-                }
-                if self.inner.durable_frozen.load(Ordering::Acquire) {
-                    bail!("restart-checkpointed orchestration cannot cancel jobs");
-                }
-                let mut prepared = self.inner.jobs.prepare_cancellation(ids, "task cancelled");
-                if self.inner.durable_bound.load(Ordering::Acquire) {
-                    let durable =
-                        self.inner.durable.lock().clone().ok_or_else(|| {
-                            anyhow!("durable orchestration binding is unavailable")
-                        })?;
-                    let jobs = prepared.take_snapshots();
-                    durable.persist(&super::persistence::build_state(
-                        self.group_id(),
-                        durable.parent_session_id(),
-                        durable.parent_session_path(),
-                        self.durable_policy_state()?,
-                        self.collect_main_mailbox(),
-                        self.delivered_messages(),
-                        self.collect_persisted_agents(),
-                        jobs,
-                    ))?;
-                } else {
-                    prepared.take_snapshots();
-                }
-                let cancelled = self.inner.jobs.commit_cancellation(prepared);
-                let snapshots = self.inner.jobs.snapshots(Some(&cancelled));
-                (cancelled, snapshots)
-            };
+        let _spawn_guard = self.inner.jobs.lock_spawns();
+        let (tokens, snapshots) = {
+            let _durable_mutation = self.inner.durable_mutation.lock();
+            if self.inner.rebind_reserved.load(Ordering::Acquire) {
+                bail!("durable orchestration rebind is in progress");
+            }
+            if self.inner.durable_frozen.load(Ordering::Acquire) {
+                bail!("restart-checkpointed orchestration cannot cancel jobs");
+            }
+            let owned = self.owner_job_ids();
+            let ownerless = self
+                .inner
+                .jobs
+                .snapshots(Some(ids))
+                .into_iter()
+                .filter(|job| {
+                    !job.status.is_settled()
+                        && job.status != JobStatus::Cancelling
+                        && !owned.contains(&job.id)
+                })
+                .map(|job| job.id)
+                .collect::<HashSet<_>>();
+            self.commit_cancellation_intent(ids, CancellationCause::Task, &ownerless)?
+        };
+        for token in tokens {
+            token.cancel();
+        }
+        let cancelled = snapshots
+            .iter()
+            .map(|job| job.id.clone())
+            .collect::<Vec<_>>();
         for job in snapshots {
             self.publish_job(job);
         }
         Ok(cancelled)
     }
-    pub fn cancel_jobs(&self, ids: &[String]) -> Vec<String> {
-        self.cancel_jobs_result(ids).unwrap_or_default()
-    }
 
-    pub fn cancel_active(&self) {
-        let tokens = self
-            .inner
-            .active
-            .lock()
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        for token in tokens {
-            token.cancel();
-        }
-    }
 
     #[must_use]
     pub fn is_shutdown(&self) -> bool {
@@ -6718,85 +7137,61 @@ impl OrchestrationRuntime {
         if self.inner.durable_frozen.load(Ordering::Acquire) {
             bail!("restart-checkpointed orchestration cannot enter terminal shutdown");
         }
-        let cancelled_jobs =
-            {
-                let _spawn_guard = self.inner.jobs.lock_spawns();
-                let _durable_mutation = self.inner.durable_mutation.lock();
-                if self.inner.durable_frozen.load(Ordering::Acquire) {
-                    bail!("restart-checkpointed orchestration cannot enter terminal shutdown");
-                }
-                if self.inner.rebind_reserved.load(Ordering::Acquire) {
-                    bail!("durable orchestration rebind is in progress");
-                }
-                let ids = self
-                    .inner
-                    .jobs
-                    .snapshots(None)
-                    .into_iter()
-                    .filter(|job| !job.status.is_settled())
-                    .map(|job| job.id)
-                    .collect::<Vec<_>>();
-                let mut prepared = self
-                    .inner
-                    .jobs
-                    .prepare_cancellation(&ids, "orchestration shut down");
-                let cancelled_ids = prepared.cancelled_ids().to_vec();
-                let jobs = prepared.take_snapshots();
-                let cancelled_jobs = jobs
-                    .iter()
-                    .filter(|job| cancelled_ids.contains(&job.id))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                if self.inner.durable_bound.load(Ordering::Acquire) {
-                    let durable =
-                        self.inner.durable.lock().clone().ok_or_else(|| {
-                            anyhow!("durable orchestration binding is unavailable")
-                        })?;
-                    let cancelled_agents = cancelled_jobs
-                        .iter()
-                        .map(|job| job.agent_id.as_str())
-                        .collect::<std::collections::HashSet<_>>();
-                    let mut agents = self.collect_persisted_agents();
-                    for agent in &mut agents {
-                        if cancelled_agents.contains(agent.snapshot.id.as_str()) {
-                            agent.snapshot.status = AgentStatus::Aborted;
-                            agent.snapshot.last_activity = now_millis();
-                        }
-                    }
-
-                    durable.persist(&super::persistence::build_state(
-                        self.group_id(),
-                        durable.parent_session_id(),
-                        durable.parent_session_path(),
-                        self.durable_policy_state()?,
-                        self.collect_main_mailbox(),
-                        self.delivered_messages(),
-                        agents,
-                        jobs,
-                    ))?;
-                }
-                self.inner.jobs.commit_cancellation(prepared);
-                for job in &cancelled_jobs {
-                    let _ = self.inner.registry.set_status(
-                        self.group_id(),
-                        &job.agent_id,
-                        AgentStatus::Aborted,
-                    );
-                }
-                self.begin_retirement();
-                cancelled_jobs
-            };
-        for job in cancelled_jobs {
-            if let Some(job) = self
+        let (tokens, cancelled_jobs, target_ids) = {
+            let _spawn_guard = self.inner.jobs.lock_spawns();
+            let _durable_mutation = self.inner.durable_mutation.lock();
+            if self.inner.durable_frozen.load(Ordering::Acquire) {
+                bail!("restart-checkpointed orchestration cannot enter terminal shutdown");
+            }
+            if self.inner.rebind_reserved.load(Ordering::Acquire) {
+                bail!("durable orchestration rebind is in progress");
+            }
+            let ids = self
                 .inner
                 .jobs
-                .snapshots(Some(std::slice::from_ref(&job.id)))
+                .snapshots(None)
                 .into_iter()
-                .next()
-            {
-                self.publish_job(job);
+                .filter(|job| !job.status.is_settled())
+                .map(|job| job.id)
+                .collect::<Vec<_>>();
+            let owned = self.owner_job_ids();
+            let ownerless = ids
+                .iter()
+                .filter(|id| !owned.contains(*id))
+                .cloned()
+                .collect::<HashSet<_>>();
+            let committed = self.commit_cancellation_intent(
+                &ids,
+                CancellationCause::Shutdown,
+                &ownerless,
+            )?;
+            for job in &committed.1 {
+                let _ = self.inner.registry.set_status(
+                    self.group_id(),
+                    &job.agent_id,
+                    AgentStatus::Aborted,
+                );
             }
+            self.begin_retirement();
+            (committed.0, committed.1, ids)
+        };
+        for token in tokens {
+            token.cancel();
         }
+        for job in &cancelled_jobs {
+            self.publish_job(job.clone());
+        }
+        let settlement = if !target_ids.is_empty() {
+            Some(
+                self.inner
+                    .jobs
+                    .wait(&target_ids, None, None, CancellationToken::new())
+                    .await
+                    .context("waiting for shutdown cancellation to settle"),
+            )
+        } else {
+            None
+        };
         let park_handles = self
             .inner
             .park_timers
@@ -6808,11 +7203,22 @@ impl OrchestrationRuntime {
             handle.abort();
         }
         self.wait_until_idle().await;
-        {
+        let persisted = {
             let _durable_mutation = self.inner.durable_mutation.lock();
             self.persist_state()
-                .context("persisting terminal orchestration shutdown")?;
-        }
+                .context("persisting terminal orchestration shutdown")
+        };
+        let settled = self.inner.jobs.snapshots(Some(&target_ids));
+        // Typed intentional-stop contract: an intentional cancel settles as
+        // `AgentStatus::Aborted` with `error: None` (the durable cause lives
+        // on the snapshot's `cancellation_cause`), so every `Some(error)` left
+        // after settlement is a real provider/persist/cleanup failure.
+        let settlement_failures = settled
+            .iter()
+            .filter_map(|job| job.result.as_ref())
+            .filter_map(|result| result.error.as_deref())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
         log_shutdown_cancel_site(
             "explicit_shutdown",
             self.inner.group_id.get().map(String::as_str),
@@ -6820,7 +7226,31 @@ impl OrchestrationRuntime {
         self.inner.shutdown.cancel();
         self.cleanup_retained_jobs();
         self.inner.registry.remove_group(self.group_id());
-        self.remove_review_artifact_tree()?;
+        let review_cleanup = self.remove_review_artifact_tree();
+        // Deferred exit: terminal cleanup above always runs. Every error is
+        // preserved — a settlement missing-error stays primary, and
+        // settlement failures plus cleanup errors attach as additional
+        // context instead of being swallowed or skipping the drain.
+        let mut failure = settlement.and_then(|settlement| settlement.err());
+        for error in settlement_failures {
+            failure = Some(match failure {
+                Some(previous) => {
+                    previous.context(format!("shutdown settlement failed: {error}"))
+                }
+                None => anyhow!("shutdown settlement failed: {error}"),
+            });
+        }
+        for cleanup in [persisted.err(), review_cleanup.err()].into_iter().flatten() {
+            failure = Some(match failure {
+                Some(previous) => previous.context(format!(
+                    "terminal shutdown cleanup also failed: {cleanup:#}"
+                )),
+                None => cleanup,
+            });
+        }
+        if let Some(error) = failure {
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -6922,10 +7352,14 @@ impl OrchestrationRuntime {
             .join(review_id)
             .join("artifacts");
         config.idle_ttl = None;
-        config.parent_model_provider = None;
-        let snapshot = parent.child_session_options_snapshot();
-        config.parent_model = snapshot.model.clone();
-        let factory = Self::child_factory_from_snapshot(snapshot);
+        // Reuse the live parent session: review children follow the parent's
+        // current model/session options without a runtime restart. The live
+        // provider keeps `current_parent_model` truthful when the parent has
+        // no model configured yet.
+        config.parent_model = parent.model();
+        let live_parent = parent.clone();
+        config.parent_model_provider = Some(Arc::new(move || live_parent.model()));
+        let factory = Self::child_factory_from_session(parent);
         let runtime = Self::new(config, factory)?;
         runtime.establish_group_id(review_id)?;
         Ok(runtime)
@@ -7112,20 +7546,56 @@ fn log_shutdown_cancel_site(site: &'static str, group_id: Option<&str>) {
     );
 }
 
+/// Typed settlement of a child run future.
+///
+/// `Cancelled` marks an intentional, runtime-requested stop: the cancellation
+/// intent is already durable on the job snapshot (`cancellation_cause`), so it
+/// must never carry a manufactured error string. `Failed` carries the
+/// authoritative real error (provider, persist, cleanup, timeout) that must
+/// surface verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChildRunStop {
+    Cancelled,
+    Failed(String),
+}
+
+fn aborted_run_result(
+    result: Result<crate::RunResult, anyhow::Error>,
+) -> Result<crate::RunResult, ChildRunStop> {
+    match result {
+        Ok(result) if result.stop_reason == pi_ai::StopReason::Aborted => {
+            Err(ChildRunStop::Cancelled)
+        }
+        Ok(result) => Ok(result),
+        Err(error) if error.downcast_ref::<pi_agent::AbortError>().is_some() => {
+            Err(ChildRunStop::Cancelled)
+        }
+        Err(error) => Err(ChildRunStop::Failed(format!("{error:#}"))),
+    }
+}
+
 struct ActiveChildGuard {
     inner: Arc<RuntimeInner>,
     id: String,
+    job_id: String,
     group_id: String,
 }
 
 impl Drop for ActiveChildGuard {
     fn drop(&mut self) {
         let _durable_mutation = self.inner.durable_mutation.lock();
-        self.inner
-            .registry
-            .unregister_active_delivery(&self.group_id, &self.id);
-        self.inner.active.lock().remove(&self.id);
-        self.inner.active_changed.notify_waiters();
+        let mut active = self.inner.active.lock();
+        if active
+            .get(&self.id)
+            .is_some_and(|owner| owner.job_id == self.job_id)
+        {
+            active.remove(&self.id);
+            drop(active);
+            self.inner
+                .registry
+                .unregister_active_delivery(&self.group_id, &self.id);
+            self.inner.active_changed.notify_waiters();
+        }
     }
 }
 
@@ -7136,8 +7606,8 @@ impl Drop for OrchestrationRuntime {
         }
         log_shutdown_cancel_site("owner_drop", self.inner.group_id.get().map(String::as_str));
         self.inner.shutdown.cancel();
-        for token in self.inner.active.lock().values() {
-            token.cancel();
+        for owner in self.inner.active.lock().values() {
+            owner.token.cancel();
         }
         for handle in self
             .inner
@@ -7160,8 +7630,8 @@ impl Drop for RuntimeInner {
         }
         log_shutdown_cancel_site("inner_drop", self.group_id.get().map(String::as_str));
         self.shutdown.cancel();
-        for token in self.active.get_mut().values() {
-            token.cancel();
+        for owner in self.active.get_mut().values() {
+            owner.token.cancel();
         }
         for handle in self.park_timers.get_mut().drain().map(|(_, handle)| handle) {
             handle.abort();
@@ -8133,7 +8603,8 @@ mod persona_runtime_tests {
         let mut config = OrchestrationConfig::new(
             AgentCatalog::from_agents(vec![definition.clone()]),
             root.path().join("artifacts"),
-        );
+        )
+        .with_parent_model(Some(fixture_parent_model()));
         config.default_agent = definition.name.clone();
         let runtime =
             OrchestrationRuntime::new(config, Arc::new(|_| Box::pin(async { unreachable!() })))
@@ -8836,11 +9307,27 @@ fn presentation_agent_snapshot(mut agent: AgentSnapshot) -> AgentSnapshot {
     agent
 }
 
-fn presentation_text(text: &str, max_chars: usize) -> String {
+/// Typed assignment wire for the Web job details surface: the child's FULL
+/// redacted assignment from its persisted spawn request — never the
+/// 1024-char job-card description, never history inference.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum JobAssignmentWire {
+    Available { text: String },
+    Unavailable { reason: &'static str },
+}
+
+/// Secret-redacted text with no display truncation: the single redaction
+/// step every presentation surface shares.
+fn redacted_text(text: &str) -> String {
     let value = crate::redact_value(&serde_json::Value::String(text.to_owned()));
-    let redacted = value.as_str().unwrap_or_default();
+    value.as_str().unwrap_or_default().to_owned()
+}
+
+fn presentation_text(text: &str, max_chars: usize) -> String {
+    let redacted = redacted_text(text);
     if redacted.chars().count() <= max_chars {
-        return redacted.to_owned();
+        return redacted;
     }
     if max_chars <= 1 {
         return redacted.chars().take(max_chars).collect();
@@ -9760,6 +10247,337 @@ fn render_history_file(file: &RetainedHistoryFile, lines: usize) -> Result<Strin
     Ok(rendered[start..].join("\n"))
 }
 
+/// Structured, display-safe slice of one child agent's retained transcript,
+#[derive(Debug)]
+pub struct ChildTranscript {
+    /// Latest rows in original transcript order, redacted for public display.
+    /// JSONL transcripts carry real session-entry `id`s; snapshot files have
+    /// no entry ids and never fabricate one. Messages stay full
+    /// [`pi_ai::Message`] values — the RPC layer projects the public display
+    /// fields on top.
+    pub rows: Vec<crate::TranscriptRow>,
+    /// Rows dropped from the head by the `limit` suffix. The RPC wire byte
+    /// budget may drop further rows and reports the combined count.
+    pub omitted_rows: usize,
+}
+
+/// Reads one retained history file as redacted display rows: snapshot files
+/// (`[…]`) keep their original message order without entry ids; session
+/// JSONL goes through the same authoritative branch projection as the main
+/// transcript (`project_retained_transcript`), never a flat `entries` walk.
+/// Summaries are dropped at this `agent_history` boundary; the `limit` suffix
+/// is then applied before redaction so only kept rows pay for it.
+fn read_transcript_rows(file: &RetainedHistoryFile, limit: usize) -> Result<ChildTranscript> {
+    let path = file.display_path();
+    let data = file
+        .read_bounded(MAX_HISTORY_FILE_BYTES)
+        .with_context(|| format!("reading history {}", path.display()))?;
+    let mut rows = if data
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace())
+        == Some(b'[')
+    {
+        let messages: Vec<pi_ai::Message> = serde_json::from_slice(&data)
+            .with_context(|| format!("parsing history snapshot {}", path.display()))?;
+        messages
+            .into_iter()
+            .map(|message| crate::TranscriptRow { id: None, message })
+            .collect::<Vec<_>>()
+    } else {
+        let tree = crate::session_store::load_session_tree_from_file(file.session_file()?, &path)
+            .with_context(|| format!("parsing session transcript {}", path.display()))?;
+        crate::session::project_retained_transcript(&tree)
+            .with_context(|| format!("projecting session transcript {}", path.display()))?
+    };
+    // agent_history rows are display-only; the main authoritative transcript
+    // keeps its compaction marker.
+    rows.retain(|row| {
+        !matches!(
+            &row.message,
+            pi_ai::Message::BranchSummary(_) | pi_ai::Message::CompactionSummary(_)
+        )
+    });
+    let omitted_rows = rows.len().saturating_sub(limit);
+    if omitted_rows > 0 {
+        rows.drain(..omitted_rows);
+    }
+    for row in &mut rows {
+        redact_display_message(&mut row.message);
+    }
+    Ok(ChildTranscript { rows, omitted_rows })
+}
+
+/// Redacts one transcript message in place for public display.
+fn redact_display_message(message: &mut pi_ai::Message) {
+    match message {
+        pi_ai::Message::User(user) => {
+            user.content = redact_display_blocks(&user.content);
+        }
+        pi_ai::Message::Assistant(assistant) => {
+            assistant.content = redact_display_blocks(&assistant.content);
+            if let Some(error) = &mut assistant.error_message {
+                *error = redact_display_text(error);
+            }
+        }
+        pi_ai::Message::ToolResult(result) => {
+            result.content = redact_display_blocks(&result.content);
+            result.details = result.details.as_ref().map(redact_public_value);
+        }
+        pi_ai::Message::BashExecution(bash) => {
+            bash.command = redact_display_text(&bash.command);
+            bash.output = redact_display_text(&bash.output);
+        }
+        pi_ai::Message::Custom(custom) => {
+            custom.content = match &custom.content {
+                pi_ai::CustomMessageContent::Text(text) => {
+                    pi_ai::CustomMessageContent::Text(redact_display_text(text))
+                }
+                pi_ai::CustomMessageContent::Blocks(blocks) => {
+                    pi_ai::CustomMessageContent::Blocks(redact_display_blocks(blocks))
+                }
+            };
+            custom.details = custom.details.as_ref().map(redact_public_value);
+        }
+        // Summaries never reach this surface (dropped by the projection
+        // policy); nothing to expose.
+        pi_ai::Message::BranchSummary(_) | pi_ai::Message::CompactionSummary(_) => {}
+    }
+}
+
+/// Redacts content blocks, scrubbing every run of adjacent text blocks as ONE
+/// logical text: a private-key block (or any secret) split across block
+/// boundaries is matched on the concatenation, never per fragment. When the
+/// whole-body pass differs from the per-block pass, the run collapses into a
+/// single redacted text block — display-equivalent and leak-free.
+fn redact_display_blocks(blocks: &[pi_ai::ContentBlock]) -> Vec<pi_ai::ContentBlock> {
+    let mut out: Vec<pi_ai::ContentBlock> = Vec::with_capacity(blocks.len());
+    let mut run: Vec<&str> = Vec::new();
+    for block in blocks {
+        match block {
+            pi_ai::ContentBlock::Text { text, .. } => run.push(text.as_str()),
+            pi_ai::ContentBlock::Thinking {
+                thinking, redacted, ..
+            } => {
+                flush_text_run(&mut out, &mut run);
+                out.push(pi_ai::ContentBlock::Thinking {
+                    thinking: redact_display_text(thinking),
+                    thinking_signature: None,
+                    redacted: *redacted,
+                });
+            }
+            pi_ai::ContentBlock::Image { data, mime_type } => {
+                flush_text_run(&mut out, &mut run);
+                out.push(pi_ai::ContentBlock::Image {
+                    data: data.clone(),
+                    mime_type: mime_type.clone(),
+                });
+            }
+            pi_ai::ContentBlock::ToolCall(call) => {
+                flush_text_run(&mut out, &mut run);
+                out.push(pi_ai::ContentBlock::ToolCall(pi_ai::ToolCall {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments: redact_public_value(&call.arguments),
+                    thought_signature: None,
+                }));
+            }
+        }
+    }
+    flush_text_run(&mut out, &mut run);
+    out
+}
+
+/// Emits one redacted text block per run member unless the whole-body secret
+/// pass differs from the per-block pass (a secret straddles the boundary), in
+/// which case the run collapses into a single block.
+fn flush_text_run(out: &mut Vec<pi_ai::ContentBlock>, run: &mut Vec<&str>) {
+    if run.is_empty() {
+        return;
+    }
+    let whole = crate::redact::redact_secrets(&run.concat());
+    let per_block: String = run
+        .iter()
+        .map(|text| crate::redact::redact_secrets(text))
+        .collect();
+    if whole == per_block {
+        for text in run.drain(..) {
+            out.push(pi_ai::ContentBlock::Text {
+                text: redact_display_paths(&crate::redact::redact_secrets(text)),
+                text_signature: None,
+            });
+        }
+    } else {
+        out.push(pi_ai::ContentBlock::Text {
+            text: redact_display_paths(&whole),
+            text_signature: None,
+        });
+        run.clear();
+    }
+}
+
+/// Recursively redacts a public JSON payload (tool-call `arguments`, message
+/// `details`): sensitive keys follow the shared `tool_presentation`
+/// `redact_value` rules, then every surviving string additionally passes the
+/// FULL secret patterns (`redact_secrets` — the `redact_text` inside
+/// `redact_value` lacks the multi-line PEM handling) and absolute-path
+/// redaction.
+fn redact_public_value(value: &Value) -> Value {
+    let keyed = crate::tool_presentation::redact_value(value);
+    upgrade_value_strings(keyed)
+}
+
+fn upgrade_value_strings(value: Value) -> Value {
+    match value {
+        Value::String(text) => Value::String(redact_display_text(&text)),
+        Value::Array(items) => Value::Array(items.into_iter().map(upgrade_value_strings).collect()),
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(key, child)| (key, upgrade_value_strings(child)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+/// Full public-text redaction: secret patterns over the WHOLE logical body
+/// first, then absolute filesystem paths.
+fn redact_display_text(text: &str) -> String {
+    redact_display_paths(&crate::redact::redact_secrets(text))
+}
+
+static REDACTED_QUOTED_PATH: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#""[^"\n]*"|'[^'\n]*'"#).expect("quoted path pattern compiles")
+    });
+
+/// Replaces absolute filesystem paths with `[PATH]` everywhere a display
+/// string can carry one: inside single/double-quoted spans (paths with
+/// spaces), as `--flag=/path` and `VAR=/path` values, as whitespace tokens,
+/// and when ASCII or CJK punctuation wraps the path (`(/private/file)`,
+/// `[C:\secret]`, `（/tmp/x）`). POSIX, `~/…` / `~user…`, Windows drive forms,
+/// and `file:` URLs are machine paths. Other URL schemes survive verbatim
+/// because `:` stays inside the token; workspace-relative paths stay readable
+/// for Read/Edit cards. A lone `~` is not a path. Whitespace is preserved
+/// exactly. The flat label renderer keeps its own
+/// `redact_absolute_path_tokens`.
+fn redact_display_paths(value: &str) -> String {
+    let without_quoted = REDACTED_QUOTED_PATH
+        .replace_all(value, |captures: &regex::Captures| {
+            let span = captures.get(0).expect("quoted span").as_str();
+            let inner = &span[1..span.len() - 1];
+            // A quoted span is one path, spaces included. The atom scan below
+            // would stop at the space and leak the tail.
+            if is_absolute_path(inner) && !is_http_url(inner) {
+                "\"[PATH]\"".to_owned()
+            } else {
+                span.to_owned()
+            }
+        })
+        .into_owned();
+    map_whitespace_tokens(&without_quoted, redact_path_spans)
+}
+
+/// Punctuation that ends a path span and lets the next absolute path start.
+/// `:` is not one: it belongs to `C:\…` and to URL schemes. CJK letters are
+/// not boundaries either, so ordinary prose does not open a path.
+fn is_path_boundary(ch: char) -> bool {
+    matches!(
+        ch,
+        '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '=' | ','
+            | '"' | '\'' | '`'
+            | '（' | '）' | '【' | '】' | '「' | '」' | '『' | '』' | '《' | '》'
+    )
+}
+
+/// Byte length of an absolute-path start at `rest`: `/`, `~` plus at least
+/// one non-boundary character, or `X:` followed by `\` or `/`.
+fn absolute_path_prefix_len(rest: &str) -> usize {
+    let bytes = rest.as_bytes();
+    if bytes.first().is_some_and(|byte| *byte == b'/') {
+        return 1;
+    }
+    if bytes.first().is_some_and(|byte| *byte == b'~') {
+        let mut chars = rest.chars();
+        chars.next();
+        return match chars.next() {
+            Some(ch) if !is_path_boundary(ch) => 1 + ch.len_utf8(),
+            _ => 0,
+        };
+    }
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+    {
+        return 3;
+    }
+    0
+}
+
+/// Replaces absolute path spans inside one whitespace token. A span starts
+/// only at the token start or after [`is_path_boundary`], then consumes
+/// through the next boundary — including non-ASCII path characters.
+/// `file:` URLs are machine paths. Any other scheme stays, because `:` is
+/// not a boundary and the following `/` does not start a span.
+fn redact_path_spans(token: &str) -> String {
+    let mut out = String::with_capacity(token.len());
+    let mut rest = token;
+    let mut at_boundary = true;
+    while !rest.is_empty() {
+        let prefix = absolute_path_prefix_len(rest);
+        let file_url = at_boundary
+            && rest
+                .get(..5)
+                .is_some_and(|head| head.eq_ignore_ascii_case("file:"));
+        if at_boundary && (file_url || prefix > 0) {
+            let mut end = if file_url { 5 } else { prefix };
+            while let Some(ch) = rest[end..].chars().next() {
+                if is_path_boundary(ch) {
+                    break;
+                }
+                end += ch.len_utf8();
+            }
+            out.push_str("[PATH]");
+            rest = &rest[end..];
+            at_boundary = true;
+            continue;
+        }
+        let ch = rest.chars().next().expect("rest");
+        out.push(ch);
+        rest = &rest[ch.len_utf8()..];
+        at_boundary = is_path_boundary(ch);
+    }
+    out
+}
+
+/// Applies `map` to whitespace-separated tokens while preserving ALL
+/// whitespace exactly (newlines, indentation, padding).
+fn map_whitespace_tokens(value: &str, map: impl Fn(&str) -> String) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut token = String::new();
+    let mut pending = String::new();
+    for character in value.chars() {
+        if character.is_whitespace() {
+            if !token.is_empty() {
+                out.push_str(&map(&token));
+                token.clear();
+            }
+            pending.push(character);
+        } else {
+            if !pending.is_empty() {
+                out.push_str(&pending);
+                pending.clear();
+            }
+            token.push(character);
+        }
+    }
+    if !token.is_empty() {
+        out.push_str(&map(&token));
+    }
+    out
+}
+
 /// Compact single-line label for one session record. Message records delegate
 /// to [`history_message_label`]; non-message records (model/thinking changes,
 /// session info, compaction, custom state) render as short bracketed tags.
@@ -10623,6 +11441,352 @@ mod history_label_tests {
         assert!(rendered.contains("[compaction] "), "{rendered}");
         assert!(rendered.contains("[REDACTED]"), "{rendered}");
     }
+    // ---- structured `agent_history` rows (redaction, suffix, projection) ----
+
+    fn capability_history_file(path: &Path) -> Arc<CapabilityFile> {
+        let capabilities = CapabilityFs::new().expect("capability filesystem");
+        Arc::new(
+            capabilities
+                .open_exact_file(
+                    CapabilityRootPurpose::SessionStore,
+                    pi_sandbox::AbsolutePath::parse(path.to_path_buf())
+                        .expect("absolute history path"),
+                )
+                .expect("history capability"),
+        )
+    }
+
+    #[test]
+    fn structured_rows_redact_secrets_across_text_blocks_and_values() {
+        let body = "MIIabc".repeat(40);
+        let mut message = tool_result("bash", "", false);
+        if let pi_ai::Message::ToolResult(result) = &mut message {
+            result.content = vec![
+                ContentBlock::text(format!("-----BEGIN PRIVATE KEY-----\n{body}")),
+                ContentBlock::text(format!("{body}\n-----END PRIVATE KEY-----")),
+            ];
+            result.details = Some(serde_json::json!({
+                "api_key": "sk-abcdefghijklmnop1234",
+                "nested": { "authToken": "ghp_abcdefghijklmnopqrstuvwxyz012345" },
+                "note": "see /home/coach/.ssh/id_rsa and https://example.com/x",
+                "relative": "src/lib.rs",
+                "quoted": "cat \"/home/coach/my secrets.conf\"",
+                "windows": "del C:\\Users\\coach\\secret.key",
+            }));
+        } else {
+            panic!("tool result fixture");
+        }
+        redact_display_message(&mut message);
+        let pi_ai::Message::ToolResult(result) = &message else {
+            panic!("tool result fixture");
+        };
+        // The PEM straddles the block boundary: the run collapses into a
+        // single, fully scrubbed text block.
+        assert_eq!(result.content.len(), 1, "{message:?}");
+        let details = result.details.as_ref().expect("details");
+        assert_eq!(
+            details.get("api_key").and_then(Value::as_str),
+            Some("[REDACTED]")
+        );
+        assert_eq!(
+            details
+                .get("nested")
+                .and_then(|nested| nested.get("authToken"))
+                .and_then(Value::as_str),
+            Some("[REDACTED]")
+        );
+        assert_eq!(
+            details.get("note").and_then(Value::as_str),
+            Some("see [PATH] and https://example.com/x")
+        );
+        assert_eq!(
+            details.get("relative").and_then(Value::as_str),
+            Some("src/lib.rs")
+        );
+        assert_eq!(
+            details.get("quoted").and_then(Value::as_str),
+            Some("cat \"[PATH]\"")
+        );
+        assert_eq!(
+            details.get("windows").and_then(Value::as_str),
+            Some("del [PATH]")
+        );
+    }
+
+    #[test]
+    fn display_paths_redact_punctuation_wrapped_absolutes() {
+        let cases = [
+            ("(/private/file)", "([PATH])"),
+            ("[C:\\secret]", "[[PATH]]"),
+            ("{C:/secret}", "{[PATH]}"),
+            ("</private/file>", "<[PATH]>"),
+            ("--file=/tmp/x", "--file=[PATH]"),
+            ("FILE=/tmp/x", "FILE=[PATH]"),
+            ("note=(/tmp/a)", "note=([PATH])"),
+            ("(/a,/b)", "([PATH],[PATH])"),
+            ("cat \"/home/coach/my secrets.conf\"", "cat \"[PATH]\""),
+            ("del C:\\Users\\coach\\secret.key", "del [PATH]"),
+            ("see /home/coach/.ssh/id_rsa", "see [PATH]"),
+            ("(~/notes)", "([PATH])"),
+            ("(~user/notes)", "([PATH])"),
+            ("file:///tmp/x", "[PATH]"),
+            ("FILE:///tmp/x", "[PATH]"),
+            ("（/tmp/x）", "（[PATH]）"),
+            ("中文 prose", "中文 prose"),
+            ("(/private/中文文件)", "([PATH])"),
+            ("【C:\\中文】", "【[PATH]】"),
+            ("src/lib.rs", "src/lib.rs"),
+            ("./src/lib.rs", "./src/lib.rs"),
+            ("../src/lib.rs", "../src/lib.rs"),
+            ("C:relative", "C:relative"),
+            ("~", "~"),
+            ("(~)", "(~)"),
+            ("https://example.com/x", "https://example.com/x"),
+            ("http://example.com/a", "http://example.com/a"),
+            ("see /tmp/x and https://example.com/x", "see [PATH] and https://example.com/x"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(redact_display_paths(input), expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn structured_rows_keep_images_and_redact_arguments_and_thinking() {
+        let mut message = assistant(vec![
+            ContentBlock::Thinking {
+                thinking: "reading /home/coach/.aws/credentials next".to_owned(),
+                thinking_signature: Some("think-sig".to_owned()),
+                redacted: false,
+            },
+            ContentBlock::Image {
+                data: "aW1hZ2U=".to_owned(),
+                mime_type: "image/png".to_owned(),
+            },
+            tool_call(
+                "read",
+                serde_json::json!({
+                    "path": "/home/coach/notes.txt",
+                    "token": "sk-abcdefghijklmnop1234",
+                }),
+            ),
+        ]);
+        redact_display_message(&mut message);
+        let pi_ai::Message::Assistant(after) = &message else {
+            panic!("assistant fixture");
+        };
+        assert!(
+            after.content.iter().any(|block| matches!(
+                block,
+                ContentBlock::Image { data, mime_type }
+                    if data == "aW1hZ2U=" && mime_type == "image/png"
+            )),
+            "image must survive verbatim: {message:?}"
+        );
+        let rendered = format!("{message:?}");
+        assert!(!rendered.contains(".aws"), "{rendered}");
+        assert!(!rendered.contains("think-sig"), "{rendered}");
+        assert!(!rendered.contains("thought-sig"), "{rendered}");
+        assert!(!rendered.contains("sk-abcdefghijklmnop1234"), "{rendered}");
+        for block in &after.content {
+            if let ContentBlock::Thinking {
+                thinking_signature, ..
+            } = block
+            {
+                assert!(thinking_signature.is_none(), "{message:?}");
+            }
+            if let ContentBlock::ToolCall(call) = block {
+                assert!(call.thought_signature.is_none(), "{message:?}");
+                assert_eq!(
+                    call.arguments.get("path").and_then(Value::as_str),
+                    Some("[PATH]")
+                );
+                assert_eq!(
+                    call.arguments.get("token").and_then(Value::as_str),
+                    Some("[REDACTED]")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn structured_rows_select_latest_suffix_without_fabricating_ids() {
+        let root = tempfile::tempdir().expect("root");
+        let path = root.path().join("history.json");
+        let messages: Vec<pi_ai::Message> = (0..5)
+            .map(|index| pi_ai::Message::user_text(format!("row {index}"), 0))
+            .collect();
+        fs::write(&path, serde_json::to_vec(&messages).expect("snapshot")).expect("write history");
+        let transcript = read_transcript_rows(
+            &RetainedHistoryFile::Artifact(capability_history_file(&path)),
+            3,
+        )
+        .expect("read");
+        assert_eq!(transcript.omitted_rows, 2);
+        assert_eq!(transcript.rows.len(), 3);
+        assert!(transcript.rows.iter().all(|row| row.id.is_none()));
+        let texts: Vec<String> = transcript
+            .rows
+            .iter()
+            .map(|row| match &row.message {
+                pi_ai::Message::User(user) => match &user.content[0] {
+                    ContentBlock::Text { text, .. } => text.clone(),
+                    _ => String::new(),
+                },
+                _ => String::new(),
+            })
+            .collect();
+        assert_eq!(texts, vec!["row 2", "row 3", "row 4"]);
+    }
+
+    #[test]
+    fn structured_rows_report_broken_snapshots_instead_of_empty_history() {
+        let root = tempfile::tempdir().expect("root");
+        let path = root.path().join("history.json");
+        fs::write(&path, b"[{broken").expect("write history");
+        let error = read_transcript_rows(
+            &RetainedHistoryFile::Artifact(capability_history_file(&path)),
+            3,
+        )
+        .expect_err("a broken snapshot must fail, never read as empty");
+        assert!(
+            format!("{error:#}").contains("parsing history snapshot"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn structured_rows_follow_retained_branch_projection_with_entry_ids() {
+        let directory = tempfile::tempdir().expect("root");
+        let path = directory.path().join("child.jsonl");
+        let header = "{\"type\":\"session\",\"version\":3,\"id\":\"detail-branch\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"/w\"}";
+        let entries = [
+            "{\"type\":\"message\",\"id\":\"a\",\"parentId\":null,\"timestamp\":\"2026-01-01T00:00:01.000Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"branch keep\"}],\"timestamp\":0}}",
+            "{\"type\":\"message\",\"id\":\"b\",\"parentId\":\"a\",\"timestamp\":\"2026-01-01T00:00:02.000Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"branch drop\"}],\"timestamp\":0}}",
+            "{\"type\":\"message\",\"id\":\"c\",\"parentId\":\"a\",\"timestamp\":\"2026-01-01T00:00:03.000Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"branch keep 2\"}],\"timestamp\":0}}",
+        ];
+        fs::write(&path, format!("{header}\n{}\n", entries.join("\n"))).expect("write session");
+        let retained = RetainedHistoryFile::Session(capability_history_file(&path));
+        let transcript = read_transcript_rows(&retained, 10).expect("read");
+        assert_eq!(transcript.omitted_rows, 0);
+        let ids: Vec<Option<&str>> =
+            transcript.rows.iter().map(|row| row.id.as_deref()).collect();
+        // The authoritative branch of the newest leaf — the sibling "b" entry
+        // is never shown, and ids are the real session-entry ids.
+        assert_eq!(ids, vec![Some("a"), Some("c")]);
+        let rendered = format!("{:?}", transcript.rows);
+        assert!(rendered.contains("branch keep"), "{rendered}");
+        assert!(!rendered.contains("branch drop"), "{rendered}");
+    }
+
+    #[test]
+    fn structured_rows_drop_compaction_summaries_before_limit_and_keep_ids() {
+        let directory = tempfile::tempdir().expect("root");
+        let session_path = directory.path().join("compacted-child.jsonl");
+        let user = |id: &str, parent: Option<&str>, text: &str| {
+            serde_json::json!({
+                "type": "message",
+                "id": id,
+                "parentId": parent,
+                "timestamp": "2026-01-01T00:00:01.000Z",
+                "message": {
+                    "role": "user",
+                    "content": [{ "type": "text", "text": text }],
+                    "timestamp": 0,
+                },
+            })
+        };
+        let lines = [
+            serde_json::json!({
+                "type": "session",
+                "version": 3,
+                "id": "compacted-child",
+                "timestamp": "2026-01-01T00:00:00.000Z",
+                "cwd": "/w",
+            }),
+            user("a", None, "history a"),
+            user("b", Some("a"), "history b"),
+            serde_json::json!({
+                "type": "compaction",
+                "id": "cut",
+                "parentId": "b",
+                "timestamp": "2026-01-01T00:00:03.000Z",
+                "summary": "E2E-COMPACT-SUMMARY",
+                "firstKeptEntryId": "b",
+                "tokensBefore": 3360,
+                "retainedTail": [],
+            }),
+            user("c", Some("cut"), "history c"),
+            user("d", Some("c"), "history d"),
+        ];
+        fs::write(
+            &session_path,
+            lines
+                .iter()
+                .map(|line| serde_json::to_string(line).expect("json"))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .expect("write session");
+        let retained = RetainedHistoryFile::Session(capability_history_file(&session_path));
+
+        let full = read_transcript_rows(&retained, 10).expect("read full");
+        assert_eq!(full.omitted_rows, 0);
+        let ids: Vec<Option<&str>> = full.rows.iter().map(|row| row.id.as_deref()).collect();
+        assert_eq!(ids, vec![Some("a"), Some("b"), Some("c"), Some("d")]);
+        assert!(
+            !full
+                .rows
+                .iter()
+                .any(|row| matches!(row.message, pi_ai::Message::CompactionSummary(_))),
+            "{:?}",
+            full.rows
+        );
+
+        let limited = read_transcript_rows(&retained, 3).expect("read limited");
+        assert_eq!(
+            limited.omitted_rows, 1,
+            "limit/omitted must count only display rows after the summary boundary"
+        );
+        let ids: Vec<Option<&str>> = limited.rows.iter().map(|row| row.id.as_deref()).collect();
+        assert_eq!(ids, vec![Some("b"), Some("c"), Some("d")]);
+
+        let snapshot_path = directory.path().join("compacted-child.snapshot.json");
+        let snapshot = vec![
+            pi_ai::Message::user_text("snap a", 0),
+            pi_ai::Message::CompactionSummary(pi_ai::CompactionSummaryMessage {
+                summary: "E2E-COMPACT-SUMMARY".to_owned(),
+                tokens_before: 3360,
+                details: None,
+                usage: None,
+                from_hook: None,
+                timestamp: 1,
+            }),
+            pi_ai::Message::user_text("snap b", 2),
+            pi_ai::Message::user_text("snap c", 3),
+        ];
+        fs::write(
+            &snapshot_path,
+            serde_json::to_vec(&snapshot).expect("snapshot"),
+        )
+        .expect("write snapshot");
+        let transcript = read_transcript_rows(
+            &RetainedHistoryFile::Artifact(capability_history_file(&snapshot_path)),
+            2,
+        )
+        .expect("read snapshot");
+        assert_eq!(transcript.omitted_rows, 1);
+        assert_eq!(transcript.rows.len(), 2);
+        assert!(
+            !transcript
+                .rows
+                .iter()
+                .any(|row| matches!(row.message, pi_ai::Message::CompactionSummary(_))),
+            "{:?}",
+            transcript.rows
+        );
+    }
+
 }
 
 impl OrchestrationRuntime {
@@ -10783,6 +11947,16 @@ pub(crate) fn register_test_agent(
             .expect("finish test agent");
     }
 }
+/// Explicit, registered parent model for test runtimes whose child spawn must
+/// resolve the parent fallback. `OrchestrationConfig::new` intentionally has no
+/// default model now, so fixtures must supply a concrete registered model
+/// rather than reintroduce a placeholder default.
+#[cfg(test)]
+fn fixture_parent_model() -> pi_ai::Model {
+    pi_ai::providers::register_default_faux();
+    pi_ai::get_model("faux", "faux-1").expect("registered faux model")
+}
+
 #[cfg(test)]
 struct IsolatedSessionFixture {
     _agent: tempfile::TempDir,
@@ -10832,7 +12006,7 @@ async fn isolated_session(
     let workspace = crate::WorkspaceRoots::new(root, Vec::<PathBuf>::new()).expect("workspace");
     let session = Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
         crate::SessionOptions {
-            model,
+            model: Some(model),
             cwd: root.to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -10889,6 +12063,7 @@ mod prompt_size_tests {
         .expect("definition");
         let clock_now = now.clone();
         let config = OrchestrationConfig::new(AgentCatalog::from_agents(vec![definition]), root)
+            .with_parent_model(Some(fixture_parent_model()))
             .with_job_retention(max_retained, ttl)
             .with_job_clock(Arc::new(move || clock_now.load(Ordering::SeqCst)));
         OrchestrationRuntime::new(config, Arc::new(|_| Box::pin(async { unreachable!() })))
@@ -11709,7 +12884,8 @@ mod prompt_size_tests {
         )
         .expect("definition");
         let runtime = OrchestrationRuntime::new(
-            OrchestrationConfig::new(AgentCatalog::from_agents(vec![definition]), root.path()),
+            OrchestrationConfig::new(AgentCatalog::from_agents(vec![definition]), root.path())
+                .with_parent_model(Some(fixture_parent_model())),
             Arc::new(move |request| {
                 *factory_capture.lock() = Some(request.system_prompt);
                 Box::pin(async { Err(anyhow!("stop after prompt capture")) })
@@ -11769,7 +12945,8 @@ mod prompt_size_tests {
         )
         .expect("definition");
         let runtime = OrchestrationRuntime::new(
-            OrchestrationConfig::new(AgentCatalog::from_agents(vec![definition]), root.path()),
+            OrchestrationConfig::new(AgentCatalog::from_agents(vec![definition]), root.path())
+                .with_parent_model(Some(fixture_parent_model())),
             Arc::new(|_| Box::pin(async { Err(anyhow!("stop after spawn")) })),
         )
         .expect("runtime");
@@ -11838,7 +13015,8 @@ mod prompt_size_tests {
         )
         .expect("definition");
         let runtime = OrchestrationRuntime::new(
-            OrchestrationConfig::new(AgentCatalog::from_agents(vec![definition]), root.path()),
+            OrchestrationConfig::new(AgentCatalog::from_agents(vec![definition]), root.path())
+                .with_parent_model(Some(fixture_parent_model())),
             Arc::new(move |request| {
                 factory_capture
                     .lock()
@@ -11956,6 +13134,7 @@ mod prompt_size_tests {
                     started_at: None,
                     finished_at: None,
                     result: None,
+                    cancellation_cause: None,
                     soft_budget_exhausted: false,
                 },
                 CancellationToken::new(),
@@ -12085,6 +13264,7 @@ mod prompt_size_tests {
                     created_at: 2,
                     started_at: None,
                     finished_at: None,
+                    cancellation_cause: None,
                     result: None,
                     soft_budget_exhausted: false,
                 },
@@ -12160,6 +13340,7 @@ mod prompt_size_tests {
                     created_at: 1,
                     started_at: None,
                     finished_at: None,
+                    cancellation_cause: None,
                     result: None,
                     soft_budget_exhausted: false,
                 },
@@ -12183,6 +13364,7 @@ mod prompt_size_tests {
                     created_at: 1,
                     started_at: None,
                     finished_at: None,
+                    cancellation_cause: None,
                     result: None,
                     soft_budget_exhausted: false,
                 },
@@ -12295,6 +13477,7 @@ mod prompt_size_tests {
                     created_at: 15,
                     started_at: None,
                     finished_at: None,
+                    cancellation_cause: None,
                     result: None,
                     soft_budget_exhausted: false,
                 },
@@ -12361,6 +13544,251 @@ mod prompt_size_tests {
         assert_persisted_graph_valid(&runtime);
     }
 
+    fn running_snapshot(id: &str, agent_id: &str) -> JobSnapshot {
+        JobSnapshot {
+            id: id.to_owned(),
+            agent_id: agent_id.to_owned(),
+            agent: "task".to_owned(),
+            parent_id: "Main".to_owned(),
+            description: None,
+            todo_task_id: None,
+            workflow_id: None,
+            workflow_generation: None,
+            status: JobStatus::Running,
+            created_at: 1,
+            started_at: Some(1),
+            finished_at: None,
+            cancellation_cause: None,
+            result: None,
+            soft_budget_exhausted: false,
+        }
+    }
+
+    use crate::JobWaitMissingError;
+    use std::future::Future;
+
+    /// Polls a pinned future once: `Ok(())` iff Pending (parked); `Err(output)`
+    /// carries the ready value so a failed park prints its actual result.
+    async fn poll_once_parked<F: Future>(mut fut: std::pin::Pin<&mut F>) -> Result<(), F::Output>
+    where
+        F::Output: std::fmt::Debug,
+    {
+        std::future::poll_fn(|cx| match fut.as_mut().poll(cx) {
+            std::task::Poll::Pending => std::task::Poll::Ready(Ok(())),
+            std::task::Poll::Ready(output) => std::task::Poll::Ready(Err(output)),
+        })
+        .await
+    }
+
+    fn settled_result(agent_id: &str) -> TaskResult {
+        TaskResult {
+            index: 0,
+            id: agent_id.to_owned(),
+            agent: "task".to_owned(),
+            status: AgentStatus::Idle,
+            output: "settled".to_owned(),
+            usage: pi_ai::Usage::default(),
+            soft_budget_exhausted: false,
+            error: None,
+            structured_output: None,
+            artifact_ref: format!("agent://{agent_id}"),
+            history_ref: format!("history://{agent_id}"),
+            artifact_uri: format!("artifact://{agent_id}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_and_reports_missing_when_retention_prunes_a_target() {
+        let root = tempfile::tempdir().expect("root");
+        let now = Arc::new(AtomicU64::new(1));
+        let runtime = retention_runtime(root.path(), now.clone(), 1, Duration::from_millis(10));
+        // Owned jobs: ownerless targets settle immediately at the cancellation
+        // commit (ownerless_cancel_settles_immediately_and_signals_no_token)
+        // and never reach the settlement wait. Owners mirror the runner guard.
+        for (id, agent) in [("job-a", "Alpha"), ("job-b", "Beta")] {
+            let token = CancellationToken::new();
+            runtime
+                .inner
+                .jobs
+                .insert(running_snapshot(id, agent), token.clone())
+                .expect("insert running job");
+            assert!(runtime.reserve_owner(agent, id, token), "owner reserved");
+        }
+        let mut shutdown = std::pin::pin!(runtime.shutdown());
+        if let Err(ready) = poll_once_parked(shutdown.as_mut()).await {
+            panic!("shutdown resolved on first poll instead of parking: {ready:?}");
+        }
+        // Deterministic runner interleave: job-a settles, its guard releases
+        // the owner, then the post-finish prune (runtime.rs:5175) retires it —
+        // max_retained=1 with an expired ttl, driven through the public
+        // jobs() entry.
+        runtime
+            .inner
+            .jobs
+            .finish("job-a", settled_result("Alpha"), 2)
+            .expect("job-a settles");
+        runtime.release_owner("Alpha", "job-a");
+        now.store(100, Ordering::SeqCst);
+        assert_eq!(runtime.jobs(None).len(), 1, "expired settled target pruned");
+        runtime
+            .inner
+            .jobs
+            .finish("job-b", settled_result("Beta"), 3)
+            .expect("job-b settles");
+        runtime.release_owner("Beta", "job-b");
+        let error = tokio::time::timeout(Duration::from_secs(10), shutdown.as_mut())
+            .await
+            .expect("shutdown resolves in bounded time")
+            .expect_err("a pruned settlement target must fail shutdown, not vanish");
+        assert!(
+            error
+                .to_string()
+                .contains("waiting for shutdown cancellation to settle")
+        );
+        assert!(
+            error
+                .root_cause()
+                .downcast_ref::<JobWaitMissingError>()
+                .is_some(),
+            "typed missing-id error preserved through the shutdown context"
+        );
+        // Authoritative terminal-state checks: jobs(None) alone can fake a
+        // pass because a second call prunes again.
+        assert!(runtime.is_shutdown(), "terminal shutdown token fired");
+        assert!(!registry_has(&runtime, "Alpha"), "registry group removed");
+        assert!(!registry_has(&runtime, "Beta"), "registry group removed");
+    }
+
+    #[tokio::test]
+    async fn ownerless_cancel_settles_immediately_and_signals_no_token() {
+        let root = tempfile::tempdir().expect("root");
+        let runtime = prompt_runtime(root.path());
+        let token = CancellationToken::new();
+        runtime
+            .inner
+            .jobs
+            .insert(running_snapshot("job-ownerless", "Worker"), token.clone())
+            .expect("insert");
+        let cancelled = runtime
+            .cancel_jobs_result(&["job-ownerless".to_owned()])
+            .expect("cancel");
+        assert_eq!(cancelled, ["job-ownerless"]);
+        let job = runtime.jobs(Some(&["job-ownerless".to_owned()]));
+        assert_eq!(job[0].status, JobStatus::Cancelled);
+        assert_eq!(job[0].cancellation_cause, Some(CancellationCause::Task));
+        assert!(job[0].result.as_ref().is_some_and(|result| result.error.is_none()),
+            "ownerless intentional stop must not manufacture an error: {:?}",
+            job[0].result
+        );
+        assert!(!token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn cancel_persist_failure_leaves_token_and_status() {
+        let root = tempfile::tempdir().expect("root");
+        let parent_dir = tempfile::tempdir().expect("parent sessions");
+        let recorder = crate::session_store::start_session_in(
+            root.path(),
+            Some(&pi_ai::Model::default()),
+            None,
+            Some(parent_dir.path()),
+            None,
+            None,
+        )
+        .expect("recorder");
+        let parent_fixture = isolated_session(root.path(), Vec::new(), None).await;
+        let parent = &parent_fixture.session;
+        parent.record(recorder).expect("record");
+        let runtime = prompt_runtime(root.path());
+        runtime.bind_and_recover(parent).expect("bind");
+        let token = CancellationToken::new();
+        runtime
+            .inner
+            .jobs
+            .insert(running_snapshot("job-durable", "Worker"), token.clone())
+            .expect("insert");
+        register_peer(
+            &runtime,
+            "Worker",
+            "task",
+            Some("Main"),
+            AgentStatus::Running,
+        );
+        attach_request_parent(&runtime, "Worker", "Main");
+        runtime.reserve_owner("Worker", "job-durable", token.clone());
+        let sidecar = runtime
+            .inner
+            .durable
+            .lock()
+            .as_ref()
+            .expect("durable")
+            .sidecar_path()
+            .to_path_buf();
+        std::fs::remove_file(&sidecar).expect("remove sidecar");
+        std::fs::create_dir(&sidecar).expect("break sidecar");
+        let error = runtime
+            .cancel_jobs_result(&["job-durable".to_owned()])
+            .expect_err("persist failure");
+        assert!(error.to_string().to_lowercase().contains("persist") || error.to_string().contains("sidecar"), "{error:#}");
+        let job = runtime.jobs(Some(&["job-durable".to_owned()]));
+        assert_eq!(job[0].status, JobStatus::Running);
+        assert_eq!(job[0].cancellation_cause, None);
+        assert!(!token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn spawn_park_blocks_cancel_until_reservation_exists() {
+        let root = tempfile::tempdir().expect("root");
+        let runtime = prompt_runtime(root.path());
+        let release = Arc::new(AtomicBool::new(false));
+        runtime.arm_spawn_test_park(SpawnTestParkPoint::AfterSpawnLock, release.clone());
+        let runtime_spawn = runtime.clone();
+        let spawned = tokio::task::spawn_blocking(move || {
+            runtime_spawn.spawn_tasks(
+                "Main",
+                0,
+                vec![TaskItem {
+                    index: 0,
+                    id: "Parked".to_owned(),
+                    agent: "task".to_owned(),
+                    assignment: "hold".to_owned(),
+                    ..Default::default()
+                }],
+            )
+        });
+        release.store(true, Ordering::Release);
+        let spawns = spawned.await.expect("spawn join").expect("spawn");
+        let job_id = spawns[0].job_id.clone();
+        let cancel = tokio::task::spawn_blocking({
+            let runtime = runtime.clone();
+            let job_id = job_id.clone();
+            move || runtime.cancel_jobs_result(&[job_id])
+        });
+        let cancelled = cancel.await.expect("cancel join").expect("cancel");
+        assert_eq!(cancelled, vec![job_id.clone()]);
+        let job = runtime.jobs(Some(&[job_id]));
+        assert!(
+            matches!(
+                job[0].status,
+                JobStatus::Cancelling | JobStatus::Cancelled
+            ),
+            "{:?}",
+            job[0].status
+        );
+        assert_eq!(job[0].cancellation_cause, Some(CancellationCause::Task));
+    }
+
+    #[test]
+    fn typed_abort_keeps_unrelated_errors() {
+        let aborted = aborted_run_result(Err(anyhow::Error::from(pi_agent::AbortError)));
+        assert_eq!(aborted.err(), Some(ChildRunStop::Cancelled));
+        let unrelated = aborted_run_result(Err(anyhow!("provider aborted the socket")));
+        assert!(
+            matches!(&unrelated, Err(ChildRunStop::Failed(error)) if error.contains("provider aborted the socket")),
+            "{unrelated:?}"
+        );
+    }
+
     #[tokio::test]
     async fn job_cancellation_publishes_terminal_job_update() {
         let root = tempfile::tempdir().expect("root");
@@ -12382,6 +13810,7 @@ mod prompt_size_tests {
                     created_at: 1,
                     started_at: Some(1),
                     finished_at: None,
+                    cancellation_cause: None,
                     result: None,
                     soft_budget_exhausted: false,
                 },
@@ -12411,9 +13840,9 @@ mod prompt_size_tests {
                 .result
                 .as_ref()
                 .and_then(|result| result.error.as_deref()),
-            Some("task cancelled"),
+            None,
+            "terminal cancel publish must not manufacture an error"
         );
-        assert_eq!(runtime.jobs(Some(&cancelled))[0], published);
     }
 
     #[tokio::test]
@@ -12458,6 +13887,7 @@ mod prompt_size_tests {
                     created_at: 1,
                     started_at: Some(1),
                     finished_at: None,
+                    cancellation_cause: None,
                     result: None,
                     soft_budget_exhausted: false,
                 },
@@ -12487,7 +13917,8 @@ mod prompt_size_tests {
                 .result
                 .as_ref()
                 .and_then(|result| result.error.as_deref()),
-            Some("task cancelled"),
+            None,
+            "durable terminal cancel publish must not manufacture an error"
         );
         let durable = runtime
             .inner
@@ -12503,6 +13934,1470 @@ mod prompt_size_tests {
             .find(|job| job.id == "job-running")
             .expect("persisted cancelled job");
         assert_eq!(persisted.status, JobStatus::Cancelled);
+    }
+
+    async fn cancellation_durable_parent(
+        root: &Path,
+    ) -> (tempfile::TempDir, IsolatedSessionFixture, std::path::PathBuf) {
+        let parent_dir = tempfile::tempdir().expect("parent sessions");
+        let recorder = crate::session_store::start_session_in(
+            root,
+            Some(&pi_ai::Model::default()),
+            None,
+            Some(parent_dir.path()),
+            None,
+            None,
+        )
+        .expect("recorder");
+        recorder.persist_now().expect("materialize parent header");
+        let parent_fixture = isolated_session(root, Vec::new(), None).await;
+        parent_fixture
+            .session
+            .record(recorder)
+            .expect("record parent");
+        let (_, parent_path) = parent_fixture
+            .session
+            .recorder_info()
+            .expect("parent recorder info");
+        (parent_dir, parent_fixture, parent_path)
+    }
+
+    fn cancellation_task_definition() -> AgentDefinition {
+        super::super::definitions::parse_agent_definition(
+            Path::new("task.md"),
+            "---\nname: task\ndescription: task\ntools: [read]\n---\nprompt",
+            super::super::AgentDefinitionSource::Bundled,
+            true,
+        )
+        .expect("definition")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gated_provider_error_surfaces_real_error_through_cancelling() {
+        let root = tempfile::tempdir().expect("root");
+        let (parent_dir, parent_fixture, parent_path) =
+            cancellation_durable_parent(root.path()).await;
+        let parent = parent_fixture.session.clone();
+        let _ = (&parent_dir, &parent_path);
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        let started_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let child_cwd = root.path().to_path_buf();
+        let release_producer = release.clone();
+        let started_signal = started.clone();
+        let started_counter = started_count.clone();
+        let mut runtime = OrchestrationRuntime::new(
+            OrchestrationConfig::new(
+                AgentCatalog::from_agents(vec![cancellation_task_definition()]),
+                root.path(),
+            )
+            .with_parent_model(parent.model()),
+            Arc::new(move |request: ChildSessionRequest| {
+                let child_cwd = child_cwd.clone();
+                let release = release_producer.clone();
+                let started = started_signal.clone();
+                let started_count = started_counter.clone();
+                Box::pin(async move {
+                    let release_signal = release.clone();
+                    let started_signal = started.clone();
+                    let started_counter = started_count.clone();
+                    let stream_fn: pi_agent::StreamFn = Arc::new(
+                        move |_model: pi_ai::Model,
+                              _context: pi_ai::Context,
+                              _options: pi_ai::SimpleStreamOptions| {
+                            let release = release_signal.clone();
+                            let started = started_signal.clone();
+                            let started_count = started_counter.clone();
+                            Box::pin(async move {
+                                let stream = pi_ai::new_assistant_message_event_stream();
+                                let producer = stream.clone();
+                                tokio::spawn(async move {
+                                    let pending =
+                                        pi_ai::AssistantMessage::pending(&pi_ai::Model::default());
+                                    producer
+                                        .push(pi_ai::AssistantMessageEvent::Start {
+                                            partial: pending,
+                                        })
+                                        .await;
+                                    started_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                    // `notify_one` stores a permit when no
+                                    // waiter is registered yet, so the gate
+                                    // cannot miss this signal.
+                                    started.notify_one();
+                                    // Withhold: the provider neither finishes
+                                    // nor errors until the gate releases.
+                                    release.notified().await;
+                                    let mut error =
+                                        pi_ai::AssistantMessage::pending(&pi_ai::Model::default());
+                                    error.stop_reason = pi_ai::StopReason::Error;
+                                    error.error_message = Some("provider exploded".to_owned());
+                                    producer
+                                        .push(pi_ai::AssistantMessageEvent::Error {
+                                            reason: pi_ai::StopReason::Error,
+                                            error: error.clone(),
+                                        })
+                                        .await;
+                                    producer.end(Some(error)).await;
+                                });
+                                stream
+                            })
+                        },
+                    );
+                    Session::new_with_additional_tools_filtered_and_discovery(
+                        crate::SessionOptions {
+                            model: Some(request.model),
+                            cwd: child_cwd,
+                            system_prompt: request.system_prompt,
+                            thinking_level: ThinkingLevel::Off,
+                            api_key: String::new(),
+                            compaction: None,
+                            stream_options: Default::default(),
+                            tools: Some(request.orchestration_tools),
+                            before_tool_call: None,
+                            after_tool_call: None,
+                            stream_fn: Some(stream_fn),
+                            auth_resolver: None,
+                            auth_manager: None,
+                        },
+                        Vec::new(),
+                        Default::default(),
+                        crate::ResourceDiscovery::Disabled,
+                    )
+                })
+            }),
+        )
+        .expect("runtime");
+        let abort_drain = Arc::new(tokio::sync::Notify::new());
+        if let Some(inner) = Arc::get_mut(&mut runtime.inner) {
+            inner.abort_drain_entered = Some(abort_drain.clone());
+        } else {
+            panic!("fresh orchestration runtime must own its inner for the drain gate");
+        }
+        runtime.bind_and_recover(&parent).expect("bind durable");
+
+        let spawn = runtime
+            .spawn_tasks(
+                "Main",
+                0,
+                vec![TaskItem {
+                    index: 0,
+                    id: "GatedChild".to_owned(),
+                    agent: "task".to_owned(),
+                    assignment: "stream until the provider explodes".to_owned(),
+                    ..Default::default()
+                }],
+            )
+            .expect("spawn gated child")
+            .remove(0);
+        tokio::time::timeout(Duration::from_secs(10), started.notified())
+            .await
+            .expect("provider stream started before cancel");
+        assert!(
+            started_count.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "provider start counter must record the stream start"
+        );
+
+        let cancelled = runtime
+            .cancel_jobs_result(&[spawn.job_id.clone()])
+            .expect("cancel intent");
+        assert_eq!(cancelled, [spawn.job_id.clone()]);
+        let job = runtime.jobs(Some(std::slice::from_ref(&spawn.job_id)));
+        assert_eq!(job[0].status, JobStatus::Cancelling);
+        assert_eq!(job[0].cancellation_cause, Some(CancellationCause::Task));
+        assert!(job[0].result.is_none());
+        assert!(job[0].finished_at.is_none());
+        assert!(!job[0].status.is_settled());
+
+        tokio::time::timeout(Duration::from_secs(10), abort_drain.notified())
+            .await
+            .expect("runner entered the abort drain after child.abort()");
+        let job = runtime.jobs(Some(std::slice::from_ref(&spawn.job_id)));
+        assert_eq!(job[0].status, JobStatus::Cancelling);
+        assert!(job[0].result.is_none(), "withheld provider must keep the job unsettled");
+
+        release.notify_one();
+        let settled = tokio::time::timeout(
+            Duration::from_secs(10),
+            runtime.inner.jobs.wait(
+                &[spawn.job_id.clone()],
+                None,
+                None,
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("job settles after the provider fails")
+        .expect("job wait");
+        assert_eq!(settled[0].status, JobStatus::Cancelled);
+        assert_eq!(settled[0].cancellation_cause, Some(CancellationCause::Task));
+        let result = settled[0].result.as_ref().expect("settled result");
+        assert_eq!(result.status, AgentStatus::Aborted);
+        let error = result
+            .error
+            .as_deref()
+            .expect("real provider error must be preserved, not manufactured");
+        assert!(error.contains("provider exploded"), "{error}");
+
+        let resolver = runtime.read_uri_resolver();
+        let artifact = resolver
+            .resolve_file("artifact://GatedChild")
+            .expect("artifact persisted");
+        let artifact_text =
+            std::fs::read_to_string(artifact.display_path()).expect("read artifact");
+        assert!(
+            artifact_text.contains("provider exploded"),
+            "{artifact_text}"
+        );
+        let history_path = artifact.display_path().with_file_name(format!(
+            "GatedChild-{}.history.json",
+            spawn.job_id
+        ));
+        let history_text =
+            std::fs::read_to_string(&history_path).expect("history persisted");
+        let history: serde_json::Value =
+            serde_json::from_str(&history_text).expect("history is json");
+        assert!(
+            history.as_array().is_some_and(|entries| !entries.is_empty()),
+            "child history must record the cancelled run, not a stub: {history_text}"
+        );
+        assert!(
+            history_text.contains("provider exploded"),
+            "child history must carry the real provider error: {history_text}"
+        );
+        runtime.wait_until_idle().await;
+
+        let durable = runtime.durable_state_for_test().expect("durable state");
+        let persisted = durable
+            .jobs
+            .iter()
+            .find(|job| job.id == spawn.job_id)
+            .expect("persisted cancelled job");
+        assert_eq!(persisted.status, JobStatus::Cancelled);
+        assert!(persisted
+            .result
+            .as_ref()
+            .and_then(|result| result.error.as_deref())
+            .is_some_and(|error| error.contains("provider exploded")));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn intentional_abort_types_cancelled_without_synthetic_error() {
+        let root = tempfile::tempdir().expect("root");
+        let (parent_dir, parent_fixture, parent_path) =
+            cancellation_durable_parent(root.path()).await;
+        let parent = parent_fixture.session.clone();
+        let _ = (&parent_dir, &parent_path);
+
+        let factory_entered = Arc::new(tokio::sync::Notify::new());
+        let release_factory = Arc::new(tokio::sync::Notify::new());
+        let release_factory_gate = release_factory.clone();
+        let entered_signal = factory_entered.clone();
+        let runtime = OrchestrationRuntime::new(
+            OrchestrationConfig::new(
+                AgentCatalog::from_agents(vec![cancellation_task_definition()]),
+                root.path(),
+            )
+            .with_parent_model(parent.model()),
+            Arc::new(move |_request: ChildSessionRequest| {
+                let factory_entered = entered_signal.clone();
+                let release_factory = release_factory_gate.clone();
+                Box::pin(async move {
+                    factory_entered.notify_one();
+                    release_factory.notified().await;
+                    std::future::pending::<Result<Session>>().await
+                })
+            }),
+        )
+        .expect("runtime");
+        runtime.bind_and_recover(&parent).expect("bind durable");
+
+        let spawn = runtime
+            .spawn_tasks(
+                "Main",
+                0,
+                vec![TaskItem {
+                    index: 0,
+                    id: "ParkedChild".to_owned(),
+                    agent: "task".to_owned(),
+                    assignment: "never gets a child session".to_owned(),
+                    ..Default::default()
+                }],
+            )
+            .expect("spawn parked child")
+            .remove(0);
+        tokio::time::timeout(Duration::from_secs(10), factory_entered.notified())
+            .await
+            .expect("child factory entered before cancel");
+        let cancelled = runtime
+            .cancel_jobs_result(&[spawn.job_id.clone()])
+            .expect("cancel intent");
+        assert_eq!(cancelled, [spawn.job_id.clone()]);
+        release_factory.notify_one();
+        let settled = tokio::time::timeout(
+            Duration::from_secs(10),
+            runtime.inner.jobs.wait(
+                &[spawn.job_id.clone()],
+                None,
+                None,
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("intentional cancel settles without the factory")
+        .expect("job wait");
+
+        runtime.wait_until_idle().await;
+        assert_eq!(settled[0].status, JobStatus::Cancelled);
+        assert_eq!(settled[0].cancellation_cause, Some(CancellationCause::Task));
+        let result = settled[0].result.as_ref().expect("typed result");
+        assert_eq!(result.status, AgentStatus::Aborted);
+        assert!(
+            result.error.is_none(),
+            "intentional abort must not manufacture an error: {:?}",
+            result.error
+        );
+
+        let durable = runtime.durable_state_for_test().expect("durable state");
+        let persisted = durable
+            .jobs
+            .iter()
+            .find(|job| job.id == spawn.job_id)
+            .expect("persisted cancelled job");
+        assert_eq!(persisted.status, JobStatus::Cancelled);
+        assert!(
+            persisted
+                .result
+                .as_ref()
+                .is_some_and(|result| result.error.is_none()),
+            "persisted intentional abort must keep error unset: {:?}",
+            persisted.result
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prestart_cancelled_job_never_starts_the_provider() {
+        // Regression: a job-level cancel that wins before the child Session
+        // run begins must skip the never-started run. The run future parks
+        // before it can reach `Session::run`, the runtime cancel branch is
+        // proven selected, and only then is the park released: the provider
+        // must never be entered, and the job must settle as an intentional
+        // cancel within the existing bounded drain wait instead of draining
+        // into a fresh uncancelled run and timing out.
+        let root = tempfile::tempdir().expect("root");
+        let (parent_dir, parent_fixture, parent_path) =
+            cancellation_durable_parent(root.path()).await;
+        let parent = parent_fixture.session.clone();
+        let _ = (&parent_dir, &parent_path);
+
+        let provider_entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let provider_started = Arc::new(tokio::sync::Notify::new());
+        let provider_flag = provider_entered.clone();
+        let provider_signal = provider_started.clone();
+        let child_cwd = root.path().to_path_buf();
+        let mut runtime = OrchestrationRuntime::new(
+            OrchestrationConfig::new(
+                AgentCatalog::from_agents(vec![cancellation_task_definition()]),
+                root.path(),
+            )
+            .with_parent_model(parent.model()),
+            Arc::new(move |request: ChildSessionRequest| {
+                let child_cwd = child_cwd.clone();
+                let provider_flag = provider_flag.clone();
+                let provider_signal = provider_signal.clone();
+                Box::pin(async move {
+                    let stream_flag = provider_flag.clone();
+                    let stream_signal = provider_signal.clone();
+                    let stream_fn: pi_agent::StreamFn = Arc::new(
+                        move |_model: pi_ai::Model,
+                              _context: pi_ai::Context,
+                              _options: pi_ai::SimpleStreamOptions| {
+                            let stream_flag = stream_flag.clone();
+                            let stream_signal = stream_signal.clone();
+                            Box::pin(async move {
+                                stream_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                                stream_signal.notify_one();
+                                // Withhold forever: if the buggy path enters
+                                // the provider, the run cannot settle on its
+                                // own and the abort drain times out.
+                                std::future::pending::<()>().await;
+                                unreachable!("provider stream is never released");
+                            })
+                        },
+                    );
+                    Session::new_with_additional_tools_filtered_and_discovery(
+                        crate::SessionOptions {
+                            model: Some(request.model),
+                            cwd: child_cwd,
+                            system_prompt: request.system_prompt,
+                            thinking_level: ThinkingLevel::Off,
+                            api_key: String::new(),
+                            compaction: None,
+                            stream_options: Default::default(),
+                            tools: Some(request.orchestration_tools),
+                            before_tool_call: None,
+                            after_tool_call: None,
+                            stream_fn: Some(stream_fn),
+                            auth_resolver: None,
+                            auth_manager: None,
+                        },
+                        Vec::new(),
+                        Default::default(),
+                        crate::ResourceDiscovery::Disabled,
+                    )
+                })
+            }),
+        )
+        .expect("runtime");
+        let run_park_entered = Arc::new(tokio::sync::Notify::new());
+        let run_park_release = Arc::new(tokio::sync::Notify::new());
+        let cancel_arm_entered = Arc::new(tokio::sync::Notify::new());
+        if let Some(inner) = Arc::get_mut(&mut runtime.inner) {
+            inner
+                .run_start_park
+                .lock()
+                .replace((run_park_entered.clone(), run_park_release.clone()));
+            inner.cancel_arm_entered = Some(cancel_arm_entered.clone());
+        } else {
+            panic!("fresh orchestration runtime must own its inner for the prestart gates");
+        }
+        runtime.bind_and_recover(&parent).expect("bind durable");
+
+        let spawn = runtime
+            .spawn_tasks(
+                "Main",
+                0,
+                vec![TaskItem {
+                    index: 0,
+                    id: "PrestartChild".to_owned(),
+                    agent: "task".to_owned(),
+                    assignment: "never reaches the provider".to_owned(),
+                    ..Default::default()
+                }],
+            )
+            .expect("spawn prestart child")
+            .remove(0);
+        tokio::time::timeout(Duration::from_secs(10), run_park_entered.notified())
+            .await
+            .expect("run future parked before the Session run began");
+
+        let cancelled = runtime
+            .cancel_jobs_result(&[spawn.job_id.clone()])
+            .expect("cancel intent");
+        assert_eq!(cancelled, [spawn.job_id.clone()]);
+        tokio::time::timeout(Duration::from_secs(10), cancel_arm_entered.notified())
+            .await
+            .expect("cancel branch selected while the run is still parked prestart");
+        let job = runtime.jobs(Some(std::slice::from_ref(&spawn.job_id)));
+        assert_eq!(job[0].status, JobStatus::Cancelling);
+        assert!(job[0].result.is_none());
+
+        run_park_release.notify_one();
+        let settled = tokio::time::timeout(
+            Duration::from_secs(10),
+            runtime.inner.jobs.wait(
+                &[spawn.job_id.clone()],
+                None,
+                None,
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("job settles after the prestart cancel")
+        .expect("job wait");
+        assert!(
+            !provider_entered.load(std::sync::atomic::Ordering::SeqCst),
+            "a run cancelled before it began must never reach the provider"
+        );
+        assert_eq!(settled[0].status, JobStatus::Cancelled);
+        assert_eq!(settled[0].cancellation_cause, Some(CancellationCause::Task));
+        let result = settled[0].result.as_ref().expect("typed result");
+        assert_eq!(result.status, AgentStatus::Aborted);
+        assert!(
+            result.error.is_none(),
+            "prestart cancel must not manufacture an error: {:?}",
+            result.error
+        );
+        runtime.wait_until_idle().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prestart_cancelled_revival_never_starts_the_provider() {
+        // Same contract as the fresh-spawn prestart regression, exercised
+        // through the revival runner: a cancel that wins before the revived
+        // run reaches `Session::run` must skip the run, never enter the
+        // provider, and settle as an intentional cancel.
+        let root = tempfile::tempdir().expect("root");
+        let (parent_dir, parent_fixture, parent_path) =
+            cancellation_durable_parent(root.path()).await;
+        let parent = parent_fixture.session.clone();
+        let _ = (&parent_dir, &parent_path);
+
+        let model = parent
+            .child_session_options_snapshot()
+            .model
+            .expect("parent model");
+        let provider_entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let provider_started = Arc::new(tokio::sync::Notify::new());
+        let provider_flag = provider_entered.clone();
+        let provider_signal = provider_started.clone();
+        let child_cwd = root.path().to_path_buf();
+        let mut runtime = OrchestrationRuntime::new(
+            OrchestrationConfig::new(
+                AgentCatalog::from_agents(vec![cancellation_task_definition()]),
+                root.path(),
+            )
+            .with_parent_model(parent.model()),
+            Arc::new(move |request: ChildSessionRequest| {
+                let child_cwd = child_cwd.clone();
+                let provider_flag = provider_flag.clone();
+                let provider_signal = provider_signal.clone();
+                Box::pin(async move {
+                    let stream_flag = provider_flag.clone();
+                    let stream_signal = provider_signal.clone();
+                    let stream_fn: pi_agent::StreamFn = Arc::new(
+                        move |_model: pi_ai::Model,
+                              _context: pi_ai::Context,
+                              _options: pi_ai::SimpleStreamOptions| {
+                            let stream_flag = stream_flag.clone();
+                            let stream_signal = stream_signal.clone();
+                            Box::pin(async move {
+                                stream_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                                stream_signal.notify_one();
+                                std::future::pending::<()>().await;
+                                unreachable!("provider stream is never released");
+                            })
+                        },
+                    );
+                    Session::new_with_additional_tools_filtered_and_discovery(
+                        crate::SessionOptions {
+                            model: Some(request.model),
+                            cwd: child_cwd,
+                            system_prompt: request.system_prompt,
+                            thinking_level: ThinkingLevel::Off,
+                            api_key: String::new(),
+                            compaction: None,
+                            stream_options: Default::default(),
+                            tools: Some(request.orchestration_tools),
+                            before_tool_call: None,
+                            after_tool_call: None,
+                            stream_fn: Some(stream_fn),
+                            auth_resolver: None,
+                            auth_manager: None,
+                        },
+                        Vec::new(),
+                        Default::default(),
+                        crate::ResourceDiscovery::Disabled,
+                    )
+                })
+            }),
+        )
+        .expect("runtime");
+        let run_park_entered = Arc::new(tokio::sync::Notify::new());
+        let run_park_release = Arc::new(tokio::sync::Notify::new());
+        let cancel_arm_entered = Arc::new(tokio::sync::Notify::new());
+        if let Some(inner) = Arc::get_mut(&mut runtime.inner) {
+            inner
+                .run_start_park
+                .lock()
+                .replace((run_park_entered.clone(), run_park_release.clone()));
+            inner.cancel_arm_entered = Some(cancel_arm_entered.clone());
+        } else {
+            panic!("fresh orchestration runtime must own its inner for the prestart gates");
+        }
+        runtime.bind_and_recover(&parent).expect("bind durable");
+        // The revival runner registers its delivery bridge against an
+        // existing registry identity; a revived child must be a known
+        // durable agent (same contract as the restart recovery fixture).
+        register_peer(
+            &runtime,
+            "RevivedChild",
+            "task",
+            Some("Main"),
+            AgentStatus::Running,
+        );
+        // The durable state validator requires the persisted definition
+        // name to match the snapshot's agent (`task`) and the persisted
+        // request identity to match the snapshot (`RevivedChild`/`Main`);
+        // without durable_info the fallback definition would serialize the
+        // agent id as its name and `persist_state` inside `run_revival`
+        // would reject the state.
+        attach_request_parent(&runtime, "RevivedChild", "Main");
+
+        let job_id = "job-prestart-revival".to_owned();
+        let cancel = CancellationToken::new();
+        runtime
+            .inner
+            .jobs
+            .insert(
+                JobSnapshot {
+                    id: job_id.clone(),
+                    agent_id: "RevivedChild".to_owned(),
+                    agent: "task".to_owned(),
+                    parent_id: "Main".to_owned(),
+                    description: None,
+                    todo_task_id: None,
+                    workflow_id: None,
+                    workflow_generation: None,
+                    status: JobStatus::Running,
+                    created_at: 1,
+                    started_at: Some(1),
+                    finished_at: None,
+                    cancellation_cause: None,
+                    result: None,
+                    soft_budget_exhausted: false,
+                },
+                cancel.clone(),
+            )
+            .expect("insert revived job");
+        // The production revival caller (`revive_recovered_jobs`) reserves
+        // the active owner before spawning the runner; without the
+        // reservation `cancel_jobs_result` proves the job ownerless and
+        // settles it immediately without signalling the token, so the
+        // runner's cancel arm can never fire. Match the caller contract.
+        assert!(
+            runtime.reserve_owner("RevivedChild", &job_id, cancel.clone()),
+            "revived child must not already have an active owner"
+        );
+        // The reservation must be live and matching before the cancel
+        // intent, otherwise the job is ownerless by definition.
+        assert!(
+            runtime
+                .inner
+                .active
+                .lock()
+                .get("RevivedChild")
+                .is_some_and(|owner| owner.job_id == job_id),
+            "active owner must match the revived job before cancel"
+        );
+        runtime.spawn_revival_runner(
+            "RevivedChild".to_owned(),
+            ChildSessionRequest {
+                child_id: "RevivedChild".to_owned(),
+                parent_id: "Main".to_owned(),
+                max_tools_per_agent: 32,
+                depth: 1,
+                definition: cancellation_task_definition(),
+                assignment: "continue the interrupted assignment".to_owned(),
+                system_prompt: String::new(),
+                requested_tool_names: None,
+                orchestration_tools: Vec::new(),
+                persona_skill_store: None,
+                persona_skills: Arc::new(Vec::new()),
+                shared_skills: Arc::new(Vec::new()),
+                thinking_level: None,
+                model,
+                output_schema: None,
+                schema_mode: None,
+                yield_state: Arc::new(YieldState::default()),
+                resolved_model_sequence: Vec::new(),
+                resolved_model_selected_index: 0,
+            },
+            None,
+            "continue the interrupted assignment".to_owned(),
+            cancel,
+            job_id.clone(),
+        );
+        if tokio::time::timeout(Duration::from_secs(10), run_park_entered.notified())
+            .await
+            .is_err()
+        {
+            // Never suppress an early return: surface the runner's settled
+            // result so a fixture/prelude failure is diagnosable, not a bare
+            // gate timeout.
+            let job = runtime.jobs(Some(std::slice::from_ref(&job_id)));
+            panic!(
+                "revived run never parked prestart; job status {:?}, result {:?}",
+                job[0].status, job[0].result
+            );
+        }
+
+        let cancelled = runtime
+            .cancel_jobs_result(&[job_id.clone()])
+            .expect("cancel intent");
+        assert_eq!(cancelled, [job_id.clone()]);
+        tokio::time::timeout(Duration::from_secs(10), cancel_arm_entered.notified())
+            .await
+            .expect("revival cancel branch selected while the run is parked prestart");
+        let job = runtime.jobs(Some(std::slice::from_ref(&job_id)));
+        assert_eq!(job[0].status, JobStatus::Cancelling);
+        assert!(job[0].result.is_none());
+
+        run_park_release.notify_one();
+        let settled = tokio::time::timeout(
+            Duration::from_secs(10),
+            runtime
+                .inner
+                .jobs
+                .wait(&[job_id.clone()], None, None, CancellationToken::new()),
+        )
+        .await
+        .expect("revived job settles after the prestart cancel")
+        .expect("job wait");
+        assert!(
+            !provider_entered.load(std::sync::atomic::Ordering::SeqCst),
+            "a revived run cancelled before it began must never reach the provider"
+        );
+        assert_eq!(settled[0].status, JobStatus::Cancelled);
+        assert_eq!(settled[0].cancellation_cause, Some(CancellationCause::Task));
+        let result = settled[0].result.as_ref().expect("typed result");
+        assert_eq!(result.status, AgentStatus::Aborted);
+        assert!(
+            result.error.is_none(),
+            "prestart revival cancel must not manufacture an error: {:?}",
+            result.error
+        );
+        runtime.wait_until_idle().await;
+    }
+
+    /// Faux provider that ends the first turn with a terminal stop reason and
+    /// the shared prose both arms must classify. The runtime cancellation
+    /// token is never triggered by this stream.
+    fn terminal_stop_stream(stop_reason: pi_ai::StopReason, prose: String) -> pi_agent::StreamFn {
+        Arc::new(
+            move |_model: pi_ai::Model,
+                  _context: pi_ai::Context,
+                  _options: pi_ai::SimpleStreamOptions| {
+                let stop_reason = stop_reason;
+                let prose = prose.clone();
+                Box::pin(async move {
+                    let stream = pi_ai::new_assistant_message_event_stream();
+                    let producer = stream.clone();
+                    tokio::spawn(async move {
+                        let mut message =
+                            pi_ai::AssistantMessage::pending(&pi_ai::Model::default());
+                        message.stop_reason = stop_reason;
+                        message.error_message = Some(prose);
+                        producer
+                            .push(pi_ai::AssistantMessageEvent::Error {
+                                reason: stop_reason,
+                                error: message.clone(),
+                            })
+                            .await;
+                        producer.end(Some(message)).await;
+                    });
+                    stream
+                })
+            },
+        )
+    }
+
+    fn ordinary_completion_child_factory(
+        root: &Path,
+        stop_reason: pi_ai::StopReason,
+        prose: String,
+    ) -> ChildSessionFactory {
+        let child_cwd = root.to_path_buf();
+        Arc::new(move |request: ChildSessionRequest| {
+            let child_cwd = child_cwd.clone();
+            let stream_fn = terminal_stop_stream(stop_reason, prose.clone());
+            Box::pin(async move {
+                Session::new_with_additional_tools_filtered_and_discovery(
+                    crate::SessionOptions {
+                        model: Some(request.model),
+                        cwd: child_cwd,
+                        system_prompt: request.system_prompt,
+                        thinking_level: ThinkingLevel::Off,
+                        api_key: String::new(),
+                        compaction: None,
+                        stream_options: Default::default(),
+                        tools: Some(request.orchestration_tools),
+                        before_tool_call: None,
+                        after_tool_call: None,
+                        stream_fn: Some(stream_fn),
+                        auth_resolver: None,
+                        auth_manager: None,
+                    },
+                    Vec::new(),
+                    Default::default(),
+                    crate::ResourceDiscovery::Disabled,
+                )
+            })
+        })
+    }
+
+    async fn assert_ordinary_completion_classification(
+        child_id: &str,
+        stop_reason: pi_ai::StopReason,
+        expect_cancelled: bool,
+    ) {
+        const PROSE: &str = "provider aborted the socket";
+        let root = tempfile::tempdir().expect("root");
+        let (parent_dir, parent_fixture, parent_path) =
+            cancellation_durable_parent(root.path()).await;
+        let parent = parent_fixture.session.clone();
+        let _ = (&parent_dir, &parent_path);
+        let runtime = OrchestrationRuntime::new(
+            OrchestrationConfig::new(
+                AgentCatalog::from_agents(vec![cancellation_task_definition()]),
+                root.path(),
+            )
+            .with_parent_model(parent.model()),
+            ordinary_completion_child_factory(root.path(), stop_reason, PROSE.to_owned()),
+        )
+        .expect("runtime");
+        runtime.bind_and_recover(&parent).expect("bind durable");
+        let spawn = runtime
+            .spawn_tasks(
+                "Main",
+                0,
+                vec![TaskItem {
+                    index: 0,
+                    id: child_id.to_owned(),
+                    agent: "task".to_owned(),
+                    assignment: "settle on the faux provider stop".to_owned(),
+                    ..Default::default()
+                }],
+            )
+            .expect("spawn child")
+            .remove(0);
+        let token = runtime
+            .inner
+            .jobs
+            .cancellation_token(&spawn.job_id)
+            .expect("job token");
+        assert!(
+            !token.is_cancelled(),
+            "the runtime cancellation token must stay untriggered"
+        );
+        let settled = tokio::time::timeout(
+            Duration::from_secs(10),
+            runtime.inner.jobs.wait(
+                &[spawn.job_id.clone()],
+                None,
+                None,
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("ordinary completion settles")
+        .expect("job wait");
+        assert!(
+            !token.is_cancelled(),
+            "ordinary completion must not cancel the runtime token"
+        );
+        let result = settled[0].result.as_ref().expect("settled result");
+        if expect_cancelled {
+            assert_eq!(settled[0].status, JobStatus::Cancelled);
+            assert_eq!(settled[0].cancellation_cause, None);
+            assert_eq!(result.status, AgentStatus::Aborted);
+            assert!(
+                result.error.is_none(),
+                "typed AbortError on ordinary completion must not become a job error: {:?}",
+                result.error
+            );
+        } else {
+            assert_eq!(settled[0].status, JobStatus::Failed);
+            assert_eq!(settled[0].cancellation_cause, None);
+            assert_eq!(result.status, AgentStatus::Idle);
+            let error = result
+                .error
+                .as_deref()
+                .expect("ordinary provider error must stay Some");
+            assert!(
+                error.contains(PROSE),
+                "same prose without AbortError must stay a real error: {error}"
+            );
+        }
+        runtime.wait_until_idle().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ordinary_completion_typed_abort_error_is_cancelled_without_error() {
+        // Regression for the fresh-spawn ordinary-completion arm: a faux
+        // provider StopReason::Aborted becomes a typed AbortError inside the
+        // agent loop, and the runtime cancellation token is never triggered.
+        // That stop must classify as Cancelled with error: None, the same
+        // way the cancel-arm classifier (`aborted_run_result`) already does.
+        assert_ordinary_completion_classification("AbortChild", pi_ai::StopReason::Aborted, true)
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ordinary_completion_same_prose_without_abort_error_stays_failed() {
+        // Control: identical prose on StopReason::Error is an untyped
+        // provider failure. The ordinary-completion arm must keep it as
+        // Failed with error: Some, so the abort case is not a prose match.
+        assert_ordinary_completion_classification("ErrorChild", pi_ai::StopReason::Error, false)
+            .await;
+    }
+
+    async fn assert_revival_ordinary_completion_classification(
+        child_id: &str,
+        job_id: &str,
+        stop_reason: pi_ai::StopReason,
+        expect_cancelled: bool,
+    ) {
+        const PROSE: &str = "provider aborted the socket";
+        let root = tempfile::tempdir().expect("root");
+        let (parent_dir, parent_fixture, parent_path) =
+            cancellation_durable_parent(root.path()).await;
+        let parent = parent_fixture.session.clone();
+        let model = parent
+            .child_session_options_snapshot()
+            .model
+            .expect("parent model");
+        let _ = (&parent_dir, &parent_path);
+        let runtime = OrchestrationRuntime::new(
+            OrchestrationConfig::new(
+                AgentCatalog::from_agents(vec![cancellation_task_definition()]),
+                root.path(),
+            )
+            .with_parent_model(parent.model()),
+            ordinary_completion_child_factory(root.path(), stop_reason, PROSE.to_owned()),
+        )
+        .expect("runtime");
+        runtime.bind_and_recover(&parent).expect("bind durable");
+        register_peer(
+            &runtime,
+            child_id,
+            "task",
+            Some("Main"),
+            AgentStatus::Running,
+        );
+        attach_request_parent(&runtime, child_id, "Main");
+        let cancel = CancellationToken::new();
+        runtime
+            .inner
+            .jobs
+            .insert(
+                JobSnapshot {
+                    id: job_id.to_owned(),
+                    agent_id: child_id.to_owned(),
+                    agent: "task".to_owned(),
+                    parent_id: "Main".to_owned(),
+                    description: None,
+                    todo_task_id: None,
+                    workflow_id: None,
+                    workflow_generation: None,
+                    status: JobStatus::Running,
+                    created_at: 1,
+                    started_at: Some(1),
+                    finished_at: None,
+                    cancellation_cause: None,
+                    result: None,
+                    soft_budget_exhausted: false,
+                },
+                cancel.clone(),
+            )
+            .expect("insert revived job");
+        assert!(
+            runtime.reserve_owner(child_id, job_id, cancel.clone()),
+            "revived child must not already have an active owner"
+        );
+        runtime.spawn_revival_runner(
+            child_id.to_owned(),
+            ChildSessionRequest {
+                child_id: child_id.to_owned(),
+                parent_id: "Main".to_owned(),
+                max_tools_per_agent: 32,
+                depth: 1,
+                definition: cancellation_task_definition(),
+                assignment: "continue the interrupted assignment".to_owned(),
+                system_prompt: String::new(),
+                requested_tool_names: None,
+                orchestration_tools: Vec::new(),
+                persona_skill_store: None,
+                persona_skills: Arc::new(Vec::new()),
+                shared_skills: Arc::new(Vec::new()),
+                thinking_level: None,
+                model,
+                output_schema: None,
+                schema_mode: None,
+                yield_state: Arc::new(YieldState::default()),
+                resolved_model_sequence: Vec::new(),
+                resolved_model_selected_index: 0,
+            },
+            None,
+            "continue the interrupted assignment".to_owned(),
+            cancel,
+            job_id.to_owned(),
+        );
+        let token = runtime
+            .inner
+            .jobs
+            .cancellation_token(job_id)
+            .expect("revived job token");
+        assert!(
+            !token.is_cancelled(),
+            "the revival runtime cancellation token must stay untriggered"
+        );
+        let settled = tokio::time::timeout(
+            Duration::from_secs(10),
+            runtime
+                .inner
+                .jobs
+                .wait(&[job_id.to_owned()], None, None, CancellationToken::new()),
+        )
+        .await
+        .expect("revived ordinary completion settles")
+        .expect("job wait");
+        assert!(
+            !token.is_cancelled(),
+            "revived ordinary completion must not cancel the runtime token"
+        );
+        let result = settled[0].result.as_ref().expect("settled result");
+        if expect_cancelled {
+            assert_eq!(settled[0].status, JobStatus::Cancelled);
+            assert_eq!(settled[0].cancellation_cause, None);
+            assert_eq!(result.status, AgentStatus::Aborted);
+            assert!(
+                result.error.is_none(),
+                "typed AbortError on revived ordinary completion must not become a job error: {:?}",
+                result.error
+            );
+        } else {
+            assert_eq!(settled[0].status, JobStatus::Failed);
+            assert_eq!(settled[0].cancellation_cause, None);
+            assert_eq!(result.status, AgentStatus::Idle);
+            let error = result
+                .error
+                .as_deref()
+                .expect("ordinary provider error must stay Some");
+            assert!(
+                error.contains(PROSE),
+                "same prose without AbortError must stay a real error: {error}"
+            );
+        }
+        runtime.wait_until_idle().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revived_ordinary_completion_typed_abort_error_is_cancelled_without_error() {
+        // Same ordinary-completion regression through the revival runner:
+        // StopReason::Aborted, no runtime cancel token, Cancelled / error None.
+        assert_revival_ordinary_completion_classification(
+            "RevivedAbortChild",
+            "job-revived-abort",
+            pi_ai::StopReason::Aborted,
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revived_ordinary_completion_same_prose_without_abort_error_stays_failed() {
+        // Revival control: the same prose on StopReason::Error stays Failed
+        // with error: Some.
+        assert_revival_ordinary_completion_classification(
+            "RevivedErrorChild",
+            "job-revived-error",
+            pi_ai::StopReason::Error,
+            false,
+        )
+        .await;
+    }
+
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restart_recovers_cancelling_job_without_child_factory() {
+        let root = tempfile::tempdir().expect("root");
+        let (parent_dir, parent_fixture, parent_path) =
+            cancellation_durable_parent(root.path()).await;
+        let parent = parent_fixture.session.clone();
+
+        let never_factory = || {
+            Arc::new(
+                |_request: ChildSessionRequest| -> BoxFuture<Result<Session>> {
+                    Box::pin(async {
+                        Err::<Session, _>(anyhow!("a cancelling job must never create a child"))
+                    })
+                },
+            ) as ChildSessionFactory
+        };
+        let runtime = OrchestrationRuntime::new(
+            OrchestrationConfig::new(
+                AgentCatalog::from_agents(vec![cancellation_task_definition()]),
+                root.path(),
+            )
+            .with_parent_model(parent.model()),
+            never_factory(),
+        )
+        .expect("runtime");
+        runtime.bind_and_recover(&parent).expect("bind durable");
+        register_peer(
+            &runtime,
+            "Worker",
+            "Worker",
+            Some("Main"),
+            AgentStatus::Running,
+        );
+        runtime
+            .inner
+            .jobs
+            .insert(
+                JobSnapshot {
+                    id: "job-cancelling".to_owned(),
+                    agent_id: "Worker".to_owned(),
+                    agent: "Worker".to_owned(),
+                    parent_id: "Main".to_owned(),
+                    description: None,
+                    todo_task_id: None,
+                    workflow_id: None,
+                    workflow_generation: None,
+                    status: JobStatus::Cancelling,
+                    created_at: 1,
+                    started_at: Some(1),
+                    finished_at: None,
+                    cancellation_cause: Some(CancellationCause::Task),
+                    result: None,
+                    soft_budget_exhausted: false,
+                },
+                CancellationToken::new(),
+            )
+            .expect("insert cancelling job");
+        runtime.persist_state().expect("persist cancelling job");
+        runtime
+            .checkpoint_for_restart()
+            .expect("checkpoint restart");
+
+        let reopened = crate::resume_session(&parent_path).expect("reopen parent recording");
+        let resumed_fixture = isolated_session(root.path(), Vec::new(), None).await;
+        resumed_fixture
+            .session
+            .set_session_dir(parent.session_dir());
+        resumed_fixture
+            .session
+            .record(reopened)
+            .expect("attach reopened recorder");
+        let factory_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = factory_calls.clone();
+        let resumed_runtime = OrchestrationRuntime::new(
+            OrchestrationConfig::new(
+                AgentCatalog::from_agents(vec![cancellation_task_definition()]),
+                root.path(),
+            )
+            .with_parent_model(parent.model()),
+            Arc::new(move |_request: ChildSessionRequest| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async {
+                    Err::<Session, _>(anyhow!("a cancelling job must never create a child"))
+                })
+            }),
+        )
+        .expect("resumed runtime");
+        resumed_runtime
+            .bind_and_recover(&resumed_fixture.session)
+            .expect("bind resumed durable");
+        resumed_runtime.revive_prepared_parent();
+
+        assert_eq!(
+            factory_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "restart must never invoke the child factory for a Cancelling job"
+        );
+        let job = resumed_runtime.jobs(Some(&["job-cancelling".to_owned()]));
+        assert_eq!(job[0].status, JobStatus::Cancelled);
+        assert_eq!(job[0].cancellation_cause, Some(CancellationCause::Task));
+        let result = job[0].result.as_ref().expect("recovered result");
+        assert_eq!(result.status, AgentStatus::Aborted);
+        let worker = resumed_runtime
+            .agent_snapshot("Worker")
+            .expect("worker agent snapshot after recovery");
+        assert_eq!(
+            worker.status,
+            AgentStatus::Aborted,
+            "recovery must project the interrupted worker as Aborted, not {:?}",
+            worker.status
+        );
+        let error = result
+            .error
+            .as_deref()
+            .expect("real interrupted-cleanup diagnostic");
+        assert!(
+            error.contains(
+                "cancellation committed but graceful completion and cleanup were not observed"
+            ),
+            "{error}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recovery_keeps_live_agent_beside_historical_cancelled_job() {
+        let root = tempfile::tempdir().expect("root");
+        let (parent_dir, parent_fixture, parent_path) =
+            cancellation_durable_parent(root.path()).await;
+        let parent = parent_fixture.session.clone();
+        let _ = (&parent_dir, &parent_path);
+        let runtime = prompt_runtime(root.path());
+        runtime.bind_and_recover(&parent).expect("bind");
+        register_peer(
+            &runtime,
+            "Worker",
+            "Worker",
+            Some("Main"),
+            AgentStatus::Idle,
+        );
+        for (id, at, status, cause, agent_status) in [
+            (
+                "job-old",
+                1u64,
+                JobStatus::Cancelled,
+                Some(CancellationCause::Task),
+                AgentStatus::Aborted,
+            ),
+            (
+                "job-new",
+                2,
+                JobStatus::Completed,
+                None,
+                AgentStatus::Idle,
+            ),
+        ] {
+            let mut job = running_snapshot(id, "Worker");
+            job.agent = "Worker".to_owned();
+            job.status = status;
+            job.created_at = at;
+            job.started_at = Some(at);
+            job.finished_at = Some(at);
+            job.cancellation_cause = cause;
+            let mut settled = settled_result("Worker");
+            settled.agent = "Worker".to_owned();
+            settled.status = agent_status;
+            job.result = Some(settled);
+            runtime
+                .inner
+                .jobs
+                .insert(job, CancellationToken::new())
+                .expect(id);
+        }
+        runtime.persist_state().expect("persist both jobs");
+        runtime.checkpoint_for_restart().expect("checkpoint");
+        let resumed = prompt_runtime(root.path());
+        resumed.bind_and_recover(&parent).expect("recover");
+        assert_eq!(
+            resumed.jobs(Some(&["job-old".to_owned()]))[0].status,
+            JobStatus::Cancelled
+        );
+        assert_eq!(
+            resumed.jobs(Some(&["job-new".to_owned()]))[0].status,
+            JobStatus::Completed
+        );
+        assert_ne!(
+            resumed.agent_snapshot("Worker").expect("worker").status,
+            AgentStatus::Aborted,
+            "a retained historical cancel must not clobber the current agent"
+        );
+        let receipts = resumed.send("Main", "Worker", "continue", None);
+        assert!(
+            receipts.iter().all(|receipt| receipt.error.is_none()),
+            "current agent must accept mail: {receipts:?}"
+        );
+    }
+
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn job_assignment_reports_unavailable_without_or_mismatched_request() {
+        let root = tempfile::tempdir().expect("root");
+        let definition = super::super::definitions::parse_agent_definition(
+            Path::new("task.md"),
+            "---\nname: task\ndescription: task\n---\nprompt",
+            super::super::AgentDefinitionSource::Bundled,
+            true,
+        )
+        .expect("definition");
+        let runtime = OrchestrationRuntime::new(
+            OrchestrationConfig::new(AgentCatalog::from_agents(vec![definition]), root.path())
+                .with_parent_model(Some(fixture_parent_model())),
+            Arc::new(|_| Box::pin(async { Err(anyhow!("stop after spawn")) })),
+        )
+        .expect("runtime");
+        let spawn = runtime
+            .spawn_tasks(
+                "Main",
+                0,
+                vec![TaskItem {
+                    index: 0,
+                    id: "AssignProbe".to_owned(),
+                    agent: "task".to_owned(),
+                    assignment: "probe assignment".to_owned(),
+                    todo_task_id: None,
+                    ..Default::default()
+                }],
+            )
+            .expect("spawn")
+            .remove(0);
+        let job = runtime
+            .jobs(Some(std::slice::from_ref(&spawn.job_id)))
+            .into_iter()
+            .next()
+            .expect("job snapshot");
+
+        // Fresh registration without a durable bind carries no request.
+        match runtime.job_assignment(&job) {
+            JobAssignmentWire::Unavailable { reason } => assert_eq!(reason, "request_unavailable"),
+            JobAssignmentWire::Available { text } => {
+                panic!("missing request must never serve assignment text: {text}")
+            }
+        }
+
+        // A durable request whose child identity disagrees with the job never serves.
+        attach_request_parent(&runtime, "AssignProbe", "Main");
+        let entry = runtime
+            .inner
+            .registry
+            .get(runtime.group_id(), "AssignProbe")
+            .expect("child entry");
+        entry
+            .durable_info
+            .lock()
+            .as_mut()
+            .expect("durable info")
+            .request
+            .child_id = "Other".to_owned();
+        match runtime.job_assignment(&job) {
+            JobAssignmentWire::Unavailable { reason } => assert_eq!(reason, "request_unavailable"),
+            JobAssignmentWire::Available { text } => {
+                panic!("mismatched binding must never serve assignment text: {text}")
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn job_assignment_serves_full_redacted_assignment_after_restart() {
+        let root = tempfile::tempdir().expect("root");
+        let (_parent_dir, parent_fixture, parent_path) =
+            cancellation_durable_parent(root.path()).await;
+        let parent = parent_fixture.session.clone();
+        let never_factory = || {
+            Arc::new(
+                |_request: ChildSessionRequest| -> BoxFuture<Result<Session>> {
+                    Box::pin(async {
+                        Err::<Session, _>(anyhow!("a cancelled job must never create a child"))
+                    })
+                },
+            ) as ChildSessionFactory
+        };
+        let runtime = OrchestrationRuntime::new(
+            OrchestrationConfig::new(
+                AgentCatalog::from_agents(vec![cancellation_task_definition()]),
+                root.path(),
+            )
+            .with_parent_model(parent.model()),
+            never_factory(),
+        )
+        .expect("runtime");
+        runtime.bind_and_recover(&parent).expect("bind durable");
+        register_peer(
+            &runtime,
+            "Worker",
+            "task",
+            Some("Main"),
+            AgentStatus::Running,
+        );
+        let secret = ["s", "k-", "abcdefghijklmnop1234"].concat();
+        let assignment = format!(
+            "HEAD-assignment-head-line\n{}\nMID-assignment-marker-中间\n{}secret {secret}\n{}\nTAIL-assignment-final-line",
+            "f".repeat(700),
+            "g".repeat(700),
+            "h".repeat(200),
+        );
+        attach_request_parent(&runtime, "Worker", "Main");
+        let entry = runtime
+            .inner
+            .registry
+            .get(runtime.group_id(), "Worker")
+            .expect("child entry");
+        entry
+            .durable_info
+            .lock()
+            .as_mut()
+            .expect("durable info")
+            .request
+            .assignment = assignment.clone();
+        runtime
+            .inner
+            .jobs
+            .insert(
+                JobSnapshot {
+                    id: "job-assignment-restart".to_owned(),
+                    agent_id: "Worker".to_owned(),
+                    agent: "task".to_owned(),
+                    parent_id: "Main".to_owned(),
+                    description: Some(presentation_text(
+                        &assignment,
+                        TASK_DESCRIPTION_MAX_CHARS,
+                    )),
+                    todo_task_id: None,
+                    workflow_id: None,
+                    workflow_generation: None,
+                    status: JobStatus::Cancelled,
+                    created_at: now_millis(),
+                    started_at: Some(now_millis()),
+                    finished_at: Some(now_millis()),
+                    cancellation_cause: None,
+                    result: None,
+                    soft_budget_exhausted: false,
+                },
+                CancellationToken::new(),
+            )
+            .expect("insert cancelled job");
+        runtime.persist_state().expect("persist assignment job");
+        runtime.checkpoint_for_restart().expect("checkpoint restart");
+
+        let reopened = crate::resume_session(&parent_path).expect("reopen parent recording");
+        let resumed_fixture = isolated_session(root.path(), Vec::new(), None).await;
+        resumed_fixture
+            .session
+            .set_session_dir(parent.session_dir());
+        resumed_fixture
+            .session
+            .record(reopened)
+            .expect("attach reopened recorder");
+        let resumed_runtime = OrchestrationRuntime::new(
+            OrchestrationConfig::new(
+                AgentCatalog::from_agents(vec![cancellation_task_definition()]),
+                root.path(),
+            )
+            .with_parent_model(parent.model()),
+            never_factory(),
+        )
+        .expect("resumed runtime");
+        resumed_runtime
+            .bind_and_recover(&resumed_fixture.session)
+            .expect("bind resumed durable");
+        resumed_runtime.revive_prepared_parent();
+
+        let job = resumed_runtime
+            .jobs(Some(&["job-assignment-restart".to_owned()]))
+            .into_iter()
+            .next()
+            .expect("job after restart");
+        match resumed_runtime.job_assignment(&job) {
+            JobAssignmentWire::Available { text } => {
+                assert!(
+                    text.starts_with("HEAD-assignment-head-line"),
+                    "restart keeps the assignment head: {text}"
+                );
+                assert!(
+                    text.contains("MID-assignment-marker-中间"),
+                    "restart keeps the assignment mid body beyond the description cap"
+                );
+                assert!(
+                    text.ends_with("TAIL-assignment-final-line"),
+                    "restart keeps the assignment tail: {text}"
+                );
+                assert!(
+                    text.chars().count() > 1024,
+                    "assignment exceeds the 1024-char description cap: {}",
+                    text.chars().count()
+                );
+                assert!(
+                    !text.contains(&secret) && text.contains("[REDACTED]"),
+                    "redaction reapplies after restart: {text}"
+                );
+            }
+            JobAssignmentWire::Unavailable { reason } => {
+                panic!("the persisted request assignment must survive restart: {reason}")
+            }
+        }
+        // The job-card description keeps its own 1024 cap.
+        let description = job.description.as_deref().expect("task description");
+        assert!(
+            description.chars().count() <= 1024,
+            "description cap must stay: {}",
+            description.chars().count()
+        );
     }
 
     #[tokio::test]
@@ -12547,6 +15442,7 @@ mod prompt_size_tests {
                     created_at: 1,
                     started_at: Some(1),
                     finished_at: None,
+                    cancellation_cause: None,
                     result: None,
                     soft_budget_exhausted: false,
                 },
@@ -12630,6 +15526,7 @@ mod prompt_size_tests {
                     created_at: 1,
                     started_at: Some(1),
                     finished_at: None,
+                    cancellation_cause: None,
                     result: None,
                     soft_budget_exhausted: false,
                 },
@@ -13197,6 +16094,7 @@ mod prompt_size_tests {
             created_at: 1,
             started_at: None,
             finished_at: None,
+            cancellation_cause: None,
             result: None,
             soft_budget_exhausted: false,
         };
@@ -13251,6 +16149,7 @@ mod prompt_size_tests {
                     created_at: 1,
                     started_at: None,
                     finished_at: None,
+                    cancellation_cause: None,
                     result: None,
                     soft_budget_exhausted: false,
                 },
@@ -13394,6 +16293,7 @@ mod prompt_size_tests {
                         created_at: 1,
                         started_at: Some(1),
                         finished_at: None,
+                        cancellation_cause: None,
                         result: None,
                         soft_budget_exhausted: false,
                     },
@@ -13467,10 +16367,10 @@ mod prompt_size_tests {
     async fn explicit_shutdown_waiting_child_terminates_exactly_once_and_never_revives() {
         // P0 (Waiting child + explicit runtime-wide shutdown): a child blocked
         // in a hub wait is authoritative Waiting/Running work. Explicit
-        // shutdown must transition it to terminal EXACTLY ONCE with the
-        // `orchestration shut down` reason, publish exactly one terminal job
-        // update, never hang, and never revive it after reopening the same
-        // parent.
+        // shutdown must transition it to terminal EXACTLY ONCE with
+        // CancellationCause::Shutdown and no manufactured result error,
+        // publish exactly one terminal job update, never hang, and never
+        // revive it after reopening the same parent.
         let root = tempfile::tempdir().expect("root");
         let parent_dir = tempfile::tempdir().expect("parent sessions");
         let recorder = crate::session_store::start_session_in(
@@ -13502,11 +16402,12 @@ mod prompt_size_tests {
         )
         .expect("definition");
         let child_cwd = root.path().to_path_buf();
-        let runtime = OrchestrationRuntime::new(
+        let mut runtime = OrchestrationRuntime::new(
             OrchestrationConfig::new(
                 AgentCatalog::from_agents(vec![definition.clone()]),
                 root.path(),
-            ),
+            )
+            .with_parent_model(parent.model()),
             Arc::new(move |request: ChildSessionRequest| {
                 let child_cwd = child_cwd.clone();
                 Box::pin(async move {
@@ -13537,7 +16438,7 @@ mod prompt_size_tests {
                     );
                     Session::new_with_additional_tools_filtered_and_discovery(
                         crate::SessionOptions {
-                            model: request.model,
+                            model: Some(request.model),
                             cwd: child_cwd,
                             system_prompt: request.system_prompt,
                             thinking_level: ThinkingLevel::Off,
@@ -13559,6 +16460,10 @@ mod prompt_size_tests {
             }),
         )
         .expect("runtime");
+        let wait_registered = Arc::new(tokio::sync::Notify::new());
+        Arc::get_mut(&mut runtime.inner)
+            .expect("fresh orchestration runtime must uniquely own its inner for the wait gate")
+            .message_wait_registered = Some(wait_registered.clone());
         runtime.bind_and_recover(&parent).expect("bind durable");
         let mut events = runtime.subscribe();
 
@@ -13576,23 +16481,37 @@ mod prompt_size_tests {
             )
             .expect("spawn waiting child")
             .remove(0);
-        // Event-driven gate: the job is Running and the child's own hub wait
-        // has registered its waiter (authoritative Waiting state).
+        // Subscribe before the phase can pass: JobUpdated proves Running,
+        // and the test notify fires only after this child's hub waiter is
+        // stored. Neither arm polls.
         tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let running = runtime
-                    .jobs(Some(std::slice::from_ref(&spawn.job_id)))
-                    .first()
-                    .is_some_and(|job| job.status == JobStatus::Running);
-                let waiting = runtime
-                    .inner
-                    .registry
-                    .get(runtime.group_id(), "WaitingChild")
-                    .is_some_and(|entry| !entry.waiters.lock().is_empty());
-                if running && waiting {
-                    break;
+            let mut running = runtime
+                .jobs(Some(std::slice::from_ref(&spawn.job_id)))
+                .first()
+                .is_some_and(|job| job.status == JobStatus::Running);
+            let mut waiting = runtime
+                .inner
+                .registry
+                .get(runtime.group_id(), "WaitingChild")
+                .is_some_and(|entry| !entry.waiters.lock().is_empty());
+            while !running || !waiting {
+                tokio::select! {
+                    event = events.recv() => {
+                        if let Ok(OrchestrationEvent::JobUpdated { job, .. }) = event
+                            && job.id == spawn.job_id
+                            && job.status == JobStatus::Running
+                        {
+                            running = true;
+                        }
+                    }
+                    () = wait_registered.notified() => {
+                        waiting = runtime
+                            .inner
+                            .registry
+                            .get(runtime.group_id(), "WaitingChild")
+                            .is_some_and(|entry| !entry.waiters.lock().is_empty());
+                    }
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
@@ -13621,12 +16540,14 @@ mod prompt_size_tests {
             "exactly one terminal job update may be published: {terminal:#?}"
         );
         assert_eq!(terminal[0].status, JobStatus::Cancelled);
-        assert_eq!(
+        assert_eq!(terminal[0].cancellation_cause, Some(CancellationCause::Shutdown));
+        assert!(
             terminal[0]
                 .result
                 .as_ref()
-                .and_then(|result| result.error.as_deref()),
-            Some("orchestration shut down")
+                .is_some_and(|result| result.error.is_none()),
+            "intentional shutdown must not manufacture an error: {:?}",
+            terminal[0].result
         );
 
         let durable = runtime.durable_state_for_test().expect("durable state");
@@ -13637,11 +16558,16 @@ mod prompt_size_tests {
             .expect("terminal job persisted");
         assert_eq!(persisted.status, JobStatus::Cancelled);
         assert_eq!(
+            persisted.cancellation_cause,
+            Some(CancellationCause::Shutdown)
+        );
+        assert!(
             persisted
                 .result
                 .as_ref()
-                .and_then(|result| result.error.as_deref()),
-            Some("orchestration shut down")
+                .is_some_and(|result| result.error.is_none()),
+            "persisted intentional shutdown must not manufacture an error: {:?}",
+            persisted.result
         );
 
         // Reopen the SAME parent: the sidecar job is terminal, so the resumed
@@ -14195,7 +17121,7 @@ mod yield_tool_tests {
         let catalog =
             AgentCatalog::from_agents(vec![task_definition(), yield_declaring_definition()]);
         let config = OrchestrationConfig::new(catalog, root.join("artifacts"))
-            .with_parent_model(fixture.session.model().expect("parent model"));
+            .with_parent_model(fixture.session.model());
         let runtime = OrchestrationRuntime::new(
             config,
             OrchestrationRuntime::child_factory_from_snapshot(snapshot),
@@ -14219,7 +17145,7 @@ mod yield_tool_tests {
             AgentCatalog::from_agents(vec![task_definition()]),
             root.join("artifacts"),
         )
-        .with_parent_model(fixture.session.model().expect("parent model"));
+        .with_parent_model(fixture.session.model());
         config.soft_budget = soft_budget;
         let runtime = OrchestrationRuntime::new(
             config,
@@ -14745,7 +17671,8 @@ mod yield_tool_tests {
         let factory_capture = captured.clone();
         let definition = task_definition();
         let runtime = OrchestrationRuntime::new(
-            OrchestrationConfig::new(AgentCatalog::from_agents(vec![definition]), root.path()),
+            OrchestrationConfig::new(AgentCatalog::from_agents(vec![definition]), root.path())
+                .with_parent_model(Some(fixture_parent_model())),
             Arc::new(move |request| {
                 factory_capture
                     .lock()
@@ -14905,7 +17832,7 @@ mod unknown_tool_declaration_tests {
             AgentCatalog::from_agents(vec![task_definition(), qa_definition(qa_tools)]),
             root.join("artifacts"),
         )
-        .with_parent_model(fixture.session.model().expect("parent model"));
+        .with_parent_model(fixture.session.model());
         config.max_tools_per_agent = max_tools_per_agent;
         let runtime = OrchestrationRuntime::new(
             config,
@@ -15116,7 +18043,7 @@ mod unknown_tool_declaration_tests {
             AgentCatalog::from_agents(vec![default_task]),
             root.path().join("artifacts"),
         )
-        .with_parent_model(fixture.session.model().expect("parent model"));
+        .with_parent_model(fixture.session.model());
         config.max_tools_per_agent = 16;
         let runtime = OrchestrationRuntime::new(
             config,
@@ -15179,7 +18106,7 @@ mod unknown_tool_declaration_tests {
             AgentCatalog::from_agents(vec![default_task, wide]),
             root.path().join("artifacts"),
         )
-        .with_parent_model(fixture.session.model().expect("parent model"));
+        .with_parent_model(fixture.session.model());
         config.max_tools_per_agent = 16;
         let runtime = OrchestrationRuntime::new(
             config,
@@ -15287,7 +18214,7 @@ mod unknown_tool_declaration_tests {
             AgentCatalog::from_agents(vec![default_task]),
             root.path().join("artifacts"),
         )
-        .with_parent_model(fixture.session.model().expect("parent model"))
+        .with_parent_model(fixture.session.model())
         .with_agent_settings(settings);
         config.max_tools_per_agent = 16;
         let runtime = OrchestrationRuntime::new(
@@ -15439,7 +18366,7 @@ mod memory_child_factory_tests {
                 ..Default::default()
             };
             let (_fixture, snapshot) = parent_snapshot(root.path(), captured.clone(), config).await;
-            let model = snapshot.model.clone();
+            let model = snapshot.model.clone().expect("parent model");
             let factory = OrchestrationRuntime::child_factory_from_snapshot(snapshot);
             let child = factory(request(
                 definition(root.path(), persona, explicit.then_some("memory")),
@@ -15472,7 +18399,7 @@ mod memory_child_factory_tests {
                     },
                 )
                 .await;
-                let model = snapshot.model.clone();
+                let model = snapshot.model.clone().expect("parent model");
                 let factory = OrchestrationRuntime::child_factory_from_snapshot(snapshot);
                 let child = factory(request(definition(root.path(), persona, None), None, model))
                     .await
@@ -15535,7 +18462,7 @@ mod memory_child_factory_tests {
                 crate::MemoryConfig::default(),
             )
             .await;
-            let model = snapshot.model.clone();
+            let model = snapshot.model.clone().expect("parent model");
             let mut definition = definition(root.path(), persona, Some("learn_skill"));
             definition.capability_ceiling = ceiling;
             definition.disallowed_tools = disallowed;
@@ -15636,7 +18563,7 @@ mod memory_child_factory_tests {
             crate::MemoryConfig::default(),
         )
         .await;
-        let model = snapshot.model.clone();
+        let model = snapshot.model.clone().expect("parent model");
         let factory = OrchestrationRuntime::child_factory_from_snapshot(snapshot);
 
         let mut persona_request = request(
@@ -15716,7 +18643,7 @@ mod memory_child_factory_tests {
             crate::MemoryConfig::default(),
         )
         .await;
-        let model = snapshot.model.clone();
+        let model = snapshot.model.clone().expect("parent model");
         let mut definition = definition(root.path(), true, Some("read"));
         definition.disallowed_tools = ["todo", "process", "task", "hub", "goal", "yield"]
             .into_iter()

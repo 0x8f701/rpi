@@ -36,7 +36,7 @@ async fn print_mode_streams_faux_text() {
 
     let cwd = tempfile::tempdir().expect("tempdir");
     let session = Session::new(SessionOptions {
-        model,
+        model: Some(model),
         cwd: cwd.path().to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,
@@ -103,7 +103,7 @@ async fn print_mode_expands_text_and_image_arguments() {
         .expect("encode png");
     std::fs::write(cwd.path().join("shot.png"), image_bytes).expect("write image");
     let session = Session::new(SessionOptions {
-        model,
+        model: Some(model),
         cwd: cwd.path().to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,
@@ -168,7 +168,7 @@ async fn print_mode_goal_command_starts_agent_turn() {
     });
     registration.set_responses(vec![FauxResponse::text("goal work")]);
     let session = Session::new(SessionOptions {
-        model,
+        model: Some(model),
         cwd: cwd.path().to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,

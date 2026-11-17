@@ -57,7 +57,7 @@ async fn bound_process(config: Option<ProcessManagerConfig>) -> BoundProcess {
     let resources = ResourceManager::new(resource_options).expect("resources");
     let session = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model,
+            model: Some(model),
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: pi_agent::ThinkingLevel::Off,

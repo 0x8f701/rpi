@@ -80,7 +80,7 @@ pub(crate) struct AgentsPanel {
     /// Effective (global+project) agents map used only for live display resolution
     /// when an agent has no pending global edit.
     effective_baseline: BTreeMap<String, AgentRuntimeSettings>,
-    parent_model: Model,
+    parent_model: Option<Model>,
     status: String,
     /// Currently preferred agent name (for marking persona/agent selection).
     preferred: Option<String>,
@@ -90,7 +90,7 @@ impl AgentsPanel {
     pub(crate) fn new(
         definitions: Vec<AgentDefinition>,
         global_agents: &BTreeMap<String, AgentRuntimeSettings>,
-        parent_model: Model,
+        parent_model: Option<Model>,
         available_models: Vec<Model>,
     ) -> Self {
         Self::new_with_effective(
@@ -106,7 +106,7 @@ impl AgentsPanel {
         definitions: Vec<AgentDefinition>,
         global_agents: &BTreeMap<String, AgentRuntimeSettings>,
         effective_agents: &BTreeMap<String, AgentRuntimeSettings>,
-        parent_model: Model,
+        parent_model: Option<Model>,
         available_models: Vec<Model>,
     ) -> Self {
         let mut edits = BTreeMap::new();
@@ -138,7 +138,7 @@ impl AgentsPanel {
         let snapshot = application
             .resource_snapshot()
             .context("session has no resource snapshot")?;
-        let parent_model = application.session().model().unwrap_or_default();
+        let parent_model = application.session().model();
         // Panel edits global settings only (OMP dashboard scope). Do not seed
         // from effective/project-merged agents or a save would promote project
         // overrides into the user-global map.
@@ -516,7 +516,7 @@ impl AgentsPanel {
     pub(crate) fn reload_definitions(
         &mut self,
         definitions: Vec<AgentDefinition>,
-        parent_model: Model,
+        parent_model: Option<Model>,
         global_settings: &BTreeMap<String, AgentRuntimeSettings>,
         effective_settings: &BTreeMap<String, AgentRuntimeSettings>,
         available_models: Option<Vec<Model>>,
@@ -564,7 +564,7 @@ impl AgentsPanel {
                 let (effective_model, model_source, model_error) = match resolve_agent_model(
                     &definition,
                     entry,
-                    &self.parent_model,
+                    self.parent_model.as_ref(),
                     &self.model_choices,
                 ) {
                     Ok(resolved) => (model_id(&resolved.model), resolved.source, None),
@@ -989,7 +989,7 @@ mod tests {
 
     #[test]
     fn lists_source_model_thinking_tools_skills() {
-        let parent = model("openai", "gpt-4.1");
+        let parent = Some(model("openai", "gpt-4.1"));
         let available = vec![
             model("openai", "gpt-4.1"),
             model("anthropic", "claude-sonnet-4-5"),
@@ -1016,7 +1016,7 @@ mod tests {
 
     #[test]
     fn toggle_and_model_override_mark_dirty_and_resolve() {
-        let parent = model("openai", "gpt-4.1");
+        let parent = Some(model("openai", "gpt-4.1"));
         let available = vec![
             model("openai", "gpt-4.1"),
             model("anthropic", "claude-sonnet-4-5"),
@@ -1056,7 +1056,7 @@ mod tests {
         let cwd = tempdir().unwrap();
         let manager =
             SettingsManager::load_phase_one(cwd.path(), agent_dir.path()).expect("settings");
-        let parent = model("openai", "gpt-4.1");
+        let parent = Some(model("openai", "gpt-4.1"));
         let available = vec![
             model("openai", "gpt-4.1"),
             model("anthropic", "claude-sonnet-4-5"),
@@ -1094,7 +1094,7 @@ mod tests {
 
     #[test]
     fn reload_definitions_preserves_dirty_edits() {
-        let parent = model("openai", "gpt-4.1");
+        let parent = Some(model("openai", "gpt-4.1"));
         let available = vec![model("openai", "gpt-4.1")];
         let mut panel = AgentsPanel::new(
             vec![definition("task", None)],
@@ -1121,7 +1121,7 @@ mod tests {
         let cwd = tempdir().unwrap();
         let manager =
             SettingsManager::load_phase_one(cwd.path(), agent_dir.path()).expect("settings");
-        let parent = model("openai", "gpt-4.1");
+        let parent = Some(model("openai", "gpt-4.1"));
         let available = vec![model("openai", "gpt-4.1")];
         // Constructed with global-only map (empty), not project-merged entries.
         let mut panel = AgentsPanel::new(
@@ -1140,7 +1140,7 @@ mod tests {
 
     #[test]
     fn invalid_override_surfaces_error_not_parent() {
-        let parent = model("openai", "gpt-4.1");
+        let parent = Some(model("openai", "gpt-4.1"));
         let available = vec![
             model("openai", "gpt-4.1"),
             model("anthropic", "claude-sonnet-4-5"),
@@ -1173,7 +1173,7 @@ mod tests {
 
     #[test]
     fn toggle_does_not_promote_project_model() {
-        let parent = model("openai", "gpt-4.1");
+        let parent = Some(model("openai", "gpt-4.1"));
         let available = vec![
             model("openai", "gpt-4.1"),
             model("anthropic", "claude-sonnet-4-5"),
@@ -1212,7 +1212,7 @@ mod tests {
 
     #[test]
     fn clear_model_override_shadows_project_effective() {
-        let parent = model("openai", "gpt-4.1");
+        let parent = Some(model("openai", "gpt-4.1"));
         let available = vec![
             model("openai", "gpt-4.1"),
             model("anthropic", "claude-sonnet-4-5"),
@@ -1257,7 +1257,7 @@ mod tests {
 
     #[test]
     fn clear_model_override_falls_back_to_definition_or_parent() {
-        let parent = model("openai", "gpt-4.1");
+        let parent = Some(model("openai", "gpt-4.1"));
         let available = vec![
             model("openai", "gpt-4.1"),
             model("anthropic", "claude-sonnet-4-5"),
@@ -1295,7 +1295,7 @@ mod tests {
         let mut panel = AgentsPanel::new(
             vec![definition("task", None)],
             &BTreeMap::new(),
-            model("openai", "gpt-4.1"),
+            Some(model("openai", "gpt-4.1")),
             vec![model("openai", "gpt-4.1")],
         );
         panel.toggle_selected_enabled();
@@ -1326,7 +1326,7 @@ mod tests {
         let mut panel = AgentsPanel::new(
             vec![definition("task", None)],
             &global,
-            model("openai", "gpt-4.1"),
+            Some(model("openai", "gpt-4.1")),
             vec![
                 model("openai", "gpt-4.1"),
                 model("anthropic", "claude-sonnet-4-5"),
@@ -1353,7 +1353,7 @@ mod tests {
         let mut panel = AgentsPanel::new(
             vec![definition("task", None)],
             &BTreeMap::new(),
-            model("openai", "gpt-4.1"),
+            Some(model("openai", "gpt-4.1")),
             vec![model("openai", "gpt-4.1")],
         );
         assert_eq!(panel.visible_model_ids(), vec!["openai/gpt-4.1".to_owned()]);
@@ -1368,7 +1368,7 @@ mod tests {
         );
         panel.reload_definitions(
             vec![definition("task", None)],
-            model("openai", "gpt-4.1"),
+            Some(model("openai", "gpt-4.1")),
             &BTreeMap::new(),
             &BTreeMap::new(),
             Some(vec![model("google", "gemini-2.5-pro")]),
@@ -1381,7 +1381,7 @@ mod tests {
 
     #[test]
     fn move_list_and_models_wrap_around() {
-        let parent = model("openai", "gpt-4.1");
+        let parent = Some(model("openai", "gpt-4.1"));
         let available = vec![
             model("openai", "gpt-4.1"),
             model("anthropic", "claude-sonnet-4-5"),
@@ -1420,7 +1420,7 @@ mod tests {
         let mut single = AgentsPanel::new(
             vec![definition("solo", None)],
             &BTreeMap::new(),
-            model("openai", "gpt-4.1"),
+            Some(model("openai", "gpt-4.1")),
             vec![model("openai", "gpt-4.1")],
         );
         single.move_list(5);
@@ -1468,7 +1468,7 @@ mod tests {
         AgentsPanel::new(
             vec![definition],
             &BTreeMap::new(),
-            model("openai", "gpt-4.1"),
+            Some(model("openai", "gpt-4.1")),
             vec![model("openai", "gpt-4.1")],
         )
     }

@@ -88,6 +88,39 @@ check('zero tolerance pins only strictly below the boundary', !isPinned(80, 100,
   check('layout-induced scroll preserves pinned state for later growth', ctrl.handleResize(t) === true && t.scrollTop === 820, `scrollTop=${t.scrollTop}`);
 }
 
+// ---- container clientHeight growth rides scrollTop to the NEW bottom ----
+// Real trace (bg1402): ch 638->680, the browser clamps scrollTop 35288->35246
+// = the NEW bottom (gap stays 0), but onScroll judged the new scrollTop against
+// the OLD remembered clientHeight (remaining 42) and unpinned a glued view.
+// Unpin on a geometry change ONLY when the viewport is away from the bottom in
+// BOTH the current and the remembered geometry; a gap-0 ride stays pinned and
+// later content growth follows.
+{
+  const ctrl = createScrollPin();
+  const t = el(35288, 35926, 638);
+  ctrl.forcePin(t);
+  check('resize-ride baseline: pinned at the old bottom', ctrl.isFollowing() === true && isPinned(t.scrollTop, t.scrollHeight, t.clientHeight));
+  t.clientHeight = 680;
+  t.scrollTop = 35926 - 680; // the browser clamp to the new bottom — gap 0
+  ctrl.onScroll(t);
+  check('clientHeight growth keeping gap 0 never unpins', ctrl.isFollowing() === true, `following=${ctrl.isFollowing()} remaining=${remainingToBottom(t.scrollTop, t.scrollHeight, t.clientHeight)}`);
+  t.scrollHeight = 36021; // +95 of really appended content
+  check('growth after the resize ride follows the new bottom', ctrl.followIfPinned(t) === true && t.scrollTop === 36021, `scrollTop=${t.scrollTop}`);
+}
+
+// ---- the same clientHeight growth WITH a genuine user scroll-away unpins ----
+{
+  const ctrl = createScrollPin();
+  const t = el(35288, 35926, 638);
+  ctrl.forcePin(t);
+  t.clientHeight = 680;
+  t.scrollTop = 30000; // deliberate upscroll during the resize: away from the bottom in BOTH geometries
+  ctrl.onScroll(t);
+  check('real upscroll during clientHeight growth unpins', ctrl.isFollowing() === false
+    && remainingToBottom(t.scrollTop, t.scrollHeight, t.clientHeight) >= PIN_TOLERANCE_PX
+    && remainingToBottom(t.scrollTop, t.scrollHeight, 638) >= PIN_TOLERANCE_PX, `following=${ctrl.isFollowing()}`);
+}
+
 // ---- user scroll-away in the same event as content growth ----
 {
   const ctrl = createScrollPin();

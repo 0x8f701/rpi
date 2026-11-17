@@ -2,7 +2,7 @@
 // Focused unit regression for the React-free job-card elapsed projection.
 // The running-details modal must render elapsed immediately rather than wait
 // for the panel's one-second clock tick.
-//   - a live (queued/running) job ALWAYS yields a duration for a real clock;
+//   - a live (queued/running/cancelling) job ALWAYS yields a duration for a real clock;
 //   - only the not-started sentinel (now === 0) yields null while live;
 //   - settled jobs use the finished - started window.
 // Bundled by `npm run build` (esbuild) and executed before the production
@@ -47,7 +47,7 @@ check('formatDuration 60s is 1m 0s', formatDuration(60_000) === '1m 0s');
 check('formatDuration 61.5s is 1m 1s', formatDuration(61_500) === '1m 1s');
 check('formatDuration 1h is 60m 0s (no hours unit)', formatDuration(3_600_000) === '60m 0s');
 
-// ---- elapsedMs: live window (queued/running) ----
+// ---- elapsedMs: live window (queued/running/cancelling) ----
 const t = 5_000;
 // With a real clock the live label is available on the first render.
 check('live job yields non-null for a real clock', elapsedMs(job('running'), t) !== null);
@@ -56,6 +56,9 @@ check('queued elapsed falls back to createdAt', elapsedMs(job('queued', { starte
 check('now === 0 sentinel yields null while live', elapsedMs(job('running'), 0) === null);
 check('now === 0 sentinel yields null while queued', elapsedMs(job('queued', { startedAt: null }), 0) === null);
 check('elapsed clamps at 0 before start', elapsedMs(job('running', { startedAt: 9_000 }), t) === 0);
+check('cancelling elapsed counts from startedAt', elapsedMs(job('cancelling'), t) === 4_000);
+check('now === 0 sentinel yields null while cancelling', elapsedMs(job('cancelling'), 0) === null);
+check('cancelling without finishedAt stays live, not a settled null', elapsedMs(job('cancelling', { finishedAt: null }), t) === 4_000);
 
 // ---- elapsedMs: settled window (finished - started) ----
 check('completed uses finished - started', elapsedMs(job('completed', { finishedAt: 9_000 }), t) === 8_000);
@@ -63,12 +66,13 @@ check('completed without finishedAt is null', elapsedMs(job('completed', { finis
 check('failed uses finished - started', elapsedMs(job('failed', { finishedAt: 8_000 }), t) === 7_000);
 check('cancelled without window is null', elapsedMs(job('cancelled', { finishedAt: null }), t) === null);
 
-// ---- subagentJobBucket: Running = live work (queued+running), else Completed ----
+// ---- subagentJobBucket: Running = live work (queued/running/cancelling), else Completed ----
 check('queued is Running (fresh spawn stays visible)', subagentJobBucket('queued') === 'running');
 check('running is Running', subagentJobBucket('running') === 'running');
 check('completed is Completed', subagentJobBucket('completed') === 'completed');
 check('failed is Completed', subagentJobBucket('failed') === 'completed');
 check('cancelled is Completed', subagentJobBucket('cancelled') === 'completed');
+check('cancelling is Running (drain stays visible)', subagentJobBucket('cancelling') === 'running');
 check('Running label is Running', SUBAGENT_FILTER_LABEL.running === 'Running');
 check('Completed label is Completed', SUBAGENT_FILTER_LABEL.completed === 'Completed');
 
@@ -77,6 +81,10 @@ check('Completed label is Completed', SUBAGENT_FILTER_LABEL.completed === 'Compl
 check(
   'live->settled moves bucket',
   subagentJobBucket('running') !== subagentJobBucket('completed'),
+);
+check(
+  'cancelling is not settled history',
+  subagentJobBucket('cancelling') !== subagentJobBucket('cancelled'),
 );
 
 if (failures.length > 0) {

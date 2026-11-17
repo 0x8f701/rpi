@@ -135,7 +135,7 @@ impl HermeticFixture {
         let session =
             Session::new_with_persistent_and_generation_tools_filtered_discovery_workspace_and_uri(
                 SessionOptions {
-                    model,
+                    model: Some(model),
                     cwd: workspace_path.clone(),
                     system_prompt: resources
                         .snapshot()
@@ -1248,7 +1248,7 @@ async fn cross_cwd_late_loop_persist_failure_preserves_queued_goal_activation() 
                 message
                     .content
                     .push(ContentBlock::text(format!("source turn {call}")));
-                message.usage = Usage::default();
+                message.usage = one_goal_token();
                 message.stop_reason = StopReason::Stop;
                 producer.end(Some(message)).await;
             });
@@ -1271,7 +1271,7 @@ async fn cross_cwd_late_loop_persist_failure_preserves_queued_goal_activation() 
         .attach_runtime_factory(Arc::new(TestRuntimeFactory::new(Vec::new(), Vec::new())))
         .expect("factory");
     application
-        .goal_create("survive late cutover failure", Some(100))
+        .goal_create("survive late cutover failure", Some(2))
         .expect("goal");
     application
         .prompt("hold old generation".to_owned(), Vec::new(), None)
@@ -1339,6 +1339,13 @@ async fn cross_cwd_late_loop_persist_failure_preserves_queued_goal_activation() 
     assert_eq!(application.session().cwd(), source.path());
 }
 
+fn one_goal_token() -> Usage {
+    Usage {
+        input: 1,
+        ..Usage::default()
+    }
+}
+
 fn controlled_goal_stream() -> (
     pi_agent::StreamFn,
     Arc<AtomicUsize>,
@@ -1367,7 +1374,7 @@ fn controlled_goal_stream() -> (
                 message
                     .content
                     .push(ContentBlock::text(format!("source turn {call}")));
-                message.usage = Usage::default();
+                message.usage = one_goal_token();
                 message.stop_reason = StopReason::Stop;
                 producer.end(Some(message)).await;
             });
@@ -1412,7 +1419,7 @@ async fn dropped_cross_cwd_switch_after_loop_reservation_restores_old_goal_admis
         .attach_runtime_factory(Arc::new(TestRuntimeFactory::new(Vec::new(), Vec::new())))
         .expect("factory");
     application
-        .goal_create("survive dropped switch", Some(100))
+        .goal_create("survive dropped switch", Some(2))
         .expect("goal");
     application
         .prompt("hold source".to_owned(), Vec::new(), None)
@@ -1693,7 +1700,7 @@ async fn rejects_another_prompt_without_streaming_behavior() {
     assert!(error.downcast_ref::<SessionAlreadyProcessing>().is_some());
     assert!(error.to_string().contains("choose steer or followUp"));
 
-    application.abort().await;
+    application.abort().await.expect("abort running turn");
     application.wait_for_idle().await;
     registration.unregister();
 }
@@ -1804,7 +1811,7 @@ async fn send_now_requeues_non_user_steering_instead_of_destroying_it() {
         .expect("queue custom steer");
 
     let outcome = application
-        .send_queued_steering_now()
+        .send_queued_steering_now(None)
         .await
         .expect("send now delivers the user part");
     assert_eq!(outcome.sent, 1, "only the user row is delivered");
@@ -1837,7 +1844,7 @@ async fn send_now_without_user_content_restores_the_whole_batch() {
         .expect("queue custom steer");
 
     let error = application
-        .send_queued_steering_now()
+        .send_queued_steering_now(None)
         .await
         .expect_err("no user content must fail the send");
     assert!(
@@ -2494,10 +2501,10 @@ async fn context_only_reload_updates_future_children_without_replacing_runtime()
             .unwrap_or_default(),
     );
     config.agent_settings = startup_snapshot.settings.agents.clone();
-    config.parent_model = session.model().expect("context reload model");
+    config.parent_model = Some(session.model().expect("context reload model"));
     let session_for_parent = session.clone();
     config = config.with_parent_model_provider(Arc::new(move || {
-        session_for_parent.model().unwrap_or_default()
+        session_for_parent.model()
     }));
     let startup_factory =
         OrchestrationRuntime::child_factory_from_snapshot(session.child_session_options_snapshot());
@@ -2655,7 +2662,7 @@ async fn attached_orchestration_rejects_foreign_child_resource_authority() {
     );
     config.max_concurrency = settings.orchestration_max_concurrency;
     config.max_tools_per_agent = settings.orchestration_max_tools_per_agent;
-    config.parent_model = owner_session.model().expect("owner model");
+    config.parent_model = Some(owner_session.model().expect("owner model"));
     config.idle_ttl = None;
     let factory: pi_coding::ChildSessionFactory = Arc::new(move |_| {
         let foreign_session = foreign_session.clone();
@@ -2955,7 +2962,7 @@ async fn non_equivalent_reload_resets_durable_sidecar_so_restart_recovers_no_job
         snapshot.cwd.join(".pi").join("artifacts"),
     );
     if let Some(model) = session.model() {
-        config.parent_model = model;
+        config.parent_model = Some(model);
     }
     let factory = pi_coding::OrchestrationRuntime::child_factory_from_session(&session);
     let fresh = pi_coding::OrchestrationRuntime::new(config, factory).expect("fresh runtime");
@@ -3593,7 +3600,7 @@ async fn external_sse_application(
     let resources = ResourceManager::new(resource_options).expect("fixture resources");
     let session = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model,
+            model: Some(model),
             cwd: workspace.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -3915,7 +3922,7 @@ async fn abort_during_loop_turn_settles_as_cancelled_not_failed() {
     assert!(saw_fired, "loop iteration must fire");
 
     // User Esc: abort the loop-owned active turn.
-    application.abort().await;
+    application.abort().await.expect("abort loop turn");
 
     // The turn must settle WITHOUT emitting LoopEvent::Failed/Finished for the
     // task, and the agent must settle (AgentSettled clears the working UI).

@@ -7,7 +7,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::sandbox::{ApprovedSpawnRegistry, SandboxGeneration};
 use crate::{
-    AgentDefinition, ContextFile, ExtensionPermissionSet, ExtensionRuntime, HostHooks,
+    AgentDefinition, ContextFile, ExtensionPermissionSet, ExtensionRuntime, FsError, FsMetadata, HostHooks,
     OrchestrationEvent, OrchestrationRuntime, PermissionRule, ReloadResult, ResourceSnapshot,
     RuntimeSettingsSnapshot, SelectorSettings, Skill,
 };
@@ -99,6 +99,11 @@ impl ApplicationGeneration {
         let directory = self.sandbox().fs().confined()?.open_directory(path)?;
         Ok(directory.display_path())
     }
+    /// Retained policy metadata for `path`, without reading its bytes.
+    pub fn metadata(&self, path: &std::path::Path) -> Result<FsMetadata, FsError> {
+        self.sandbox().fs().confined()?.metadata(path)
+    }
+
 
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(

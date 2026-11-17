@@ -240,7 +240,7 @@ async fn tool_for(cwd: &Path, resolver: Option<TestResolver>) -> ImageToolFixtur
     let resources = crate::ResourceManager::new(resource_options).expect("resources");
     let session = crate::Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
         crate::SessionOptions {
-            model,
+            model: Some(model),
             cwd: cwd.to_path_buf(),
             system_prompt: String::new(),
             thinking_level: pi_agent::ThinkingLevel::Off,
@@ -342,7 +342,7 @@ async fn policy_fs_with_mode_result(
     let (model, faux) = unique_faux_model(false, None);
     let session = crate::Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
         crate::SessionOptions {
-            model,
+            model: Some(model),
             cwd: cwd.to_path_buf(),
             system_prompt: String::new(),
             thinking_level: pi_agent::ThinkingLevel::Off,

@@ -59,6 +59,11 @@ pub(super) struct RunSessionCandidate {
     pub(super) extension_runtime: ExtensionRuntime,
     pub(super) extension_permissions: ExtensionPermissionSet,
     pub(super) orchestration: Option<OrchestrationRuntime>,
+    /// True when the runtime is explicit launching authority (CLI `task`/`hub`
+    /// allow-list or a forced workflow planner), not settings-derived. Rides to
+    /// `ApplicationRuntimeCandidate::with_orchestration_override` so an implicit
+    /// settings reload cannot retire it beneath the active allow-list.
+    pub(super) orchestration_explicit: bool,
     pub(super) goal_tool: Option<GoalToolBinding>,
     pub(super) todo_child_tool: Option<TodoChildToolBinding>,
 }
@@ -76,6 +81,7 @@ impl RunSessionCandidate {
             extension_runtime,
             extension_permissions,
             orchestration,
+            orchestration_explicit,
             goal_tool,
             todo_child_tool,
         } = self;
@@ -100,8 +106,54 @@ impl RunSessionCandidate {
             extension_runtime,
             extension_permissions,
             orchestration,
+            orchestration_explicit,
             goal_tool,
             todo_child_tool,
+        })
+    }
+}
+
+/// Late-bound live parent for orchestration children.
+///
+/// A candidate builds its orchestration runtime before the [`Session`] exists
+/// (the session's generation tools include the orchestration tools), so the
+/// child factory is deferred and bound once, immediately after construction.
+/// Every child spawn then reads the parent's live snapshot — including a model
+/// selected after startup — instead of a construction-time snapshot. This is
+/// the only handle for a candidate's children; it is not a registry.
+#[derive(Clone, Default)]
+struct LiveParentSession(Arc<std::sync::OnceLock<Session>>);
+
+impl LiveParentSession {
+    fn bind(&self, session: Session) -> std::result::Result<(), Session> {
+        self.0.set(session)
+    }
+
+    /// Live parent model for orchestration resolution. `None` means no model
+    /// is configured yet; child resolution fails closed with a typed
+    /// `ModelNotConfigured` rather than a placeholder model.
+    fn model_provider(&self) -> pi_coding::ParentModelProvider {
+        let live = self.0.clone();
+        Arc::new(move || live.get().and_then(Session::model))
+    }
+
+    fn child_factory(
+        &self,
+        uri_resolver: Option<pi_coding::InternalUriResolverFn>,
+    ) -> pi_coding::ChildSessionFactory {
+        let live = self.0.clone();
+        Arc::new(move |request| {
+            let Some(parent) = live.get() else {
+                return Box::pin(async {
+                    Err(anyhow!(
+                        "orchestration child spawned before the parent session was bound"
+                    ))
+                });
+            };
+            OrchestrationRuntime::child_factory_from_session_and_uri(
+                parent,
+                uri_resolver.clone(),
+            )(request)
         })
     }
 }
@@ -198,18 +250,20 @@ impl RunSessionBlueprint {
                 false,
             )
             .await;
-        let (session, orchestration, goal_tool, todo_child_tool) = match build_result {
-            Ok(candidate) => candidate,
-            Err(error) => {
-                runtime.shutdown().await;
-                return Err(error);
-            }
-        };
+        let (session, orchestration, orchestration_explicit, goal_tool, todo_child_tool) =
+            match build_result {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    runtime.shutdown().await;
+                    return Err(error);
+                }
+            };
         Ok(RunSessionCandidate {
             session,
             extension_runtime: runtime,
             extension_permissions: permissions,
             orchestration,
+            orchestration_explicit,
             goal_tool,
             todo_child_tool,
         })
@@ -253,18 +307,20 @@ impl RunSessionBlueprint {
                 true,
             )
             .await;
-        let (session, orchestration, goal_tool, todo_child_tool) = match built {
-            Ok(candidate) => candidate,
-            Err(error) => {
-                runtime.shutdown().await;
-                return Err(error);
-            }
-        };
+        let (session, orchestration, orchestration_explicit, goal_tool, todo_child_tool) =
+            match built {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    runtime.shutdown().await;
+                    return Err(error);
+                }
+            };
         Ok(RunSessionCandidate {
             session,
             extension_runtime: runtime,
             extension_permissions: permissions,
             orchestration,
+            orchestration_explicit,
             goal_tool,
             todo_child_tool,
         })
@@ -327,6 +383,7 @@ impl RunSessionBlueprint {
     ) -> Result<(
         Session,
         Option<OrchestrationRuntime>,
+        bool,
         Option<GoalToolBinding>,
         Option<TodoChildToolBinding>,
     )> {
@@ -365,7 +422,9 @@ impl RunSessionBlueprint {
         };
         // Keep a clone for orchestration children: they inherit the same live
         // source so their lsp rename preflight obeys current permissionRules.
-        let child_permission_rules = permission_rules.clone();
+        // Orchestration children read the parent session live (see
+        // `LiveParentSession`), which carries its own attached live source.
+        let live_parent = LiveParentSession::default();
         let approval = match &self.acp_approval {
             Some(factory) => crate::modes::acp::acp_approval_before_tool_call(
                 approval_mode,
@@ -406,46 +465,28 @@ impl RunSessionBlueprint {
             }
             gates.orchestration = true;
             gates.todo = true;
+            // The planner cannot run without the internal task/todo tools, so
+            // this runtime is launching authority even when settings disable
+            // orchestration; an implicit reload must not retire it.
+            gates.orchestration_explicit = true;
         }
         let (orchestration, uri_resolver) = if gates.orchestration {
             let snapshot = resources.snapshot();
-            let config =
-                orchestration_config(&snapshot, &settings, &options.model, force_workflow_runtime);
+            // Children spawn from the LIVE parent session, never from a
+            // construction-time snapshot: a model selected after startup (Web
+            // `/model`, RPC, ACP) is inherited by ordinary, Todo, and
+            // orchestration children without a process restart. The handle is
+            // bound once, immediately after the session exists; no snapshot of
+            // `options.model`, auth, or stream options is retained.
+            let config = orchestration_config(
+                &snapshot,
+                &settings,
+                options.model.as_ref(),
+                force_workflow_runtime,
+            )
+            .with_parent_model_provider(live_parent.model_provider());
             let (uri_resolver, resolver_binding) = InternalUriResolver::deferred();
-            let factory = OrchestrationRuntime::child_factory_from_snapshot_and_uri(
-                pi_coding::ChildSessionOptionsSnapshot {
-                    model: options.model.clone(),
-                    workspace: workspace.clone(),
-                    thinking_level: options.thinking_level,
-                    api_key: options.api_key.clone(),
-                    stream_options: options.stream_options.clone(),
-                    stream_fn: options
-                        .stream_fn
-                        .clone()
-                        .unwrap_or_else(|| pi_agent::AgentOptions::default().stream_fn),
-                    auth_resolver: options.auth_resolver.clone(),
-                    auth_manager: options.auth_manager.clone(),
-                    retry_settings: settings.retry_settings(),
-                    retry_role: None,
-                    generation_capture: resources.child_generation_capture(),
-                    memory: {
-                        let resources = resources.clone();
-                        let resolver: pi_coding::MemoryConfigFn =
-                            Arc::new(move || Some(resources.snapshot().settings.memory_config()));
-                        Some(resolver)
-                    },
-                    // The same live source the host approval hook consults, so
-                    // child lsp rename preflight obeys current permissionRules.
-                    permission_rules: Some(child_permission_rules.clone()),
-                    context_files_resolver: {
-                        let resources = resources.clone();
-                        let resolver: pi_coding::ContextFilesFn =
-                            Arc::new(move || resources.snapshot().context_files.clone());
-                        Some(resolver)
-                    },
-                },
-                Some(uri_resolver.clone()),
-            );
+            let factory = live_parent.child_factory(Some(uri_resolver.clone()));
             let orchestration = OrchestrationRuntime::new(config, factory)?;
             resolver_binding.bind(orchestration.read_uri_resolver())?;
             (Some(orchestration), Some(uri_resolver))
@@ -525,6 +566,17 @@ impl RunSessionBlueprint {
                 return Err(error).context("building session");
             }
         };
+        // Bind the deferred child factory to the live session before anything
+        // can spawn from it. This is the single authority for this candidate's
+        // children — no second registry, and no startup model/auth snapshot.
+        if live_parent.bind(session.clone()).is_err() {
+            if let Some(orchestration) = orchestration {
+                orchestration.shutdown().await;
+            }
+            return Err(anyhow!(
+                "orchestration child factory parent was already bound for this session"
+            ));
+        }
         session.set_approve_tool_call(Some(approval));
         // Offline contract: `--offline` / process `RPI_OFFLINE` (resolved by
         // `session_run::offline`) must fail network-touching session
@@ -546,6 +598,7 @@ impl RunSessionBlueprint {
         Ok((
             session,
             orchestration,
+            gates.orchestration_explicit,
             gates.goal.then_some(goal_tool).flatten(),
             todo_child_tool,
         ))
@@ -568,6 +621,9 @@ impl RunSessionBlueprint {
             orchestration: tools_allowed
                 && self.tool_policy.orchestration
                 && (settings.orchestration_enabled() || requested("task") || requested("hub")),
+            orchestration_explicit: tools_allowed
+                && self.tool_policy.orchestration
+                && (requested("task") || requested("hub")),
 
             process: tools_allowed && (settings.process_tool_enabled() || requested("process")),
             glob: tools_allowed && (settings.glob_tool_enabled() || requested("glob")),
@@ -598,6 +654,7 @@ impl ApplicationRuntimeFactory for RunSessionBlueprint {
                 extension_runtime,
                 extension_permissions,
                 orchestration,
+                orchestration_explicit,
                 goal_tool,
                 todo_child_tool,
             } = candidate;
@@ -622,7 +679,7 @@ impl ApplicationRuntimeFactory for RunSessionBlueprint {
             let mut runtime = ApplicationRuntimeCandidate::new(session)
                 .with_extensions(extension_runtime, extension_permissions);
             if let Some(orchestration) = orchestration {
-                runtime = runtime.with_orchestration(orchestration);
+                runtime = runtime.with_orchestration_override(orchestration, orchestration_explicit);
             }
             if let Some(goal_tool) = goal_tool {
                 runtime = runtime.with_goal_tool(goal_tool);
@@ -649,6 +706,7 @@ impl ApplicationRuntimeFactory for RunSessionBlueprint {
                 extension_runtime,
                 extension_permissions,
                 orchestration,
+                orchestration_explicit,
                 goal_tool,
                 todo_child_tool,
             } = candidate;
@@ -659,7 +717,7 @@ impl ApplicationRuntimeFactory for RunSessionBlueprint {
             let mut runtime = ApplicationRuntimeCandidate::new(session)
                 .with_extensions(extension_runtime, extension_permissions);
             if let Some(orchestration) = orchestration {
-                runtime = runtime.with_orchestration(orchestration);
+                runtime = runtime.with_orchestration_override(orchestration, orchestration_explicit);
             }
             if let Some(goal_tool) = goal_tool {
                 runtime = runtime.with_goal_tool(goal_tool);
@@ -700,7 +758,7 @@ pub(crate) fn test_orchestration_config(
     settings: &pi_coding::Settings,
     parent_model: &pi_ai::Model,
 ) -> OrchestrationConfig {
-    orchestration_config(snapshot, settings, parent_model, false)
+    orchestration_config(snapshot, settings, Some(parent_model), false)
 }
 
 #[cfg(test)]
@@ -709,11 +767,16 @@ pub(crate) fn test_workflow_orchestration_config(
     settings: &pi_coding::Settings,
     parent_model: &pi_ai::Model,
 ) -> OrchestrationConfig {
-    orchestration_config(snapshot, settings, parent_model, true)
+    orchestration_config(snapshot, settings, Some(parent_model), true)
 }
 
 struct MainToolGates {
     orchestration: bool,
+    /// Whether the orchestration runtime is explicit launching authority (CLI
+    /// `task`/`hub` allow-list, or the forced workflow planner). Independent of
+    /// settings so a later settings disable cannot retire a runtime the active
+    /// tool allow-list still requires.
+    orchestration_explicit: bool,
     process: bool,
     glob: bool,
     todo: bool,
@@ -723,7 +786,7 @@ struct MainToolGates {
 fn orchestration_config(
     snapshot: &pi_coding::ResourceSnapshot,
     settings: &pi_coding::Settings,
-    parent_model: &pi_ai::Model,
+    parent_model: Option<&pi_ai::Model>,
     is_workflow: bool,
 ) -> OrchestrationConfig {
     let artifact_dir = if is_workflow {
@@ -785,7 +848,10 @@ fn orchestration_config(
     }
     config = config.with_selector_settings(settings.selector.clone().unwrap_or_default());
     config.agent_settings = settings.agents.clone();
-    config.parent_model = parent_model.clone();
+    // Absent when the operator has not selected/authenticated a model yet.
+    // Resolution then fails closed with a typed `ModelNotConfigured` unless a
+    // definition or override names a model.
+    config.parent_model = parent_model.cloned();
     config
 }
 
@@ -839,7 +905,7 @@ mod tests {
     }
     fn options(cwd: &Path, model: &Model, agent_dir: &Path) -> SessionOptions {
         SessionOptions {
-            model: model.clone(),
+            model: Some(model.clone()),
             cwd: cwd.to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::High,
@@ -870,6 +936,7 @@ mod tests {
             extension_runtime,
             extension_permissions,
             orchestration,
+            orchestration_explicit,
             goal_tool,
             todo_child_tool,
         } = candidate;
@@ -883,7 +950,7 @@ mod tests {
         let mut runtime = ApplicationRuntimeCandidate::new(session)
             .with_extensions(extension_runtime, extension_permissions);
         if let Some(orchestration) = orchestration {
-            runtime = runtime.with_orchestration(orchestration);
+            runtime = runtime.with_orchestration_override(orchestration, orchestration_explicit);
         }
         if let Some(goal_tool) = goal_tool {
             runtime = runtime.with_goal_tool(goal_tool);
@@ -1414,7 +1481,7 @@ mod tests {
         let config = orchestration_config(
             &snapshot,
             &pi_coding::Settings::default(),
-            &pi_ai::Model::default(),
+            Some(&pi_ai::Model::default()),
             true,
         );
         assert!(!config.artifact_dir.starts_with(&snapshot.cwd));
@@ -1686,6 +1753,7 @@ mod tests {
             extension_runtime,
             extension_permissions,
             orchestration,
+            orchestration_explicit,
             goal_tool,
             todo_child_tool,
         } = candidate;
@@ -1693,7 +1761,7 @@ mod tests {
         let mut runtime = ApplicationRuntimeCandidate::new(session)
             .with_extensions(extension_runtime, extension_permissions);
         if let Some(orchestration) = orchestration {
-            runtime = runtime.with_orchestration(orchestration);
+            runtime = runtime.with_orchestration_override(orchestration, orchestration_explicit);
         }
         if let Some(goal_tool) = goal_tool {
             runtime = runtime.with_goal_tool(goal_tool);
@@ -2134,6 +2202,7 @@ mod tests {
             extension_runtime,
             extension_permissions,
             orchestration,
+            orchestration_explicit,
             goal_tool,
             todo_child_tool,
         } = candidate;
@@ -2141,7 +2210,7 @@ mod tests {
         let mut runtime = ApplicationRuntimeCandidate::new(session)
             .with_extensions(extension_runtime, extension_permissions);
         if let Some(orchestration) = orchestration {
-            runtime = runtime.with_orchestration(orchestration);
+            runtime = runtime.with_orchestration_override(orchestration, orchestration_explicit);
         }
         if let Some(goal_tool) = goal_tool {
             runtime = runtime.with_goal_tool(goal_tool);

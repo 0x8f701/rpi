@@ -1,26 +1,44 @@
 /**
- * Per-session compacting progress — the Web mirror of TUI `is_compacting`.
+ * Per-runtime compacting progress — the Web mirror of TUI `is_compacting`.
  *
- * `/compact` / `/compact --snap` wait for the RPC report (wait_for_idle +
- * summarization). The UI must paint immediately from optimistic local state,
- * then reconcile from `get_state.isCompacting`. Duplicate/stream dispatch is
- * rejected locally like the TUI match-arm (`!is_streaming && !is_compacting`),
- * never silently queued. Other sessions stay independent.
+ * The backend owns the lifecycle: `compaction_start` / `compaction_end` are
+ * published on the exact-runtime stream (crates/pi-coding/src/session.rs), and
+ * an authoritative subscription cut carries `isCompacting` plus the ordered
+ * events that led to it. The UI paints optimistically from a local `/compact`
+ * dispatch, then takes the accepted events/cuts as authority:
+ *
+ * - every ACCEPTED end settles the runtime (success, abort, error, willRetry);
+ *   only a later start begins a new compaction;
+ * - an ordinary watermark-less `get_state` never arms or disarms this book;
+ * - slots are keyed by the exact `runtimeKey(identity)`, so a retired
+ *   incarnation's finally/event/cut cannot touch the session's next runtime.
  *
  * DOM/React-free so node tests can drive the book without mounting App.
  */
+import { runtimeKey, type RuntimeIdentity, type RuntimeKey } from './sessionSwitch';
+import { isCompactionEvent, type CompactionEvent, type ExactRuntimeEventFrame } from './types';
 
 export type CompactMode = 'llm' | 'snap';
 
-/** Per-session compacting book. `token` is the local in-flight generation.
- * `settled` suppresses server snapshots captured before the matching RPC
- * completed until an authoritative false snapshot arrives. */
-export type CompactBook = {
-  compacting: Record<string, boolean>;
-  mode: Record<string, CompactMode>;
-  token: Record<string, number>;
-  settled: Record<string, boolean>;
+/** One exact runtime's compact state.
+ *  - `requestGeneration` is the local `/compact` generation (the existing
+ *    monotonic command counter, `seqRef`) that owns the optimistic paint, or
+ *    null when no local request is outstanding.
+ *  - `sequence` is the last projected compaction event sequence for this
+ *    runtime: the same monotonic stream discipline as the live event gate, so
+ *    a replayed/reordered start can never re-arm an accepted end. */
+export type CompactSlot = {
+  compacting: boolean;
+  mode: CompactMode | null;
+  requestGeneration: number | null;
+  sequence: number;
 };
+
+export type CompactBook = { byRuntime: Record<RuntimeKey, CompactSlot> };
+
+export function emptyCompactBook(): CompactBook {
+  return { byRuntime: {} };
+}
 
 /** TUI loop-style reject: compact while a turn streams. */
 export const COMPACT_BUSY_STREAMING =
@@ -61,79 +79,176 @@ export function compactBadgeLabel(mode: CompactMode | null | undefined): string 
   return mode === 'snap' ? 'snapcompacting' : 'compacting';
 }
 
-/** Optimistic start: bump the session token and mark compacting immediately. */
+/** Display projection for one exact runtime (badge, send gate, aria copy). */
+export function compactView(
+  book: CompactBook,
+  identity: RuntimeIdentity | null | undefined,
+): { compacting: boolean; mode: CompactMode | null } {
+  if (!identity) return { compacting: false, mode: null };
+  const slot = book.byRuntime[runtimeKey(identity)];
+  if (!slot || slot.compacting !== true) return { compacting: false, mode: null };
+  return { compacting: true, mode: slot.mode };
+}
+
+/** Optimistic start: paint this runtime immediately under `requestGeneration`.
+ *  The App reserves that generation from the existing monotonic command
+ *  counter, so a superseded attempt's finally can never match a newer round. */
 export function beginCompact(
   book: CompactBook,
-  sid: string,
+  identity: RuntimeIdentity,
   mode: CompactMode,
-): { book: CompactBook; token: number } {
-  const token = (book.token[sid] ?? 0) + 1;
+  requestGeneration: number,
+): CompactBook {
+  const key = runtimeKey(identity);
+  const previous = book.byRuntime[key];
   return {
-    token,
-    book: {
-      compacting: { ...book.compacting, [sid]: true },
-      mode: { ...book.mode, [sid]: mode },
-      token: { ...book.token, [sid]: token },
-      settled: { ...book.settled, [sid]: false },
+    byRuntime: {
+      ...book.byRuntime,
+      [key]: {
+        compacting: true,
+        mode,
+        requestGeneration,
+        sequence: previous?.sequence ?? 0,
+      },
     },
   };
 }
 
-/** Settlement/finally: clear only the matching token so a newer compact
- *  (or a late timeout from a superseded attempt) cannot wipe live progress. */
-export function settleCompact(book: CompactBook, sid: string, token: number): CompactBook {
-  if (book.token[sid] !== token) return book;
-  const compacting = { ...book.compacting, [sid]: false };
-  const mode = { ...book.mode };
-  delete mode[sid];
-  const tokens = { ...book.token };
-  delete tokens[sid];
+/** RPC finally: clear only the exact identity AND generation that started this
+ *  paint. A no-op once an accepted end already settled the runtime, and never
+ *  able to clear a newer round or a different incarnation. */
+export function settleCompact(
+  book: CompactBook,
+  identity: RuntimeIdentity,
+  requestGeneration: number,
+): CompactBook {
+  const key = runtimeKey(identity);
+  const slot = book.byRuntime[key];
+  if (!slot || slot.requestGeneration !== requestGeneration) return book;
   return {
-    compacting,
-    mode,
-    token: tokens,
-    settled: { ...book.settled, [sid]: true },
+    byRuntime: {
+      ...book.byRuntime,
+      [key]: { ...slot, compacting: false, mode: null, requestGeneration: null },
+    },
   };
 }
 
-/**
- * Reconcile from `get_state.isCompacting`.
- * - `true` adopts server/other-client activity unless a just-settled local RPC
- *   is waiting for a confirming false snapshot.
- * - `false` clears server state only when there is no local in-flight token and
- *   releases the post-settlement suppression marker.
- */
-export function reconcileCompacting(
+/** Project one compaction event onto a slot, without deciding whether the
+ *  event is fresh (that ordering call belongs to the caller). */
+function projectEvent(slot: CompactSlot | undefined, event: CompactionEvent): CompactSlot {
+  const sequence = Math.max(slot?.sequence ?? 0, event.sequence);
+  if (event.type === 'compaction_start') {
+    // The wire carries no mode: keep a locally dispatched snap while that
+    // request is still outstanding, else the truthful default.
+    const mode: CompactMode = slot && slot.requestGeneration !== null ? (slot.mode ?? 'llm') : 'llm';
+    return { compacting: true, mode, requestGeneration: slot?.requestGeneration ?? null, sequence };
+  }
+  return { compacting: false, mode: null, requestGeneration: null, sequence };
+}
+
+/** Project one ACCEPTED exact-runtime compaction event. App calls this only
+ *  after the live gate validated identity, incarnation, and sequence.
+ *
+ *  Every accepted end settles the runtime — success, abort, error, and
+ *  `willRetry` alike; the retry's next start begins a fresh compaction. */
+export function applyCompactionEvent(book: CompactBook, event: CompactionEvent): CompactBook {
+  const key = runtimeKey(event);
+  const previous = book.byRuntime[key];
+  if (previous && event.sequence <= previous.sequence) return book;
+  return { byRuntime: { ...book.byRuntime, [key]: projectEvent(previous, event) } };
+}
+
+/** Take over compact state from one ACCEPTED authoritative cut: the cut state
+ *  is the baseline at `watermark`, then the cut's ordered compaction events
+ *  win (an end in the same cut beats a guard-lagged `isCompacting: true`), so
+ *  the projection is independent of the stream-only cold replay subset.
+ *
+ *  - a `false` baseline never erases a local optimistic request whose own
+ *    event/RPC has not landed yet (the cut predates that request's outcome);
+ *  - a baseline older than the last projected compaction event cannot re-arm
+ *    an already settled runtime;
+ *  - a cut END beats a guard-lagged `isCompacting: true` only while it does
+ *    not contradict newer knowledge: an end older than our cursor never
+ *    applies, an end AT our cursor applies only when that cursor came from an
+ *    idle runtime with no outstanding local request, and an already-projected
+ *    START is never re-applied. */
+export function reconcileCompactCut(
   book: CompactBook,
-  sid: string,
-  isCompacting: boolean,
+  identity: RuntimeIdentity,
+  state: unknown,
+  events: readonly ExactRuntimeEventFrame[],
+  watermark: number,
 ): CompactBook {
-  if (isCompacting) {
-    if (book.settled[sid] === true) return book;
-    if (book.compacting[sid] === true) {
-      return book.mode[sid] ? book : {
-        compacting: book.compacting,
-        mode: { ...book.mode, [sid]: 'llm' },
-        token: book.token,
-        settled: book.settled,
+  const key = runtimeKey(identity);
+  const previous = book.byRuntime[key];
+  const baseSequence = previous?.sequence ?? 0;
+  const snapshot =
+    state !== null && typeof state === 'object' && 'isCompacting' in state
+      ? state.isCompacting
+      : undefined;
+  let next = book;
+  if (typeof snapshot === 'boolean' && watermark >= baseSequence) {
+    if (snapshot === true) {
+      const mode: CompactMode =
+        previous && previous.requestGeneration !== null ? (previous.mode ?? 'llm') : 'llm';
+      next = {
+        byRuntime: {
+          ...next.byRuntime,
+          [key]: {
+            compacting: true,
+            mode,
+            requestGeneration: previous?.requestGeneration ?? null,
+            sequence: baseSequence,
+          },
+        },
+      };
+    } else if (!previous || previous.requestGeneration === null) {
+      next = {
+        byRuntime: {
+          ...next.byRuntime,
+          [key]: {
+            compacting: false,
+            mode: null,
+            requestGeneration: null,
+            sequence: baseSequence,
+          },
+        },
       };
     }
-    return {
-      compacting: { ...book.compacting, [sid]: true },
-      mode: { ...book.mode, [sid]: book.mode[sid] ?? 'llm' },
-      token: book.token,
-      settled: book.settled,
-    };
   }
-  const settled = { ...book.settled };
-  delete settled[sid];
-  if (book.token[sid] != null || book.compacting[sid] !== true) {
-    return Object.keys(settled).length === Object.keys(book.settled).length
-      ? book
-      : { ...book, settled };
+  // Only compaction events are projected: the full cut event list must never
+  // be replayed through App's onEvent (it would duplicate tools/messages).
+  const projections = events
+    .filter(isCompactionEvent)
+    .sort((left, right) => left.sequence - right.sequence);
+  for (const event of projections) {
+    // A cut re-states its range, so an end we already projected may beat a
+    // guard-lagged `isCompacting: true`. But that authority is bounded:
+    //  - the cut may only speak about its own range (events <= watermark);
+    //  - a start at/before our cursor never begins another compaction;
+    //  - an end OLDER than our cursor cannot clear a newer start we projected;
+    //  - an end AT our cursor only beats the baseline when that cursor came
+    //    from an idle runtime with no outstanding local request (otherwise it
+    //    is the previous round's end and must not clear a newer local round).
+    const staleStart = event.type === 'compaction_start' && event.sequence <= baseSequence;
+    const staleEnd = event.type === 'compaction_end'
+      && (event.sequence < baseSequence
+        || (event.sequence === baseSequence
+          && previous !== undefined
+          && (previous.compacting === true || previous.requestGeneration !== null)));
+    if (event.sequence > watermark || staleStart || staleEnd) continue;
+    const slot = next.byRuntime[key];
+    next = { byRuntime: { ...next.byRuntime, [key]: projectEvent(slot, event) } };
   }
-  const compacting = { ...book.compacting, [sid]: false };
-  const mode = { ...book.mode };
-  delete mode[sid];
-  return { compacting, mode, token: book.token, settled };
+  return next;
+}
+
+/** Runtime invalidation: drop exactly this incarnation's slot so a retired
+ *  runtime's finally/event/cut cannot touch the session's next runtime. */
+export function removeCompactRuntime(book: CompactBook, identity: RuntimeIdentity): CompactBook {
+  const key = runtimeKey(identity);
+  if (!(key in book.byRuntime)) return book;
+  const byRuntime = { ...book.byRuntime };
+  delete byRuntime[key];
+  return { byRuntime };
 }

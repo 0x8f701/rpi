@@ -391,7 +391,7 @@ mod tests {
         let session =
             pi_coding::Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
                 pi_coding::SessionOptions {
-                    model,
+                    model: Some(model),
                     cwd: cwd.to_path_buf(),
                     system_prompt: "main system".to_owned(),
                     thinking_level: ThinkingLevel::Off,
@@ -596,7 +596,7 @@ mod tests {
             .expect("fork");
         side.apply_agent_event(AgentEvent::AgentStart);
         side.apply_agent_event(AgentEvent::TurnStart);
-        let mut partial = pi_ai::AssistantMessage::pending(side.model());
+        let mut partial = pi_ai::AssistantMessage::pending(side.model().expect("side chat model"));
         side.apply_agent_event(AgentEvent::MessageUpdate {
             message: Message::Assistant(partial.clone()),
             assistant_message_event: AssistantMessageEvent::TextDelta {
@@ -632,7 +632,7 @@ mod tests {
             .expect("fork");
         side.apply_agent_event(AgentEvent::AgentStart);
         side.apply_agent_event(AgentEvent::TurnStart);
-        let mut partial = pi_ai::AssistantMessage::pending(side.model());
+        let mut partial = pi_ai::AssistantMessage::pending(side.model().expect("side chat model"));
         side.apply_agent_event(AgentEvent::MessageUpdate {
             message: Message::Assistant(partial.clone()),
             assistant_message_event: AssistantMessageEvent::ThinkingStart {

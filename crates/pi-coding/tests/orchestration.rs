@@ -112,7 +112,7 @@ fn faux_factory(
                 .expect("registration for child");
             let child_model = registration.model(None).expect("registered child model");
             Session::new(SessionOptions {
-                model: child_model,
+                model: Some(child_model),
                 cwd: std::env::current_dir().expect("cwd"),
                 system_prompt: request.system_prompt,
                 thinking_level: request.thinking_level.unwrap_or(ThinkingLevel::Off),
@@ -171,7 +171,7 @@ fn faux_factory_with_wait_readiness(
                     }) as pi_agent::BeforeToolCallFn
                 });
             Session::new(SessionOptions {
-                model: child_model,
+                model: Some(child_model),
                 cwd: std::env::current_dir().expect("cwd"),
                 system_prompt: request.system_prompt,
                 thinking_level: request.thinking_level.unwrap_or(ThinkingLevel::Off),
@@ -433,7 +433,7 @@ async fn user_task_spawns_child_that_invokes_configured_glob() {
     ]);
 
     let parent = Session::new(SessionOptions {
-        model: model.clone(),
+        model: Some(model.clone()),
         cwd: root.path().to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,
@@ -465,7 +465,7 @@ async fn user_task_spawns_child_that_invokes_configured_glob() {
         AgentCatalog::from_agents(vec![agent]),
         root.path().join("artifacts"),
     );
-    config.parent_model = model;
+    config.parent_model = Some(model);
     let runtime = OrchestrationRuntime::new(
         config,
         OrchestrationRuntime::child_factory_from_session(&parent),
@@ -630,7 +630,7 @@ async fn real_task_children_route_main_alpha_beta_main_through_owned_hub_tools()
     config.max_concurrency = 2;
     config.mailbox_capacity = 8;
     config.max_recursion_depth = 2;
-    config.parent_model = model;
+    config.parent_model = Some(model);
     let runtime = OrchestrationRuntime::new(
         config,
         faux_factory_with_wait_readiness(
@@ -845,7 +845,7 @@ async fn parent_factory_disables_ambient_discovery_and_forbidden_child_tools() {
     )
     .expect("skill");
     let parent = Session::new(SessionOptions {
-        model: Model::default(),
+        model: Some(Model::default()),
         cwd: root.path().to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,
@@ -891,7 +891,7 @@ async fn parent_factory_disables_ambient_discovery_and_forbidden_child_tools() {
             persona_skills: Arc::new(Vec::new()),
             shared_skills: Arc::new(Vec::new()),
             thinking_level: None,
-            model: parent.model().unwrap_or_default(),
+            model: parent.model().expect("parent model"),
             resolved_model_sequence: Vec::new(),
             resolved_model_selected_index: 0,
             yield_state: Arc::new(pi_coding::YieldState::default()),
@@ -933,7 +933,7 @@ async fn new_children_inherit_parent_validated_context_snapshot() {
         chunk_size: 1,
     });
     let parent = Session::new(SessionOptions {
-        model: context_model,
+        model: Some(context_model),
         cwd: root.path().to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,
@@ -1023,7 +1023,7 @@ async fn child_factory_resolves_auth_for_a_different_provider() {
         })
     });
     let parent = Session::new(SessionOptions {
-        model: parent_model,
+        model: Some(parent_model),
         cwd: root.path().to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,
@@ -1070,13 +1070,13 @@ async fn child_factory_resolves_auth_for_a_different_provider() {
 async fn child_factory_rejects_cross_provider_reuse_without_auth_resolver() {
     let root = tempfile::tempdir().expect("root");
     let parent = Session::new(SessionOptions {
-        model: Model {
+        model: Some(Model {
             id: "parent-model".to_owned(),
             name: "Parent Model".to_owned(),
             api: "parent-api".to_owned(),
             provider: "parent-provider".to_owned(),
             ..Model::default()
-        },
+        }),
         cwd: root.path().to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,
@@ -1166,7 +1166,7 @@ async fn batch_results_are_correlated_and_artifacts_resolve() {
                 })
             });
             Session::new(SessionOptions {
-                model: request.model,
+                model: Some(request.model),
                 cwd: std::env::current_dir().expect("cwd"),
                 system_prompt: request.system_prompt,
                 thinking_level: ThinkingLevel::Off,
@@ -1292,7 +1292,7 @@ async fn batch_results_are_correlated_and_artifacts_resolve() {
     });
     let read_session = Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
         SessionOptions {
-            model: read_model,
+            model: Some(read_model),
             cwd: artifacts.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -1399,7 +1399,7 @@ async fn batch_never_exceeds_configured_concurrency() {
                 })
             });
             Session::new(SessionOptions {
-                model,
+                model: Some(model),
                 cwd: std::env::current_dir().expect("cwd"),
                 system_prompt: request.system_prompt,
                 thinking_level: ThinkingLevel::Off,
@@ -1611,7 +1611,7 @@ async fn cancellation_aborts_a_running_child() {
         let stream_fn = stream_fn.clone();
         Box::pin(async move {
             Session::new(SessionOptions {
-                model,
+                model: Some(model),
                 cwd: std::env::current_dir().expect("cwd"),
                 system_prompt: request.system_prompt,
                 thinking_level: ThinkingLevel::Off,
@@ -1656,7 +1656,17 @@ async fn cancellation_aborts_a_running_child() {
             .expect("cancel batch")
     });
     started.notified().await;
-    assert_eq!(runtime.cancel(&["CancelMe".to_owned()]), vec!["CancelMe"]);
+    let cancel_me = runtime
+        .jobs(None)
+        .into_iter()
+        .find(|job| job.agent_id == "CancelMe")
+        .expect("cancel-me job");
+    assert_eq!(
+        runtime
+            .cancel_jobs_result(std::slice::from_ref(&cancel_me.id))
+            .expect("cancel running child"),
+        vec![cancel_me.id.clone()]
+    );
     let results = run.await.expect("run join");
     assert_eq!(results[0].status, AgentStatus::Aborted);
     assert_eq!(observed.load(Ordering::SeqCst), 1);
@@ -1705,7 +1715,7 @@ async fn dropping_runtime_owner_cancels_children() {
         let stream_fn = stream_fn.clone();
         Box::pin(async move {
             Session::new(SessionOptions {
-                model,
+                model: Some(model),
                 cwd: std::env::current_dir().expect("cwd"),
                 system_prompt: request.system_prompt,
                 thinking_level: ThinkingLevel::Off,
@@ -1809,7 +1819,7 @@ fn hanging_factory() -> (
         let stream_fn = stream_fn.clone();
         Box::pin(async move {
             Session::new(SessionOptions {
-                model: Model::default(),
+                model: Some(Model::default()),
                 cwd: std::env::current_dir().expect("cwd"),
                 system_prompt: request.system_prompt,
                 thinking_level: ThinkingLevel::Off,
@@ -1973,7 +1983,7 @@ async fn running_child_observes_mid_run_steering_exactly_once() {
         let stream_fn = stream_fn.clone();
         Box::pin(async move {
             Session::new(SessionOptions {
-                model: Model::default(),
+                model: Some(Model::default()),
                 cwd: std::env::current_dir().expect("cwd"),
                 system_prompt: request.system_prompt,
                 thinking_level: ThinkingLevel::Off,
@@ -2069,7 +2079,17 @@ async fn cancellation_race_does_not_report_or_deliver_fake_wake() {
             .await
     });
     started.notified().await;
-    assert_eq!(runtime.cancel(&["Race".to_owned()]), vec!["Race"]);
+    let race_job = runtime
+        .jobs(None)
+        .into_iter()
+        .find(|job| job.agent_id == "Race")
+        .expect("race job");
+    assert_eq!(
+        runtime
+            .cancel_jobs_result(std::slice::from_ref(&race_job.id))
+            .expect("cancel race child"),
+        vec![race_job.id]
+    );
     let receipt = runtime.send("Main", "Race", "too late", None)[0].clone();
     let results = run.await.expect("race join").expect("race result");
     assert_eq!(results[0].status, AgentStatus::Aborted);
@@ -2136,7 +2156,7 @@ async fn concurrent_send_run_end_race_retains_message_exactly_once() {
         let stream_fn = stream_fn.clone();
         Box::pin(async move {
             Session::new(SessionOptions {
-                model: Model::default(),
+                model: Some(Model::default()),
                 cwd: std::env::current_dir().expect("cwd"),
                 system_prompt: request.system_prompt,
                 thinking_level: ThinkingLevel::Off,
@@ -2298,7 +2318,17 @@ async fn delivery_outcomes_queued_woken_parked_failed() {
             .await
     });
     started2.notified().await;
-    assert_eq!(runtime2.cancel(&["CancelMe".to_owned()]), vec!["CancelMe"]);
+    let cancel_job = runtime2
+        .jobs(None)
+        .into_iter()
+        .find(|job| job.agent_id == "CancelMe")
+        .expect("cancel job");
+    assert_eq!(
+        runtime2
+            .cancel_jobs_result(std::slice::from_ref(&cancel_job.id))
+            .expect("cancel hanging child"),
+        vec![cancel_job.id.clone()]
+    );
     let results2 = run2.await.expect("run2 join").expect("results2");
     assert_eq!(results2[0].status, AgentStatus::Aborted);
     assert_eq!(
@@ -2549,7 +2579,7 @@ async fn group_bound_resolver_keeps_same_agent_artifacts_unique_and_stale_safe()
                 })
             });
             Session::new(SessionOptions {
-                model: request.model,
+                model: Some(request.model),
                 cwd: std::env::current_dir().expect("cwd"),
                 system_prompt: request.system_prompt,
                 thinking_level: ThinkingLevel::Off,
@@ -2738,7 +2768,7 @@ async fn agent_model_override_changes_child_session_model() {
         Box::pin(async move {
             *seen_factory.lock() = Some(request.model.clone());
             Session::new(SessionOptions {
-                model: request.model,
+                model: Some(request.model),
                 cwd: std::env::current_dir().expect("cwd"),
                 system_prompt: request.system_prompt,
                 thinking_level: request.thinking_level.unwrap_or(ThinkingLevel::Off),
@@ -2761,7 +2791,7 @@ async fn agent_model_override_changes_child_session_model() {
         AgentCatalog::from_agents(vec![definition]),
         artifacts.path(),
     );
-    config.parent_model = parent_model.clone();
+    config.parent_model = Some(parent_model.clone());
     // Settings override names the parent model so empty available catalogs still resolve.
     config.agent_settings.insert(
         "task".to_owned(),
@@ -2816,7 +2846,7 @@ async fn live_parent_model_provider_changes_fallback_between_spawns() {
         provider: "live-parent-provider-second".to_owned(),
         ..Model::default()
     };
-    let current = Arc::new(Mutex::new(first.clone()));
+    let current = Arc::new(Mutex::new(Some(first.clone())));
     let provider_current = current.clone();
     let seen = Arc::new(Mutex::new(Vec::<Model>::new()));
     let factory_seen = seen.clone();
@@ -2825,7 +2855,7 @@ async fn live_parent_model_provider_changes_fallback_between_spawns() {
         Box::pin(async move {
             seen.lock().push(request.model.clone());
             Session::new(SessionOptions {
-                model: request.model,
+                model: Some(request.model),
                 cwd: std::env::current_dir().expect("cwd"),
                 system_prompt: request.system_prompt,
                 thinking_level: request.thinking_level.unwrap_or(ThinkingLevel::Off),
@@ -2845,7 +2875,7 @@ async fn live_parent_model_provider_changes_fallback_between_spawns() {
         AgentCatalog::from_agents(vec![definition("task")]),
         artifacts.path(),
     )
-    .with_parent_model(first.clone())
+    .with_parent_model(Some(first.clone()))
     .with_parent_model_provider(Arc::new(move || provider_current.lock().clone()));
     let runtime = OrchestrationRuntime::new(config, factory).expect("runtime");
 
@@ -2873,7 +2903,7 @@ async fn live_parent_model_provider_changes_fallback_between_spawns() {
     })
     .await
     .expect("first model captured");
-    *current.lock() = second.clone();
+    *current.lock() = Some(second.clone());
     runtime
         .spawn_tasks(
             "Main",
@@ -2955,7 +2985,7 @@ async fn public_events_report_queued_running_terminal_and_parked_truthfully() {
                         Some("summarize secret [REDACTED]")
                     );
                 }
-                pi_coding::JobStatus::Running => running = true,
+                pi_coding::JobStatus::Running | pi_coding::JobStatus::Cancelling => running = true,
                 pi_coding::JobStatus::Completed => {
                     completed = true;
                     assert_eq!(

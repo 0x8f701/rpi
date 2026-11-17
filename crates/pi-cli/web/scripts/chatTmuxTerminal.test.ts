@@ -1998,10 +1998,6 @@ TmuxPanel = tmuxPanelModule.TmuxPanel;
     app.includes('send={(command, options) => registry.command(tmuxTerminal.runnerId, command, options)}'));
   check('ChatApp overlay events subscribe per overlay runner',
     app.includes('onEvent={(callback) => subscribeRunnerEvents(tmuxTerminal.runnerId, callback)}'));
-  check('ChatApp Esc closes the workspace menu before the overlay trap',
-    app.includes('if (workspaceMenuOpen) {')
-    && app.indexOf('if (workspaceMenuOpen) {') < app.indexOf('if (tmuxTerminal && !tmuxTerminal.hidden) return;')
-    && app.includes("addEventListener('keydown', onKeyDown, true)"));
   check('ChatApp Esc keeps the visible overlay but never a hidden one',
     app.includes('if (tmuxTerminal && !tmuxTerminal.hidden) return;'));
   check('preview board and overlay stay independent of the project gear',

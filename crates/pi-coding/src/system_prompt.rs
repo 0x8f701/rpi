@@ -39,6 +39,9 @@ const GREP_OVER_SHELL_GUIDELINE: &str =
 const MERMAID_NO_INLINE_COLOR_GUIDELINE: &str =
     "Mermaid diagrams must not inline style/classDef/%%{init}%% color directives; leave coloring to the render theme.";
 
+const MERMAID_QUOTE_TEXT_GUIDELINE: &str =
+    "Where Mermaid syntax supports double-quoted text, double-quote titles and labels containing CJK characters, spaces, or punctuation, especially xychart-beta `title \"...\"` and category `x-axis [\"...\", ...]`; follow each diagram type's own syntax elsewhere, and do not assume the renderer will auto-quote invalid xychart-beta source.";
+
 const CODE_REF_LINE_NUMBER_GUIDELINE: &str =
     "When citing code locations in prose, write them as `path/file.rs:299` in backticks; never start a line or bullet with a bare `:299`-style number marker.";
 
@@ -143,6 +146,11 @@ pub fn build_system_prompt(opts: BuildSystemPromptOptions) -> String {
     );
     add(
         MERMAID_NO_INLINE_COLOR_GUIDELINE.to_string(),
+        &mut guidelines,
+        &mut seen,
+    );
+    add(
+        MERMAID_QUOTE_TEXT_GUIDELINE.to_string(),
         &mut guidelines,
         &mut seen,
     );

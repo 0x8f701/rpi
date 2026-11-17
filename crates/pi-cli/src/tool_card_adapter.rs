@@ -3,6 +3,7 @@
 use pi_ai::BashExecutionMessage;
 use pi_coding::markdown::{display_width, fit_text};
 use pi_coding::redact::{redact_bounded, redact_secrets};
+use pi_coding::tools::{BashDiagnostic, BashFailureStage};
 use pi_coding::{
     ApplicationEvent, ToolCallViewStatus, ToolCard, ToolPresentationState, compact_tool_arguments,
     redact_value,
@@ -457,6 +458,81 @@ impl SkillCardView {
         }
     }
 }
+fn bash_stage_wire(stage: BashFailureStage) -> &'static str {
+    match stage {
+        BashFailureStage::Launch => "launch",
+        BashFailureStage::TimedOut => "timed_out",
+        BashFailureStage::NonZeroExit => "non_zero_exit",
+    }
+}
+
+fn bash_exit_code(value: &serde_json::Value) -> Option<Option<i32>> {
+    if value.is_null() {
+        Some(None)
+    } else {
+        value
+            .as_i64()
+            .and_then(|code| i32::try_from(code).ok())
+            .map(Some)
+    }
+}
+
+/// `exitCode` must be present as null or an i32. Serde's `Option` is not the
+/// contract: a missing field is invalid and must not become `None`.
+fn bash_diagnostic(details: &serde_json::Value) -> Option<BashDiagnostic> {
+    let record = details.as_object()?;
+    let requested_cwd = record.get("requestedCwd")?.as_str()?;
+    if requested_cwd.is_empty() {
+        return None;
+    }
+    match record.get("stage")?.as_str()? {
+        "launch" | "timed_out" | "non_zero_exit" => {}
+        _ => return None,
+    }
+    let exit_code = bash_exit_code(record.get("exitCode")?)?;
+    let diagnostic = serde_json::from_value::<BashDiagnostic>(details.clone()).ok()?;
+    (diagnostic.exit_code == exit_code
+        && diagnostic.requested_cwd.as_os_str() == std::ffi::OsStr::new(requested_cwd))
+        .then_some(diagnostic)
+}
+
+fn generated_bash_diagnostic_line(diagnostic: &BashDiagnostic) -> String {
+    format!(
+        "[bash diagnostic] stage={} requested_cwd={}",
+        bash_stage_wire(diagnostic.stage),
+        diagnostic.requested_cwd.display()
+    )
+}
+
+fn strip_generated_bash_diagnostic_line(content: &str, diagnostic: &BashDiagnostic) -> String {
+    let expected = generated_bash_diagnostic_line(diagnostic);
+    let mut lines: Vec<&str> = content.lines().collect();
+    let Some(index) = lines.iter().rposition(|line| !line.trim().is_empty()) else {
+        return content.to_owned();
+    };
+    if lines[index] != expected {
+        return content.to_owned();
+    }
+    lines.remove(index);
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.pop();
+    }
+    lines.join("\n")
+}
+
+fn bash_diagnostic_fields(diagnostic: &BashDiagnostic) -> [String; 3] {
+    let stage = bash_stage_wire(diagnostic.stage);
+    [
+        format!("cwd: {}", diagnostic.requested_cwd.display()),
+        format!("stage: {stage}"),
+        format!(
+            "exit: {}",
+            diagnostic
+                .exit_code
+                .map_or_else(|| "none".to_owned(), |code| code.to_string())
+        ),
+    ]
+}
 
 /// Detects a bare `skill://<name>` read whose content carries frontmatter and
 /// returns the prose view. Sub-resource reads (`skill://<name>/…`) and
@@ -810,7 +886,7 @@ fn hub_wait_timeout_projection(
             && jobs.iter().all(|job| {
                 matches!(
                     job.get("status").and_then(serde_json::Value::as_str),
-                    Some("queued" | "running")
+                    Some("queued" | "running" | "cancelling")
                 )
             });
         all_unsettled.then_some("Wait timed out · no job settled. Retry wait or inspect jobs.")
@@ -919,6 +995,12 @@ fn card_rows(card: &ToolCard, expanded: bool) -> ToolCardRows {
     let mut status = card.status;
     let mut bash_footer = None;
     if is_bash {
+        let diagnostic = (card.is_error && !card.cancelled)
+            .then(|| bash_diagnostic(&view_details))
+            .flatten();
+        if let Some(diagnostic) = &diagnostic {
+            content = strip_generated_bash_diagnostic_line(&content, diagnostic);
+        }
         let terminal_line = content
             .lines()
             .rev()
@@ -960,7 +1042,7 @@ fn card_rows(card: &ToolCard, expanded: bool) -> ToolCardRows {
                 if let Some(timeout) = background_timeout {
                     fields.push(format!("Timeout: {timeout}s"));
                 }
-                bash_footer = Some(format!("⟦{}⟧", fields.join(" | ")));
+                bash_footer = Some(format!("\u{27e6}{}\u{27e7}", fields.join(" | ")));
             }
         } else {
             if canonical_abort || canonical_exit.is_some() || has_canonical_timeout {
@@ -976,11 +1058,16 @@ fn card_rows(card: &ToolCard, expanded: bool) -> ToolCardRows {
             }
             if !status.is_partial() {
                 let mut fields = Vec::new();
+                if let Some(diagnostic) = &diagnostic {
+                    if status != ToolCallViewStatus::Cancelled {
+                        fields.extend(bash_diagnostic_fields(diagnostic));
+                    }
+                }
                 if let Some(timeout) = canonical_timeout {
                     fields.push(format!("Timeout: {timeout}s"));
                 } else if status == ToolCallViewStatus::Cancelled {
                     fields.push("Cancelled".to_owned());
-                } else if let Some(code) = canonical_exit.filter(|code| *code != 0) {
+                } else if let Some(code) = canonical_exit.filter(|code| *code != 0 && diagnostic.is_none()) {
                     fields.push(format!("Exit: {code}"));
                 }
                 if !fields.is_empty() {
@@ -2982,6 +3069,143 @@ mod tests {
                 .iter()
                 .any(|r| r.role == ToolCardRowRole::Status && r.text == "⟦Exit: 7⟧")
         );
+    }
+    #[test]
+    fn bash_error_footer_shows_typed_diagnostic_and_keeps_output() {
+        let mut adapter = ToolCardPresentationAdapter::new();
+        adapter.apply_application_event(&start("cwd", "bash", json!({"command": "exit 7"})));
+        let body = "boom\nCommand exited with code 7";
+        adapter.apply_application_event(&end(
+            "cwd",
+            "bash",
+            body,
+            json!({
+                "requestedCwd": "/workspace/app",
+                "stage": "non_zero_exit",
+                "exitCode": 7,
+                "ignored": true
+            }),
+            true,
+        ));
+        let rows = adapter.rows("cwd", false).expect("bash error card");
+        assert_eq!(rows.bash_command.as_deref(), Some("exit 7"));
+        assert_eq!(content(&rows), vec!["boom"]);
+        assert!(rows.is_error);
+        assert_eq!(
+            rows.rows
+                .iter()
+                .filter(|row| row.role == ToolCardRowRole::Status)
+                .map(|row| row.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["\u{27e6}cwd: /workspace/app | stage: non_zero_exit | exit: 7\u{27e7}"]
+        );
+        assert!(
+            !rows.rows.iter().any(|row| row.role == ToolCardRowRole::Details),
+            "typed diagnostic stays in the single bash footer"
+        );
+
+        for (id, details) in [
+            ("launch", json!({"requestedCwd": "/workspace/app", "stage": "launch", "exitCode": null})),
+            ("timeout", json!({"requestedCwd": "/tmp/job", "stage": "timed_out", "exitCode": null})),
+        ] {
+            adapter.apply_application_event(&start(id, "bash", json!({"command": "sleep 9"})));
+            adapter.apply_application_event(&end(id, "bash", "still failing", details, true));
+        }
+        let launch = adapter.rows("launch", false).expect("launch card");
+        let timeout = adapter.rows("timeout", false).expect("timeout card");
+        let launch_status = status_line(&launch);
+        let timeout_status = status_line(&timeout);
+        assert_eq!(content(&launch), vec!["still failing"]);
+        assert_eq!(content(&timeout), vec!["still failing"]);
+        assert!(launch_status.contains("stage: launch") && launch_status.contains("exit: none"));
+        assert!(timeout_status.contains("cwd: /tmp/job") && timeout_status.contains("stage: timed_out"));
+
+        adapter.apply_application_event(&start("legacy", "bash", json!({"command": "false"})));
+        adapter.apply_application_event(&end(
+            "legacy",
+            "bash",
+            "legacy failure\nCommand exited with code 2",
+            json!({"exitCode": 2}),
+            true,
+        ));
+        let legacy = adapter.rows("legacy", false).expect("legacy card");
+        assert_eq!(content(&legacy), vec!["legacy failure"]);
+        assert_eq!(status_line(&legacy), "\u{27e6}Exit: 2\u{27e7}");
+
+        adapter.apply_application_event(&start("bad", "bash", json!({"command": "false"})));
+        adapter.apply_application_event(&end(
+            "bad",
+            "bash",
+            "kept error",
+            json!({"requestedCwd": "", "stage": "aborted", "exitCode": "7"}),
+            true,
+        ));
+        let invalid = adapter.rows("bad", false).expect("invalid card");
+        assert_eq!(content(&invalid), vec!["kept error"]);
+        assert!(status_line(&invalid).is_empty());
+
+        adapter.apply_application_event(&start("abort", "bash", json!({"command": "sleep 9"})));
+        adapter.apply_application_event(&end(
+            "abort",
+            "bash",
+            "Command aborted",
+            json!({"requestedCwd": "/workspace/app", "stage": "launch", "exitCode": null, "cancelled": true}),
+            true,
+        ));
+        let aborted = adapter.rows("abort", false).expect("abort card");
+        assert_eq!(aborted.status, ToolCallViewStatus::Cancelled);
+        assert!(content(&aborted).is_empty());
+        assert_eq!(status_line(&aborted), "\u{27e6}Cancelled\u{27e7}");
+    }
+    #[test]
+    fn bash_diagnostic_missing_exit_code_is_invalid_and_keeps_body() {
+        let mut adapter = ToolCardPresentationAdapter::new();
+        adapter.apply_application_event(&start("noexit", "bash", json!({"command": "false"})));
+        adapter.apply_application_event(&end(
+            "noexit",
+            "bash",
+            "boom\nCommand exited with code 1",
+            json!({"requestedCwd": "/workspace/app", "stage": "launch"}),
+            true,
+        ));
+        let rows = adapter.rows("noexit", false).expect("bash error card");
+        assert_eq!(content(&rows), vec!["boom"]);
+        assert_eq!(status_line(&rows), "\u{27e6}Exit: 1\u{27e7}");
+    }
+
+    #[test]
+    fn bash_diagnostic_real_producer_trailer_is_stripped_and_rendered_once() {
+        let mut adapter = ToolCardPresentationAdapter::new();
+        adapter.apply_application_event(&start("trailer", "bash", json!({"command": "exit 7"})));
+        adapter.apply_application_event(&end(
+            "trailer",
+            "bash",
+            "boom\nCommand exited with code 7\n[bash diagnostic] stage=non_zero_exit requested_cwd=/workspace/app",
+            json!({"requestedCwd": "/workspace/app", "stage": "non_zero_exit", "exitCode": 7}),
+            true,
+        ));
+        let rows = adapter.rows("trailer", false).expect("bash error card");
+        assert_eq!(content(&rows), vec!["boom"]);
+        let all = rows
+            .rows
+            .iter()
+            .map(|row| row.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!all.contains("[bash diagnostic]"), "trailer must not leak: {all}");
+        assert_eq!(all.matches("cwd: /workspace/app").count(), 1);
+        assert_eq!(all.matches("stage: non_zero_exit").count(), 1);
+        assert_eq!(all.matches("exit: 7").count(), 1);
+        assert_eq!(all.matches("Exit: 7").count(), 0);
+    }
+
+    fn status_line(rows: &ToolCardRows) -> String {
+        rows.rows
+            .iter()
+            .filter(|row| row.role == ToolCardRowRole::Status)
+            .map(|row| row.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
     #[test]
     fn read_code_language_uses_only_trusted_path_extensions() {

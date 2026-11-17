@@ -3,7 +3,7 @@ set -euo pipefail
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 . "$SCRIPT_DIR/../lib/common.sh"
 case "${1:-list}" in
-    list|--list|--dry-run) printf '%s\n' 'release.archive-fixture - synthesize all five archive shapes and exercise inventory/checksum/member validation'; exit 0 ;;
+    list|--list|--dry-run) printf '%s\n' 'release.archive-fixture - synthesize both Linux archive shapes and exercise inventory/checksum/member validation'; exit 0 ;;
     run) ;;
     *) fail "usage: $0 [run|list|--dry-run]" ;;
 esac

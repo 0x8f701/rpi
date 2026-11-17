@@ -102,7 +102,7 @@ async fn recorded_parent(
     .expect("parent recorder");
     let session = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model: model.clone(),
+            model: Some(model.clone()),
             cwd: artifacts.to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -315,7 +315,7 @@ fn child_orchestration_runtime(
         artifact_dir,
     );
     config.idle_ttl = None;
-    config.parent_model = session.model().expect("child runtime model");
+    config.parent_model = Some(session.model().expect("child runtime model"));
     OrchestrationRuntime::new(config, factory)
 }
 
@@ -621,7 +621,7 @@ async fn recorded_parent_with_stream(
     .expect("parent recorder");
     let session = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model: model.clone(),
+            model: Some(model.clone()),
             cwd: artifacts.to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -1140,7 +1140,7 @@ async fn natural_language_route_survives_parent_disconnect_and_a_b_a_switch() {
 
     let resumed_a = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model: model.clone(),
+            model: Some(model.clone()),
             cwd: artifacts.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -1388,7 +1388,7 @@ async fn restart_switching_separate_addressing() {
     // (and thus the same manifest storage lease) so the child is discoverable.
     let session_b = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model: model.clone(),
+            model: Some(model.clone()),
             cwd: artifacts.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -2180,7 +2180,7 @@ async fn concurrent_first_sends_share_one_durable_child() {
     }
     let recovered_parent = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model: model.clone(),
+            model: Some(model.clone()),
             cwd: artifacts.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -2268,7 +2268,7 @@ async fn archived_child_stays_absent_after_restart() {
 
     let session = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model: model.clone(),
+            model: Some(model.clone()),
             cwd: artifacts.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -2532,7 +2532,7 @@ async fn removing_running_child_cancels_awaits_and_prunes_durable_state() {
 
     let session = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model: model.clone(),
+            model: Some(model.clone()),
             cwd: artifacts.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -3193,7 +3193,7 @@ async fn parent_cleanup_does_not_stop_active_todo() {
     // still observe and interact with the active child.
     let session_b = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model: model.clone(),
+            model: Some(model.clone()),
             cwd: artifacts.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -3829,7 +3829,7 @@ async fn restart_recovery_preserves_tasks_maps_running_to_interrupted() {
     let (new_service, _new_factory) = shared_service();
     let session_b = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model: model.clone(),
+            model: Some(model.clone()),
             cwd: artifacts.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -4014,7 +4014,7 @@ async fn child_model_requests_preserve_fork_context_prompt_model_auth_and_fallba
     .expect("parent recorder");
     let session = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model: primary.clone(),
+            model: Some(primary.clone()),
             cwd: artifacts.path().to_path_buf(),
             system_prompt: PARENT_ONLY_PROMPT.into(),
             thinking_level: ThinkingLevel::Off,
@@ -4231,7 +4231,7 @@ async fn child_model_requests_preserve_fork_context_prompt_model_auth_and_fallba
     });
     let session_b = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model: primary.clone(),
+            model: Some(primary.clone()),
             cwd: artifacts.path().to_path_buf(),
             system_prompt: RESTART_PARENT_ONLY_PROMPT.into(),
             thinking_level: ThinkingLevel::Off,
@@ -4576,7 +4576,7 @@ async fn service_shutdown_preserves_restartable_children() {
 
     let recovered_parent = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model: model.clone(),
+            model: Some(model.clone()),
             cwd: artifacts.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -4848,7 +4848,7 @@ async fn restart_recovers_paused_queued_receipts_and_catalog_ancestry() {
 
     let recovered_parent = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model: model.clone(),
+            model: Some(model.clone()),
             cwd: artifacts.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -5168,7 +5168,7 @@ async fn terminal_receipt_append_failure_is_not_replayed_after_restart() {
 
     let recovered_parent = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model: model.clone(),
+            model: Some(model.clone()),
             cwd: artifacts.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,

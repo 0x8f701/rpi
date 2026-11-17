@@ -69,7 +69,11 @@ export function createScrollPin(initialPinned = true): ScrollPinController {
     const geometryChanged = rememberedHeight !== null
       && (rememberedHeight !== el.scrollHeight || rememberedClient !== el.clientHeight);
     if (pinned && geometryChanged && rememberedHeight !== null) {
-      if (!isPinned(el.scrollTop, rememberedHeight, rememberedClient ?? el.clientHeight)) {
+      // Unpin only when the viewport is away from the bottom in BOTH the
+      // current and the remembered geometry: a clientHeight growth can clamp
+      // scrollTop to the NEW bottom (gap 0) while the old dimensions still
+      // read a positive remaining — that ride is not a user scroll-away.
+      if (!isPinned(el.scrollTop, el.scrollHeight, el.clientHeight) && !isPinned(el.scrollTop, rememberedHeight, rememberedClient ?? el.clientHeight)) {
         pinned = false;
         rememberGeometry(el);
         return;

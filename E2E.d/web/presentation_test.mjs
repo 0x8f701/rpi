@@ -24,6 +24,7 @@ import { chromium } from 'playwright';
 import fs from 'node:fs';
 import path from 'node:path';
 import WebSocket from 'ws';
+import { clickFeature, openSessionsDrawer } from './lib/feature-menu.mjs';
 
 const url = process.env.RPI_URL;
 const token = process.env.RPI_TOKEN || '';
@@ -57,6 +58,11 @@ const DOCUMENTED_IDS = [
   'pres.hub-wait-timeout',
   'pres.hub-wait-typed-running',
   'pres.hub-wait-typed-irc',
+  'pres.hub-wait-ids-running',
+  'pres.hub-wait-ids-identity',
+  'pres.hub-wait-ids-job-typed',
+  'pres.hub-wait-ids-settles-after-job',
+  'pres.hub-wait-ids-frames',
   'pres.hub-send-card',
   'pres.no-raw-json',
   'pres.no-done-text',
@@ -90,7 +96,7 @@ const consoleErrors = [];
 const turnByPage = new WeakMap();
 const turnFramesByPage = new WeakMap();
 function observeBrowserErrors(page) {
-  const turnFrames = { startWaiters: [], terminals: new Map(), terminalWaiters: new Map() };
+  const turnFrames = { startWaiters: [], terminals: new Map(), terminalWaiters: new Map(), frames: [] };
   turnFramesByPage.set(page, turnFrames);
   page.on('pageerror', (err) => pageErrors.push(err.message));
   page.on('console', (msg) => {
@@ -116,6 +122,18 @@ function observeBrowserErrors(page) {
         const waiters = turnFrames.terminalWaiters.get(key) || [];
         turnFrames.terminalWaiters.delete(key);
         for (const resolve of waiters) resolve(event.status);
+      }
+      // Ordered typed frames for settlement-order contracts: job_updated
+      // (jobId/jobStatus/sessionId) and tool_execution_end (toolCallId) in
+      // wire arrival order.
+      if (event.type === 'job_updated' || event.type === 'tool_execution_end') {
+        turnFrames.frames.push({
+          type: event.type,
+          sessionId,
+          jobId: event.job && typeof event.job.id === 'string' ? event.job.id : '',
+          jobStatus: event.job && typeof event.job.status === 'string' ? event.job.status : '',
+          toolCallId: typeof event.toolCallId === 'string' ? event.toolCallId : '',
+        });
       }
     });
   });
@@ -667,6 +685,201 @@ async function main() {
       'hub wait settled card did not render the typed incoming IRC',
     );
 
+    // ============ hub wait ids — REAL task → multi-child ids-wait → settle contract ====
+    // Reported regression: every child job settled but the parent's hub
+    // {op:"wait", ids:[…]} card stayed `running` (no ToolExecutionEnd, no
+    // turn terminal). The REAL chain runs here: the mock's
+    // `presentation hub wait ids` marker emits a real `task` spawn of TWO
+    // children with distinct fixture-chosen identities "Alpha"/"Beta"
+    // (deterministic from tasks[].name, echoed as TaskSpawn.agent_id;
+    // jobs.wait matches snapshot.id OR snapshot.agent_id, so the wait ids
+    // are typed, never regex-parsed from the "queued as job …" prose), then
+    // the real hub {"op":"wait","ids":["Alpha","Beta"]} with NO timeoutMs —
+    // the user's common wait shape, bounded by this lane's assertion
+    // deadlines. Alpha streams ~5s and Beta ~9s, so both jobs are still
+    // unsettled when the ids-wait card appears, Alpha settles first
+    // (partial settlement), then Beta. Identity is captured from typed
+    // surfaces only (DOM data-* of the generated fixture + job_list
+    // snapshots), and the SAME tool-call-id card must settle `done` within
+    // 8s of BOTH typed completions — a still-running card is the reported
+    // bug, never a long-poll pass.
+    const activeSidIds = await page.evaluate(
+      () => document.querySelector('.session-sidebar__row--active .session-sidebar__switch')?.dataset.sessionId || '',
+    );
+    if (!activeSidIds) fail('no active session id in the sidebar for the hub ids-wait chain');
+    const idsTurnId = await sendPrompt(page, 'presentation hub wait ids');
+    await assertId(
+      page,
+      'pres.hub-wait-ids-running',
+      () => {
+        const card = [...document.querySelectorAll('.tool-card--hub')]
+          .find((candidate) => (candidate.getAttribute('data-tool-call-id') || '').startsWith('call-presentation-hub-wait-ids-'));
+        if (!card) return false;
+        if (card.getAttribute('data-tool-status') !== 'running') return false;
+        const head = card.querySelector('.tool-card__head')?.textContent || '';
+        const txt = card.textContent || '';
+        if (!head.includes('Waiting')) return false;
+        if (!txt.includes('Waiting for a job to complete')) return false;
+        if (txt.includes('Waiting for an agent message')) return false;
+        if (card.querySelector('.tool-card__args') !== null || card.querySelector('.tool-card__raw') !== null) return false;
+        if (txt.includes('timeoutMs') || txt.includes('"op"') || txt.includes('"ids"')) return false;
+        return true;
+      },
+      'hub ids-wait running card did not render the job-wait headline',
+      30000,
+    );
+    const idsIdentity = await page.evaluate(() => {
+      const strip = document.getElementById('activity-strip');
+      const hubCard = [...document.querySelectorAll('.tool-card--hub')]
+        .find((candidate) => (candidate.getAttribute('data-tool-call-id') || '').startsWith('call-presentation-hub-wait-ids-'));
+      const taskChildren = [...document.querySelectorAll('.tool-card--task .tool-card__child')];
+      const alphaChild = taskChildren.find((candidate) => candidate.getAttribute('data-agent-id') === 'Alpha');
+      const betaChild = taskChildren.find((candidate) => candidate.getAttribute('data-agent-id') === 'Beta');
+      // data-parent-id is legitimately ABSENT at spawn time: App.tsx renders
+      // `data-parent-id={child.parentId || undefined}` and the card child's
+      // parent only fills from projectedChildren details / job frames —
+      // TaskSpawn details carry no parent field. Asserting a nonexistent
+      // attribute here would sample the projection, not the backend; the
+      // parent owner is asserted on the authoritative job_list snapshots
+      // below (JobSnapshot.parentId === 'Main').
+      return {
+        sessionId: document.querySelector('.session-sidebar__row--active .session-sidebar__switch')?.dataset.sessionId || '',
+        stripSessionId: strip?.dataset.sessionId || '',
+        stripState: strip?.dataset.state || '',
+        stripTurnId: strip?.dataset.turnId || '',
+        stripToolCallId: strip?.dataset.toolCallId || '',
+        hubToolCallId: hubCard?.getAttribute('data-tool-call-id') || '',
+        hubStatus: hubCard?.getAttribute('data-tool-status') || '',
+        taskToolCallId: alphaChild?.closest('.tool-card--task')?.getAttribute('data-tool-call-id') || '',
+        alphaJobId: alphaChild?.getAttribute('data-job-id') || '',
+        alphaStatus: alphaChild?.getAttribute('data-status') || '',
+        betaJobId: betaChild?.getAttribute('data-job-id') || '',
+        betaStatus: betaChild?.getAttribute('data-status') || '',
+      };
+    });
+    if (idsIdentity.hubToolCallId === '' || idsIdentity.hubStatus !== 'running') {
+      fail(`hub ids-wait card identity incomplete: ${JSON.stringify(idsIdentity)}`);
+    }
+    if (idsIdentity.stripState !== 'tool' || idsIdentity.stripToolCallId !== idsIdentity.hubToolCallId
+      || idsIdentity.stripSessionId !== activeSidIds || idsIdentity.sessionId !== activeSidIds
+      || idsIdentity.stripTurnId !== idsTurnId) {
+      fail(`hub ids-wait session/turn/tool association mismatch: ${JSON.stringify(idsIdentity)}`);
+    }
+    if (idsIdentity.alphaJobId === '' || idsIdentity.betaJobId === '' || idsIdentity.alphaJobId === idsIdentity.betaJobId
+      || !['queued', 'running'].includes(idsIdentity.alphaStatus)
+      || !['queued', 'running'].includes(idsIdentity.betaStatus)) {
+      fail(`hub ids-wait Task children identity mismatch: ${JSON.stringify(idsIdentity)}`);
+    }
+    record('pres.hub-wait-ids-identity');
+    // Typed completion signal: poll job_list (authoritative snapshots) for
+    // BOTH "Alpha" and "Beta" jobs. This poll is the completion OBSERVER,
+    // not the pass proof — the pass proof is the bounded settle assertion
+    // below. The seen-unsettled flags keep the fixture honest: both jobs
+    // must still be live when the wait card first ran (partial-settlement
+    // repro window).
+    const idsSettledStatuses = ['completed', 'failed', 'cancelled'];
+    const idsJobDeadline = Date.now() + 30000;
+    let idsJobAlpha = null;
+    let idsJobBeta = null;
+    let alphaSeenUnsettled = false;
+    let betaSeenUnsettled = false;
+    while (Date.now() < idsJobDeadline) {
+      const jobData = await rpc.call({ type: 'job_list', sessionId: activeSidIds });
+      const jobs = Array.isArray(jobData?.jobs) ? jobData.jobs : [];
+      const alpha = jobs.filter((candidate) => candidate.agentId === 'Alpha');
+      const beta = jobs.filter((candidate) => candidate.agentId === 'Beta');
+      if (alpha.length > 0) {
+        idsJobAlpha = alpha[alpha.length - 1];
+        if (!idsSettledStatuses.includes(String(idsJobAlpha.status))) alphaSeenUnsettled = true;
+      }
+      if (beta.length > 0) {
+        idsJobBeta = beta[beta.length - 1];
+        if (!idsSettledStatuses.includes(String(idsJobBeta.status))) betaSeenUnsettled = true;
+      }
+      if (idsJobAlpha && idsJobBeta
+        && idsSettledStatuses.includes(String(idsJobAlpha.status))
+        && idsSettledStatuses.includes(String(idsJobBeta.status))) break;
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    }
+    if (!idsJobAlpha || !idsSettledStatuses.includes(String(idsJobAlpha.status))
+      || !idsJobBeta || !idsSettledStatuses.includes(String(idsJobBeta.status))) {
+      fail(`hub ids-wait jobs never settled: ${JSON.stringify({ idsJobAlpha, idsJobBeta })}`);
+    }
+    if (!alphaSeenUnsettled || !betaSeenUnsettled) {
+      fail('hub ids-wait pre-condition lost: a job was already settled when the wait card first ran');
+    }
+    if (idsJobAlpha.id !== idsIdentity.alphaJobId || idsJobAlpha.agentId !== 'Alpha' || idsJobAlpha.parentId !== 'Main'
+      || idsJobBeta.id !== idsIdentity.betaJobId || idsJobBeta.agentId !== 'Beta' || idsJobBeta.parentId !== 'Main') {
+      fail(`job_list snapshots do not match the Task child identities: ${JSON.stringify({ idsJobAlpha, idsJobBeta, idsIdentity })}`);
+    }
+    record('pres.hub-wait-ids-job-typed');
+    // The reported bug shape: the card is STILL running after every child
+    // settled. The SAME tool-call-id card must reach `done` within 8s of the
+    // LAST typed completion — a bounded window, never a poll-until-pass.
+    await assertId(
+      page,
+      'pres.hub-wait-ids-settles-after-job',
+      (jobIds) => {
+        const card = [...document.querySelectorAll('.tool-card--hub')]
+          .find((candidate) => (candidate.getAttribute('data-tool-call-id') || '').startsWith('call-presentation-hub-wait-ids-'));
+        if (!card) return false;
+        if (card.getAttribute('data-tool-status') !== 'done') return false;
+        if (card.querySelector('.tool-card__state--running') !== null) return false;
+        const txt = card.textContent || '';
+        if (!jobIds.every((jobId) => txt.includes(jobId))) return false;
+        if (card.querySelector('.tool-card__args') !== null || card.querySelector('.tool-card__raw') !== null) return false;
+        if (txt.includes('timeoutMs') || txt.includes('"op"') || txt.includes('"ids"')) return false;
+        return true;
+      },
+      'hub ids-wait card did not settle within 8s of the typed job completions',
+      8000,
+      [idsJobAlpha.id, idsJobBeta.id],
+    );
+    // The ids-wait tool must END for the turn to conclude: a stuck wait
+    // never reaches turn_terminal and fails here too.
+    await waitForTerminal(page, 'succeeded', 60000);
+    // Wire frames are captured as EVIDENCE of the session/tool/job
+    // association ONLY: job_updated frames travel through a separate
+    // forwarder task + two broadcast hops (application.rs
+    // spawn_orchestration_forwarder → runtime.publish → manager fan-in),
+    // so their delivery order versus tool_execution_end is
+    // scheduler-dependent and proves nothing about the backend
+    // all-or-nothing settlement — that contract stays proven where it is
+    // authoritative: the typed job_list snapshots above (both settled,
+    // parentId Main, ids matching the DOM), the wait tool RETURNING, the
+    // ≤8s card settle, and turn_terminal below. The raw frame indices and
+    // fixture ids are persisted BEFORE any assertion so a failure can
+    // never lose the capture.
+    const idsFrames = turnFramesByPage.get(page)?.frames || [];
+    const idsFrameProbe = (type, match) => {
+      const index = idsFrames.findIndex((frame) => frame.type === type
+        && frame.sessionId === activeSidIds
+        && (match.jobId !== undefined ? frame.jobId === match.jobId : frame.toolCallId === match.toolCallId));
+      return { index, seen: index >= 0 };
+    };
+    const alphaFrame = idsFrameProbe('job_updated', { jobId: idsJobAlpha.id });
+    const betaFrame = idsFrameProbe('job_updated', { jobId: idsJobBeta.id });
+    const hubEndFrame = idsFrameProbe('tool_execution_end', { toolCallId: idsIdentity.hubToolCallId });
+    await fs.promises.mkdir(evidence, { recursive: true });
+    fs.writeFileSync(
+      path.join(evidence, 'hub-wait-ids-identity.json'),
+      JSON.stringify({
+        ...idsIdentity,
+        jobAlpha: idsJobAlpha,
+        jobBeta: idsJobBeta,
+        frames: {
+          alphaJobUpdated: alphaFrame,
+          betaJobUpdated: betaFrame,
+          hubToolEnd: hubEndFrame,
+          captured: idsFrames.length,
+        },
+      }, null, 2),
+    );
+    if (!alphaFrame.seen || !betaFrame.seen || !hubEndFrame.seen) {
+      fail(`hub ids-wait frame association incomplete: ${JSON.stringify({ alphaFrame, betaFrame, hubEndFrame, captured: idsFrames.length })}`);
+    }
+    record('pres.hub-wait-ids-frames');
+
     // ============ hub send — no regression: outgoing message + outcome ============
     // The real hub send to an unknown recipient UUID returns a failed
     // receipt; the card keeps the outgoing message + outcome label and never
@@ -715,6 +928,13 @@ async function main() {
       'pres.no-done-text',
       () => {
         for (const card of document.querySelectorAll('.tool-card')) {
+          // task/edit keep their structured state label when done BY DESIGN
+          // (App.tsx: isStructuredVariant || running || cancelled) — the
+          // border-color-only "no done label" contract covers the plain
+          // variants. The ids-wait lane added the first real Task card, so
+          // the scan skips the structured variants; their done state is
+          // asserted structurally by the Task child data-status instead.
+          if (card.classList.contains('tool-card--task') || card.classList.contains('tool-card--edit') || card.classList.contains('tool-card--todo')) continue;
           if (card.getAttribute('data-tool-status') === 'done' && card.querySelector('.tool-card__state') !== null) return false;
         }
         return true;
@@ -1076,7 +1296,7 @@ async function main() {
     // ============ session sidebar — providers + no tmp/UUID + search ============
     await waitFor(page, () => document.getElementById('session-sidebar') !== null, 'session sidebar did not render');
     await waitFor(page, () => document.querySelectorAll('.session-sidebar__row').length >= 1, 'session sidebar never listed rows');
-    await page.click('#settings-toggle-btn');
+    await clickFeature(page, '#settings-toggle-btn');
     await assertId(
       page,
       'pres.host-switch-hidden-default',
@@ -1116,14 +1336,29 @@ async function main() {
     );
     // Search filters rows.
     const rowsBefore = await page.evaluate(() => [...document.querySelectorAll('.session-sidebar__row')].filter((r) => r.offsetParent !== null).length);
+    const activeSessionIdBeforeSearch = await page.evaluate(() => document.querySelector('.session-sidebar__row--active .session-sidebar__switch')?.dataset.sessionId || '');
     await page.fill('#session-sidebar-search', 'OMP external');
     await assertId(
       page,
       'pres.session-search-filter',
-      (before) => [...document.querySelectorAll('.session-sidebar__row')].filter((r) => r.offsetParent !== null).length < before,
-      'search query did not reduce the visible session rows',
+      (expected) => {
+        const query = document.getElementById('session-sidebar-search')?.value ?? '';
+        if (query !== expected.query) return false;
+        const visibleIds = [...document.querySelectorAll('.session-sidebar__row')]
+          .filter((r) => r.offsetParent !== null && r.getClientRects().length > 0)
+          .map((r) => r.querySelector('.session-sidebar__switch')?.dataset.sessionId || '');
+        // EXACT visible set: the OMP fixture match (presentation.sh seed
+        // omp-pres-e2e) plus the current active row (possibly the same row —
+        // the active/loaded row is always retained by the filter). Any
+        // visible row outside that set fails; the match itself must render.
+        const allowed = new Set([expected.matchId, expected.activeId].filter(Boolean));
+        return visibleIds.length > 0
+          && visibleIds.includes(expected.matchId)
+          && visibleIds.every((id) => allowed.has(id));
+      },
+      'search did not reduce the visible rows to exactly the OMP match + the active session',
       15000,
-      rowsBefore,
+      { query: 'OMP external', matchId: 'omp-pres-e2e', activeId: activeSessionIdBeforeSearch },
     );
     // Clear restores the full list.
     await page.click('#session-sidebar-search-clear');
@@ -1144,8 +1379,8 @@ async function main() {
     const mobile = await browser.newPage({ viewport: { width: 375, height: 667 } });
     observeBrowserErrors(mobile);
     await connectPage(mobile);
-    await mobile.click('#sidebar-toggle-btn');
-    await mobile.click('#settings-toggle-btn');
+    await openSessionsDrawer(mobile);
+    await clickFeature(mobile, '#settings-toggle-btn');
     await assertId(
       mobile,
       'pres.host-switch-hidden-mobile',

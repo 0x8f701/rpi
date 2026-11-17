@@ -15,7 +15,7 @@
 // lifecycle; the real transport is covered by the realtime_webrtc lane).
 //
 // ok phase:
-//   R1  #mic-btn is in realtime mode; clicking dispatches the real
+//   R1  #live-btn starts live voice; clicking dispatches the real
 //       realtime_create_call frame on the WS
 //   R2  the Rust proxy reached the mock: the evidence file records
 //       OpenAI-Alpha quicksilver=v2, a Bearer token, and an AVAS-compatible
@@ -23,8 +23,8 @@
 //   R3  the live overlay renders (#realtime-transcript with the
 //       .realtime-transcript__label "realtime voice") and
 //       #realtime-conn-state exposes a non-empty state bucket
-//   R5  clicking #mic-btn again dispatches realtime_stop and the overlay
-//       disappears
+//   R5  A→B teardown clears #live-btn pressed state and the overlay;
+//       #mic-btn stays Hold to talk
 // error phase:
 //   R4  the mock rejects with 500; the page surfaces the "realtime call
 //       failed" toast and #realtime-transcript never renders
@@ -196,21 +196,27 @@ async function main() {
       'WS did not reach "connected"'
     );
 
-    // The backend advertises realtime live mode -> the mic is in realtime
-    // mode (aria-pressed reflects realtimeActive, not recording).
+    // Split controls: #live-btn owns the live call, #mic-btn stays Hold to talk.
     await waitFor(
       page,
       () => {
-        const btn = document.getElementById('mic-btn');
-        return btn !== null && btn.getAttribute('aria-pressed') === 'false';
+        const live = document.getElementById('live-btn');
+        const mic = document.getElementById('mic-btn');
+        return live !== null
+          && mic !== null
+          && live.getAttribute('aria-label') === 'Start live voice'
+          && live.getAttribute('aria-pressed') === 'false'
+          && live.disabled !== true
+          && mic.getAttribute('aria-label') === 'Hold to talk'
+          && mic.getAttribute('aria-pressed') === 'false';
       },
-      'mic button did not enter realtime mode (aria-pressed false idle)'
+      '#live-btn was not idle Start live voice beside Hold to talk #mic-btn'
     );
 
     if (phase === 'error') {
       // ---- R4: mock rejects -> user-visible "realtime call failed" toast,
       // overlay never renders ----
-      await page.click('#mic-btn');
+      await page.click('#live-btn');
       await waitFor(
         page,
         () =>
@@ -232,7 +238,7 @@ async function main() {
     }
 
     if (phase === 'owner-delay') {
-      await page.click('#mic-btn');
+      await page.click('#live-btn');
       const createDeadline = Date.now() + 15000;
       let createFrame = null;
       while (Date.now() < createDeadline && !createFrame) {
@@ -245,6 +251,32 @@ async function main() {
         if (!createFrame) await page.waitForTimeout(100);
       }
       if (!createFrame?.id) fail('R6: held realtime setup never dispatched create-call');
+      const micDuringSetup = await page.evaluate(() => {
+        const mic = document.getElementById('mic-btn');
+        if (!mic) return null;
+        return {
+          disabled: mic.disabled === true,
+          label: mic.getAttribute('aria-label'),
+          pressed: mic.getAttribute('aria-pressed'),
+        };
+      });
+      if (!micDuringSetup) fail('R6: #mic-btn missing while realtime setup is in flight');
+      if (micDuringSetup.label !== 'Hold to talk') {
+        fail(`R6: #mic-btn is not Hold to talk during realtime setup (${JSON.stringify(micDuringSetup)})`);
+      }
+      if (micDuringSetup.disabled !== true) {
+        fail(`R6: Hold to talk stayed enabled while realtime setup was in flight (${JSON.stringify(micDuringSetup)})`);
+      }
+      const framesBeforeHold = sentFrames.length;
+      const heldMic = await page.locator('#mic-btn').boundingBox();
+      if (!heldMic) fail('R6: #mic-btn has no box during held realtime setup');
+      await page.mouse.move(heldMic.x + heldMic.width / 2, heldMic.y + heldMic.height / 2);
+      await page.mouse.down();
+      await page.mouse.up();
+      const sttDuringSetup = sentFrames.slice(framesBeforeHold).some((raw) => {
+        try { return JSON.parse(raw).type === 'stt_transcribe'; } catch { return false; }
+      });
+      if (sttDuringSetup) fail('R6: Hold to talk dispatched stt_transcribe while realtime setup was in flight');
       const created = await createFreshSessionViaManage(page, waitFor, 'R6: create session B during held realtime setup');
       if (!realtimeReleaseUrl) fail('R6: RPI_REALTIME_RELEASE_URL is required');
       const release = await fetch(realtimeReleaseUrl, { method: 'POST' });
@@ -272,13 +304,13 @@ async function main() {
       return;
     }
 
-    // ---- R1: click #mic-btn -> realtime_create_call on the WS ----
-    await page.click('#mic-btn');
+    // ---- R1: click #live-btn -> realtime_create_call on the WS ----
+    await page.click('#live-btn');
     const r1Deadline = Date.now() + 20000;
     let r1Pressed = false;
     while (Date.now() < r1Deadline) {
       r1Pressed = await page.evaluate(
-        () => document.getElementById('mic-btn')?.getAttribute('aria-pressed') === 'true'
+        () => document.getElementById('live-btn')?.getAttribute('aria-pressed') === 'true'
       );
       if (r1Pressed) break;
       await page.waitForTimeout(120);
@@ -288,15 +320,23 @@ async function main() {
       // frames) instead of a bare timeout.
       const diag = await page.evaluate(() => ({
         toasts: Array.from(document.querySelectorAll('.toast')).map((el) => el.textContent || ''),
+        liveLabel: document.getElementById('live-btn')?.getAttribute('aria-label') || null,
+        livePressed: document.getElementById('live-btn')?.getAttribute('aria-pressed') || null,
+        micLabel: document.getElementById('mic-btn')?.getAttribute('aria-label') || null,
         micPressed: document.getElementById('mic-btn')?.getAttribute('aria-pressed') || null,
-        micTitle: document.getElementById('mic-btn')?.getAttribute('title') || null,
       }));
       fail(
-        `R1: mic did not enter the active (pressed) state (timeout 20000ms) | ` +
+        `R1: #live-btn did not enter the active (pressed) state (timeout 20000ms) | ` +
           `pageErrors=${JSON.stringify(pageErrors)} | ${JSON.stringify(diag)} | ` +
           `frames=${sentFrames.slice(-5).join(' | ')}`
       );
     }
+    const micStillHold = await page.evaluate(() => {
+      const mic = document.getElementById('mic-btn');
+      return mic?.getAttribute('aria-label') === 'Hold to talk'
+        && mic.getAttribute('aria-pressed') === 'false';
+    });
+    if (!micStillHold) fail('R1: live call changed #mic-btn away from idle Hold to talk');
     let sawStart = false;
     const deadline = Date.now() + 15000;
     while (Date.now() < deadline && !sawStart) {
@@ -452,6 +492,7 @@ async function main() {
         overlay: rect('#realtime-transcript'),
         previewText: document.querySelector('.realtime-transcript__text')?.textContent || '',
         toasts: Array.from(document.querySelectorAll('.toast')).map((el) => el.textContent || ''),
+        livePressed: document.getElementById('live-btn')?.getAttribute('aria-pressed'),
         micPressed: document.getElementById('mic-btn')?.getAttribute('aria-pressed'),
       };
     });
@@ -482,8 +523,9 @@ async function main() {
     await waitFor(
       page,
       () => document.getElementById('realtime-transcript') === null
-        && document.getElementById('mic-btn')?.getAttribute('aria-pressed') === 'false',
-      'R5: A→B switch did not tear down the realtime overlay and mic state'
+        && document.getElementById('live-btn')?.getAttribute('aria-pressed') === 'false'
+        && document.getElementById('mic-btn')?.getAttribute('aria-label') === 'Hold to talk',
+      'R5: A→B switch did not tear down the realtime overlay and live-button state'
     );
     const stopFrame = await waitForSentFrame(
       sentFrames,

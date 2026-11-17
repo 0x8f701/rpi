@@ -2,12 +2,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 
 use super::Application;
 use crate::{
-    JobStatus, MailboxMessage, OrchestrationConcurrencyGate, OrchestrationRuntime,
+    JobSnapshot, JobStatus, JobWaitMissingError, MailboxMessage, OrchestrationConcurrencyGate,
+    OrchestrationRuntime,
     PlannerIdentity, PlanningTurnOutcome, Session, TodoApplyResult, TodoDagExecutionOutcome,
     TodoDagExecutionStatus, TodoOp, TodoState, WorkflowId, WorkflowJobSnapshot,
     WorkflowRuntimeProjectionSink, WorkflowRuntimeScope, WorkflowSupervisorBackend,
@@ -129,26 +130,38 @@ impl WorkflowApplicationBackend {
     fn active_scoped_job_ids(&self) -> Vec<String> {
         self.scoped_jobs()
             .into_iter()
-            .filter(|job| matches!(job.job.status, JobStatus::Queued | JobStatus::Running))
+            .filter(|job| matches!(job.job.status, JobStatus::Queued | JobStatus::Running | JobStatus::Cancelling))
             .map(|job| job.job.id)
             .collect()
     }
 
-    async fn drain_jobs(&self, ids: &[String]) -> Result<()> {
+    /// Wait until every job in `ids` that belongs to this workflow scope is
+    /// settled, returning the settled snapshots for callers that must inspect
+    /// the outcome.
+    ///
+    /// Callers must pass the frozen target ids: `cancel_jobs_result` reports
+    /// only the ids it newly moved (or settled immediately), so waiting on that
+    /// changed subset would skip a job whose cancellation was already
+    /// committed.
+    async fn settle_jobs(&self, ids: &[String]) -> Result<Vec<JobSnapshot>> {
         if ids.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let deadline = Instant::now() + WORKFLOW_JOB_DRAIN_TIMEOUT;
         loop {
-            let active = self
-                .orchestration
-                .workflow_jobs(&self.workflow_id, self.generation)
-                .into_iter()
-                .filter(|job| ids.contains(&job.job.id) && !job.job.status.is_settled())
-                .map(|job| job.job.id)
-                .collect::<Vec<_>>();
-            if active.is_empty() {
-                return Ok(());
+            let (jobs, missing) = Self::snapshot_frozen_jobs(
+                ids,
+                self.orchestration
+                    .workflow_jobs(&self.workflow_id, self.generation)
+                    .into_iter()
+                    .map(|job| job.job)
+                    .collect(),
+            );
+            if !missing.is_empty() {
+                return Err(anyhow!(JobWaitMissingError { missing }));
+            }
+            if jobs.iter().all(|job| job.status.is_settled()) {
+                return Ok(jobs);
             }
             if Instant::now() >= deadline {
                 return Err(anyhow!("workflow job drain timed out"));
@@ -157,17 +170,54 @@ impl WorkflowApplicationBackend {
         }
     }
 
-    pub(super) async fn abort_application(&self) {
-        self.application.abort().await;
+    fn freeze_scoped_targets(&self, ids: &[String]) -> Vec<String> {
+        self.orchestration
+            .workflow_jobs(&self.workflow_id, self.generation)
+            .into_iter()
+            .map(|job| job.job.id)
+            .filter(|id| ids.contains(id))
+            .collect()
+    }
+
+    fn snapshot_frozen_jobs(
+        frozen: &[String],
+        scoped: Vec<JobSnapshot>,
+    ) -> (Vec<JobSnapshot>, Vec<String>) {
+        let jobs: Vec<JobSnapshot> = scoped
+            .into_iter()
+            .filter(|job| frozen.contains(&job.id))
+            .collect();
+        let missing = frozen
+            .iter()
+            .filter(|id| !jobs.iter().any(|job| &job.id == *id))
+            .cloned()
+            .collect();
+        (jobs, missing)
+    }
+
+    async fn drain_jobs(&self, ids: &[String]) -> Result<()> {
+        self.settle_jobs(ids).await.map(drop)
+    }
+
+    pub(super) async fn abort_application(&self) -> Result<()> {
+        self.application.abort().await?;
         self.application.wait_for_idle().await;
+        Ok(())
     }
 
     pub(super) async fn cleanup(&self) -> Result<()> {
         let ids = self.active_scoped_job_ids();
-        self.orchestration.cancel_jobs(&ids);
-        self.abort_application().await;
+        self.orchestration.cancel_jobs_result(&ids).context("cancelling active workflow jobs")?;
+        let abort_result = self.abort_application().await;
         let drain_result = self.drain_jobs(&ids).await;
         let cleanup_result = self.application.cleanup().await;
+        let drain_result = match (abort_result, drain_result) {
+            (Ok(()), drain) => drain,
+            (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(drain_error)) => Err(error.context(format!(
+                "workflow job drain also failed: {drain_error:#}"
+            ))),
+        };
         match (drain_result, cleanup_result) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
@@ -279,7 +329,7 @@ impl WorkflowSupervisorBackend for WorkflowApplicationBackend {
         self.orchestration
             .workflow_jobs(workflow_id, generation)
             .into_iter()
-            .filter(|job| matches!(job.job.status, JobStatus::Queued | JobStatus::Running))
+            .filter(|job| matches!(job.job.status, JobStatus::Queued | JobStatus::Running | JobStatus::Cancelling))
             .map(|job| job.job.id)
             .collect()
     }
@@ -422,7 +472,7 @@ impl WorkflowSupervisorBackend for WorkflowApplicationBackend {
     }
     async fn pause(&self) -> Result<()> {
         let ids = self.active_scoped_job_ids();
-        self.application.abort().await;
+        self.application.abort().await?;
         self.application.wait_for_idle().await;
         self.drain_jobs(&ids).await
     }
@@ -444,8 +494,25 @@ impl WorkflowSupervisorBackend for WorkflowApplicationBackend {
     }
 
     async fn cancel_jobs(&self, ids: &[String]) -> Result<Vec<String>> {
-        let cancelled = self.orchestration.cancel_jobs(ids);
-        self.drain_jobs(&cancelled).await?;
+        // `cancel_jobs_result` returns only the ids this call newly moved to
+        // `Cancelling` (or settled immediately); an id whose cancellation was
+        // already committed is omitted from that subset. Wait the frozen
+        // requested ids, never the changed subset, so an in-flight
+        // cancellation is not reported complete before its child has cleaned
+        // up.
+        let frozen = self.freeze_scoped_targets(ids);
+        let cancelled = self.orchestration.cancel_jobs_result(ids)?;
+        let settled = self.settle_jobs(&frozen).await?;
+        // A requested child that failed while the cancellation was draining
+        // must surface its real error instead of being reported as a clean
+        // cancel.
+        if let Some(error) = settled
+            .iter()
+            .filter_map(|job| job.result.as_ref())
+            .find_map(|result| result.error.as_deref())
+        {
+            bail!("workflow job cancellation failed: {error}");
+        }
         Ok(cancelled)
     }
 }
@@ -553,6 +620,22 @@ mod tests {
         }
     }
 
+    /// Terminal stream event matching a scripted assistant message's stop
+    /// reason: provider failures arrive as `Error`, everything else as `Done`.
+    fn terminal_event(message: &AssistantMessage) -> AssistantMessageEvent {
+        if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
+            AssistantMessageEvent::Error {
+                reason: message.stop_reason,
+                error: message.clone(),
+            }
+        } else {
+            AssistantMessageEvent::Done {
+                reason: message.stop_reason,
+                message: message.clone(),
+            }
+        }
+    }
+
     async fn stream_message(
         model: Model,
         message: AssistantMessage,
@@ -566,18 +649,7 @@ mod tests {
                     partial: AssistantMessage::pending(&model),
                 })
                 .await;
-            let terminal = if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)
-            {
-                AssistantMessageEvent::Error {
-                    reason: message.stop_reason,
-                    error: message.clone(),
-                }
-            } else {
-                AssistantMessageEvent::Done {
-                    reason: message.stop_reason,
-                    message: message.clone(),
-                }
-            };
+            let terminal = terminal_event(&message);
             producer.push(terminal).await;
             producer.end(Some(message)).await;
         });
@@ -603,13 +675,83 @@ mod tests {
         message
     }
 
-    /// Generation-backed Application (with only the explicit Todo tool and a
-    /// scripted provider) plus a backend pinned to it and a dummy
-    /// orchestration. Resource/session discovery is isolated under disjoint
-    /// temp roots, and every owner is returned so it stays alive for the test.
-    async fn test_backend(
-        stream: pi_agent::StreamFn,
-    ) -> (
+    /// Provider stream for the real-child cancellation test: signals
+    /// `started` once the call is in flight, then withholds the terminal event
+    /// until `release` fires. The withheld call ignores the abort signal, so
+    /// the runtime's cancellation drain stays held on it until the test
+    /// releases the provider — the held cleanup the backend drain must wait
+    /// for even when the cancellation intent is already committed.
+    fn gated_stream_fn(
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+        terminal: AssistantMessage,
+    ) -> pi_agent::StreamFn {
+        std::sync::Arc::new(
+            move |model: Model, _context: pi_ai::Context, _options: SimpleStreamOptions| {
+                let started = started.clone();
+                let release = release.clone();
+                let terminal = terminal.clone();
+                Box::pin(async move {
+                    let stream = new_assistant_message_event_stream();
+                    let producer = stream.clone();
+                    let model = model.clone();
+                    tokio::spawn(async move {
+                        producer
+                            .push(AssistantMessageEvent::Start {
+                                partial: AssistantMessage::pending(&model),
+                            })
+                            .await;
+                        started.notify_one();
+                        release.notified().await;
+                        producer.push(terminal_event(&terminal)).await;
+                        producer.end(Some(terminal)).await;
+                    });
+                    stream
+                })
+            },
+        )
+    }
+
+    /// Child factory building a real orchestration child session whose only
+    /// provider call is [`gated_stream_fn`]: the same child-session
+    /// construction the orchestration cancellation tests use, so the job
+    /// bookkeeping, cancellation commit, and drain are the production ones.
+    fn gated_child_factory(
+        child_cwd: std::path::PathBuf,
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+        terminal: AssistantMessage,
+    ) -> crate::ChildSessionFactory {
+        std::sync::Arc::new(move |request: crate::ChildSessionRequest| {
+            let child_cwd = child_cwd.clone();
+            let stream_fn = gated_stream_fn(started.clone(), release.clone(), terminal.clone());
+            Box::pin(async move {
+                crate::Session::new_with_additional_tools_filtered_and_discovery(
+                    crate::SessionOptions {
+                        model: Some(request.model),
+                        cwd: child_cwd,
+                        system_prompt: request.system_prompt,
+                        thinking_level: pi_agent::ThinkingLevel::Off,
+                        api_key: String::new(),
+                        compaction: None,
+                        stream_options: Default::default(),
+                        tools: Some(request.orchestration_tools),
+                        before_tool_call: None,
+                        after_tool_call: None,
+                        stream_fn: Some(stream_fn),
+                        auth_resolver: None,
+                        auth_manager: None,
+                    },
+                    Vec::new(),
+                    Default::default(),
+                    crate::ResourceDiscovery::Disabled,
+                )
+            })
+        })
+    }
+
+    /// Every isolated owner the backend fixture returns so tests keep it alive.
+    type TestBackendFixture = (
         Arc<WorkflowApplicationBackend>,
         Application,
         tempfile::TempDir,
@@ -618,7 +760,29 @@ mod tests {
         tempfile::TempDir,
         FauxProviderRegistration,
         crate::ResourceManager,
-    ) {
+    );
+
+    /// Generation-backed Application (with only the explicit Todo tool and a
+    /// scripted provider) plus a backend pinned to it and a dummy
+    /// orchestration. Resource/session discovery is isolated under disjoint
+    /// temp roots, and every owner is returned so it stays alive for the test.
+    async fn test_backend(stream: pi_agent::StreamFn) -> TestBackendFixture {
+        // Planning must never spawn a child, so the default child factory is
+        // unreachable; tests that drive a real child use the factory variant.
+        let factory: crate::ChildSessionFactory = std::sync::Arc::new(
+            |_request: crate::ChildSessionRequest| -> pi_agent::BoxFuture<Result<crate::Session>> {
+                Box::pin(async { unreachable!("workflow backend fixture has no child factory") })
+            },
+        );
+        test_backend_with_child_factory(factory, stream).await
+    }
+
+    /// [`test_backend`] with the orchestration's child factory supplied by the
+    /// caller: the only difference is which session a spawned child runs.
+    async fn test_backend_with_child_factory(
+        factory: crate::ChildSessionFactory,
+        stream: pi_agent::StreamFn,
+    ) -> TestBackendFixture {
         let cwd = tempfile::tempdir().expect("cwd");
         let agent_dir = tempfile::tempdir().expect("agent dir");
         let session_dir = tempfile::tempdir().expect("session dir");
@@ -658,7 +822,7 @@ mod tests {
             .expect("workspace");
         let session = Session::new_with_todo_additional_tools_filtered_discovery_workspace_and_uri(
             SessionOptions {
-                model,
+                model: Some(model),
                 cwd: cwd.path().to_path_buf(),
                 system_prompt: String::new(),
                 thinking_level: pi_agent::ThinkingLevel::Off,
@@ -696,15 +860,19 @@ mod tests {
             true,
         )
         .expect("definition");
-        let config = crate::OrchestrationConfig::new(
+        let mut config = crate::OrchestrationConfig::new(
             crate::AgentCatalog::from_agents(vec![definition]),
             artifacts.path(),
         );
-        let orchestration = crate::OrchestrationRuntime::new(
-            config,
-            std::sync::Arc::new(|_| Box::pin(async { unreachable!() })),
-        )
-        .expect("orchestration");
+        // Fixture contract: the live registered test model is the explicit
+        // parent resolution authority; production has no default parent model.
+        config.parent_model = Some(
+            session
+                .model()
+                .expect("workflow backend fixture requires an explicit registered model"),
+        );
+        let orchestration =
+            crate::OrchestrationRuntime::new(config, factory).expect("orchestration");
         // Mirror the supervisor's `configure_workflow_runtime`: a workflow
         // scope suppresses the application's Todo auto-arm, so the
         // planning run's `todo init` never spawns worker jobs through the
@@ -741,6 +909,56 @@ mod tests {
             faux,
             resources,
         )
+    }
+
+    fn job_snapshot(id: &str, status: JobStatus) -> JobSnapshot {
+        JobSnapshot {
+            id: id.to_owned(),
+            agent_id: "Worker".to_owned(),
+            agent: "task".to_owned(),
+            parent_id: "Main".to_owned(),
+            description: None,
+            todo_task_id: None,
+            workflow_id: None,
+            workflow_generation: None,
+            status,
+            created_at: 1,
+            started_at: None,
+            finished_at: None,
+            cancellation_cause: None,
+            result: None,
+            soft_budget_exhausted: false,
+        }
+    }
+
+    #[test]
+    fn snapshot_frozen_jobs_excludes_ids_outside_frozen_targets() {
+        let (jobs, missing) = WorkflowApplicationBackend::snapshot_frozen_jobs(
+            &["job-a".to_owned()],
+            vec![
+                job_snapshot("job-a", JobStatus::Completed),
+                job_snapshot("job-b", JobStatus::Completed),
+                job_snapshot("job-c", JobStatus::Running),
+            ],
+        );
+        assert_eq!(missing, Vec::<String>::new());
+        assert_eq!(
+            jobs.iter().map(|job| job.id.as_str()).collect::<Vec<_>>(),
+            ["job-a"]
+        );
+    }
+
+    #[test]
+    fn snapshot_frozen_jobs_names_missing_frozen_targets() {
+        let (jobs, missing) = WorkflowApplicationBackend::snapshot_frozen_jobs(
+            &["job-a".to_owned(), "job-b".to_owned()],
+            vec![job_snapshot("job-a", JobStatus::Completed)],
+        );
+        assert_eq!(missing, ["job-b".to_owned()]);
+        assert_eq!(
+            jobs.iter().map(|job| job.id.as_str()).collect::<Vec<_>>(),
+            ["job-a"]
+        );
     }
 
     fn assistant_tool_turn_count(application: &Application) -> usize {
@@ -783,7 +1001,7 @@ mod tests {
         let _ = handle.await;
         // Settle the orphaned session run exactly like the supervisor's
         // pause() before steering.
-        application.abort().await;
+        application.abort().await.expect("abort orphaned planning run");
         application.wait_for_idle().await;
 
         // A steer run with 12 tool-calling turns must complete every scripted
@@ -1092,6 +1310,117 @@ mod tests {
             assert!(!text.contains(invalid_endpoint), "{surface}: {text}");
             assert!(!text.contains("embedded-private-value"), "{surface}: {text}");
         }
+        application.cleanup().await;
+    }
+
+    /// GPT finding (staged `cancel_jobs`, lines 454-457):
+    /// `cancel_jobs_result` returns only the ids this call NEWLY moved (or
+    /// immediately settled), so a job whose cancellation intent is already
+    /// committed is absent from that subset. Draining the subset therefore
+    /// skips exactly the ids the caller asked to wait for. Against a real
+    /// orchestration child whose provider call is gated (the runtime's held
+    /// cleanup), `cancel_jobs` for those same ids must stay pending until that
+    /// cleanup releases, and must then propagate the child's real provider
+    /// failure instead of reporting a clean cancel.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_jobs_waits_requested_ids_after_cancel_commit_and_preserves_provider_error() {
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let child_root = tempfile::tempdir().expect("child cwd");
+        let mut provider_error = AssistantMessage::pending(&Model::default());
+        provider_error.stop_reason = StopReason::Error;
+        provider_error.error_message = Some("provider exploded during held cleanup".to_owned());
+        let factory = gated_child_factory(
+            child_root.path().to_path_buf(),
+            started.clone(),
+            release.clone(),
+            provider_error,
+        );
+
+        let (backend, application, _cwd, _agent, _session, _artifacts, _faux, _resources) =
+            test_backend_with_child_factory(factory, ScriptedStream::new().stream_fn()).await;
+
+        let spawn = backend
+            .orchestration()
+            .spawn_tasks(
+                "Main",
+                0,
+                vec![crate::TaskItem {
+                    index: 0,
+                    id: "GatedChild".to_owned(),
+                    agent: "task".to_owned(),
+                    assignment: "hold the provider until the test releases it".to_owned(),
+                    ..Default::default()
+                }],
+            )
+            .expect("spawn gated workflow child")
+            .remove(0);
+        tokio::time::timeout(Duration::from_secs(10), started.notified())
+            .await
+            .expect("child provider must reach the gated call");
+
+        // Commit the cancellation through the runtime first: an already
+        // committed job stays `Cancelling` because the gated provider ignores
+        // the abort and the runner's drain is still awaiting the child run.
+        let committed = backend
+            .orchestration()
+            .cancel_jobs_result(std::slice::from_ref(&spawn.job_id))
+            .expect("commit cancellation intent");
+        assert_eq!(committed, [spawn.job_id.clone()]);
+        let job = backend
+            .orchestration()
+            .jobs(Some(std::slice::from_ref(&spawn.job_id)));
+        assert_eq!(
+            job[0].status,
+            JobStatus::Cancelling,
+            "the held child must stay unsettled after the cancel commit"
+        );
+        assert!(
+            job[0].result.is_none(),
+            "the held child must not report a result yet: {:?}",
+            job[0].result
+        );
+
+        // Same ids, already committed: `cancel_jobs_result` yields an empty
+        // changed subset here, so the backend must fall back to the requested
+        // ids. The call cannot resolve cleanly: the child's real provider
+        // error is the only terminal outcome.
+        let ids = vec![spawn.job_id.clone()];
+        let cancel = tokio::spawn({
+            let backend = backend.clone();
+            let ids = ids.clone();
+            async move { backend.cancel_jobs(&ids).await }
+        });
+        release.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(10), cancel)
+            .await
+            .expect("cancel must settle once the held cleanup is released")
+            .expect("cancel task join");
+        let error = result.expect_err(
+            "waiting the requested ids must preserve the child's real provider error",
+        );
+        assert!(
+            format!("{error:#}").contains("provider exploded during held cleanup"),
+            "the cancellation must propagate the child's real error, got {error:#}"
+        );
+
+        let settled = backend
+            .orchestration()
+            .jobs(Some(std::slice::from_ref(&spawn.job_id)));
+        assert!(
+            settled[0].status.is_settled(),
+            "the released child must settle, got {:?}",
+            settled[0].status
+        );
+        assert!(
+            settled[0]
+                .result
+                .as_ref()
+                .and_then(|result| result.error.as_deref())
+                .is_some_and(|error| error.contains("provider exploded during held cleanup")),
+            "the real child run must carry the provider error: {:?}",
+            settled[0].result
+        );
         application.cleanup().await;
     }
 }

@@ -562,8 +562,9 @@ where
     let mut renderer = HumanEventRenderer::new(writer, ansi);
     let mut interrupt = Box::pin(interrupt);
     let mut interrupted = false;
+    let mut interrupt_abort_error = None;
     let mut run_failure = None;
-    let mut terminal_failure = None;
+    let mut terminal_failure: Option<String> = None;
 
     loop {
         tokio::select! {
@@ -592,20 +593,31 @@ where
                     ApplicationEvent::AgentSettled | ApplicationEvent::TodoChildRouted { .. }
                 );
                 if let Err(error) = renderer.render(&event) {
-                    application.abort().await;
+                    let abort_error = application.abort().await.err();
                     application.abort_bash();
                     application.wait_for_idle().await;
-                    return Err(error).context("rendering application event");
+                    let error = Err(error).context("rendering application event");
+                    return match abort_error {
+                        None => error,
+                        Some(abort_error) => Err(abort_error).context(error.expect_err("render error")),
+                    };
                 }
                 if settled {
                     break;
                 }
             }
             signal = &mut interrupt, if !interrupted => {
-                signal.context("listening for Ctrl-C")?;
+                let signal_error = signal.context("listening for Ctrl-C");
                 interrupted = true;
-                application.abort().await;
+                interrupt_abort_error = application.abort().await.err();
                 application.abort_bash();
+                if let Err(error) = signal_error {
+                    application.wait_for_idle().await;
+                    return match interrupt_abort_error {
+                        None => Err(error),
+                        Some(abort_error) => Err(abort_error).context(error),
+                    };
+                }
             }
         }
     }
@@ -615,7 +627,11 @@ where
         .finish_turn()
         .context("finishing human turn output")?;
     if interrupted {
-        return Ok(());
+        application.wait_for_idle().await;
+        return match interrupt_abort_error {
+            None => Ok(()),
+            Some(error) => Err(error).context("aborting after Ctrl-C"),
+        };
     }
     if let Some(message) = run_failure {
         return Err(anyhow!(message));
@@ -821,7 +837,7 @@ mod tests {
         let resources = ResourceManager::new(resource_options).expect("renderer test resources");
         let session = Session::new_with_additional_tools_filtered_and_discovery(
             SessionOptions {
-                model,
+                model: Some(model),
                 cwd,
                 system_prompt: String::new(),
                 thinking_level: ThinkingLevel::Off,

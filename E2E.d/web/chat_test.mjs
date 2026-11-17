@@ -67,7 +67,7 @@ const consoleErrors = [];
 const IDENTITY_UNAVAILABLE = 'Runner session identity is unavailable';
 const CONNECTION_CLOSED_1006 = 'Connection closed (code 1006)';
 const TOKEN_REQUIRED = 'Token required';
-const wireRecorder = { newSessionCommands: 0, getMessagesBySession: {}, sockets: [], promptsByHost: {} };
+const wireRecorder = { newSessionCommands: 0, getMessagesBySession: {}, sockets: [], promptsByHost: {}, commands: [] };
 function recordRunnerSocket(webSocket) {
   wireRecorder.sockets.push(webSocket.url());
   webSocket.on('framesent', (frame) => {
@@ -83,6 +83,13 @@ function recordRunnerSocket(webSocket) {
       if (parsed && parsed.type === 'get_messages' && typeof parsed.sessionId === 'string') {
         const sessionId = parsed.sessionId;
         wireRecorder.getMessagesBySession[sessionId] = (wireRecorder.getMessagesBySession[sessionId] || 0) + 1;
+      }
+      if (parsed && typeof parsed.type === 'string' && parsed.type !== 'ping') {
+        wireRecorder.commands.push({
+          type: parsed.type,
+          sessionId: typeof parsed.sessionId === 'string' ? parsed.sessionId : '',
+          text: typeof parsed.text === 'string' ? parsed.text : '',
+        });
       }
     } catch {
       // Non-JSON or fragmented control frame: never a runner command.
@@ -479,7 +486,15 @@ async function main() {
   try {
     const page = await browser.newPage({ viewport: { width: 1360, height: 900 } });
     await page.addInitScript((token) => {
-      window.localStorage.setItem('rpi-web-token', token);
+      // Seed the legacy host token ONCE for this tab. The seeded marker lives
+      // in sessionStorage, INDEPENDENT of product storage: if the product
+      // deletes or breaks its token, a later document must not re-seed and
+      // mask that. Navigation documents never re-write the token; the submit
+      // sampler/listener below still installs on EVERY document.
+      if (window.sessionStorage.getItem('rpi-web-e2e-token-seeded') !== '1') {
+        window.localStorage.setItem('rpi-web-token', token);
+        window.sessionStorage.setItem('rpi-web-e2e-token-seeded', '1');
+      }
       window.__chatProjectRowName = (row) => {
         const label = row.querySelector('.chat-project-row__label');
         if (!label) return '';
@@ -489,17 +504,11 @@ async function main() {
           .join('')
           .trim();
       };
-    }, runnerAToken);
-    page.on('pageerror', (error) => pageErrors.push(error.message));
-    page.on('console', (message) => {
-      if (message.type() === 'error' && !isKnownConsoleNoise(message.text())) consoleErrors.push(message.text());
-    });
-    page.on('websocket', recordRunnerSocket);
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
-    await waitFor(page, () => document.getElementById('chat-projects') !== null, '/chat app did not mount');
-    // Observe REAL form submissions on the project form (capture phase, so
-    // the counter sees the browser's own submit dispatch — not the handler).
-    await page.evaluate(() => {
+      // Observe REAL form submissions on the project form (capture phase, so
+      // the counter sees the browser's own submit dispatch — not the handler).
+      // This is an INIT script because the lane performs REAL navigations
+      // (Chat -> Web -> Chat); each new document must reinstall the counter
+      // from zero instead of losing it. The count is never faked or dropped.
       window.__chatE2E = { projectFormSubmits: 0 };
       document.addEventListener('submit', (event) => {
         const form = event.target;
@@ -508,7 +517,14 @@ async function main() {
           window.__chatE2E.projectFormSubmits += 1;
         }
       }, true);
+    }, runnerAToken);
+    page.on('pageerror', (error) => pageErrors.push(error.message));
+    page.on('console', (message) => {
+      if (message.type() === 'error' && !isKnownConsoleNoise(message.text())) consoleErrors.push(message.text());
     });
+    page.on('websocket', recordRunnerSocket);
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+    await waitFor(page, () => document.getElementById('chat-projects') !== null, '/chat app did not mount');
     if (INJECT_FAIL) {
       // Deterministic self-test: a REAL uncaught page error and a REAL
       // console.error, observed through the handlers above; the final
@@ -548,6 +564,134 @@ async function main() {
       return rail !== null && add !== null && rail.hidden === false && add.getClientRects().length > 0
         && document.getElementById('chat-empty-workspace') !== null;
     }, 'desktop rail did not return after the mobile empty screenshot');
+
+    // ---- Page switch: frozen brand-switch contract, four viewports ----
+    // /chat marks Chat CURRENT (span[aria-current=page]) and offers Web as a
+    // plain same-host /web link: a real 44px hit target, the SAME height and
+    // padding as its row sibling, the 4px segment / 8px brand gap rhythm,
+    // aligned with the current label, hittable at its centre, contained by
+    // bar and viewport.
+    const pageSwitchViewports = [
+      ['desktop', 1360, 900], ['ipad-landscape', 1180, 820],
+      ['ipad-portrait', 768, 1024], ['phone', 390, 844],
+    ];
+    for (const [switchLabel, switchWidth, switchHeight] of pageSwitchViewports) {
+      await page.setViewportSize({ width: switchWidth, height: switchHeight });
+      await waitFor(page, () => {
+        const nav = document.querySelector('nav.brand-switch[aria-label="Page"]');
+        return nav?.querySelector('[aria-current="page"]') != null
+          && document.getElementById('web-console-link') != null;
+      }, `${switchLabel} Chat page switch did not mount`);
+      const pageSwitch = await page.evaluate(() => {
+        const nav = document.querySelector('nav.brand-switch[aria-label="Page"]');
+        const current = nav.querySelector('[aria-current="page"]');
+        const link = document.getElementById('web-console-link');
+        const bar = document.getElementById('chat-workspace-bar').getBoundingClientRect();
+        const barEl = document.getElementById('chat-workspace-bar');
+        const n = nav.getBoundingClientRect();
+        const c = current.getBoundingClientRect();
+        const l = link.getBoundingClientRect();
+        const hit = document.elementFromPoint(l.left + l.width / 2, l.top + l.height / 2);
+        const linkStyle = getComputedStyle(link);
+        const currentStyle = getComputedStyle(current);
+        const brandName = barEl.querySelector('.brand-name');
+        const brandNameShown = brandName !== null && getComputedStyle(brandName).display !== 'none';
+        return {
+          current: [current.tagName, (current.textContent || '').trim(), current.getAttribute('aria-current')],
+          link: [link.tagName, (link.textContent || '').trim(), link.getAttribute('href'), link.getAttribute('aria-current')],
+          size: [l.width, l.height],
+          heights: [l.height, c.height],
+          pads: [linkStyle.paddingLeft, linkStyle.paddingRight, currentStyle.paddingLeft, currentStyle.paddingRight],
+          segGap: c.left - l.right,
+          brandGap: brandNameShown ? n.left - (brandName.getBoundingClientRect().right) : null,
+          aligned: Math.abs((c.top + c.height / 2) - (l.top + l.height / 2)) <= 1,
+          hit: hit === link || link.contains(hit),
+          contained: l.left >= bar.left - 0.5 && l.right <= bar.right + 0.5
+            && l.top >= bar.top - 0.5 && l.bottom <= bar.bottom + 0.5
+            && n.left >= bar.left - 0.5 && n.right <= bar.right + 0.5
+            && l.right <= document.documentElement.clientWidth,
+        };
+      });
+      const dump = JSON.stringify(pageSwitch);
+      if (pageSwitch.current.join('|') !== 'SPAN|Chat|page') {
+        fail(`${switchLabel} brand switch does not mark Chat current: ${dump}`);
+      }
+      if (pageSwitch.link.join('|') !== 'A|Web|/web|') {
+        fail(`${switchLabel} brand switch Web entry is not a plain /web link: ${dump}`);
+      }
+      if (pageSwitch.size[0] < 44 || pageSwitch.size[1] < 44) {
+        fail(`${switchLabel} brand switch Web entry is below 44px: ${dump}`);
+      }
+      if (!pageSwitch.hit) fail(`${switchLabel} brand switch Web entry is not hittable: ${dump}`);
+      if (!pageSwitch.aligned) fail(`${switchLabel} brand switch entries are not aligned: ${dump}`);
+      if (Math.abs(pageSwitch.heights[0] - pageSwitch.heights[1]) > 1) {
+        fail(`${switchLabel} brand switch entries are not the same height: ${dump}`);
+      }
+      if (pageSwitch.pads[0] !== pageSwitch.pads[2] || pageSwitch.pads[1] !== pageSwitch.pads[3]) {
+        fail(`${switchLabel} brand switch entries do not share the same padding: ${dump}`);
+      }
+      if (Math.abs(pageSwitch.segGap - 4) > 0.5) {
+        fail(`${switchLabel} brand switch segment gap is off the 4px rhythm: ${dump}`);
+      }
+      if (pageSwitch.brandGap !== null && Math.abs(pageSwitch.brandGap - 8) > 0.5) {
+        fail(`${switchLabel} brand name to page switch gap is off the 8px rhythm: ${dump}`);
+      }
+      if (!pageSwitch.contained) fail(`${switchLabel} brand switch overflows the header: ${dump}`);
+      await laneShot(page, `chat-page-switch-${switchLabel}.png`);
+    }
+    await page.setViewportSize({ width: 1360, height: 900 });
+    await waitFor(page, () => {
+      const rail = document.getElementById('chat-projects-rail');
+      const add = document.getElementById('chat-empty-new-project');
+      return rail !== null && rail.hidden === false && add !== null && add.getClientRects().length > 0;
+    }, 'desktop empty workspace did not return after the page switch sweep');
+
+    // ---- Real round-trip: Chat -> Web -> Chat on the empty workspace ----
+    // Same-page real clicks only; no mapping/runner mutation. Compare the
+    // REAL host-scoped auth key (rpi-web-token:<authority>) that the product
+    // migrated from the one-shot seed — the legacy key is never re-seeded.
+    const hostTokenKey = `rpi-web-token:${encodeURIComponent(new URL(url).host)}`;
+    await waitFor(page, (key) => (window.localStorage.getItem(key) || '') !== '',
+      'host-scoped token was not migrated before the page switch', 15000, hostTokenKey);
+    const tokenBeforePageSwitch = await page.evaluate((key) => window.localStorage.getItem(key), hostTokenKey);
+    if (tokenBeforePageSwitch !== runnerAToken) {
+      fail('host-scoped token did not match the seeded runner token');
+    }
+    await Promise.all([
+      page.waitForURL((next) => new URL(next).pathname === '/web', { timeout: 20000 }),
+      page.click('#web-console-link'),
+    ]);
+    await waitFor(page, () => {
+      const current = document.querySelector('nav.brand-switch[aria-label="Page"] [aria-current="page"]');
+      return (current?.textContent || '').trim() === 'Web'
+        && document.getElementById('chat-console-link')?.getAttribute('href') === '/chat'
+        && (document.querySelector('header')?.getClientRects().length ?? 0) > 0
+        && document.getElementById('feature-menu-btn') !== null;
+    }, '/web main header did not render after switching from Chat', 20000);
+    const tokenOnWeb = await page.evaluate((key) => window.localStorage.getItem(key), hostTokenKey);
+    if (tokenOnWeb !== tokenBeforePageSwitch) {
+      fail('host-scoped token did not stay equal on arriving at /web');
+    }
+    await laneShot(page, 'chat-page-switch-web.png', { fullPage: true });
+    await Promise.all([
+      page.waitForURL((next) => new URL(next).pathname === '/chat', { timeout: 20000 }),
+      page.click('#chat-console-link'),
+    ]);
+    await waitFor(page, () => {
+      const current = document.querySelector('nav.brand-switch[aria-label="Page"] [aria-current="page"]');
+      return (current?.textContent || '').trim() === 'Chat'
+        && document.getElementById('web-console-link')?.getAttribute('href') === '/web'
+        && document.getElementById('chat-empty-workspace') !== null
+        && document.getElementById('chat-empty-new-project') !== null;
+    }, '/chat did not restore its empty workspace after switching back', 20000);
+    const tokenAfterPageSwitch = await page.evaluate((key) => window.localStorage.getItem(key), hostTokenKey);
+    if (tokenAfterPageSwitch !== tokenBeforePageSwitch) {
+      fail('page switch changed the host-scoped token');
+    }
+    if (!((await page.locator('#chat-empty-workspace').textContent()) || '')
+      .includes('Projects are channels for people and rpi agents')) {
+      fail('page switch did not restore the empty workspace hero state');
+    }
 
     // ---- Negative: relative cwd is rejected locally by the EXACT form ----
     // One bounded alert, one attempt, no project/mapping/session mutation,
@@ -1001,6 +1145,52 @@ async function main() {
     if (phoneBack.label !== 'Back to Projects' || phoneBack.text !== '←') {
       fail('phone Back is not a compact ← control');
     }
+    // ---- Mobile Back: real Projects round-trip preserves the 1:1 binding ----
+    // Put a REAL runner 1:1 session in front (not the Channel target), read
+    // the authoritative current binding from every rendered transcript row
+    // (runner/mapping/session must be one non-empty tuple), then use the real
+    // Back control and re-select the same project row with a real click: the
+    // binding AND the durable mapping set must be exactly equal (no new
+    // mapping, no empty-value exemption).
+    await page.locator(`.chat-chip[data-runner-id="${runnerAId}"]`).click();
+    await waitChatSessionReady(page, 'mobile Back runner 1:1');
+    const backBinding = await page.evaluate(() => {
+      const selected = document.querySelector('.chat-project-row[data-selected="true"]');
+      const bindings = new Set([...document.querySelectorAll('.chat-session-message[data-session-id]')]
+        .map((row) => [row.getAttribute('data-runner-id') || '', row.getAttribute('data-mapping-id') || '', row.getAttribute('data-session-id') || ''].join('|')));
+      const mappings = JSON.parse(window.localStorage.getItem('rpi-web-chat-mapping:v1') || '{}');
+      return {
+        projectId: selected?.getAttribute('data-project-id') || '',
+        bindingCount: bindings.size,
+        binding: bindings.size === 1 ? [...bindings][0] : '',
+        mappings: (mappings.mappings || []).map((row) => `${row.projectId}:${row.runnerId}:${row.sessionId}:${row.state}`).sort(),
+      };
+    });
+    if (!backBinding.projectId || backBinding.bindingCount !== 1 || !backBinding.mappings.length) {
+      fail(`mobile Back had no single authoritative 1:1 binding: ${JSON.stringify(backBinding)}`);
+    }
+    if (backBinding.binding.split('|').some((part) => part === '')) {
+      fail(`mobile Back binding had an empty identity: ${backBinding.binding}`);
+    }
+    await page.click('#chat-mobile-back-projects');
+    await waitFor(page, () => {
+      const rail = document.getElementById('chat-projects-rail');
+      const main = document.getElementById('chat-project-main');
+      return rail !== null && rail.hidden === false && rail.getClientRects().length > 0
+        && main !== null && main.hidden === true;
+    }, 'mobile Back did not return to the Projects pane');
+    await page.locator(`.chat-project-row[data-project-id="${backBinding.projectId}"]`).click();
+    await waitFor(page, (before) => {
+      const main = document.getElementById('chat-project-main');
+      const selected = document.querySelector('.chat-project-row[data-selected="true"]');
+      const bindings = new Set([...document.querySelectorAll('.chat-session-message[data-session-id]')]
+        .map((row) => [row.getAttribute('data-runner-id') || '', row.getAttribute('data-mapping-id') || '', row.getAttribute('data-session-id') || ''].join('|')));
+      const mappings = JSON.parse(window.localStorage.getItem('rpi-web-chat-mapping:v1') || '{}');
+      return main !== null && main.hidden === false
+        && selected?.getAttribute('data-project-id') === before.projectId
+        && bindings.size === 1 && [...bindings][0] === before.binding
+        && JSON.stringify((mappings.mappings || []).map((row) => `${row.projectId}:${row.runnerId}:${row.sessionId}:${row.state}`).sort()) === JSON.stringify(before.mappings);
+    }, 'mobile Back round-trip changed the 1:1 binding or mapping set', 15000, backBinding);
     await laneShot(page, 'chat-conversation-mobile.png', { fullPage: true });
     await page.setViewportSize({ width: 1360, height: 900 });
     await waitFor(page, () => {
@@ -1036,6 +1226,96 @@ async function main() {
       || mappedSessionFiles(runnerBHome, runnerBProject).length !== 1) {
       fail('reload reconciliation duplicated or lost mapped session files');
     }
+
+    // ---- App-switch pagehide/pageshow on the original mapped session ----
+    // pagehide must not dispose the registry (an iOS app switch emits it and
+    // the page stays alive). This is a browser lifecycle event on the real
+    // /chat page, not an installed iPad app-switch or bfcache proof.
+    await clickProjectRow(page, 'Mapped Project A');
+    await page.locator(`.chat-chip[data-runner-id="${runnerAId}"]`).click();
+    await waitChatSessionReady(page, 'pagehide original session');
+    const pagehideSessionId = mappedAHeader.id;
+    const sessionMessages = await page.locator(`.chat-session-message[data-session-id="${pagehideSessionId}"]`).count();
+    if (sessionMessages < 1) fail('pagehide fixture lost the original mapped session transcript');
+    const commandsBeforeHide = wireRecorder.commands.length;
+    const socketsBeforeHide = wireRecorder.sockets.length;
+    await page.evaluate(() => {
+      Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' });
+      document.dispatchEvent(new Event('visibilitychange'));
+      window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: true }));
+    });
+    await page.waitForTimeout(300);
+    const hidden = await page.evaluate(() => ({
+      mounted: document.getElementById('chat-projects') !== null,
+      session: document.querySelector('.chat-session') !== null,
+      overlay: document.getElementById('reconnect-overlay') !== null,
+      composerDisabled: document.querySelector('.chat-session .chat-session__composer textarea')?.disabled === true,
+      loading: [...document.querySelectorAll('.chat-session__status')]
+        .some((node) => (node.textContent || '').includes('Loading transcript')),
+      closed: (document.body.textContent || '').includes('Connection closed (code 1006)'),
+      unavailable: (document.body.textContent || '').includes('Runner session identity is unavailable'),
+    }));
+    if (!hidden.mounted || !hidden.session) fail(`pagehide disposed /chat: ${JSON.stringify(hidden)}`);
+    if (hidden.overlay) fail('pagehide claimed a reconnect while the original session was still mounted');
+    if (hidden.composerDisabled || hidden.loading) {
+      fail(`pagehide claimed the composer was not ready on a completed session: ${JSON.stringify(hidden)}`);
+    }
+    if (hidden.closed || hidden.unavailable) fail(`pagehide surfaced a transport failure: ${JSON.stringify(hidden)}`);
+    if (wireRecorder.sockets.length !== socketsBeforeHide) {
+      fail('pagehide opened or replaced a runner socket');
+    }
+    await page.evaluate(() => {
+      Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'visible' });
+      document.dispatchEvent(new Event('visibilitychange'));
+      window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true }));
+    });
+    await waitChip(page, runnerAId, true, 'pageshow dropped the original runner', 15000);
+    await waitChatSessionReady(page, 'pageshow original session');
+    const goalComposer = page.locator('.chat-session .chat-session__composer textarea');
+    await goalComposer.fill('/goal');
+    // Inline completion owns the SELECTING Enter (settles the token, dismisses
+    // the popup, no dispatch); dispatch is an INDEPENDENT Enter on the settled
+    // token. Wait for the catalog-backed popup instead of racing its fetch.
+    await waitFor(page, () => document.querySelector(
+      '.chat-session .command-picker__popover[aria-label="Slash command suggestions"]') !== null,
+    'pageshow /goal inline completion never armed', 20000);
+    await goalComposer.press('Enter');
+    await waitFor(page, () => {
+      const input = document.querySelector('.chat-session .chat-session__composer textarea');
+      return input?.value === '/goal'
+        && document.querySelector('.chat-session .command-picker__popover[aria-label="Slash command suggestions"]') === null;
+    }, 'pageshow /goal selecting Enter did not settle on /goal with the popup dismissed', 5000);
+    const goalAfterSelect = wireRecorder.commands.slice(commandsBeforeHide)
+      .filter((frame) => frame.type === 'goal_get' || frame.type === 'goal_journal');
+    if (goalAfterSelect.length !== 0) {
+      fail(`pageshow /goal selecting Enter dispatched: ${JSON.stringify(goalAfterSelect)}`);
+    }
+    await goalComposer.press('Enter');
+    const goalDeadline = Date.now() + 20000;
+    while (!wireRecorder.commands.slice(commandsBeforeHide).some((frame) => (
+      (frame.type === 'goal_get' || frame.type === 'goal_journal') && frame.sessionId === pagehideSessionId
+    ))) {
+      if (Date.now() > goalDeadline) {
+        fail(`pageshow /goal never sent a command for the original session: ${JSON.stringify(wireRecorder.commands.slice(commandsBeforeHide))}`);
+      }
+      await page.waitForTimeout(50);
+    }
+    await waitFor(page, () => document.querySelector('.chat-goal-overlay[aria-label="Goal"]') !== null,
+      'pageshow /goal did not open on the original session', 20000);
+    const goalCommands = wireRecorder.commands.slice(commandsBeforeHide)
+      .filter((frame) => frame.type === 'goal_get' || frame.type === 'goal_journal');
+    if (goalCommands.length === 0 || goalCommands.some((frame) => frame.sessionId !== pagehideSessionId)) {
+      fail(`pageshow /goal did not stay on the original session: ${JSON.stringify(goalCommands)}`);
+    }
+    const goalOverlaySession = await page.evaluate((sessionId) => {
+      const overlay = document.querySelector('.chat-goal-overlay');
+      const transcript = document.querySelector(`.chat-session-message[data-session-id="${sessionId}"]`);
+      return overlay !== null && transcript !== null;
+    }, pagehideSessionId);
+    if (!goalOverlaySession) fail('pageshow goal overlay is not on the original session transcript');
+    await page.click('.chat-goal-overlay__close');
+    await waitFor(page, () => document.querySelector('.chat-goal-overlay') === null, 'goal overlay did not close');
+    await laneShot(page, 'chat-pagehide-pageshow.png', { fullPage: true });
 
     // ---- Backend shutdown: runner B goes down, runner A unaffected ----
     await clickProjectRow(page, 'Mapped Project B');
@@ -1217,6 +1497,7 @@ async function main() {
       channelTwoRunnersOneProject: true,
       channelMentionTargeted: true,
       channelLogReloadRestored: true,
+      pagehidePageshowOriginalSession: true,
       independentReconnect: true,
       samePortRecovery: true,
       projectMappingsActive: measuredActiveMappings,

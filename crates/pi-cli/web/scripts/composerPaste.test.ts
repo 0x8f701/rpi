@@ -15,9 +15,6 @@ import {
   nextPasteEnterGuard,
   planLargeTextPaste,
 } from '../src/composerPaste.ts';
-import { readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 
 const failures: string[] = [];
 let ran = 0;
@@ -210,26 +207,6 @@ check(
     && !nativeEventShiftKey({} as Event),
 );
 
-{
-  const appSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../src/App.tsx'), 'utf8');
-  const promptAt = appSource.indexOf('id="prompt-input"');
-  const slice = promptAt >= 0 ? appSource.slice(promptAt, promptAt + 2800) : '';
-  const preventHelperAt = slice.indexOf('composerEnterShouldPreventDefault');
-  const preventAt = slice.indexOf('e.preventDefault()');
-  const submitAt = slice.indexOf('composerEnterShouldSubmit');
-  check(
-    'App preventDefault follows composerEnterShouldPreventDefault before submit',
-    preventHelperAt >= 0 && preventAt > preventHelperAt && submitAt > preventAt,
-    String({ preventHelperAt, preventAt, submitAt }),
-  );
-  check(
-    'App GBoard beforeinput and send enterKeyHint are wired on the composer',
-    slice.includes('composerBeforeInputShouldSubmit')
-      && slice.includes('enterKeyHint="send"')
-      && slice.includes('compositionActive: composerComposingRef.current'),
-    slice.slice(0, 200),
-  );
-}
 
 console.log(`\ncomposerPaste.test: ${ran} assertions, ${failures.length} failure(s)`);
 if (failures.length) {

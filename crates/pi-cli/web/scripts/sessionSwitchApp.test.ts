@@ -79,13 +79,13 @@ import {
   type VideoUploadOutcome,
 } from '../src/attachments.ts';
 import { nextId, messagesToItems, mergeAuthoritativeItems, planReconnectTurn, planStreamStallReconcile, planSettledStreamRefillRequest, planLiveSequenceGap, planLiveGapCatchUp, planStreamCatchUpToast, reduceStreamStall, planStreamStallChrome, type Item, type ReconnectTurnPlan } from '../src/transcript.ts';
-import { activityStripView, applyActivityStripEvent, emptyActivityStripState } from '../src/activityStrip.ts';
+import { activityStripView, applyActivityStripEvent, emptyActivityStripState, reconcileActivityStrip } from '../src/activityStrip.ts';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server.browser';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { BashCard, FinalAssistant, StreamingAssistant, ToolCard, TranscriptSurface } from '../src/App.tsx';
+import { BashCard, FinalAssistant, StreamingAssistant, ToolCard, TranscriptSurface, settledRefillStillOwned, planStarredJump, replyStarScopeKey } from '../src/App.tsx';
 import { isPinned } from '../src/scrollPin.ts';
 import type { PendingCommandError } from '../src/pending.ts';
 import {
@@ -96,6 +96,7 @@ import {
   applyOpenFoldKeys,
   applyRestoredViewport,
   applySurfaceVisibility,
+  compensateAnchorShapeShift,
   compensatePrependedStage,
   noteLiveViewportFold,
   normalizeTranscriptWindow,
@@ -4204,6 +4205,127 @@ function seedReady(app: AppSwitchHarness, identity: RuntimeIdentity, cursor = 4)
     compensatePrependedStage({ scroll, content, prepended: 0, openFoldKeys: new Set(['p:0:x']) }).deltaPx === 0);
 }
 
+// Star-jump second landing: ONE id-rect correction may re-seat the restored
+// anchor once the folded layout settles. A recycled-out anchor or an
+// already-exact rect MUST move nothing; a drifted rect gets exactly one
+// scrollTop write that puts the row back on its recorded offset. The restore
+// itself runs its fold pass BEFORE measuring, so a fold that opens above the
+// anchor is inside the rect the landing is computed from.
+{
+  class CountingScroll {
+    writes = 0;
+    constructor(private value: number) {}
+    get scrollTop(): number { return this.value; }
+    set scrollTop(next: number) { this.writes += 1; this.value = next; }
+    readonly scrollHeight = 5000;
+    readonly clientHeight = 300;
+    getBoundingClientRect() { return { top: 0, bottom: 300, left: 0, width: 800 }; }
+  }
+  interface ShapeChild {
+    parentElement: null;
+    getAttribute(name: string): string | null;
+    getBoundingClientRect(): { top: number; bottom: number };
+  }
+  const child = (id: string, top: () => number, measured?: () => void): ShapeChild => ({
+    parentElement: null,
+    getAttribute: (name: string) => (name === TRANSCRIPT_ITEM_ATTRIBUTE ? id : null),
+    getBoundingClientRect: () => {
+      measured?.();
+      const t = top();
+      return { top: t, bottom: t + TRANSCRIPT_ITEM_HEIGHT };
+    },
+  });
+  const contentWith = (children: ShapeChild[]): TranscriptContentRoot => ({
+    children,
+    stampedFolds: () => [],
+  });
+
+  const recycled = new CountingScroll(500);
+  const recycledDelta = compensateAnchorShapeShift({
+    scroll: recycled,
+    content: contentWith([child('kept', () => 0)]),
+    anchorItemId: 'recycled-out',
+    anchorOffsetPx: 0,
+  });
+  check('a recycled-out anchor moves nothing (never a fallback scrollTop)',
+    recycledDelta === 0 && recycled.writes === 0 && recycled.scrollTop === 500,
+    JSON.stringify({ recycledDelta, writes: recycled.writes, scrollTop: recycled.scrollTop }));
+
+  const exact = new CountingScroll(500);
+  let exactReads = 0;
+  const exactDelta = compensateAnchorShapeShift({
+    scroll: exact,
+    content: contentWith([child('anchor', () => 24, () => { exactReads += 1; })]),
+    anchorItemId: 'anchor',
+    anchorOffsetPx: 24,
+  });
+  check('an already-seated anchor measures once and writes zero corrections',
+    exactDelta === 0 && exact.writes === 0 && exactReads === 1 && exact.scrollTop === 500,
+    JSON.stringify({ exactDelta, writes: exact.writes, exactReads, scrollTop: exact.scrollTop }));
+
+  const drifted = new CountingScroll(0);
+  const driftedAnchor = child('anchor', () => 200 - drifted.scrollTop);
+  const driftedDelta = compensateAnchorShapeShift({
+    scroll: drifted,
+    content: contentWith([driftedAnchor]),
+    anchorItemId: 'anchor',
+    anchorOffsetPx: 16,
+  });
+  const reseatedTop = driftedAnchor.getBoundingClientRect().top - drifted.getBoundingClientRect().top - 16;
+  check('a drifted anchor gets exactly ONE scrollTop write and lands back on its offset',
+    driftedDelta === 184 && drifted.writes === 1 && drifted.scrollTop === 184 && reseatedTop === 0,
+    JSON.stringify({ driftedDelta, writes: drifted.writes, scrollTop: drifted.scrollTop, reseatedTop }));
+}
+
+{
+  // Fold-driven layout: opening the fold above the anchor grows every later
+  // child's rect by FOLD_GROWTH, so a measurement taken BEFORE the fold pass
+  // would land the anchor one fold-height too high.
+  const FOLD_GROWTH = 30;
+  const fold = {
+    open: false,
+    getAttribute: (name: string) => (name === TRANSCRIPT_FOLD_ATTRIBUTE ? 'lead:0:x' : null),
+  };
+  let openedAtMeasure: boolean | null = null;
+  const rows = [
+    { id: 'lead', top: () => 0 },
+    { id: 'anchor', top: () => TRANSCRIPT_ITEM_HEIGHT + (fold.open ? FOLD_GROWTH : 0) },
+    { id: 'tail', top: () => 2 * TRANSCRIPT_ITEM_HEIGHT + (fold.open ? FOLD_GROWTH : 0) },
+  ];
+  const content: TranscriptContentRoot = {
+    children: rows.map((row) => ({
+      parentElement: null,
+      getAttribute: (name: string) => (name === TRANSCRIPT_ITEM_ATTRIBUTE ? row.id : null),
+      getBoundingClientRect: () => {
+        if (row.id === 'anchor') openedAtMeasure = fold.open;
+        const top = row.top();
+        return { top, bottom: top + TRANSCRIPT_ITEM_HEIGHT };
+      },
+    })),
+    stampedFolds: () => [fold],
+  };
+  const scroll = {
+    scrollTop: 0,
+    scrollHeight: 500,
+    clientHeight: 100,
+    getBoundingClientRect: () => ({ top: 0, bottom: 100, left: 0, width: 800 }),
+  };
+  applyRestoredViewport(scroll, content, {
+    follow: false,
+    anchorItemId: 'anchor',
+    anchorOffsetPx: 0,
+    fallbackScrollTop: 0,
+    openFoldKeys: new Set(['lead:0:x']),
+  });
+  const anchorTop = content.children[1].getBoundingClientRect().top;
+  check('restore applies the saved fold BEFORE measuring the anchor, then seats it at offset 0',
+    fold.open === true
+      && openedAtMeasure === true
+      && scroll.scrollTop === TRANSCRIPT_ITEM_HEIGHT + FOLD_GROWTH
+      && anchorTop - scroll.scrollTop === 0,
+    JSON.stringify({ open: fold.open, openedAtMeasure, scrollTop: scroll.scrollTop, anchorTop }));
+}
+
 {
   const attrs = new Map<string, string>();
   const surface = {
@@ -4573,15 +4695,9 @@ function seedReady(app: AppSwitchHarness, identity: RuntimeIdentity, cursor = 4)
         && displayedSessionMatches(displayedB.sessionId, null) === false);
     const idleToastAt = appSource.indexOf('const toastAborted = abortIdleSnapshotToasts');
     const idleToastSlice = idleToastAt >= 0 ? appSource.slice(idleToastAt, idleToastAt + 420) : '';
-    const terminalToastAt = appSource.indexOf("case 'turn_terminal':");
-    const terminalToastSlice = terminalToastAt >= 0 ? appSource.slice(terminalToastAt, terminalToastAt + 900) : '';
-    check('abort toasts use display authority on the idle snapshot and on turn_terminal',
+    check('abort toasts use display authority on the idle snapshot',
       idleToastSlice.includes('displayedSessionMatches(target, displayStateRef.current?.displayed.sessionId)')
-        && !idleToastSlice.includes('sessionIdRef.current')
-        && terminalToastSlice.includes('displayedSessionMatches(sid, displayStateRef.current?.displayed.sessionId)')
-        && !terminalToastSlice.includes("if (active) toast('run aborted')"));
-    // Wiring lock: both slash stamp sites resolve through that helper — the
-    // extension `/run` dispatch/summary and the `/code-review` probe with its
+        && !idleToastSlice.includes('sessionIdRef.current'));
     // mid-flight switch guard. Every read of the active ref in those slices is
     // an argument to the helper, so no site stamps the clobberable ref alone.
     const composerAt = appSource.indexOf('const parsed = parseSupportedCommand(text);');
@@ -5117,6 +5233,269 @@ function seedReady(app: AppSwitchHarness, identity: RuntimeIdentity, cursor = 4)
 
 
 
+
+// ---- Reply stars: App integration (minimap source, jump, row toggle) ----
+{
+  // Ownership truth table for the turn_terminal settled refill: the captured
+  // runtime (incarnation + socket generation + TERMINAL TURN ID) must still
+  // own the session at response time — the captured terminal turn must be
+  // the session's MOST RECENT terminal turn and no turn may be in flight.
+  // Settled agent_settled/queue_update frames advance the accepted cursor
+  // but carry no turn identity, so they never invalidate (deterministic
+  // captured frame order: turn_terminal(T1) → get_messages sent →
+  // agent_settled/queue_update → response lands).
+  const ownership = { runtimeIncarnation: 'inc-a', socketGeneration: 3, turnId: 'T1' };
+  const stripIdleT1 = { turnId: '', isStreaming: false, terminalTurnIds: ['T1'] };
+  check('fresh settled-refill ownership passes', settledRefillStillOwned('s', ownership, 'inc-a', 3, stripIdleT1) === true);
+  check('settled refill survives agent_settled/queue_update cursor advances (T1 still last terminal)',
+    settledRefillStillOwned('s', ownership, 'inc-a', 3, { turnId: '', isStreaming: false, terminalTurnIds: ['T0', 'T1'] }) === true);
+  check('settled refill rejects a bumped socket generation', settledRefillStillOwned('s', ownership, 'inc-a', 4, stripIdleT1) === false);
+  check('settled refill rejects a replaced resident incarnation', settledRefillStillOwned('s', ownership, 'inc-b', 3, stripIdleT1) === false);
+  check('settled refill rejects a newer turn still in flight', settledRefillStillOwned('s', ownership, 'inc-a', 3, { turnId: 'T2', isStreaming: true, terminalTurnIds: ['T1'] }) === false);
+  check('settled refill rejects a newer accepted turn id', settledRefillStillOwned('s', ownership, 'inc-a', 3, { turnId: 'T2', isStreaming: false, terminalTurnIds: ['T1'] }) === false);
+  check('settled refill rejects when T2 started AND finished before the response (T2 is the last terminal)',
+    settledRefillStillOwned('s', ownership, 'inc-a', 3, { turnId: '', isStreaming: false, terminalTurnIds: ['T1', 'T2'] }) === false);
+  check('settled refill fails closed on an unknown/reset strip', settledRefillStillOwned('s', ownership, 'inc-a', 3, undefined) === false
+    && settledRefillStillOwned('s', ownership, 'inc-a', 3, { turnId: '', isStreaming: false, terminalTurnIds: [] }) === false);
+  check('settled refill rejects empty identity parts', settledRefillStillOwned('', ownership, 'inc-a', 3, stripIdleT1) === false
+    && settledRefillStillOwned('s', { ...ownership, runtimeIncarnation: '' }, 'inc-a', 3, stripIdleT1) === false
+    && settledRefillStillOwned('s', { ...ownership, turnId: '' }, 'inc-a', 3, stripIdleT1) === false);
+  // Stop-tap regression (goal-stop "Saving reply…"): the optimistic idle
+  // reset must not orphan the live turn's typed identity — the real
+  // turn_terminal still has to land on the strip's terminal ledger, or the
+  // settled-refill ownership check rejects the canonical-id hydration and
+  // the aborted reply is stuck on "Saving reply…" forever. Full sequence:
+  // turn_started(T1) → stop tap (reconcile false,'') → turn_terminal(T1).
+  let stopStrip = applyActivityStripEvent(emptyActivityStripState('s'), { type: 'turn_started', turnId: 'T1' }, 's');
+  stopStrip = reconcileActivityStrip(stopStrip, 's', false, '');
+  check('stop-tap idle preserves the pending turn identity', stopStrip.turnId === 'T1' && stopStrip.isStreaming === false);
+  stopStrip = applyActivityStripEvent(stopStrip, { type: 'turn_terminal', turnId: 'T1', status: 'aborted' }, 's');
+  check('settled refill owns the terminal that landed after a stop-tap idle',
+    stopStrip.terminalTurnIds.includes('T1')
+    && settledRefillStillOwned('s', ownership, 'inc-a', 3, stopStrip) === true);
+  // The stop-tap sequence must not weaken the refill ownership guards.
+  check('stop-tap sequence keeps every refill ownership rejection',
+    settledRefillStillOwned('s', ownership, 'inc-b', 3, stopStrip) === false
+    && settledRefillStillOwned('s', ownership, 'inc-a', 4, stopStrip) === false
+    && settledRefillStillOwned('s', { ...ownership, turnId: 'T2' }, 'inc-a', 3, stopStrip) === false);
+  // Jump resolution: by authoritative entry id against the CURRENT items
+  // only — never body text, never a stale snapshot.
+  const jumpItems = messagesToItems([
+    { id: 'row-1', message: { role: 'user', content: [{ type: 'text', text: 'q' }], timestamp: 1 } },
+    { id: 'row-2', message: { role: 'assistant', content: [{ type: 'text', text: 'same body' }], timestamp: 2 } },
+    { id: 'row-3', message: { role: 'assistant', content: [{ type: 'text', text: 'same body' }], timestamp: 3 } },
+    { id: 'row-4', message: { role: 'assistant', content: [{ type: 'text', text: 'other' }], timestamp: 4 } },
+  ]);
+  check('jump resolves the exact authoritative entry index', planStarredJump(jumpItems, 'row-3') === 2);
+  check('identical reply bodies resolve independently by entry id',
+    planStarredJump(jumpItems, 'row-2') === 1 && planStarredJump(jumpItems, 'row-2') !== planStarredJump(jumpItems, 'row-3'));
+  check('a stale minimap entry (refilled away) resolves nothing',
+    planStarredJump(jumpItems, 'row-gone') === -1 && planStarredJump(jumpItems, '') === -1);
+
+  // Listener+session scope keying: identical entry-id strings in two
+  // listeners or two sessions never share a bucket.
+  check('star scope key discriminates authority and session',
+    replyStarScopeKey({ authority: 'h1', sessionId: 's' }) !== replyStarScopeKey({ authority: 'h2', sessionId: 's' })
+    && replyStarScopeKey({ authority: 'h1', sessionId: 's' }) !== replyStarScopeKey({ authority: 'h1', sessionId: 's2' })
+    && replyStarScopeKey({ authority: 'h1', sessionId: 's' }) === replyStarScopeKey({ authority: 'h1', sessionId: 's' }));
+
+  // Reply action strip (shared ReplyActions behind the FinalAssistant
+  // `reply` gate): the favorite keeps its legacy toggle DOM/classes/entry
+  // id, and copy/save raw markdown always render — independent of entry id
+  // and timestamp. A missing wire timestamp fails ONLY the save, through
+  // the caller's central onError sink. No reply prop → no action chrome.
+  resetTranscriptStamps();
+  const starBase = { blocks: [{ type: 'text', text: 'done' }], sessionId: 'sess', workspaceCwd: '/w', itemId: 'final-1' };
+  const replyWith = (star: { entryId: string | null; starred: boolean; onToggle: (entryId: string, starred: boolean) => void }, timestampMs?: number) =>
+    renderToStaticMarkup(createElement(FinalAssistant, {
+      ...starBase,
+      reply: { ...(timestampMs !== undefined ? { timestampMs } : {}), star, onError: () => {} },
+    }));
+  const unstarred = replyWith({ entryId: 'row-2', starred: false, onToggle: () => {} }, 1700000000000);
+  const starred = replyWith({ entryId: 'row-2', starred: true, onToggle: () => {} }, 1700000000000);
+  const pendingStar = renderToStaticMarkup(createElement(FinalAssistant, {
+    ...starBase,
+    errorMessage: 'model failed',
+    reply: { timestampMs: 1700000000000, star: { entryId: null, starred: false, onToggle: () => {} }, onError: () => {} },
+  }));
+  const noTime = replyWith({ entryId: 'row-2', starred: false, onToggle: () => {} });
+  const noReply = renderToStaticMarkup(createElement(FinalAssistant, { ...starBase }));
+  check('unstarred row renders the star toggle with explicit label, glyph, and the authoritative entry id',
+    unstarred.includes('assistant-star-toggle') && unstarred.includes('aria-pressed="false"')
+      && unstarred.includes('aria-label="Star"') && unstarred.includes('☆')
+      && unstarred.includes('data-entry-id="row-2"'),
+    unstarred);
+  check('starred row renders pressed state with Unstar label, glyph, and entry id',
+    starred.includes('aria-pressed="true"') && starred.includes('aria-label="Unstar"') && starred.includes('★')
+      && starred.includes('data-entry-id="row-2"'),
+    starred);
+  check('copy and save raw markdown render on every reply with the strip, independent of entry id and timestamp',
+    unstarred.includes('data-reply-action="copy-markdown"') && unstarred.includes('data-reply-action="save-markdown"')
+      && pendingStar.includes('data-reply-action="copy-markdown"') && pendingStar.includes('data-reply-action="save-markdown"')
+      && noTime.includes('data-reply-action="copy-markdown"') && noTime.includes('data-reply-action="save-markdown"')
+      && unstarred.includes('aria-label="Copy markdown"') && unstarred.includes('aria-label="Save markdown"'),
+    JSON.stringify({ pendingStar: pendingStar.includes('data-reply-action='), noTime: noTime.includes('data-reply-action=') }));
+  check('a live-synthetic final has no pending label, star button, or entry stamp, and keeps its error',
+    !pendingStar.includes('Saving reply…') && !pendingStar.includes('assistant-star-pending')
+      && !pendingStar.includes('assistant-star-toggle') && !pendingStar.includes('data-entry-id')
+      && pendingStar.includes('msg--assistant__error') && pendingStar.includes('model failed'),
+    pendingStar);
+  check('components without the reply prop render no star or reply-action chrome',
+    !noReply.includes('assistant-star-toggle') && !noReply.includes('assistant-star-pending') && !noReply.includes('Saving reply…')
+      && !noReply.includes('assistant-reply-action') && !noReply.includes('msg--assistant__actions') && !noReply.includes('data-entry-id'),
+    noReply);
+  check('the action strip renders at the reply start, before the answer body',
+    unstarred.indexOf('class="msg--assistant__actions"') >= 0
+      && unstarred.indexOf('class="assistant-text"') >= 0
+      && unstarred.indexOf('class="msg--assistant__actions"') < unstarred.indexOf('class="assistant-text"'),
+    unstarred);
+  check('starred reply markup contains Unstar label after glyph',
+    starred.includes('class="assistant-star-toggle__label">Unstar</span>')
+      && starred.indexOf('★') < starred.indexOf('assistant-star-toggle__label'),
+    starred);
+  check('unstarred reply shows an explicit Star label next to the ☆ glyph',
+    unstarred.includes('assistant-star-toggle__label') && unstarred.includes('☆')
+      && unstarred.includes('>Star</span>'),
+    unstarred);
+  check('exactly one star control per reply — no duplicate anywhere in the row',
+    (unstarred.match(/class="assistant-star-toggle"/g) ?? []).length === 1
+      && (starred.match(/class="assistant-star-toggle"/g) ?? []).length === 1,
+    JSON.stringify({
+      unstarred: (unstarred.match(/class="assistant-star-toggle"/g) ?? []).length,
+      starred: (starred.match(/class="assistant-star-toggle"/g) ?? []).length,
+    }));
+
+  // Actual jump mount: the jump drives the live viewport to the starred
+  // anchor with follow=false, and the DISPLAYED surface renders the anchor
+  // neighborhood AND the tail ownership marker together (bounded retained
+  // slices) — through the real React component, before any scroll write.
+  resetTranscriptStamps();
+  const mountHistory = Array.from({ length: 301 }, (_, index) => ({
+    id: `m${index}`,
+    message: { role: index % 2 === 0 ? 'user' : 'assistant', content: [{ type: 'text', text: `mount turn ${index}` }], timestamp: index },
+  }));
+  const mountItems = messagesToItems(mountHistory);
+  const mountViewport = seedLiveViewport(runtimeKey(A), {
+    follow: false,
+    anchorItemId: 'm2',
+    anchorOffsetPx: 0,
+    fallbackScrollTop: 0,
+    openFoldKeys: new Set<string>(),
+  }).viewport;
+  const jumpRendered = renderToStaticMarkup(createElement(TranscriptSurface, {
+    rk: runtimeKey(A),
+    sessionId: A.sessionId,
+    items: mountItems,
+    active: true,
+    connState: 'on' as const,
+    workspaceCwd: '/w',
+    itemsVersion: 1,
+    initialStart: tailProjectionStart(mountItems.length),
+    getViewport: () => mountViewport,
+    scrollRef: { current: null },
+    pinIfPinned: () => {},
+    forcePin: () => {},
+    onContentEl: () => {},
+    onCommit: () => {},
+    getAnchorIndex: (_sid: string, anchorItemId: string) => mountItems.findIndex((item) => item.id === anchorItemId),
+    starJumpNonce: 0,
+  }));
+  const mounted = (jumpRendered.match(/data-item-id="/g) ?? []).length;
+  check('the jump viewport mounts the starred anchor and the tail marker together',
+    jumpRendered.includes('data-live-anchor="m2"') && jumpRendered.includes('data-live-follow="false"')
+      && jumpRendered.includes('mount turn 2')
+      && jumpRendered.includes('mount turn 300'),
+    JSON.stringify({ mounted }));
+  check('the jump-mounted retained slices stay bounded', mounted <= 240, JSON.stringify({ mounted }));
+
+}
+
+{
+  // Refresh-mid-turn regression (pure): a cold-full cut of a session with an
+  // ACTIVE turn must replay ONLY that turn's turn_started plus the in-flight
+  // assistant chain tracked by itemId start/end pairing. A settled
+  // (message_end-matched) assistant and every user message stay in
+  // apply-messages — never duplicated. Tool-wait (no open assistant) replays
+  // turn_started alone. session_resync / empty activeTurnId / trimmed
+  // non-contiguous chains never replay.
+  const refreshRaw = (events: unknown[], watermark: number, extra: Record<string, unknown> = {}) => ({
+      type: 'subscription_snapshot',
+      sessionId: B.sessionId,
+      runtimeIncarnation: B.runtimeIncarnation,
+      watermark,
+      reason: 'cold-full',
+      state: { sessionId: B.sessionId },
+      messages: [
+        { message: { role: 'user', content: [{ type: 'text', text: 'u' }] } },
+        { message: { role: 'assistant', content: [{ type: 'text', text: 'settled' }] } },
+      ],
+      events: events.map((event) => ({
+        ...(event as Record<string, unknown>),
+        sessionId: B.sessionId,
+        runtimeIncarnation: B.runtimeIncarnation,
+      })),
+      ...extra,
+  });
+  const refreshPlan = (raw: unknown) => {
+    const started = beginSessionSwitch({
+      displayed: A, commandTarget: A, pending: null, nextGeneration: 1,
+    }, targetB);
+    const afterHandoff = acceptSwitchHandoff(
+      started.state, started.generation, parseSwitchHandoff(handoff(B, 0), targetB), undefined,
+    );
+    return acceptAuthoritativeCut(afterHandoff.state, started.generation, parseSubscriptionCut(raw));
+  };
+  const openChain = [
+    { type: 'turn_started', sequence: 1, turnId: 'T' },
+    { type: 'message_start', sequence: 2, turnId: 'T', itemId: 'B:T:m1', message: { role: 'user' } },
+    { type: 'message_end', sequence: 3, turnId: 'T', itemId: 'B:T:m1', message: { role: 'user' } },
+    { type: 'message_start', sequence: 4, turnId: 'T', itemId: 'B:T:m2', message: { role: 'assistant' } },
+    { type: 'message_update', sequence: 5, turnId: 'T', itemId: 'B:T:m2', assistantMessageEvent: { type: 'text_delta' } },
+    { type: 'message_end', sequence: 6, turnId: 'T', itemId: 'B:T:m2', message: { role: 'assistant' } },
+    { type: 'message_start', sequence: 7, turnId: 'T', itemId: 'B:T:m3', message: { role: 'assistant' } },
+    { type: 'message_update', sequence: 8, turnId: 'T', itemId: 'B:T:m3', assistantMessageEvent: { type: 'text_delta' } },
+  ];
+  const multiPlan = refreshPlan(refreshRaw(openChain, 8, { activeTurnId: 'T' }));
+  const multiReplay = multiPlan.actions.filter((action) => action.type === 'replay-events');
+  const multiReplaySeqs = multiReplay.length === 1
+    ? multiReplay[0].events.map((event) => event.sequence) : [];
+  check('cold active-turn replay restores ONLY turn_started + the unmatched-end in-flight assistant chain',
+    multiPlan.settlesPromise === true
+      && multiReplay.length === 1
+      && JSON.stringify(multiReplaySeqs) === JSON.stringify([1, 7, 8])
+      && multiPlan.actions.find((action) => action.type === 'apply-messages')?.preserveInflight === false,
+    JSON.stringify(multiReplaySeqs));
+  const multiCursor = multiPlan.actions.find((action) => action.type === 'install-cursor');
+  check('the replayed tail never regresses the live cursor: install-cursor re-stamps the cut watermark',
+    multiCursor?.type === 'install-cursor' && multiCursor.cursor === 8,
+    JSON.stringify({ cursor: multiCursor && multiCursor.type === 'install-cursor' ? multiCursor.cursor : null }));
+  const toolWaitPlan = refreshPlan(refreshRaw(openChain.slice(0, 6), 6, { activeTurnId: 'T' }));
+  const toolWaitReplay = toolWaitPlan.actions.filter((action) => action.type === 'replay-events');
+  check('tool-wait (no open assistant) replays turn_started alone — settled assistants and user frames never replay',
+    toolWaitReplay.length === 1
+      && toolWaitReplay[0].events.length === 1
+      && toolWaitReplay[0].events[0].type === 'turn_started'
+      && toolWaitPlan.actions.find((action) => action.type === 'apply-messages')?.preserveInflight === true,
+    JSON.stringify(toolWaitReplay.map((action) => action.events.map((event) => event.sequence))));
+  const resyncPlan = refreshPlan({
+    ...refreshRaw(openChain.slice(0, 2), 2, { activeTurnId: 'T' }),
+    type: 'session_resync',
+    reason: 'resync',
+  });
+  check('session_resync cuts never replay active-turn events',
+    !resyncPlan.actions.some((action) => action.type === 'replay-events'),
+    JSON.stringify(resyncPlan.actions.map((action) => action.type)));
+  const noActivePlan = refreshPlan(refreshRaw(openChain, 8));
+  check('a cold-full cut without an active turn never replays',
+    !noActivePlan.actions.some((action) => action.type === 'replay-events'),
+    JSON.stringify(noActivePlan.actions.map((action) => action.type)));
+  const trimmedPlan = refreshPlan(refreshRaw(openChain.slice(4), 8, { activeTurnId: 'T' }));
+  check('a trimmed non-contiguous chain keeps the existing resubscribe-zero guard and never replays',
+    trimmedPlan.settlesPromise === false
+      && trimmedPlan.actions.some((action) => action.type === 'resubscribe-zero')
+      && !trimmedPlan.actions.some((action) => action.type === 'replay-events'),
+    JSON.stringify(trimmedPlan.actions.map((action) => action.type)));
+}
 
 console.log(`\nsessionSwitchApp.test: ${ran} assertions, ${failures.length} failure(s)`);
 if (failures.length) {

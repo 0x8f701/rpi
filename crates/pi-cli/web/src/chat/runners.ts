@@ -538,10 +538,45 @@ export class RunnerRegistry {
     }
   }
 
+  private probeConnectedLiveness(runner: RunnerRuntime): void {
+    if (runner.view.state !== 'connected') return;
+    const socket = runner.socket;
+    if (!socket || socket.readyState !== 1) return;
+    const sourceSessionId = runner.bootstrapSessionId?.trim() ?? '';
+    if (!sourceSessionId) return;
+    const generation = runner.generation;
+    for (const pending of runner.pending.values()) {
+      if (
+        pending.generation === generation
+        && pending.command === 'get_state'
+        && pending.responseOwner === sourceSessionId
+      ) return;
+    }
+    void this.sendCommand(
+      runner,
+      generation,
+      { type: 'get_state' },
+      undefined,
+      sourceSessionId,
+    ).then(
+      () => undefined,
+      (error: unknown) => {
+        if (error instanceof RunnerCommandError && error.kind === 'transport') return;
+        if (!this.isCurrentGeneration(runner, generation)) return;
+        const message = error instanceof Error ? error.message : String(error);
+        this.updateView(runner, { error: safeText(message) || 'Runner probe failed.' });
+      },
+    );
+  }
+
   private readonly onWake = (): void => {
     if (this.disposed) return;
     if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
     for (const runner of this.runners.values()) {
+      if (runner.view.state === 'connected') {
+        this.probeConnectedLiveness(runner);
+        continue;
+      }
       if (!this.shouldWake(runner)) continue;
       this.cancelReconnect(runner);
       runner.reconnectDelay = RUNNER_RECONNECT_INITIAL_MS;

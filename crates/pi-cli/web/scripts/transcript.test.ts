@@ -19,12 +19,14 @@ import { TaskToolCardBody, ToastList, ToolCard, BashCard } from '../src/App.tsx'
 import { redactedClipboardText } from '../src/ansi.ts';
 import {
   messagesToItems,
+  assistantTimestampMs,
   boundOutput,
   customToItem,
   orchestrationIrcView,
   applyToolSnapshot,
   applyToolStartToItems,
   applyToolResultToItems,
+  toolCardId,
   toolMedia,
   userImages,
   userMessageProjection,
@@ -45,6 +47,7 @@ import {
   parseEditCard,
   compactToolArgs,
   parseCommandCardArgs,
+  parseBashDiagnostic,
   parseProcessCardArgs,
   parseWriteCardArgs,
   parseReadCard,
@@ -82,6 +85,7 @@ import {
   IRC_COMPACT_LINE_LIMIT,
   transcriptPathContext,
 } from '../src/transcript.ts';
+import { deriveStarredReplies } from '../src/replyStars.ts';
 import {
   activityStripView,
   applyActivityStripEvent,
@@ -257,6 +261,68 @@ check('TOOL_OUTPUT_LINE_LIMIT == 6 (TUI DEFAULT_CARD_OUTPUT_LIMIT)', TOOL_OUTPUT
       && waitCards[0].status === 'error'
       && waitCards[0].result === 'orchestration shut down',
     JSON.stringify(waitCards[0]),
+  );
+}
+
+// ---- frozen tool-card identity: live start → authoritative merge patches the row ----
+// Reported defect (web-commands-review): a live tool card took its row id from
+// the tool_execution_start frame's wire entry id (`<session>:<turn>:tool:call-…`)
+// while the get_messages restore derived `tc:<toolCallId>`. mergeAuthoritativeItems
+// then swapped the row (removed + re-added) instead of patching it, so the card's
+// copy control remounted mid-interaction: the click target detached and the
+// `copied` confirmation never rendered even though the clipboard write
+// succeeded. One frozen identity derived from toolCallId must survive the merge
+// and keep the card's settled state. Mirrors the exact observed itemIds.
+{
+  const callId = 'call-presentation-bash-16';
+  const frameItemId = `sess-1:turn-1:tool:${callId}`;
+  const live = applyToolStartToItems([], {
+    kind: 'toolCard',
+    toolCallId: callId,
+    toolName: 'bash',
+    args: { command: 'printf ok' },
+    status: 'running',
+    result: '',
+  }, frameItemId);
+  const liveCard = live[0];
+  check(
+    'live tool card id is frozen from toolCallId',
+    liveCard?.kind === 'toolCard' && liveCard.id === toolCardId(callId),
+    JSON.stringify(liveCard),
+  );
+  check(
+    'live tool card never adopts the frame wire entry id',
+    liveCard?.kind === 'toolCard' && liveCard.id !== frameItemId,
+    JSON.stringify(liveCard),
+  );
+
+  const ended = applyToolSnapshot(live, callId, 'ok', 'done');
+  const history = messagesToItems([
+    { id: 'entry-call', message: { role: 'assistant', content: [{ type: 'toolCall', id: callId, name: 'bash', arguments: { command: 'printf ok' } }] } },
+    { id: 'entry-result', message: { role: 'toolResult', toolCallId: callId, content: [{ type: 'text', text: 'ok' }], isError: false } },
+  ]);
+  const restoredCard = history.find((item) => item.kind === 'toolCard');
+  check(
+    'restored tool card derives the same frozen id',
+    restoredCard?.kind === 'toolCard' && restoredCard.id === liveCard.id,
+    JSON.stringify(history),
+  );
+
+  const merged = mergeAuthoritativeItems(history, ended);
+  const cards = merged.filter((item) => item.kind === 'toolCard');
+  check('live → authority merge leaves exactly one row for the call', cards.length === 1, JSON.stringify(merged));
+  check(
+    'live → authority merge keeps the row identity (patch, never remount)',
+    cards[0]?.id === liveCard.id,
+    JSON.stringify(cards.map((item) => item.id)),
+  );
+  check(
+    'live → authority merge keeps the settled card state',
+    cards[0]?.kind === 'toolCard'
+      && cards[0].status === 'done'
+      && cards[0].result === 'ok'
+      && cards[0].toolCallId === callId,
+    JSON.stringify(cards[0]),
   );
 }
 
@@ -1340,6 +1406,127 @@ check(
     && restoredView.children.every((child) => child.status === 'completed')
     && restoredView.children[0].result === 'restored output'
     && taskCardStatus(restoredSettled[0]) === 'done', JSON.stringify(restoredView));
+  const hydrationJobId = '01a1abe0-fd7d-7a91-832b-8ac93b93996f';
+  const hydrationToolCallId = 'call-restart-held-task';
+  const hydrationArgs = {
+    context: 'Durable reconnect contract: preserve the exact child job, agent, and parent identity across process restart.',
+    tasks: [{
+      name: 'RestartWorker',
+      agent: 'writer',
+      task: 'restart-held-subagent: preserve exact identity across process restart and deliver the held marker exactly once.',
+    }],
+  };
+  const hydrationSpawn = [{
+    index: 0,
+    jobId: hydrationJobId,
+    agentId: 'RestartWorker',
+    agent: 'writer',
+    status: 'queued',
+  }];
+  const hydrationJob = (status: string) => ({
+    id: hydrationJobId,
+    agentId: 'RestartWorker',
+    agent: 'writer',
+    parentId: 'Main',
+    status,
+  });
+  let hydrationLive = applyToolStartToItems([], {
+    kind: 'toolCard',
+    toolCallId: hydrationToolCallId,
+    toolName: 'task',
+    args: hydrationArgs,
+    status: 'running',
+    result: '',
+  });
+  hydrationLive = applyJobUpdated(hydrationLive, { job: hydrationJob('queued') });
+  hydrationLive = applyToolSnapshot(
+    hydrationLive,
+    hydrationToolCallId,
+    '[0] RestartWorker (writer) — queued as job 01a1abe0-fd7d-7a91-832b-8ac93b93996f',
+    'done',
+    hydrationSpawn,
+  );
+  hydrationLive = applyJobUpdated(hydrationLive, { job: hydrationJob('running') });
+  const hydrationHistory = messagesToItems([
+    {
+      id: 'hydration-assistant',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'toolCall', id: hydrationToolCallId, name: 'task', arguments: hydrationArgs }],
+        timestamp: 1,
+      },
+    },
+    {
+      id: 'hydration-result',
+      message: {
+        role: 'toolResult',
+        toolCallId: hydrationToolCallId,
+        toolName: 'task',
+        content: [{ type: 'text', text: '[0] RestartWorker (writer) — queued as job 01a1abe0-fd7d-7a91-832b-8ac93b93996f' }],
+        details: hydrationSpawn,
+        isError: false,
+        timestamp: 2,
+      },
+    },
+  ]);
+  const hydrated = mergeAuthoritativeItems(hydrationHistory, hydrationLive, false);
+  const hydratedCard = hydrated.find((item) => item.kind === 'toolCard' && item.toolCallId === hydrationToolCallId);
+  const hydratedChild = hydratedCard?.kind === 'toolCard'
+    ? resolveTaskCardView(hydratedCard.args, hydratedCard.details)?.children[0]
+    : undefined;
+  check('hydration keeps the same running child and Main parent',
+    hydrated.filter((item) => item.kind === 'toolCard' && item.toolCallId === hydrationToolCallId).length === 1
+      && hydratedChild?.jobId === hydrationJobId
+      && hydratedChild.agentId === 'RestartWorker'
+      && hydratedChild.parentId === 'Main'
+      && hydratedChild.status === 'running',
+    JSON.stringify(hydratedChild));
+  const unrelatedHydration = applyJobUpdated(hydrationLive, {
+    job: { id: 'job-other', agentId: 'RestartWorker', agent: 'writer', parentId: 'Main', status: 'completed' },
+  });
+  const unrelatedChild = resolveTaskCardView(unrelatedHydration[0].args, unrelatedHydration[0].details)?.children[0];
+  check('unrelated job does not replace the hydrated task child',
+    unrelatedChild?.jobId === hydrationJobId
+      && unrelatedChild.status === 'running'
+      && unrelatedChild.parentId === 'Main',
+    JSON.stringify(unrelatedChild));
+  const runningHistory = messagesToItems([
+    {
+      id: 'running-history-assistant',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'toolCall', id: hydrationToolCallId, name: 'task', arguments: hydrationArgs }],
+        timestamp: 1,
+      },
+    },
+    {
+      id: 'running-history-result',
+      message: {
+        role: 'toolResult',
+        toolCallId: hydrationToolCallId,
+        toolName: 'task',
+        content: [{ type: 'text', text: '[0] RestartWorker (writer) — queued as job 01a1abe0-fd7d-7a91-832b-8ac93b93996f' }],
+        details: [{ ...hydrationSpawn[0], status: 'running' }],
+        isError: false,
+        timestamp: 2,
+      },
+    },
+  ]);
+  const queuedLive = applyJobUpdated(applyToolSnapshot(applyToolStartToItems([], {
+    kind: 'toolCard',
+    toolCallId: hydrationToolCallId,
+    toolName: 'task',
+    args: hydrationArgs,
+    status: 'running',
+    result: '',
+  }), hydrationToolCallId, 'queued', 'done', hydrationSpawn), { job: hydrationJob('queued') });
+  const retainedRunning = mergeAuthoritativeItems(runningHistory, queuedLive, false);
+  const retainedRunningChild = resolveTaskCardView(retainedRunning[0].args, retainedRunning[0].details)?.children[0];
+  check('history running outranks a live queued child',
+    retainedRunningChild?.status === 'running' && retainedRunningChild.parentId === 'Main',
+    JSON.stringify(retainedRunningChild));
+  const repeat = mergeAuthoritativeItems(hydrated, hydrationLive, false);
+  check('hydration projection is idempotent', JSON.stringify(repeat) === JSON.stringify(hydrated));
   const runningBeforeReconnect = applyJobUpdated(items, {
     job: { id: 'job-a', agentId: 'Alpha', agent: 'reviewer', status: 'running' },
   });
@@ -1386,6 +1573,31 @@ check(
     job: { id: 'job-b', agentId: 'Beta', agent: 'task', status: 'cancelled' },
   });
   check('task parent cancellation is explicit for completed plus cancelled children', taskCardStatus(completedAndCancelled[0]) === 'cancelled', JSON.stringify(completedAndCancelled[0]));
+
+  const cancellingParent = applyJobUpdated(items, {
+    job: { id: 'job-a', agentId: 'Alpha', agent: 'reviewer', status: 'cancelling' },
+  });
+  const cancellingView = resolveTaskCardView(cancellingParent[0].args, cancellingParent[0].details);
+  check('cancelling child keeps the Task card running', !!cancellingView
+    && cancellingView.children[0].status === 'cancelling'
+    && taskCardStatus(cancellingParent[0]) === 'running', JSON.stringify(cancellingView));
+  const regressRunning = applyJobUpdated(cancellingParent, {
+    job: { id: 'job-a', agentId: 'Alpha', agent: 'reviewer', status: 'running' },
+  });
+  const regressView = resolveTaskCardView(regressRunning[0].args, regressRunning[0].details);
+  check('stale running cannot regress cancelling', !!regressView
+    && regressView.children[0].status === 'cancelling', JSON.stringify(regressView));
+  const advanceCancel = applyJobUpdated(cancellingParent, {
+    job: { id: 'job-a', agentId: 'Alpha', agent: 'reviewer', status: 'cancelled' },
+  });
+  const advanceView = resolveTaskCardView(advanceCancel[0].args, advanceCancel[0].details);
+  check('cancelled advances past cancelling', !!advanceView
+    && advanceView.children[0].status === 'cancelled', JSON.stringify(advanceView));
+  const omittedCancelling = applyJobSnapshot(cancellingParent, []);
+  const omittedView = resolveTaskCardView(omittedCancelling[0].args, omittedCancelling[0].details);
+  check('empty authoritative snapshot omission-settles every live child', !!omittedView
+    && omittedView.children[0].status === 'cancelled'
+    && omittedView.children[1].status === 'cancelled', JSON.stringify(omittedView));
 
   const renamedWithoutStatusMutation = applyAgentUpdated(runningBeforeReconnect, {
     agent: { id: 'Alpha', displayName: 'Alpha revived', status: 'idle' },
@@ -1792,6 +2004,122 @@ check('compactToolArgs null → empty', compactToolArgs(null) === '');
   check('parseCommandCardArgs null for empty command', empty === null, JSON.stringify(empty));
   const noCmd = parseCommandCardArgs({ foo: 'bar' });
   check('parseCommandCardArgs null when no command field', noCmd === null, JSON.stringify(noCmd));
+}
+// ---- typed bash diagnostic: rendered card, invalid details keep the error ----
+{
+  // Class assertions match whole class attributes split into tokens, so an
+  // unrelated token with the same prefix can never satisfy them.
+  const classTokens = (markup: string): string[] =>
+    [...markup.matchAll(/class="([^"]*)"/g)].flatMap((attr) => attr[1].split(/\s+/));
+  const hasClass = (markup: string, token: string): boolean => classTokens(markup).includes(token);
+  const occurrences = (markup: string, needle: string): number => markup.split(needle).length - 1;
+  const stages = [
+    { stage: 'launch', exitCode: null, exit: 'none' },
+    { stage: 'timed_out', exitCode: null, exit: 'none' },
+    { stage: 'non_zero_exit', exitCode: 7, exit: '7' },
+  ];
+  for (const sample of stages) {
+    const details = { requestedCwd: '/workspace/app', stage: sample.stage, exitCode: sample.exitCode, extra: true };
+    const parsed = parseBashDiagnostic(details);
+    const view = parseCommandCardArgs({ command: 'exit 7' }, details);
+    const html = renderToStaticMarkup(createElement(ToolCard, {
+      item: {
+        kind: 'toolCard', id: `bash-${sample.stage}`, toolCallId: `call-${sample.stage}`, toolName: 'bash',
+        args: { command: 'exit 7' }, status: 'error', result: 'boom', details,
+      },
+    }));
+    check(
+      `bash ${sample.stage} error card renders typed cwd and stage`,
+      parsed?.requestedCwd === '/workspace/app'
+        && parsed.stage === sample.stage
+        && parsed.exitCode === sample.exitCode
+        && view?.command === 'exit 7'
+        && view.diagnostic?.stage === sample.stage
+        && hasClass(html, 'tool-card--error')
+        && hasClass(html, 'tool-card__command-text')
+        && html.includes('exit 7')
+        && hasClass(html, 'tool-card__output')
+        && html.includes('boom')
+        && hasClass(html, 'tool-card__command-diagnostic')
+        && html.includes('cwd: /workspace/app')
+        && html.includes(`stage: ${sample.stage}`)
+        && html.includes(`exit: ${sample.exit}`)
+        && !html.includes('"requestedCwd"'),
+      html,
+    );
+  }
+
+  const invalidDetails = [
+    undefined,
+    null,
+    { exitCode: 2 },
+    { requestedCwd: '', stage: 'launch', exitCode: null },
+    { requestedCwd: '/workspace/app', stage: 'aborted', exitCode: null },
+    { requestedCwd: '/workspace/app', stage: 'launch', exitCode: 1.5 },
+    { requestedCwd: '/workspace/app', stage: 'constructor', exitCode: null },
+    { requestedCwd: '/workspace/app', stage: 'toString', exitCode: null },
+    { requestedCwd: '/workspace/app', stage: '__proto__', exitCode: null },
+  ];
+  for (const details of invalidDetails) {
+    const html = renderToStaticMarkup(createElement(ToolCard, {
+      item: {
+        kind: 'toolCard', id: 'bash-invalid', toolCallId: 'call-invalid', toolName: 'bash',
+        args: { command: 'false' }, status: 'error', result: 'kept error', details,
+      },
+    }));
+    check(
+      'invalid or legacy bash details keep command and error without a diagnostic',
+      parseBashDiagnostic(details) === null
+        && parseCommandCardArgs({ command: 'false' }, details)?.diagnostic === null
+        && html.includes('false')
+        && html.includes('kept error')
+        && !hasClass(html, 'tool-card__command-diagnostic'),
+      html,
+    );
+  }
+
+  const cancelled = renderToStaticMarkup(createElement(ToolCard, {
+    item: {
+      kind: 'toolCard', id: 'bash-cancel', toolCallId: 'call-cancel', toolName: 'bash',
+      args: { command: 'sleep 9' }, status: 'cancelled', result: 'Command aborted',
+      details: { requestedCwd: '/workspace/app', stage: 'launch', exitCode: null, cancelled: true },
+    },
+  }));
+  check(
+    'cancelled bash keeps abort text and does not render the failure diagnostic',
+    cancelled.includes('Command aborted')
+      && cancelled.includes('sleep 9')
+      && !hasClass(cancelled, 'tool-card__command-diagnostic'),
+    cancelled,
+  );
+  // Real producer body: for every stage the exact trailer line is stripped,
+  // cwd/stage/exit render exactly once, and the original error text survives.
+  for (const sample of [
+    { stage: 'launch', exitCode: null, exit: 'none', command: 'nonexistent-binary-xyz', error: 'spawn bash ENOENT' },
+    { stage: 'timed_out', exitCode: null, exit: 'none', command: 'sleep 60', error: 'Command timed out after 30 seconds' },
+    { stage: 'non_zero_exit', exitCode: 7, exit: '7', command: 'exit 7', error: 'Command exited with code 7' },
+  ]) {
+    const details = { requestedCwd: '/workspace/app', stage: sample.stage, exitCode: sample.exitCode };
+    const trailer = `[bash diagnostic] stage=${sample.stage} requested_cwd=/workspace/app`;
+    const html = renderToStaticMarkup(createElement(ToolCard, {
+      item: {
+        kind: 'toolCard', id: `bash-trailer-${sample.stage}`, toolCallId: `call-trailer-${sample.stage}`, toolName: 'bash',
+        args: { command: sample.command }, status: 'error', result: `boom\n${sample.error}\n${trailer}`, details,
+      },
+    }));
+    check(
+      `bash ${sample.stage} producer trailer stripped, typed fields rendered once`,
+      parseBashDiagnostic(details) !== null
+        && hasClass(html, 'tool-card__command-diagnostic')
+        && occurrences(html, 'cwd: /workspace/app') === 1
+        && occurrences(html, `stage: ${sample.stage}`) === 1
+        && occurrences(html, `exit: ${sample.exit}`) === 1
+        && html.includes(sample.command)
+        && html.includes(sample.error)
+        && !html.includes('[bash diagnostic]'),
+      html,
+    );
+  }
 }
 
 // ---- command copy: both render paths, redaction, clipboard success/failure ----
@@ -3024,6 +3352,174 @@ check('resolveTodoCardView returns phases not raw args JSON', (() => {
   check('non-handoff customs stay plain labeled customs', plain !== null && plain.kind === 'custom' && plain.label === 'notice');
   const loop = customToItem({ role: 'custom', customType: 'loop_scheduled_turn', content: '<system-reminder>x</system-reminder>', display: false });
   check('display:false non-handoff customs stay hidden', loop === null);
+}
+
+// ---- reply stars: authoritative-entry-id derivation (App minimap source) ----
+{
+  const starItems = messagesToItems([
+    { id: 'row-1', message: { role: 'user', content: [{ type: 'text', text: 'question' }], timestamp: 1 } },
+    { id: 'row-2', message: { role: 'assistant', content: [{ type: 'text', text: 'same body' }], timestamp: 2 } },
+    { id: 'row-3', message: { role: 'assistant', content: [{ type: 'text', text: 'same body' }], timestamp: 3 } },
+    { id: 'row-5', message: { role: 'assistant', content: [{ type: 'text', text: 'unstarred answer' }], timestamp: 5 } },
+  ]);
+  const bothSameBody = deriveStarredReplies(starItems, new Set(['row-2', 'row-3']));
+  check('identical reply bodies stay independently starred by entry id',
+    bothSameBody.length === 2
+      && bothSameBody[0].entryId === 'row-2' && bothSameBody[1].entryId === 'row-3'
+      && bothSameBody[0].transcriptIndex === 1 && bothSameBody[1].transcriptIndex === 2
+      && bothSameBody[0].preview === bothSameBody[1].preview
+      && bothSameBody[0].itemId !== bothSameBody[1].itemId,
+    JSON.stringify(bothSameBody));
+  const single = deriveStarredReplies(starItems, new Set(['row-3']));
+  check('starring one of two identical bodies derives exactly that entry',
+    single.length === 1 && single[0].entryId === 'row-3' && single[0].transcriptIndex === 2,
+    JSON.stringify(single));
+  check('user rows never derive even with a colliding starred id',
+    deriveStarredReplies(starItems, new Set(['row-1'])).length === 0);
+  check('a starred id whose row is absent stays invisible (stale hydration)',
+    deriveStarredReplies(starItems, new Set(['row-gone'])).length === 0);
+  check('an empty starred set derives an empty minimap list',
+    deriveStarredReplies(starItems, new Set()).length === 0);
+  const settled = starItems.find((item) => item.kind === 'assistant' && item.entryId === 'row-2');
+  check('settled assistant rows carry the authoritative entryId',
+    !!settled && settled.status === 'final' && settled.entryId === 'row-2');
+}
+
+// ---- assistant wire timestamp: stable epoch-ms projection, wrapper authority ----
+// The reply actions (copy / save .md / star) must key on the message's stable
+// wire clock, never the click time or `Date.now()`. `assistantTimestampMs` is
+// the single typed boundary App / chat / collab reuse; `messagesToItems`
+// carries the same value onto the restored assistant item.
+{
+  // Direct message shape: pi-ai AssistantMessage.timestamp is epoch ms.
+  const direct = { role: 'assistant', content: [], timestamp: 1730000000123 };
+  check(
+    'assistantTimestampMs reads the real message timestamp',
+    assistantTimestampMs(direct) === 1730000000123,
+    String(assistantTimestampMs(direct)),
+  );
+  // Hydrated wrapper ({ id, message } from public_transcript_rows): the inner
+  // message timestamp is authoritative; an outer wrapper value is no fallback.
+  check(
+    'assistantTimestampMs prefers the hydrated wrapper message timestamp',
+    assistantTimestampMs({ id: 'row-1', message: { role: 'assistant', timestamp: 1730000000456 } }) === 1730000000456,
+  );
+  check(
+    'assistantTimestampMs ignores an outer wrapper timestamp',
+    assistantTimestampMs({ timestamp: 111, message: { role: 'assistant', timestamp: 222 } }) === 222,
+  );
+  // Undefined — not a throw, not a synthesized clock — for missing/unusable
+  // wire values so the reply itself can never be hidden by a timestamp gap.
+  const unusable: Array<[string, unknown]> = [
+    ['a message without timestamp', { role: 'assistant', content: [] }],
+    ['a wrapper whose message has no timestamp', { id: 'r', message: { role: 'assistant' }, timestamp: 333 }],
+    ['a string timestamp', { role: 'assistant', timestamp: '1730000000123' }],
+    ['a NaN timestamp', { role: 'assistant', timestamp: Number.NaN }],
+    ['an infinite timestamp', { role: 'assistant', timestamp: Number.POSITIVE_INFINITY }],
+    ['the zero sentinel', { role: 'assistant', timestamp: 0 }],
+    ['a negative timestamp', { role: 'assistant', timestamp: -1 }],
+    ['a wrapper with a null message', { id: 'r', message: null }],
+    ['null raw', null],
+    ['an array raw', [{ role: 'assistant', timestamp: 1 }]],
+  ];
+  for (const [name, raw] of unusable) {
+    check(`assistantTimestampMs keeps undefined for ${name}`, assistantTimestampMs(raw) === undefined, JSON.stringify(raw));
+  }
+}
+
+// ---- restored: assistant rows carry distinct, row-stable wire timestamps ----
+{
+  const rows = [
+    { id: 'row-u', message: { role: 'user', content: [{ type: 'text', text: 'first' }], timestamp: 1000 } },
+    { id: 'row-a1', message: { role: 'assistant', content: [{ type: 'text', text: 'first answer' }], timestamp: 2000 } },
+    { id: 'row-a2', message: { role: 'assistant', content: [{ type: 'text', text: 'second answer' }], timestamp: 3000 } },
+  ];
+  const items = messagesToItems(rows);
+  const projected = items.flatMap((item) => (
+    item.kind === 'assistant' ? [{ entryId: item.entryId, timestamp: item.timestamp }] : []
+  ));
+  check(
+    'messagesToItems projects each message’s own wire timestamp',
+    projected.length === 2
+      && projected[0].timestamp === 2000
+      && projected[1].timestamp === 3000
+      && projected[0].timestamp !== projected[1].timestamp,
+    JSON.stringify(projected),
+  );
+  check(
+    'messagesToItems keeps entryId and timestamp distinct authorities',
+    projected[0].entryId === 'row-a1' && projected[0].timestamp === 2000
+      && projected[1].entryId === 'row-a2' && projected[1].timestamp === 3000,
+    JSON.stringify(projected),
+  );
+  const repeated = messagesToItems(rows).flatMap((item) => (
+    item.kind === 'assistant' ? [[item.entryId, item.timestamp]] : []
+  ));
+  check(
+    'restored assistant timestamps are stable across repeated restores',
+    JSON.stringify(repeated) === JSON.stringify([['row-a1', 2000], ['row-a2', 3000]]),
+    JSON.stringify(repeated),
+  );
+  // A missing or unusable wire time keeps the reply visible with NO
+  // timestamp field — never a hole, never a fabricated browser clock.
+  for (const [name, message] of [
+    ['missing', { role: 'assistant', content: [{ type: 'text', text: 'kept' }] }],
+    ['invalid', { role: 'assistant', content: [{ type: 'text', text: 'kept' }], timestamp: 'not-ms' }],
+    ['zero sentinel', { role: 'assistant', content: [{ type: 'text', text: 'kept' }], timestamp: 0 }],
+  ] as Array<[string, Record<string, unknown>]>) {
+    const [kept] = messagesToItems([{ id: `row-${name}`, message }]);
+    check(
+      `restored reply with ${name} timestamp stays visible without a timestamp field`,
+      kept.kind === 'assistant'
+        && kept.status === 'final'
+        && kept.blocks.length === 1
+        && kept.entryId === `row-${name}`
+        && !('timestamp' in kept),
+      JSON.stringify(kept),
+    );
+  }
+  const [failed] = messagesToItems([
+    { id: 'row-f', message: { role: 'assistant', content: [], stopReason: 'error', errorMessage: 'boom', timestamp: 4000 } },
+  ]);
+  check(
+    'failed assistant rows keep their wire timestamp',
+    failed.kind === 'assistant' && failed.errorMessage === 'boom' && failed.timestamp === 4000,
+    JSON.stringify(failed),
+  );
+  // Merge keeps the authoritative wire value and never invents one for a
+  // live streaming reply that has no timestamp yet.
+  const history = messagesToItems([
+    { id: 'row-a1', message: { role: 'assistant', content: [{ type: 'text', text: 'answer' }], timestamp: 2000 } },
+  ]);
+  const liveStreaming = [{ kind: 'assistant' as const, id: 'live-1', status: 'streaming' as const, blocks: [] }];
+  const merged = mergeAuthoritativeItems(history, liveStreaming, true);
+  const mergedDurable = merged.find((item) => item.kind === 'assistant' && item.entryId === 'row-a1');
+  const mergedLive = merged.find((item) => item.kind === 'assistant' && item.id === 'live-1');
+  check(
+    'authoritative merge preserves the restored wire timestamp',
+    mergedDurable !== undefined && mergedDurable.kind === 'assistant' && mergedDurable.timestamp === 2000,
+    JSON.stringify(merged),
+  );
+  check(
+    'merge never invents a timestamp for a live streaming reply',
+    mergedLive !== undefined && mergedLive.kind === 'assistant' && !('timestamp' in mergedLive),
+    JSON.stringify(mergedLive),
+  );
+  // Re-running the SAME merge (same authoritative history + same live cut)
+  // is deterministic and keeps the wire timestamp. Do NOT re-feed the merged
+  // array: preserveInflight intentionally appends the same streaming item
+  // again, so asserting array length/idempotence of merged output would be a
+  // false contract (and unrelated to timestamps).
+  const mergedAgain = mergeAuthoritativeItems(history, liveStreaming, true);
+  const mergedAgainDurable = mergedAgain.find((item) => item.kind === 'assistant' && item.entryId === 'row-a1');
+  check(
+    'repeated merge from the same history and live cut keeps the wire timestamp stable',
+    mergedAgainDurable !== undefined
+      && mergedAgainDurable.kind === 'assistant'
+      && mergedAgainDurable.timestamp === 2000
+      && JSON.stringify(mergedAgain) === JSON.stringify(merged),
+    JSON.stringify(mergedAgain),
+  );
 }
 
 console.log(`\ntranscript.test: ${ran} assertions, ${failures.length} failure(s)`);

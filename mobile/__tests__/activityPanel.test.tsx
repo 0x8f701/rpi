@@ -68,6 +68,11 @@ it('seeds at sequence zero, deduplicates jobs and buckets messages only in Recen
   expect(seed.sequence).toBe(0);
   expect(seed.entries.filter((entry) => activityEntryMatchesPage(entry, 'recent')).map((entry) => entry.summary)).toEqual(['Replacement', MESSAGE.body]);
   expect(seed.entries.filter((entry) => activityEntryMatchesPage(entry, 'settled')).map((entry) => entry.summary)).toEqual(['Delivered answer']);
+  const draining = seedActivityFromList(SESSION, [{ ...LIVE, id: 'j3', status: 'cancelling', description: 'stopping review' }], []);
+  expect(draining.entries[0]?.status).toBe('cancelling');
+  expect(activityEntryMatchesPage(draining.entries[0], 'recent')).toBe(true);
+  expect(activityEntryMatchesPage(draining.entries[0], 'settled')).toBe(false);
+  expect(draining.entries[0]?.summary).toBe('stopping review');
   expect(applyActivityEvent(seed, { type: 'job_updated', sessionId: SESSION, sequence: 1, job: { ...LIVE, description: 'Live replacement' } }).entries.some((entry) => entry.summary === 'Live replacement')).toBe(true);
   expect(seedActivityFromList(SESSION, [], Array.from({ length: 205 }, (_, timestamp) => ({ ...MESSAGE, id: String(timestamp), timestamp }))).entries[0].sourceId).toBe('5');
 });

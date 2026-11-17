@@ -10,6 +10,7 @@ import {
   applyChatMarkdownOpenPath,
   beginMarkdownProbeAttempt,
   boundedVisibleRunnerError,
+  chatCitationChoicesForReopen,
   chatMarkdownExplorerOwnerKey,
   markdownProbeErrorText,
   chatMarkdownOpenFailureText,
@@ -23,7 +24,7 @@ import { SessionView } from '../src/chat/SessionView.tsx';
 import type { ActiveMapping, ProjectRecord } from '../src/chat/mapping.ts';
 import { RunnerCommandError, type RunnerView } from '../src/chat/runners.ts';
 import { emptyFileExplorerSlot, emptyFileExplorerPageCache, fileExplorerApplyCachedPage, fileExplorerBeginCachedPage, fileExplorerCommandForSession, fileExplorerReadCommand, fileExplorerSyncPageCacheWithSlots, readFileExplorerSlot, writeModuleFileExplorerPageCache } from '../src/fileExplorer.ts';
-import { dispatchMarkdownPathClick, markdownOpenValidatedPath, markdownOpenMissingFileVerdict, subscribeMarkdownOpenPath } from '../src/markdown.ts';
+import { dispatchMarkdownPathClick, markdownOpenValidatedPath, markdownOpenMissingFileVerdict, markdownOpenHostFileUnavailable, subscribeMarkdownOpenPath } from '../src/markdown.ts';
 import { FILE_EXPLORER_CLOSE_BTN_ID, FILE_EXPLORER_REFRESH_BTN_ID, FILE_EXPLORER_TOGGLE_ID, FILE_EXPLORER_TREE_TOGGLE_ID, FileExplorerPanel, fileExplorerControlId, fileExplorerHandleDocumentKeyDown, fileExplorerKeydownScope, fileExplorerLineId } from '../src/panels/FileExplorerPanel.tsx';
 
 const failures: string[] = [];
@@ -301,10 +302,11 @@ const activeMapping: ActiveMapping = {
     chatOnError,
   );
   check(
-    'mismatched echoed path reports the typed missing-file verdict to the chat error owner',
+    'mismatched echoed path reports the unresolved read to the chat error owner',
     chatOpens.length === 0
       && chatErrors.length === 1
-      && markdownOpenMissingFileVerdict(true, chatErrors[0]) === true
+      && markdownOpenHostFileUnavailable(chatErrors[0]) === false
+      && markdownOpenMissingFileVerdict(true, chatErrors[0]) === false
       && markdownProbeErrorText(chatErrors[0]).length > 0,
     JSON.stringify({ chatOpens, chatErrors }),
   );
@@ -433,11 +435,12 @@ const activeMapping: ActiveMapping = {
     }),
   );
   check(
-    'probe slot clears on a new probe (target change) and on probe success, gated to the current attempt',
+    'a new probe claims the attempt before its send clears the current toast',
     markdownProbe.includes('if (isCurrentAttempt()) onProbeStarted();')
-      && markdownHandler.includes("if (isCurrentAttempt()) setMarkdownProbeError('');")
-      && (markdownHandler.match(/setMarkdownProbeError\(''\);/g)?.length ?? 0) === 2,
-    markdownHandler.slice(-600),
+      && markdownHandler.includes('const attempt = beginMarkdownProbeAttempt(markdownProbeAttemptRef);')
+      && markdownHandler.includes('const isCurrentAttempt = attempt.isCurrent;')
+      && markdownHandler.includes("if (isCurrentAttempt()) setMarkdownProbeError('');"),
+    markdownHandler.slice(0, 700),
   );
   check(
     'stale probe completions are gated on all three commit paths (send, success, rejection)',
@@ -533,8 +536,23 @@ const activeMapping: ActiveMapping = {
       state.toast === '' && state.opened.join(',') === 'b.ts', JSON.stringify(state));
   }
 
-  // The gate only suppresses superseded attempts: the current attempt's own
-  // commits always land.
+
+  {
+    const attemptRef = { current: 0 };
+    const state = { toast: 'stale', opened: [] as string[] };
+    const pending = wireProbe(attemptRef, state);
+    const stored = chatCitationChoicesForReopen({
+      ...emptyFileExplorerSlot(),
+      citationChoices: { path: 'a.ts', candidates: ['pkg/a.ts', 'pkg/b.ts'] },
+    }, 'a.ts');
+    const reuse = beginMarkdownProbeAttempt(attemptRef);
+    check('stored choices are reused without another probe', stored?.candidates.length === 2 && reuse.isCurrent());
+    pending.succeed('pending.ts');
+    pending.fail(new Error('late'));
+    check('reusing stored choices invalidates the earlier probe',
+      state.opened.length === 0 && state.toast === 'stale', JSON.stringify(state));
+  }
+
   {
     const attemptRef = { current: 0 };
     const state = { toast: '', opened: [] as string[] };
@@ -544,7 +562,6 @@ const activeMapping: ActiveMapping = {
     check('current attempt commits its own rejection', state.toast === 'file is unavailable', state.toast);
   }
 }
-
 // ---- Unique per-route toggle id ----
 {
   check('Chat Files toggle id is its own constant', CHAT_FILE_EXPLORER_TOGGLE_ID === 'chat-file-explorer-toggle-btn');
@@ -615,7 +632,7 @@ const activeMapping: ActiveMapping = {
   };
   seedFile('sess-route-ids', 'src/a.ts', ['const a = 1;']);
   const slot = { tabs: [{ path: 'src/a.ts', view: 'file' as const }], activePath: 'src/a.ts', mode: 'open' as const };
-  const appHtml = renderToStaticMarkup(createElement(FileExplorerPanel, { ...panelProps, sessionId: 'sess-route-ids', slot, onToggleExpanded: () => {} }));
+  const appHtml = renderToStaticMarkup(createElement(FileExplorerPanel, { ...panelProps, sessionId: 'sess-route-ids', slot }));
   const chatHtml = renderToStaticMarkup(createElement(FileExplorerPanel, { ...panelProps, sessionId: 'sess-route-ids', slot, toggleId: CHAT_FILE_EXPLORER_TOGGLE_ID }));
   const ids = (html: string): Set<string> => new Set(Array.from(html.matchAll(/ id="([^"]+)"/g), (m) => m[1]));
   const appIds = ids(appHtml);
@@ -627,7 +644,7 @@ const activeMapping: ActiveMapping = {
     appIds.has('file-explorer-refresh-btn')
       && appIds.has('file-explorer-tree-toggle')
       && appIds.has('file-explorer-drawer-close-btn')
-      && appIds.has('file-explorer-expand-btn')
+      && !appIds.has('file-explorer-expand-btn')
       && appIds.has('file-explorer-line-1')
       && !appIds.has('file-explorer-hide-btn'),
   );
@@ -655,8 +672,7 @@ const activeMapping: ActiveMapping = {
       && fileExplorerLineId(FILE_EXPLORER_TOGGLE_ID, 299) === 'file-explorer-line-299'
       && fileExplorerControlId(FILE_EXPLORER_TOGGLE_ID, 'refresh-btn') === FILE_EXPLORER_REFRESH_BTN_ID
       && fileExplorerControlId(FILE_EXPLORER_TOGGLE_ID, 'tree-toggle') === FILE_EXPLORER_TREE_TOGGLE_ID
-      && fileExplorerControlId(FILE_EXPLORER_TOGGLE_ID, 'drawer-close-btn') === FILE_EXPLORER_CLOSE_BTN_ID
-      && fileExplorerControlId(FILE_EXPLORER_TOGGLE_ID, 'expand-btn') === 'file-explorer-expand-btn',
+      && fileExplorerControlId(FILE_EXPLORER_TOGGLE_ID, 'drawer-close-btn') === FILE_EXPLORER_CLOSE_BTN_ID,
   );
   check(
     'chat toggleId derivation is route-prefixed and has no fullscreen control',

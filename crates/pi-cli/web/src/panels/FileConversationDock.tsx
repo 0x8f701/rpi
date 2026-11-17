@@ -9,6 +9,8 @@ import {
   nextPasteEnterGuard,
 } from '../composerPaste';
 import { nextId } from '../transcript';
+import { fileExplorerDisplayPath } from '../fileExplorer';
+import { safeText } from '../redact';
 import { createScrollPin, type ScrollPinController } from '../scrollPin';
 import {
   ConversationEntryView,
@@ -107,6 +109,11 @@ export function FileConversationDock({
   const disclosure = contextDisclosure(snapshot?.context, selection);
   const ownerSessionId = sessionId ?? '';
   const ownerCwd = cwd ?? undefined;
+  // Scope header shows the REDACTED display path only (credential-shaped
+  // tokens, host absolutes, and out-of-workspace paths never reach the DOM
+  // raw — same pipeline as the tree rows); the raw business path stays
+  // owner-internal and is never rendered as data-path/title/text.
+  const scopePath = snapshot?.path ? safeText(fileExplorerDisplayPath(snapshot.path, ownerCwd)) : '';
 
   const pinIfPinned = useCallback(() => {
     pinRef.current?.followIfPinned(transcriptRef.current);
@@ -186,6 +193,18 @@ export function FileConversationDock({
       data-session-id={ownerSessionId}
       data-workspace-cwd={ownerCwd}
     >
+      <div
+        className="file-conversation__scope"
+        data-testid="file-conversation-scope"
+        data-path={scopePath}
+      >
+        <span className="file-conversation__scope-title">File conversation</span>
+        {scopePath !== '' ? (
+          <div className="file-conversation__scope-path" title={scopePath}>
+            {scopePath}
+          </div>
+        ) : null}
+      </div>
       {disclosure && (
         <div className="file-conversation__context">{disclosure}</div>
       )}
@@ -195,7 +214,13 @@ export function FileConversationDock({
         aria-live="polite"
         onScroll={onTranscriptScroll}
       >
-        {entries.length === 0 ? null : (
+        {entries.length === 0 ? (
+          streaming ? null : (
+            <div className="file-conversation__empty" data-testid="file-conversation-empty">
+              Ask about this file. Messages stay in this file conversation.
+            </div>
+          )
+        ) : (
           entries.map((entry) => (
             <ConversationEntryView
               key={entry.id}
@@ -206,6 +231,8 @@ export function FileConversationDock({
               onLayoutChange={pinIfPinned}
               sessionId={ownerSessionId}
               cwd={ownerCwd}
+              liveStreaming={streaming}
+              onReplyActionError={onError}
             />
           ))
         )}

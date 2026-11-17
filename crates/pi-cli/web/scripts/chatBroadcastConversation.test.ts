@@ -7,6 +7,8 @@ import type { createRoot as CreateRoot, Root } from 'react-dom/client';
 import type { BroadcastConversation as BroadcastConversationComponent } from '../src/chat/BroadcastConversation.tsx';
 import type { ActiveProjectMember, BroadcastRun } from '../src/chat/team';
 import type { ProjectRecord } from '../src/chat/mapping';
+import { replyMarkdownFileName, sourceMarkdownFromBlocks } from '../src/replyMarkdown.ts';
+import { channelLogStorageKey, loadChannelLogs, saveChannelLogs } from '../src/chat/chatChannelLog.ts';
 
 const failures: string[] = [];
 let assertions = 0;
@@ -76,6 +78,14 @@ interface MiniNode {
   querySelector(selector: string): MiniNode | null;
   querySelectorAll(selector: string): MiniNode[];
   dispatchEvent(raw: Record<string, unknown>): boolean;
+  contains(candidate: MiniNode): boolean;
+  scrollIntoView(): void;
+  getBoundingClientRect(): {
+    top: number; left: number; right: number; bottom: number;
+    width: number; height: number; x: number; y: number;
+    toJSON(): Record<string, number>;
+  };
+  readonly isConnected: boolean;
   click(): void;
   focus(): void;
 }
@@ -92,17 +102,67 @@ function relink(parent: MiniNode): void {
 }
 
 function matches(node: MiniNode, selector: string): boolean {
-  if (selector.startsWith('.')) return node.className.split(/\s+/).includes(selector.slice(1));
-  if (selector.startsWith('#')) return node.id === selector.slice(1);
-  if (selector.startsWith('[') && selector.endsWith(']')) {
-    const body = selector.slice(1, -1);
-    const eq = body.indexOf('=');
-    if (eq < 0) return node.hasAttribute(body);
-    const name = body.slice(0, eq);
-    const raw = body.slice(eq + 1).replace(/^["']|["']$/g, '');
-    return node.getAttribute(name) === raw;
+  // Real compound selector support for the mini tree (tag*, .class, #id,
+  // [attr], [attr=value]) — the harness must query the actual rendered tree,
+  // never echo a result. Descendant combinators are not used by this suite.
+  const input = selector.trim();
+  if (input === '') return false;
+  let rest = input;
+  let tag: string | null = null;
+  const tagMatch = /^([A-Za-z][A-Za-z0-9_-]*|\*)/.exec(rest);
+  if (tagMatch !== null) {
+    tag = tagMatch[1];
+    rest = rest.slice(tagMatch[0].length);
   }
-  return node.tagName === selector.toUpperCase();
+  const classes: string[] = [];
+  const ids: string[] = [];
+  const attributes: Array<{ name: string; value?: string }> = [];
+  while (rest.length > 0) {
+    if (rest.startsWith('.')) {
+      const classMatch = /^\.([A-Za-z0-9_-]+)/.exec(rest);
+      if (classMatch === null) return false;
+      classes.push(classMatch[1]);
+      rest = rest.slice(classMatch[0].length);
+      continue;
+    }
+    if (rest.startsWith('#')) {
+      const idMatch = /^#([A-Za-z0-9_-]+)/.exec(rest);
+      if (idMatch === null) return false;
+      ids.push(idMatch[1]);
+      rest = rest.slice(idMatch[0].length);
+      continue;
+    }
+    if (rest.startsWith('[')) {
+      const close = rest.indexOf(']');
+      if (close < 0) return false;
+      const body = rest.slice(1, close);
+      rest = rest.slice(close + 1);
+      const eq = body.indexOf('=');
+      if (eq < 0) {
+        attributes.push({ name: body.trim() });
+      } else {
+        attributes.push({
+          name: body.slice(0, eq).trim(),
+          value: body.slice(eq + 1).trim().replace(/^["']|["']$/g, ''),
+        });
+      }
+      continue;
+    }
+    return false;
+  }
+  if (tag !== null && tag !== '*' && node.tagName !== tag.toUpperCase()) return false;
+  for (const className of classes) {
+    if (!node.className.split(/\s+/).includes(className)) return false;
+  }
+  for (const id of ids) {
+    if (node.id !== id) return false;
+  }
+  for (const attribute of attributes) {
+    const actual = node.getAttribute(attribute.name);
+    if (actual === null) return false;
+    if (attribute.value !== undefined && actual !== attribute.value) return false;
+  }
+  return true;
 }
 
 function makeNode(nodeType: number, nodeName: string, owner: MiniDoc): MiniNode {
@@ -242,6 +302,32 @@ function makeNode(nodeType: number, nodeName: string, owner: MiniDoc): MiniNode 
     click() {
       node.dispatchEvent({ type: 'click', target: node });
     },
+    contains(candidate: MiniNode): boolean {
+      let current: MiniNode | null = candidate;
+      while (current !== null) {
+        if (current === node) return true;
+        current = current.parentNode;
+      }
+      return false;
+    },
+    scrollIntoView(): void {
+      // Mini DOM has no layout; a scroll request is a legal no-op here.
+    },
+    getBoundingClientRect() {
+      return {
+        top: 0, left: 0, right: 0, bottom: 0,
+        width: 0, height: 0, x: 0, y: 0,
+        toJSON: () => ({ top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0, x: 0, y: 0 }),
+      };
+    },
+    get isConnected() {
+      let current: MiniNode | null = node;
+      while (current !== null) {
+        if (current.nodeType === 9) return true;
+        current = current.parentNode;
+      }
+      return false;
+    },
     focus() {
       owner.activeElement = node;
     },
@@ -274,10 +360,43 @@ function installGlobals(): MiniDoc {
   doc.body = body;
   doc.activeElement = body;
   doc.oninput = null;
-  const windowObj = {
+  const windowListeners = new Map<string, Set<Listener>>();
+  interface MiniWindow {
+    document: MiniDoc;
+    event: Record<string, unknown> | undefined;
+    HTMLIFrameElement: typeof DummyHTMLIFrameElement;
+    addEventListener(type: string, fn: Listener, options?: boolean | { capture?: boolean }): void;
+    removeEventListener(type: string, fn: Listener, options?: boolean | { capture?: boolean }): void;
+    dispatchEvent(raw: Record<string, unknown>): boolean;
+    requestAnimationFrame(callback: (time: number) => void): number;
+    cancelAnimationFrame(): void;
+    getComputedStyle(): { lineHeight: string; paddingTop: string; paddingBottom: string };
+  }
+  const windowObj: MiniWindow = {
     document: doc,
     event: undefined as Record<string, unknown> | undefined,
     HTMLIFrameElement: DummyHTMLIFrameElement,
+    // Real EventTarget surface: mermaid's module init registers a window
+    // "load" listener; dispatch actually invokes captured/target listeners.
+    addEventListener(type: string, fn: Listener, options?: boolean | { capture?: boolean }): void {
+      const capture = options === true || (typeof options === 'object' && options.capture === true);
+      const key = capture ? `${type}-capture` : type;
+      const set = windowListeners.get(key) ?? new Set<Listener>();
+      set.add(fn);
+      windowListeners.set(key, set);
+    },
+    removeEventListener(type: string, fn: Listener, options?: boolean | { capture?: boolean }): void {
+      const capture = options === true || (typeof options === 'object' && options.capture === true);
+      const key = capture ? `${type}-capture` : type;
+      windowListeners.get(key)?.delete(fn);
+    },
+    dispatchEvent(raw: Record<string, unknown>): boolean {
+      const event = { ...raw, target: windowObj };
+      const type = String(raw.type);
+      for (const fn of [...(windowListeners.get(`${type}-capture`) ?? [])]) fn(event);
+      for (const fn of [...(windowListeners.get(type) ?? [])]) fn(event);
+      return true;
+    },
     requestAnimationFrame: (callback: (time: number) => void) => {
       callback(0);
       return 1;
@@ -376,6 +495,7 @@ async function mount(props: Record<string, unknown>): Promise<{ root: Root; cont
       onCancelTarget: async () => {},
       onRetryTarget: async () => {},
       onViewRunner: () => {},
+      onReplyActionError: () => {},
       ...props,
     }));
   });
@@ -432,6 +552,183 @@ async function typeDraft(container: MiniNode, text: string): Promise<void> {
   const alert = container.querySelector('[role="alert"]');
   check('rejected Retry surfaces mentionError', (alert?.textContent ?? '') === 'Runner is not connected.', alert?.textContent ?? 'missing');
   await act(async () => { root.unmount(); });
+}
+
+// ---- channel-log reply: raw source, real wire clock, persistence ----
+// bg2442: the terminal channel log row must expose the shared reply actions,
+// copying/saving the RAW assistant source (no trim/newline normalization) and
+// naming the file from the settled item's real wire END timestamp
+// (`generatedAt`, distinct from the log append clock `at`). No star is
+// fabricated; legacy rows without a wire clock fail save through the sink.
+{
+  const doc = globalThis.document as unknown as MiniDoc;
+  const originalCreate = doc.createElement.bind(doc);
+  const createdAnchors: MiniNode[] = [];
+  doc.createElement = (tag: string) => {
+    const node = originalCreate(tag);
+    if (tag.toLowerCase() === 'a') {
+      createdAnchors.push(node);
+      // Real DOM anchors expose remove(); add it to the mini node so the
+      // component's cleanup path runs unmodified.
+      Object.assign(node, {
+        remove: () => {
+          const parent: MiniNode | null = node.parentNode;
+          if (parent) parent.removeChild(node);
+        },
+      });
+    }
+    return node;
+  };
+  const blobs: Array<{ url: string; blob: Blob }> = [];
+  const originalCreateObjectURL = URL.createObjectURL;
+  const originalRevokeObjectURL = URL.revokeObjectURL;
+  URL.createObjectURL = ((blob: Blob) => {
+    const url = `blob:channel-log/${blobs.length}`;
+    blobs.push({ url, blob });
+    return url;
+  }) as typeof URL.createObjectURL;
+  URL.revokeObjectURL = (() => {}) as typeof URL.revokeObjectURL;
+  try {
+    // Raw source = sourceMarkdownFromBlocks: leading/trailing whitespace,
+    // CRLF and multiple text blocks preserved byte-for-byte.
+    const runnerText = sourceMarkdownFromBlocks([
+      { type: 'text', text: '  **channel** reply\r\n' },
+      { type: 'text', text: '- first\r\n- second  ' },
+    ]);
+    const wireEnd = 1750000050000;
+    const logAt = 1750000000123;
+    const humanMessage = { id: 'log-h', at: 1750000000000, kind: 'human' as const, mappingId: null, author: 'You', text: 'hello team' };
+    const runnerMessage = {
+      id: 'log-r', at: logAt, kind: 'runner' as const, mappingId: 'm1', author: 'alpha', text: runnerText, generatedAt: wireEnd,
+    };
+    const { root, container } = await mount({ messages: [humanMessage, runnerMessage], members });
+    const reply = container.querySelectorAll('.chat-session-message--assistant')
+      .find((node) => node.querySelector('button[data-reply-action="save-markdown"]') !== null) ?? null;
+    check('channel log reply renders the shared action strip in the row band',
+      reply !== null && reply.className.includes('msg--assistant')
+        && reply.querySelector('.msg--assistant__actions') !== null,
+      reply === null ? 'missing reply article' : reply.className);
+    const buttons = reply === null ? [] : reply.querySelectorAll('button');
+    check('channel log reply exposes copy+save and never a fabricated star',
+      reply !== null
+        && buttons.length === 2
+        && reply.querySelector('button.assistant-star-toggle') === null
+        && reply.querySelector('button[data-reply-action="copy-markdown"]') !== null
+        && reply.querySelector('button[data-reply-action="save-markdown"]') !== null,
+      String(buttons.length));
+    check('short log reply keeps the author header inside the row band',
+      reply !== null
+        && (reply.querySelector('.chat-session-message__role')?.textContent ?? '') === '@alpha'
+        && reply.querySelector('.msg--assistant__actions')?.parentNode === reply,
+      reply?.querySelector('.chat-session-message__role')?.textContent ?? 'missing header');
+    const human = container.querySelectorAll('.chat-session-message--user')[0] ?? null;
+    check('human channel message has no reply-action strip',
+      human !== null && human.querySelector('button[data-reply-action="save-markdown"]') === null);
+    await act(async () => {
+      reply?.querySelector('button[data-reply-action="save-markdown"]')?.click();
+    });
+    const anchor = createdAnchors.at(-1);
+    const downloadName = anchor !== undefined && 'download' in anchor && typeof anchor.download === 'string'
+      ? anchor.download
+      : undefined;
+    const saved = blobs.at(-1)?.blob ?? null;
+    const wireName = replyMarkdownFileName(runnerText, wireEnd);
+    check('channel log filename derives from the wire END timestamp, not the log clock',
+      wireEnd !== logAt && downloadName === wireName && downloadName !== replyMarkdownFileName(runnerText, logAt),
+      String(downloadName));
+    check('channel log save writes the raw source byte-for-byte',
+      saved !== null && (await saved.text()) === runnerText,
+      saved === null ? 'no blob created' : 'source mismatch');
+    await act(async () => { root.unmount(); });
+
+    // Legacy row (persisted before generatedAt): no fabricated clock — save
+    // fails visibly through the central sink, copy stays available.
+    const legacy = { id: 'log-legacy', at: logAt, kind: 'runner' as const, mappingId: 'm1', author: 'alpha', text: 'legacy reply' };
+    const legacyErrors: string[] = [];
+    const legacyAnchorsBefore = createdAnchors.length;
+    const legacyBlobsBefore = blobs.length;
+    const legacyMount = await mount({
+      messages: [legacy],
+      members,
+      onReplyActionError: (message: string) => { legacyErrors.push(message); },
+    });
+    const legacyArticle = legacyMount.container.querySelector('.chat-session-message--assistant');
+    const legacySave = legacyArticle?.querySelector('button[data-reply-action="save-markdown"]');
+    check('legacy log reply still offers copy+save', legacySave !== null && legacySave !== undefined);
+    await act(async () => { legacySave?.click(); });
+    check('legacy log reply save fails through the central sink (no clock fabricated)',
+      legacyErrors.length === 1 && legacyErrors[0] === 'Failed to save reply markdown'
+        && createdAnchors.length === legacyAnchorsBefore && blobs.length === legacyBlobsBefore,
+      JSON.stringify(legacyErrors));
+    await act(async () => { legacyMount.root.unmount(); });
+
+    // Persistence: generatedAt round-trips and the raw runner source is stored
+    // complete (>8000 chars, no truncation).
+    const overBound = `  ${'x'.repeat(9_000)}\r\n  `;
+    const store = new Map<string, string>();
+    const storage = {
+      getItem: (key: string) => store.get(key) ?? null,
+      setItem: (key: string, value: string) => { store.set(key, value); },
+      removeItem: (key: string) => { store.delete(key); },
+    };
+    const savedLog = saveChannelLogs(storage, 'auth', {
+      p1: [{ ...runnerMessage, text: overBound }, legacy],
+    });
+    const loadedLog = loadChannelLogs(storage, 'auth');
+    const rows = loadedLog.logs.p1 ?? [];
+    check('channel log persistence keeps the complete raw runner source',
+      savedLog.ok && rows.length === 2
+        && rows[0].text === overBound && rows[0].text.length === overBound.length,
+      String(rows[0]?.text.length));
+    check('channel log persistence round-trips the wire END timestamp',
+      rows[0].generatedAt === wireEnd, String(rows[0]?.generatedAt));
+    check('legacy persisted row stays without a wire clock (never fabricated)',
+      rows[1].generatedAt === undefined);
+
+    // A corrupt generatedAt must never corrupt the whole log: the raw reply
+    // survives and only the unusable clock is dropped (no `at` fallback).
+    const corruptStore = new Map<string, string>();
+    const corruptStorage = {
+      getItem: (key: string) => corruptStore.get(key) ?? null,
+      setItem: (key: string, value: string) => { corruptStore.set(key, value); },
+      removeItem: (key: string) => { corruptStore.delete(key); },
+    };
+    corruptStore.set(channelLogStorageKey('auth'), JSON.stringify({
+      version: 1,
+      projects: {
+        p1: [{
+          id: 'log-bad-clock', at: logAt, kind: 'runner', mappingId: 'm1', author: 'alpha',
+          text: runnerText, generatedAt: 'not-a-clock',
+        }],
+      },
+    }));
+    const recovered = loadChannelLogs(corruptStorage, 'auth');
+    const recoveredRow = recovered.logs.p1?.[0];
+    check('invalid generatedAt is dropped but the raw reply text survives',
+      recovered.ok && recoveredRow !== undefined
+        && recoveredRow.text === runnerText && recoveredRow.generatedAt === undefined
+        && recoveredRow.at === logAt,
+      JSON.stringify(recoveredRow));
+    if (recoveredRow !== undefined) {
+      const recoveredErrors: string[] = [];
+      const recoveredMount = await mount({
+        messages: [recoveredRow],
+        members,
+        onReplyActionError: (message: string) => { recoveredErrors.push(message); },
+      });
+      const recoveredSave = recoveredMount.container
+        .querySelector('.chat-session-message--assistant')?.querySelector('button[data-reply-action="save-markdown"]');
+      await act(async () => { recoveredSave?.click(); });
+      check('recovered row without a wire clock fails save through the central sink',
+        recoveredErrors.length === 1 && recoveredErrors[0] === 'Failed to save reply markdown',
+        JSON.stringify(recoveredErrors));
+      await act(async () => { recoveredMount.root.unmount(); });
+    }
+  } finally {
+    doc.createElement = originalCreate;
+    URL.createObjectURL = originalCreateObjectURL;
+    URL.revokeObjectURL = originalRevokeObjectURL;
+  }
 }
 
 uninstallGlobals();

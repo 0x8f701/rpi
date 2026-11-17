@@ -84,7 +84,7 @@ fn quick_factory(cwd: PathBuf, response_text: &'static str) -> pi_coding::ChildS
             });
             Session::new_with_additional_tools_filtered_and_discovery(
                 SessionOptions {
-                    model: request.model,
+                    model: Some(request.model),
                     cwd,
                     system_prompt: request.system_prompt,
                     thinking_level: ThinkingLevel::Off,
@@ -148,7 +148,7 @@ fn held_factory(
             });
             Session::new_with_additional_tools_filtered_and_discovery(
                 SessionOptions {
-                    model: request.model,
+                    model: Some(request.model),
                     cwd,
                     system_prompt: request.system_prompt,
                     thinking_level: ThinkingLevel::Off,
@@ -172,7 +172,7 @@ fn held_factory(
 
 fn config(artifacts: &Path, definitions: Vec<AgentDefinition>) -> OrchestrationConfig {
     let mut config = OrchestrationConfig::new(AgentCatalog::from_agents(definitions), artifacts);
-    config.parent_model = test_model();
+    config.parent_model = Some(test_model());
     config.idle_ttl = None;
     config
 }
@@ -194,7 +194,7 @@ fn parent_session(artifacts: &Path, session_dir: &Path) -> (Session, String, Pat
     let parent_path = recorder.path();
     let parent = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model: test_model(),
+            model: Some(test_model()),
             cwd: artifacts.to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -266,7 +266,7 @@ fn restarted_parent_session(parent: &Session) -> anyhow::Result<Session> {
         .ok_or_else(|| anyhow::anyhow!("parent recording is unavailable"))?;
     let restarted = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model: test_model(),
+            model: Some(test_model()),
             cwd: parent.cwd().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,

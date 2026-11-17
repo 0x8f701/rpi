@@ -83,13 +83,13 @@ fn task_id(details: &Value, content: &str) -> String {
 
 fn session_options(cwd: &Path) -> SessionOptions {
     SessionOptions {
-        model: Model {
+        model: Some(Model {
             id: "todo-dag-lifecycle".to_owned(),
             name: "Todo DAG Lifecycle".to_owned(),
             api: "todo-dag-lifecycle-api".to_owned(),
             provider: "todo-dag-lifecycle-provider".to_owned(),
             ..Model::default()
-        },
+        }),
         cwd: cwd.to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,

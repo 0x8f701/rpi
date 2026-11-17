@@ -17,8 +17,8 @@ mod macos_proof {
 
     use pi_sandbox::{
         AbsolutePath, CredentialPolicy, FileSystemPolicy, HostHttpPolicy, HostPlatform,
-        LaunchedUnixHandle, MountSource, NetworkPolicy, PipeStdio, PlatformFactInputs,
-        PolicyRevision, PolicySnapshot, PreparedSpawnRequest, ResourceLimits,
+        LaunchedUnixHandle, NetworkPolicy, PipeStdio, PlatformFactInputs,
+        PolicyRevision, PolicySnapshot, PreparedSpawnRequest, RelativePath, ResourceLimits,
         RetainedExecutable, SandboxPolicy, SpawnFamily, SpawnStdio, WritableRoot,
         derive_platform_facts, launch_prepared_unix, prepare_spawn, probe_backend,
     };
@@ -53,6 +53,10 @@ mod macos_proof {
             let session = root_path.join("session");
             for directory in [&workspace, &agent, &session] {
                 std::fs::create_dir(directory).expect("create owned sandbox directory");
+            }
+            for name in [".git", ".rpi", ".agents"] {
+                std::fs::create_dir(workspace.join(name))
+                    .expect("create mandatory protected descendant");
             }
             Self {
                 _root: root,
@@ -113,10 +117,14 @@ mod macos_proof {
             .expect("valid platform fact inputs"),
         )
         .expect("macOS platform facts and Seatbelt prerequisites must be available");
-        // The linux fixture mounts the bare workspace root with no protected
-        // descendants; mirror it so the caller mount represents the policy.
-        let workspace = WritableRoot::new(absolute(&roots.workspace), Vec::new())
-            .expect("valid workspace root");
+        let protected = [".git", ".rpi", ".agents"]
+            .into_iter()
+            .map(|name| {
+                RelativePath::parse(PathBuf::from(name)).expect("relative protected descendant")
+            })
+            .collect::<Vec<_>>();
+        let workspace = WritableRoot::new(absolute(&roots.workspace), protected)
+            .expect("valid workspace root with mandatory protected descendants");
         let revision = roots.session.join("sandbox").join("1");
         let home = revision.join("home");
         let tmp = revision.join("tmp");
@@ -215,13 +223,7 @@ mod macos_proof {
             },
             SpawnStdio::Piped(stdio),
             Vec::new(),
-            vec![
-                MountSource::read_write_directory(
-                    open_directory(&roots.workspace),
-                    absolute(&roots.workspace),
-                )
-                .expect("workspace mount source"),
-            ],
+            Vec::new(),
             Some(retained_target),
             None,
         )
@@ -268,6 +270,13 @@ mod macos_proof {
         match target {
             "seatbelt" => {
                 let cwd = std::env::current_dir().expect("confined current directory");
+                for name in [".git", ".rpi", ".agents"] {
+                    let protected = cwd.join(name).join("child-write.txt");
+                    assert!(
+                        std::fs::write(&protected, b"must-not-write").is_err(),
+                        "mandatory protected descendant {name} was writable"
+                    );
+                }
                 let written = cwd.join("workspace-write-proof.txt");
                 std::fs::write(&written, b"workspace-write-ok")
                     .expect("workspace root must be writable");
@@ -275,7 +284,7 @@ mod macos_proof {
                     std::fs::read(&written).expect("read workspace proof"),
                     b"workspace-write-ok"
                 );
-                println!("workspace-write=ok");
+                println!("protected-path=denied workspace-write=ok");
             }
             "home-tmp" => {
                 let home = std::env::var("HOME").expect("HOME projected into child");
@@ -404,13 +413,27 @@ mod macos_proof {
         let roots = OwnedRoots::new();
         let (current, backend) = build_backend(&roots);
 
-        let (seatbelt_status, _seatbelt_output) =
+        let (seatbelt_status, seatbelt_output) =
             run_target("seatbelt", &roots, &current, &backend, None);
         assert_eq!(
             seatbelt_status.code(),
             Some(0),
             "literal Seatbelt filesystem proof"
         );
+        assert!(
+            seatbelt_output.contains("protected-path=denied"),
+            "target output: {seatbelt_output:?}"
+        );
+        assert!(
+            seatbelt_output.contains("workspace-write=ok"),
+            "target output: {seatbelt_output:?}"
+        );
+        for name in [".git", ".rpi", ".agents"] {
+            assert!(
+                !roots.workspace.join(name).join("child-write.txt").exists(),
+                "mandatory protected descendant {name} received a child write"
+            );
+        }
         assert_eq!(
             std::fs::read(roots.workspace.join("workspace-write-proof.txt"))
                 .expect("read workspace proof from host"),

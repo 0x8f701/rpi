@@ -156,7 +156,7 @@ async fn nl_todo_fixture(tag: &str, session_id: &str, with_child_tools: bool) ->
     let queue: Arc<Mutex<VecDeque<AssistantMessage>>> = Arc::new(Mutex::new(VecDeque::new()));
     let session = Session::new_with_todo_and_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model: model.clone(),
+            model: Some(model.clone()),
             cwd: artifacts.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -875,7 +875,7 @@ fn child_orchestration_runtime(
         artifact_dir,
     );
     config.idle_ttl = None;
-    config.parent_model = session.model().expect("child runtime model");
+    config.parent_model = Some(session.model().expect("child runtime model"));
     OrchestrationRuntime::new(config, factory)
 }
 

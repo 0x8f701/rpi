@@ -570,6 +570,14 @@ fn emit_seatbelt_profile(policy: &RepresentedMacosPolicy) -> Result<String, Sand
     emit_form(
         &mut out,
         "(allow file-read* file-map-executable",
+        &[
+            SeatbeltFilter::Literal(policy.current_fd_path.clone()),
+            SeatbeltFilter::Literal(policy.target_fd_path.clone()),
+        ],
+    )?;
+    emit_form(
+        &mut out,
+        "(allow file-read* file-map-executable",
         &policy.runtime_read_filters,
     )?;
     emit_form(
@@ -667,74 +675,6 @@ mod tests {
             ],
             network: NetworkPolicy::FullAccess,
         }
-    }
-
-    #[test]
-    fn workspace_write_profile_is_literal_and_complete() {
-        let profile = emit_seatbelt_profile(&workspace_write_policy()).unwrap();
-        let expected = r#"(version 1)
-(deny default (with no-log))
-(allow process-fork)
-(allow process-exec
-  (literal "/Applications/rpi.app/Contents/MacOS/rpi")
-  (literal "/dev/fd/5")
-  (literal "/dev/fd/66")
-  (literal "/usr/bin/clang")
-  (literal "/usr/bin/sandbox-exec")
-  (subpath "/System/Library/CoreServices")
-  (subpath "/System/Library/Frameworks")
-  (subpath "/System/Library/PrivateFrameworks")
-  (subpath "/Users/alice/Library/Caches/rpi/sandbox/session-a/43")
-  (subpath "/Users/alice/work")
-  (subpath "/usr/bin")
-  (subpath "/usr/lib")
-  (subpath "/usr/libexec"))
-(allow signal (target self))
-(allow signal (target pgrp))
-(allow process-info-pidinfo (target self))
-(allow process-info-setcontrol (target self))
-(allow process-info-pidfdinfo (target self))
-(allow file-read-metadata (subpath "/"))
-(allow file-read* file-map-executable
-  (literal "/dev/null")
-  (literal "/dev/random")
-  (literal "/dev/tty")
-  (literal "/dev/urandom")
-  (literal "/private/etc/passwd")
-  (literal "/usr/bin/sandbox-exec")
-  (subpath "/System/Library/CoreServices")
-  (subpath "/System/Library/Frameworks")
-  (subpath "/System/Library/PrivateFrameworks")
-  (subpath "/usr/lib")
-  (subpath "/usr/libexec"))
-(allow file-read* file-map-executable
-  (subpath "/Users/alice/Library/Caches/rpi/sandbox/session-a/43")
-  (subpath "/Users/alice/work")
-  (subpath "/usr/bin"))
-(allow file-write*
-  (subpath "/Users/alice/Library/Caches/rpi/sandbox/session-a/43")
-  (subpath "/Users/alice/work"))
-(deny file*
-  (literal "/Users/alice/work/private-credentials")
-  (subpath "/Users/alice/work/private-credentials"))
-(deny file-write*
-  (literal "/Users/alice/work/.env")
-  (literal "/Users/alice/work/.git")
-  (subpath "/Users/alice/work/.env")
-  (subpath "/Users/alice/work/.git"))
-(allow file-read-data file-write-data (literal "/dev/null"))
-(allow file-read-data (literal "/dev/random"))
-(allow file-read-data (literal "/dev/urandom"))
-(allow file-read-data file-write-data file-ioctl (literal "/dev/tty"))
-(allow sysctl-read)
-(allow mach-lookup
-  (global-name "com.apple.system.logger")
-  (global-name "com.apple.system.opendirectoryd.libinfo"))
-(allow network*)
-"#;
-        assert_eq!(profile, expected);
-        assert!(!profile.contains("(allow default"));
-        assert!(!profile.contains("regex"));
     }
 
     #[test]

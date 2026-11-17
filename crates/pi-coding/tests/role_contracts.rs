@@ -116,7 +116,7 @@ fn scripted_runtime_with_budget(
                 })
             });
             Session::new(SessionOptions {
-                model: request.model,
+                model: Some(request.model),
                 cwd: std::env::current_dir().expect("cwd"),
                 system_prompt: request.system_prompt,
                 thinking_level: pi_agent::ThinkingLevel::Off,
@@ -137,13 +137,13 @@ fn scripted_runtime_with_budget(
     config.idle_ttl = None;
     config.soft_budget = soft_budget;
     config.max_tools_per_agent = 64;
-    config.parent_model = Model {
+    config.parent_model = Some(Model {
         id: "role-contract-test".to_owned(),
         name: "Role Contract Test".to_owned(),
         api: "role-contract-test".to_owned(),
         provider: "role-contract-test".to_owned(),
         ..Model::default()
-    };
+    });
     OrchestrationRuntime::new(config, factory).expect("runtime")
 }
 
@@ -376,7 +376,7 @@ async fn timeout_aborts_hanging_child_with_clear_reason() {
         let stream_fn = stream_fn.clone();
         Box::pin(async move {
             Session::new(SessionOptions {
-                model: Model::default(),
+                model: Some(Model::default()),
                 cwd: std::env::current_dir().expect("cwd"),
                 system_prompt: request.system_prompt,
                 thinking_level: pi_agent::ThinkingLevel::Off,
@@ -430,7 +430,7 @@ fn production_child_factory() -> (
     let cwd = tempfile::tempdir().expect("cwd");
     let model = Model::default();
     let parent = Session::new(SessionOptions {
-        model: model.clone(),
+        model: Some(model.clone()),
         cwd: cwd.path().to_path_buf(),
         system_prompt: String::new(),
         thinking_level: pi_agent::ThinkingLevel::Off,

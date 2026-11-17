@@ -4602,7 +4602,7 @@ impl SessionRuntimeManager {
                 // Fixed category + safe cause class only: the full causal
                 // chain embeds operator paths and never reaches this log.
                 eprintln!(
-                    "switch_session_failed mode={} code={} cause={}",
+                    "switch_session_failed mode={} code={} cause={} resume_stage={:?}",
                     if negotiated {
                         "subscribe-handoff-v1"
                     } else {
@@ -4610,6 +4610,7 @@ impl SessionRuntimeManager {
                     },
                     class.code,
                     class.cause,
+                    error.downcast_ref::<crate::session_run::ResumeStage>(),
                 );
                 let mut response =
                     RpcResponse::failure(id, name, bounded_switch_failure(&error))
@@ -6434,7 +6435,7 @@ impl SessionRuntimeManager {
         #[cfg(test)]
         runtime.cleanup_count.fetch_add(1, Ordering::SeqCst);
         runtime.dispatcher.shutdown_side_chat().await;
-        runtime.dispatcher.shutdown_code_review().await;
+        runtime.dispatcher.shutdown_code_review().await?;
         // File conversations own forked controllers with live turns and
         // private side sessions; they must be quiesced and drained BEFORE
         // the application teardown they were forked from.
@@ -7177,7 +7178,7 @@ mod tests {
 
     fn session_options(model: Model, cwd: &Path) -> SessionOptions {
         SessionOptions {
-            model,
+            model: Some(model),
             cwd: cwd.to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -7432,7 +7433,7 @@ mod tests {
                 });
                 Session::new_with_additional_tools_filtered_and_discovery(
                     SessionOptions {
-                        model: request.model,
+                        model: Some(request.model),
                         cwd,
                         system_prompt: request.system_prompt,
                         thinking_level: ThinkingLevel::Off,
@@ -7719,7 +7720,7 @@ mod tests {
             AgentCatalog::from_agents(vec![manager_task_definition()]),
             root.path().join("artifacts"),
         );
-        config.parent_model = model;
+        config.parent_model = Some(model);
         config.idle_ttl = None;
         let orchestration = OrchestrationRuntime::new(
             config,
@@ -7769,7 +7770,7 @@ mod tests {
             AgentCatalog::from_agents(vec![manager_task_definition()]),
             dir.path().join("artifacts"),
         );
-        config.parent_model = model;
+        config.parent_model = Some(model);
         config.idle_ttl = None;
         let orchestration = OrchestrationRuntime::new(
             config,
@@ -22147,7 +22148,7 @@ mod tests {
             serde_json::to_value(&first).expect("first"),
             serde_json::to_value(&second).expect("second")
         );
-        manager.primary.application.abort().await;
+        manager.primary.application.abort().await.expect("abort duplicate prompt");
         manager.shutdown().await;
     }
 
@@ -22496,4 +22497,86 @@ mod tests {
         );
         manager.shutdown().await;
     }
+    #[tokio::test]
+    async fn code_review_snapshot_returns_while_ordinary_file_diff_is_held() {
+        let (manager, _registration) = manager_with(None).await;
+        let session_id = manager.primary_session_id();
+        let cwd = manager.primary.application.session().cwd().to_path_buf();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&cwd)
+                .args(args)
+                .output()
+                .expect("git")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        assert!(git(&["config", "user.email", "test@example.com"]).status.success());
+        assert!(git(&["config", "user.name", "Test"]).status.success());
+        assert!(git(&["config", "commit.gpgsign", "false"]).status.success());
+        std::fs::write(cwd.join("greet.txt"), "alpha\n").expect("baseline");
+        assert!(git(&["add", "greet.txt"]).status.success());
+        assert!(git(&["commit", "-q", "-m", "baseline"]).status.success());
+        std::fs::write(cwd.join("greet.txt"), "alpha\nBETA\n").expect("dirty");
+        let opened = manager
+            .admit_web(
+                RpcCommand::CodeReviewOpen {
+                    id: Some("fifo-open".into()),
+                    commit: None,
+                    from: None,
+                    to: None,
+                    include_working_tree: None,
+                    repo: None,
+                },
+                Some(session_id.clone()),
+                false,
+            )
+            .await
+            .wait()
+            .await;
+        assert!(opened.success, "{opened:?}");
+        let open_data = opened.data.as_ref().expect("open projection");
+        let snapshot_id = open_data["snapshotId"].as_str().expect("snapshot id").to_owned();
+        assert!(open_data["files"].as_array().is_some_and(|files| !files.is_empty()));
+        let gate = manager.primary.dispatcher.arm_file_diff_load_gate_for_test().await;
+        let file_diff = manager
+            .admit_web(
+                RpcCommand::CodeReviewFileDiff {
+                    id: Some("fifo-fd".into()),
+                    snapshot_id: snapshot_id.clone(),
+                    path: "greet.txt".into(),
+                    cursor: 0,
+                    max_lines: Some(50),
+                },
+                Some(session_id.clone()),
+                false,
+            )
+            .await;
+        gate.wait_loaded().await;
+        let snapshot = manager
+            .admit_web(
+                RpcCommand::CodeReviewSnapshot {
+                    id: Some("fifo-snap".into()),
+                },
+                Some(session_id),
+                false,
+            )
+            .await;
+        let snapshot_within =
+            tokio::time::timeout(std::time::Duration::from_secs(1), snapshot.wait()).await;
+        gate.release().await;
+        let file_diff = file_diff.wait().await;
+        manager.shutdown().await;
+        let snapshot = snapshot_within.expect("snapshot returned while file_diff was held");
+        assert!(snapshot.success, "{snapshot:?}");
+        let data = snapshot.data.as_ref().expect("snapshot projection");
+        assert_eq!(data["snapshotId"].as_str(), Some(snapshot_id.as_str()));
+        assert!(data["files"].as_array().is_some());
+        assert!(file_diff.success, "{file_diff:?}");
+        let page = file_diff.data.as_ref().expect("file diff page");
+        assert_eq!(page["path"].as_str(), Some("greet.txt"));
+        assert_eq!(page["snapshotId"].as_str(), Some(snapshot_id.as_str()));
+        assert!(page["hunks"].as_array().is_some());
+    }
+
 }

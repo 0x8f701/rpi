@@ -91,6 +91,8 @@ export function normalizedEventGroup(frame: EventFrame): string {
 
 function statusRank(status: JobStatus): number {
   switch (status) {
+    case 'cancelling':
+      return 3;
     case 'running':
       return 2;
     case 'queued':

@@ -30,7 +30,7 @@ export interface ActivityEventFrame {
   message?: unknown;
 }
 export const ACTIVITY_LIMIT = 200;
-const JOB_STATUSES: Record<string, true> = { queued: true, running: true, completed: true, failed: true, cancelled: true };
+const JOB_STATUSES: Record<string, true> = { queued: true, running: true, cancelling: true, completed: true, failed: true, cancelled: true };
 
 function record(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;

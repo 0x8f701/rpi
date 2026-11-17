@@ -457,7 +457,7 @@ async fn adapter_executes_through_real_manager_lifecycle() {
     let workspace = WorkspaceRoots::new(&source, Vec::<PathBuf>::new()).expect("workspace");
     let session = Session::new_with_todo_additional_tools_filtered_discovery_workspace_and_uri(
         SessionOptions {
-            model,
+            model: Some(model),
             cwd: source.clone(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,

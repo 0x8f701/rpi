@@ -19,6 +19,7 @@
 // waitForFunction with a deadline; any assertion failure exits nonzero).
 import { chromium } from 'playwright';
 import fs from 'node:fs';
+import { selectCompletionThenSubmit } from './lib/slash-completion.mjs';
 
 const url = process.env.RPI_URL;
 const token = process.env.RPI_TOKEN || '';
@@ -160,6 +161,11 @@ async function main() {
         window.localStorage.setItem(`rpi-web-token:${window.location.host}`, t);
       }, token);
     }
+    // Outgoing frames: the slash journey proves the selecting Enter stays wire-silent.
+    const sentFrames = [];
+    page.on('websocket', (socket) => {
+      socket.on('framesent', (frame) => { if (typeof frame.payload === 'string') sentFrames.push(frame.payload); });
+    });
 
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
     // A1 bootstrap: fixture session is the get_state owner.
@@ -184,7 +190,15 @@ async function main() {
 
     // A2: open the review, select the dirty file + hunk, composer ready.
     await page.fill('#prompt-input', '/review');
-    await page.press('#prompt-input', 'Enter');
+    // The inline completion popup owns the SELECTING Enter and never
+    // dispatches; the helper presses the independent dispatch Enter on the
+    // settled /review token and proves the selection step stayed wire-silent.
+    await selectCompletionThenSubmit(page, {
+      token: '/review',
+      label: 'A2: /review',
+      sentFrames,
+      dispatchType: 'code_review_open',
+    });
     await waitFor(
       page,
       () => document.getElementById('code-review-panel') !== null,

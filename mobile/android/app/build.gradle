@@ -79,6 +79,17 @@ if (keystorePropertiesFile.exists()) {
     keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
 }
 
+// Release signing is fail-closed: `app/debug.keystore` has publicly known store
+// and key passwords and is for `debug` builds only. A release artifact is signed
+// only when keystore.properties supplies all four keys; otherwise every
+// release-producing task fails at the signing gate at the end of this file.
+def releaseSigningKeys = ['storeFile', 'keyAlias', 'storePassword', 'keyPassword']
+def missingReleaseSigningKeys = releaseSigningKeys.findAll { key ->
+    def value = keystoreProperties[key]
+    value == null || value.toString().trim().isEmpty()
+}
+def releaseSigningConfigured = keystorePropertiesFile.exists() && missingReleaseSigningKeys.isEmpty()
+
 android {
     ndkVersion rootProject.ext.ndkVersion
     buildToolsVersion rootProject.ext.buildToolsVersion
@@ -100,14 +111,15 @@ android {
             keyPassword 'android'
         }
         release {
-            def releaseStore = keystorePropertiesFile.exists() ? keystoreProperties['storeFile'] : 'app/debug.keystore'
-            def releaseAlias = keystorePropertiesFile.exists() ? keystoreProperties['keyAlias'] : 'androiddebugkey'
-            def releaseStorePassword = keystorePropertiesFile.exists() ? keystoreProperties['storePassword'] : 'android'
-            def releaseKeyPassword = keystorePropertiesFile.exists() ? keystoreProperties['keyPassword'] : 'android'
-            storeFile rootProject.file(releaseStore)
-            keyAlias releaseAlias
-            storePassword releaseStorePassword
-            keyPassword releaseKeyPassword
+            // No debug fallback: signing material comes only from
+            // keystore.properties, and an incomplete configuration fails at the
+            // signing gate instead of shipping a publicly-known key.
+            if (releaseSigningConfigured) {
+                storeFile rootProject.file(keystoreProperties['storeFile'])
+                keyAlias keystoreProperties['keyAlias']
+                storePassword keystoreProperties['storePassword']
+                keyPassword keystoreProperties['keyPassword']
+            }
         }
     }
     buildTypes {
@@ -115,7 +127,9 @@ android {
             signingConfig signingConfigs.debug
         }
         release {
-            signingConfig signingConfigs.release
+            if (releaseSigningConfigured) {
+                signingConfig signingConfigs.release
+            }
             minifyEnabled enableProguardInReleaseBuilds
             proguardFiles getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro"
         }
@@ -146,3 +160,21 @@ tasks.register('copyXtermAssets', Copy) {
     into("${projectDir}/src/main/assets")
 }
 tasks.named("preBuild").configure { dependsOn("copyXtermAssets") }
+
+// signing-gate:begin
+// Fail closed before any release artifact is produced. The check runs on the
+// task graph, so `debug` builds, IDE sync, and `test*` tasks are unaffected,
+// and `--dry-run` exercises it without compiling or signing anything.
+gradle.taskGraph.whenReady { graph ->
+    def wantsReleaseArtifact = graph.allTasks.any {
+        it.project == project && it.name ==~ /(assemble|bundle|install|package)Release.*/
+    }
+    if (wantsReleaseArtifact && !releaseSigningConfigured) {
+        throw new GradleException(
+            "Refusing to produce a release artifact without release signing: " +
+            "${keystorePropertiesFile} is missing or lacks ${missingReleaseSigningKeys.join(', ')}. " +
+            "Provide all four keys (storeFile, keyAlias, storePassword, keyPassword); " +
+            "the checked-in debug keystore never signs a release.")
+    }
+}
+// signing-gate:end

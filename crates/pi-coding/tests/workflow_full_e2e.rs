@@ -272,7 +272,7 @@ fn parent_session(
     });
     registration.set_responses(responses);
     let session = Session::new(SessionOptions {
-        model,
+        model: Some(model),
         cwd: repo.to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,

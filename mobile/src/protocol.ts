@@ -348,7 +348,7 @@ export type RunnerCommand =
   | { type: 'file_explorer_stage_download'; path: string }
   // Orchestration (panels/SubagentsPanel.tsx, PersonasPanel Run).
   | { type: 'job_output'; jobId: string }
-  | { type: 'agent_history'; agentId: string; lines?: number }
+  | { type: 'agent_history'; agentId: string; limit?: number }
   | { type: 'task_spawn'; args: unknown }
   | { type: 'hub_send'; to: string; body: string; replyTo?: string };
 
@@ -1048,7 +1048,7 @@ export const RUNNER_COMMAND_WIRE = {
   path_complete: { path: 'string', kind: 'enum:directory|file|any', limit: 'number?' },
   file_explorer_stage_download: { path: 'string' },
   job_output: { jobId: 'string' },
-  agent_history: { agentId: 'string', lines: 'number?' },
+  agent_history: { agentId: 'string', limit: 'number?' },
   task_spawn: { args: 'any' },
   hub_send: { to: 'string', body: 'string', replyTo: 'string?' },
 } satisfies {
@@ -1370,7 +1370,7 @@ export function parseTmuxSendResult(data: unknown): TmuxSendResultData | null {
   return session === null || value.sent !== true ? null : { session, sent: true };
 }
 
-export type JobWireStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+export type JobWireStatus = 'queued' | 'running' | 'cancelling' | 'completed' | 'failed' | 'cancelled';
 
 /** Settled job result. `output` is the delivered yield payload as text. */
 export interface JobResultWire {
@@ -1407,6 +1407,7 @@ export interface JobWire {
 const JOB_STATUSES: Record<string, true> = {
   queued: true,
   running: true,
+  cancelling: true,
   completed: true,
   failed: true,
   cancelled: true,
@@ -1495,18 +1496,67 @@ export function parseJobOutput(data: unknown): JobOutputData | null {
   return job === null ? null : { job };
 }
 
-/** `agent_history` data: one child agent's bounded, redacted transcript. */
+/** One retained history row of `agent_history`: the session-entry id when the
+ *  row was read from disk (`id` is absent for in-memory snapshot rows) and the
+ *  public display projection of the persisted message — `get_messages` shape
+ *  with role/content blocks (text/thinking/image/toolCall, toolResult, and
+ *  bashExecution rows) and signatures/internal metadata already stripped by
+ *  the runner. */
+export interface AgentHistoryRow {
+  id?: string;
+  message: Record<string, unknown>;
+}
+
+/** Why the runner withheld retained history rows. */
+export type AgentHistoryTruncationReason = 'none' | 'limit' | 'bytes' | 'limit_and_bytes';
+
+/** Required truncation metadata: an untruncated response is
+ *  `{ omittedRows: 0, reason: 'none' }`, never an absent field. */
+export interface AgentHistoryTruncation {
+  omittedRows: number;
+  reason: AgentHistoryTruncationReason;
+}
+
+/** `agent_history` data: one child agent's bounded, redacted transcript as
+ *  structured rows plus the truncation account. There is no `text` body: the
+ *  panel feeds `messages` straight into the shared transcript projector. */
 export interface AgentHistoryData {
   agentId: string;
-  text: string;
+  messages: AgentHistoryRow[];
+  truncation: AgentHistoryTruncation;
+}
+
+const AGENT_HISTORY_REASONS: Readonly<Record<string, true>> = {
+  none: true,
+  limit: true,
+  bytes: true,
+  limit_and_bytes: true,
+};
+
+function parseAgentHistoryRow(row: unknown): AgentHistoryRow | null {
+  const record = wireRecord(row);
+  if (!record) return null;
+  const message = wireRecord(record.message);
+  // A row without a role cannot be projected; rejecting the row rejects the
+  // whole payload below, so a half-valid transcript is never rendered.
+  if (!message || typeof message.role !== 'string') return null;
+  const id = wireOptionalString(record.id);
+  return id === null ? { message } : { id, message };
 }
 
 export function parseAgentHistory(data: unknown): AgentHistoryData | null {
   const value = wireRecord(data);
   if (!value) return null;
   const agentId = readNonemptyString(value.agentId);
-  if (agentId === null || typeof value.text !== 'string') return null;
-  return { agentId, text: value.text };
+  if (agentId === null) return null;
+  const messages = wireList(value.messages, parseAgentHistoryRow);
+  if (messages === null) return null;
+  const truncationRecord = wireRecord(value.truncation);
+  if (!truncationRecord) return null;
+  const omittedRows = wireCount(truncationRecord.omittedRows);
+  const reason = truncationRecord.reason;
+  if (omittedRows === null || typeof reason !== 'string' || !AGENT_HISTORY_REASONS[reason]) return null;
+  return { agentId, messages, truncation: { omittedRows, reason: reason as AgentHistoryTruncationReason } };
 }
 
 /** Spawned job row of a `task_spawn` batch (`spawns`). */

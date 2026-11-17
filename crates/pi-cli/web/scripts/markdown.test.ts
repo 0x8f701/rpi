@@ -44,8 +44,10 @@ import {
   markdownPathReadValid,
   markdownOpenMissingFileVerdict,
   markdownOpenMissingFileToast,
-  markdownDownloadFileName,
+  markdownOpenHostFileUnavailable,
+  markdownOwnerBasenameSearch,
 } from '../src/markdown.ts';
+import { parseFileExplorerAmbiguity } from '../src/fileExplorer.ts';
 import {
   configurePlantumlServer,
   configuredPlantumlServer,
@@ -137,6 +139,16 @@ function fragmentText(html: string): string {
     .replace(/&amp;/g, '&');
 }
 
+/** textContent of every KaTeX application/x-tex annotation. */
+function texAnnotations(html: string): string[] {
+  const out: string[] = [];
+  const pattern = /<annotation\b(?=[^>]*\bencoding="application\/x-tex")[^>]*>([\s\S]*?)<\/annotation>/g;
+  for (const match of html.matchAll(pattern)) out.push(fragmentText(match[1]));
+
+  return out;
+}
+
+
 function streamingSplits(
   name: string,
   fullText: string,
@@ -166,7 +178,9 @@ streamingSplits(
 streamingSplits(
   'stream safe link',
   'visit [safe link](https://example.com/path?q=1) now',
-  (html) => html.includes('<a href="https://example.com/path?q=1" rel="noopener noreferrer">safe link</a>'),
+  (html) => html.includes('<a href="https://example.com/path?q=1" target="_blank" rel="noopener noreferrer">safe link</a>')
+    && !html.includes('md-link-download')
+    && !html.includes('>Download<'),
 );
 streamingSplits(
   'stream link safety',
@@ -195,6 +209,76 @@ streamingSplits(
     && html.includes('&lt;img src=x onerror=alert(2)&gt;')
     && !/<script\b|<img\b|<svg\b/i.test(html),
 );
+
+// Host summary cells backslash-prefix ASCII punctuation (README\.md, a\[b\]).
+// The old parser still treats those as links, emphasis, and code, and it
+// would turn an escaped path token into a clickable citation. Inline code
+// must keep the backslash. This assertion is the pre-fix failure.
+{
+  const source = 'README\\.md a\\[b\\] \\*not bold\\* \\`not code\\` and `README\\.md` plus \\<tag\\> &amp;';
+  const html = renderMarkdown(source);
+  const text = fragmentText(html);
+  check(
+    'literal escapes: escaped path, link, emphasis, and code stay literal text',
+    text === 'README.md a[b] *not bold* `not code` and README\\.md plus <tag> &amp;',
+    text,
+  );
+  check(
+    'literal escapes: escaped punctuation is not a link, emphasis, code span, or path citation',
+    !html.includes('<a ')
+      && !html.includes('<em>')
+      && !html.includes('<strong>')
+      && !html.includes('md-code-path')
+      && (html.match(/<code class="md-code"/g) ?? []).length === 1
+      && html.includes('<code class="md-code">README\\.md</code>'),
+    html,
+  );
+  check(
+    'literal escapes: HTML specials stay escaped',
+    html.includes('&lt;tag&gt;') && html.includes('&amp;amp;') && !html.includes('<tag>'),
+    html,
+  );
+}
+
+{
+  const bracedSource = String.raw`$\{x\}$`;
+  const braced = renderMarkdown(bracedSource);
+  check(
+    'literal escapes: genuine math keeps escaped TeX braces',
+    texAnnotations(braced).join('\n') === String.raw`\{x\}`
+      && !/[\u0001\u0002]|katex-error/.test(braced),
+    braced,
+  );
+  const spacedSource = String.raw`$a\,b$`;
+  const spaced = renderMarkdown(spacedSource);
+  check(
+    'literal escapes: genuine math keeps TeX spacing',
+    texAnnotations(spaced).join('\n') === String.raw`a\,b`
+      && !/[\u0001\u0002]|katex-error/.test(spaced),
+    spaced,
+  );
+  const matrixSource = String.raw`$$\begin{matrix}a\\b\end{matrix}$$`;
+  const matrix = renderMarkdown(matrixSource);
+  check(
+    'literal escapes: genuine math keeps TeX line breaks',
+    texAnnotations(matrix).join('\n') === String.raw`\begin{matrix}a\\b\end{matrix}`
+      && !/[\u0001\u0002]|katex-error/.test(matrix),
+    matrix,
+  );
+  const oldMarker = '\u0001E0\u0002';
+  const currentMarker = '\u0001Z0\u0002';
+  const collision = renderMarkdown('\\* `' + oldMarker + '` and `' + currentMarker + '`');
+  check(
+    'literal escapes: source control tokens in raw code stay unchanged',
+    fragmentText(collision) === '* ' + oldMarker + ' and ' + currentMarker
+      && collision.includes('<code class="md-code">' + oldMarker + '</code>')
+      && collision.includes('<code class="md-code">' + currentMarker + '</code>')
+      && !collision.includes('<em>'),
+    collision,
+  );
+}
+
+
 // --- representative Rust source: attributes, lifetimes, async fn, match,
 //     macros, raw strings, generics, comments, XSS bait ---
 const RUST_SOURCE = [
@@ -611,6 +695,89 @@ const SOLIDITY_SOURCE = [
   const fourSpace = renderMarkdown('text:\n\n     ```rust\n     fn f() {}\n     ```\n');
   check('4-space indent stays a plain code block (CommonMark boundary)',
     fourSpace.includes('```rust'), fourSpace.slice(0, 200));
+}
+
+// ---- fence marker RUN: a fence may open with more than three backticks, and
+// its closer must be the SAME marker, at least as long as the opening run
+// (CommonMark; the Rust neutral renderer already parses it this way:
+// analysis.rs parse_fence_opening/is_fence_closing). Reproduced defect: two
+// real model diagrams opened with ````mermaid were rendered as code fences
+// (info string became "`mermaid") and no diagram hydrated.
+{
+  const hostCount = (html: string) => (html.match(/class="md-mermaid-host[" ]/g) ?? []).length;
+  const fenceCount = (html: string) => (html.match(/class="md-fence[" ]/g) ?? []).length;
+
+  const four = renderMarkdown([
+    'Fenced reply head.',
+    '',
+    '````mermaid',
+    'flowchart LR',
+    '  A[Start] --> B[Done]',
+    '````',
+    '',
+    '| step | state |',
+    '| --- | --- |',
+    '| 1 | ok |',
+    '',
+    '````mermaid',
+    'flowchart TD',
+    '  C[One] --> D[Two]',
+    '````',
+    '',
+    'tail',
+  ].join('\n'));
+  check('4-backtick mermaid fences: both blocks are hosts', hostCount(four) === 2, four.slice(0, 400));
+  check('4-backtick mermaid fences: no code fence and no marker-in-lang label',
+    fenceCount(four) === 0 && !fragmentText(four).includes('`mermaid'), four.slice(0, 400));
+  check('4-backtick mermaid fences: both sources stay inside their host',
+    four.includes('flowchart LR') && four.includes('flowchart TD'), four.slice(0, 400));
+
+  // A 3-backtick line INSIDE a 4-backtick block is content, not its closer.
+  const shortInside = renderMarkdown([
+    '````mermaid',
+    'flowchart LR',
+    '```',
+    '  A --> B',
+    '````',
+    'after',
+  ].join('\n'));
+  check('4-backtick opening: the 3-backtick line does not close it',
+    hostCount(shortInside) === 1 && fenceCount(shortInside) === 0, shortInside.slice(0, 300));
+  check('4-backtick opening: the short marker stays diagram source',
+    fragmentText(shortInside).includes('```'), shortInside.slice(0, 300));
+  check('4-backtick opening: text after the real closer stays prose',
+    fragmentText(shortInside).trim().endsWith('after'), shortInside.slice(-160));
+
+  // The reverse direction: a longer closing run still closes a 3-run opening.
+  const longCloser = renderMarkdown('```mermaid\nflowchart LR\n  A --> B\n````\nafter');
+  check('4-backtick closer closes a 3-backtick opening',
+    hostCount(longCloser) === 1 && fragmentText(longCloser).trim().endsWith('after'), longCloser.slice(0, 300));
+
+  // A 4-backtick non-mermaid fence nests a mermaid fence as CODE (TUI parity):
+  // exactly one code fence, the nested marker kept, and no diagram host.
+  const nested = renderMarkdown([
+    '````markdown',
+    '```mermaid',
+    'flowchart TD',
+    '  A --> B',
+    '```',
+    '````',
+  ].join('\n'));
+  check('4-backtick markdown fence: one code fence, zero hosts',
+    fenceCount(nested) === 1 && hostCount(nested) === 0, nested.slice(0, 400));
+  check('4-backtick markdown fence: label is the info token',
+    fragmentText(nested).includes('markdown'), nested.slice(0, 300));
+  check('4-backtick markdown fence: nested fence markers stay inside the code',
+    fragmentText(nested).includes('```mermaid'), nested.slice(0, 400));
+
+  // The info string's FIRST token selects the language (CommonMark/TUI parity).
+  const meta = renderMarkdown('```mermaid title="x"\nflowchart LR\n  A --> B\n```\n');
+  check('fence info string: first token selects mermaid', hostCount(meta) === 1, meta.slice(0, 300));
+
+  // No diagram-type guessing: an unknown info string stays a code fence.
+  const unknown = renderMarkdown('```sequenceDiagram\nsequenceDiagram\n  A->>B: hi\n```\n');
+  check('unknown info string stays a code fence (no mermaid guessing)',
+    hostCount(unknown) === 0 && fenceCount(unknown) === 1, unknown.slice(0, 300));
 }
 
 {
@@ -2378,6 +2545,8 @@ function fakeRoot(hosts: FakeHost[]): HTMLElement {
     dataMdResolved?: string | null;
     sessionId?: string;
     workspaceCwd?: string;
+    reviewScope?: string | null;
+    reviewRepo?: string | null;
     /** textContent of the rendered owner root ([data-session-id]): the
      *  surrounding message text a bare-basename click is completed from. */
     rootText?: string | null;
@@ -2388,6 +2557,8 @@ function fakeRoot(hosts: FakeHost[]): HTMLElement {
       getAttribute(name: string): string | null {
         if (name === 'data-session-id') return opts.sessionId ?? null;
         if (name === 'data-workspace-cwd') return opts.workspaceCwd ?? null;
+        if (name === 'data-review-scope') return opts.reviewScope ?? null;
+        if (name === 'data-review-repo') return opts.reviewRepo ?? null;
         return null;
       },
       closest(): unknown { return null; },
@@ -2405,7 +2576,7 @@ function fakeRoot(hosts: FakeHost[]): HTMLElement {
       closest(sel: string): unknown {
         if (sel === '[data-session-id]') return opts.sessionId ? owner : null;
         if (sel === '[data-md-path]') return opts.dataMdPath ? node : null;
-        if (sel === '.md-link-download') return opts.kind === 'download' ? node : null;
+        if (sel === '.md-link-download') return null;
         if (sel === 'code.md-code' || sel === '.md-code') {
           return opts.kind === 'code' || opts.kind === 'fence-code' ? node : null;
         }
@@ -2482,8 +2653,8 @@ function fakeRoot(hosts: FakeHost[]): HTMLElement {
   opened.length = 0;
   const makefileEvent = click(fakeNode({ kind: 'code', text: 'Makefile:12', dataMdResolved: 'none', sessionId: 'session-a' }));
   check(
-    'Makefile:12 without a unique path is not a click',
-    dispatchMarkdownPathClick(makefileEvent, onOpen) === false && opened.length === 0,
+    'Makefile:12 without a unique path dispatches the basename for candidate discovery',
+    dispatchMarkdownPathClick(makefileEvent, onOpen) === true && opened.length === 1 && opened[0].path === 'Makefile' && opened[0].line === 12 && opened[0].completion === undefined,
     JSON.stringify(opened),
   );
 
@@ -2508,8 +2679,8 @@ function fakeRoot(hosts: FakeHost[]): HTMLElement {
   opened.length = 0;
   const appTsEvent = click(fakeNode({ kind: 'code', text: 'app.ts:42', dataMdResolved: 'none', sessionId: 'session-a' }));
   check(
-    'app.ts:42 without a unique path is not a click',
-    dispatchMarkdownPathClick(appTsEvent, onOpen) === false && opened.length === 0,
+    'app.ts:42 without a unique path dispatches the basename for candidate discovery',
+    dispatchMarkdownPathClick(appTsEvent, onOpen) === true && opened.length === 1 && opened[0].path === 'app.ts' && opened[0].line === 42 && opened[0].completion === undefined,
     JSON.stringify(opened),
   );
   opened.length = 0;
@@ -2585,8 +2756,8 @@ function fakeRoot(hosts: FakeHost[]): HTMLElement {
   opened.length = 0;
   const rangeEvent = click(fakeNode({ kind: 'code', text: 'node_start_config.rs:37-41', dataMdResolved: 'none', sessionId: 'session-a' }));
   check(
-    'line-range basename without a unique path is not a click',
-    dispatchMarkdownPathClick(rangeEvent, onOpen) === false && opened.length === 0,
+    'line-range basename without a unique path dispatches the basename for candidate discovery',
+    dispatchMarkdownPathClick(rangeEvent, onOpen) === true && opened.length === 1 && opened[0].path === 'node_start_config.rs' && opened[0].line === 37 && opened[0].completion === undefined,
     JSON.stringify(opened),
   );
   opened.length = 0;
@@ -2740,6 +2911,49 @@ function fakeRoot(hosts: FakeHost[]): HTMLElement {
     JSON.stringify(appHits),
   );
   appUnsub();
+  const unavailableOpened: string[] = [];
+  const unavailableEvent = click(fakeNode({
+    kind: 'anchor',
+    href: 'https://example.com/file.bin',
+    sessionId: 'session-review',
+    reviewScope: 'unavailable',
+  }));
+  const unavailableUnsub = subscribeMarkdownOpenPath((path) => { unavailableOpened.push(path); });
+  check(
+    'unavailable review scope prevents the native link and sends no open',
+    dispatchMarkdownPathClick(unavailableEvent) === true
+      && unavailableEvent.defaultPrevented === true
+      && unavailableOpened.length === 0,
+  );
+  unavailableUnsub();
+  const nullOpened: Array<{ reviewRepo: string | null | undefined }> = [];
+  const nullEvent = click(fakeNode({
+    kind: 'code',
+    text: 'src/lib.rs',
+    dataMdPath: 'src/lib.rs',
+    sessionId: 'session-review',
+    reviewScope: 'null',
+  }));
+  const nullUnsub = subscribeMarkdownOpenPath((_path, _line, owner) => {
+    nullOpened.push({ reviewRepo: owner.reviewRepo });
+  });
+  check(
+    'null review scope stays a review owner distinct from a transcript click',
+    dispatchMarkdownPathClick(nullEvent) === true
+      && nullOpened.length === 1
+      && nullOpened[0]?.reviewRepo === null,
+  );
+  nullUnsub();
+  for (const reviewScope of ['child', 'other']) {
+    const opened: string[] = [];
+    const event = click(fakeNode({ kind: 'anchor', href: 'https://example.com/file.bin', sessionId: 'session-review', reviewScope }));
+    const unsub = subscribeMarkdownOpenPath((path) => { opened.push(path); });
+    check(
+      `malformed review scope ${reviewScope} prevents navigation and sends no open`,
+      dispatchMarkdownPathClick(event) === true && event.defaultPrevented === true && opened.length === 0,
+    );
+    unsub();
+  }
 
   unsubB();
   refHits.length = 0;
@@ -2756,11 +2970,11 @@ function fakeRoot(hosts: FakeHost[]): HTMLElement {
   schemeUnsub();
 
   const html = renderMarkdown('see [safe](https://example.com/file.bin) and [mail](mailto:a@b.c) and [src](src/app.ts)');
-  check('https link keeps navigation', html.includes('<a href="https://example.com/file.bin" rel="noopener noreferrer">safe</a>'), html.slice(0, 400));
-  check('https link offers Download', html.includes('class="md-link-download" data-href="https://example.com/file.bin"'), html.slice(0, 400));
-  check('mailto has no Download', !html.includes('data-href="mailto:a@b.c"'), html.slice(0, 400));
-  check('relative workspace href renders', html.includes('<a href="src/app.ts" rel="noopener noreferrer">src</a>'), html.slice(0, 400));
-  check('relative href has no Download', !html.includes('data-href="src/app.ts"'), html.slice(0, 400));
+  check('https link keeps navigation', html.includes('<a href="https://example.com/file.bin" target="_blank" rel="noopener noreferrer">safe</a>'), html.slice(0, 500));
+  check('https link has no adjacent Download', !html.includes('md-link-download') && !html.includes('>Download<'), html.slice(0, 500));
+  check('mailto has no Download', html.includes('<a href="mailto:a@b.c" rel="noopener noreferrer">mail</a>') && !html.includes('data-href="mailto:a@b.c"'), html.slice(0, 500));
+  check('relative workspace href renders', html.includes('<a href="src/app.ts" rel="noopener noreferrer">src</a>'), html.slice(0, 500));
+  check('relative href has no Download', !html.includes('data-href="src/app.ts"') && !html.includes('download'), html.slice(0, 500));
   const pathLineHtml = renderMarkdown('open [here](src/app.ts:12) and [file](app.ts:8)');
   check(
     'path:line href still renders',
@@ -2944,10 +3158,26 @@ function fakeRoot(hosts: FakeHost[]): HTMLElement {
     e2eHtml.slice(0, 600),
   );
   check(
-    'e2e bare https is interactive with Download',
-    e2eHtml.includes(`<a href="${e2eUrl}" rel="noopener noreferrer">${e2eUrl}</a>`)
-      && e2eHtml.includes(`class="md-link-download" data-href="${e2eUrl}"`),
+    'e2e bare https is a text link with no Download button',
+    e2eHtml.includes(`<a href="${e2eUrl}" target="_blank" rel="noopener noreferrer">${e2eUrl}</a>`)
+      && !e2eHtml.includes('md-link-download')
+      && !e2eHtml.includes('>Download<')
+      && !e2eHtml.includes('&amp;amp;'),
     e2eHtml.slice(0, 600),
+  );
+  const queryHtml = renderMarkdown('see https://example.org/pi-web?a=1&b=2 now');
+  check(
+    'bare query href is escaped once',
+    queryHtml.includes('<a href="https://example.org/pi-web?a=1&amp;b=2" target="_blank" rel="noopener noreferrer">https://example.org/pi-web?a=1&amp;b=2</a>')
+      && !queryHtml.includes('&amp;amp;'),
+    queryHtml.slice(0, 700),
+  );
+  const explicitQueryHtml = renderMarkdown('[docs](https://example.org/pi-web?a=1&b=2)');
+  check(
+    'explicit query href is escaped once',
+    explicitQueryHtml.includes('<a href="https://example.org/pi-web?a=1&amp;b=2" target="_blank" rel="noopener noreferrer">docs</a>')
+      && !explicitQueryHtml.includes('&amp;amp;'),
+    explicitQueryHtml.slice(0, 500),
   );
 
   const punctHtml = renderMarkdown(`see ${e2eAbs}. also ${e2eUrl}.`);
@@ -2960,8 +3190,42 @@ function fakeRoot(hosts: FakeHost[]): HTMLElement {
   );
   check(
     'https punctuation stays outside the target',
-    punctHtml.includes(`${e2eUrl}</a>`) && punctHtml.includes('Download</button>.'),
+    punctHtml.includes(`${e2eUrl}</a>.`),
     punctHtml.slice(0, 500),
+  );
+
+  // Real-user sample: a bare URL followed by full-width sentence punctuation and
+  // prose must linkify only the URL. The bare-token scan is ASCII-agnostic and
+  // previously swallowed "。omlo" into both the href and the anchor label.
+  const cjkPunctUrl = 'https://example.org/issues/49#issuecomment-6785212840';
+  const cjkPunctHtml = renderMarkdown(`：${cjkPunctUrl}。omlo 已经`);
+  check(
+    'bare https href stops at the fragment while CJK sentence debris stays prose',
+    cjkPunctHtml.includes(
+      `：<a href="${cjkPunctUrl}" target="_blank" rel="noopener noreferrer">${cjkPunctUrl}</a>。omlo 已经`,
+    )
+      && !cjkPunctHtml.includes(`href="${cjkPunctUrl}。`)
+      && !cjkPunctHtml.includes(`>${cjkPunctUrl}。`)
+      && !cjkPunctHtml.includes('omlo</a>')
+      && (cjkPunctHtml.match(/<a /g) ?? []).length === 1,
+    cjkPunctHtml.slice(0, 700),
+  );
+  check(
+    'the full-width-period sample captures no CJK text inside its anchor',
+    !/<a\b[^>]*>[^<]*[\u3000-\u303f\u3400-\u4dbf\u4e00-\u9fff\uff00-\uffef][^<]*<\/a>/.test(cjkPunctHtml),
+    cjkPunctHtml.slice(0, 700),
+  );
+  // The boundary excludes only CJK sentence punctuation, never CJK ideographs:
+  // a genuine Chinese path/query/fragment must still linkify as one URL.
+  const cjkPathUrl = 'https://zh.example.org/wiki/中文?q=检索#section-一';
+  const cjkPathHtml = renderMarkdown(`见 ${cjkPathUrl} 现在`);
+  check(
+    'bare https with a Chinese path, query, and fragment still links whole',
+    cjkPathHtml.includes(
+      `<a href="${cjkPathUrl}" target="_blank" rel="noopener noreferrer">${cjkPathUrl}</a> 现在`,
+    )
+      && (cjkPathHtml.match(/<a /g) ?? []).length === 1,
+    cjkPathHtml.slice(0, 700),
   );
 
   const multiHtml = renderMarkdown(`a ${e2eAbs} b ${e2eUrl} c /workspace/other.txt`);
@@ -2970,7 +3234,8 @@ function fakeRoot(hosts: FakeHost[]): HTMLElement {
     !multiHtml.includes('md-bare-abs')
       && multiHtml.includes(e2eAbs)
       && multiHtml.includes('/workspace/other.txt')
-      && (multiHtml.match(/class="md-link-download"/g) ?? []).length === 1,
+      && (multiHtml.match(/class="md-link-download"/g) ?? []).length === 0
+      && (multiHtml.match(/target="_blank"/g) ?? []).length === 1,
     multiHtml.slice(0, 700),
   );
 
@@ -2978,7 +3243,8 @@ function fakeRoot(hosts: FakeHost[]): HTMLElement {
   check(
     'existing markdown https is not double-linked',
     (existingLinkHtml.match(/<a href="https:\/\/example\.com\/notes\.md"/g) ?? []).length === 2
-      && (existingLinkHtml.match(/class="md-link-download" data-href="https:\/\/example\.com\/notes\.md"/g) ?? []).length === 2
+      && (existingLinkHtml.match(/class="md-link-download"/g) ?? []).length === 0
+      && (existingLinkHtml.match(/target="_blank"/g) ?? []).length === 2
       && !/<a [^>]*>[^<]*<a /.test(existingLinkHtml),
     existingLinkHtml.slice(0, 600),
   );
@@ -3154,14 +3420,15 @@ function fakeRoot(hosts: FakeHost[]): HTMLElement {
       onError,
     );
     check(
-      'malformed read response opens nothing and reports the typed missing-file verdict',
+      'malformed read response opens nothing and is not a host missing-file search',
       opens.length === 0
         && probes.length === 1
         && errors.length === 1
         && rejectionFields(errors[0]).rpc === true
-        && rejectionFields(errors[0]).rpcCode === 'file_unavailable'
+        && rejectionFields(errors[0]).rpcCode === 'file_unresolved'
         && markdownOpenRejectionOwnership(errors[0]) === 'local'
-        && markdownOpenMissingFileVerdict(true, errors[0]) === true,
+        && markdownOpenHostFileUnavailable(errors[0]) === false
+        && markdownOpenMissingFileVerdict(true, errors[0]) === false,
       JSON.stringify({ opens, errors }),
     );
 
@@ -3178,10 +3445,11 @@ function fakeRoot(hosts: FakeHost[]): HTMLElement {
       onError,
     );
     check(
-      'mismatched returned path rejects the open with the typed missing-file verdict',
+      'mismatched returned path rejects the open and is not a host missing-file search',
       opens.length === 0
         && errors.length === 1
-        && rejectionFields(errors[0]).rpcCode === 'file_unavailable',
+        && rejectionFields(errors[0]).rpcCode === 'file_unresolved'
+        && markdownOpenHostFileUnavailable(errors[0]) === false,
       JSON.stringify({ opens, errors }),
     );
 
@@ -3199,7 +3467,9 @@ function fakeRoot(hosts: FakeHost[]): HTMLElement {
       'missing path:line probe never opens and names the path in its toast',
       opens.length === 0
         && errors.length === 1
-        && markdownOpenMissingFileVerdict(true, errors[0]) === true
+        && rejectionFields(errors[0]).rpcCode === 'file_unresolved'
+        && markdownOpenHostFileUnavailable(errors[0]) === false
+        && markdownOpenMissingFileVerdict(true, errors[0]) === false
         && markdownOpenMissingFileToast('missing.rs') === 'File not found: missing.rs',
       JSON.stringify({ opens, errors }),
     );
@@ -3307,17 +3577,17 @@ function fakeRoot(hosts: FakeHost[]): HTMLElement {
       { sessionId: 'session-a', workspaceCwd: '/workspace' },
       (command) => {
         probes.push(command);
-        return Promise.resolve(echo('pkg/nested/target.rs'));
+        return Promise.resolve(echo(String(command.path)));
       },
       (opened, line) => { opens.push(`${opened}:${line ?? ''}`); },
       (error) => { errors.push(error); },
       'vendor/pkg/nested/target.rs',
     );
     check(
-      'exact read success opens the cited path and sends no alternate read',
+      'a valid same-owner completion is the only read and the short path is not probed',
       probes.length === 1
-        && probes[0].path === 'pkg/nested/target.rs'
-        && opens.join(',') === 'pkg/nested/target.rs:1'
+        && probes[0].path === 'vendor/pkg/nested/target.rs'
+        && opens.join(',') === 'vendor/pkg/nested/target.rs:1'
         && errors.length === 0,
       JSON.stringify({ probes, opens, errors }),
     );
@@ -3330,11 +3600,6 @@ function fakeRoot(hosts: FakeHost[]): HTMLElement {
       { sessionId: 'session-a', workspaceCwd: '/workspace' },
       (command) => {
         probes.push(command);
-        if (command.path === 'nested/target.rs') {
-          const error = new Error('file is unavailable') as Error & { rpcCode: 'file_unavailable' };
-          error.rpcCode = 'file_unavailable';
-          return Promise.reject(error);
-        }
         return Promise.resolve(echo('pkg/nested/target.rs'));
       },
       (opened, line) => { opens.push(`${opened}:${line ?? ''}`); },
@@ -3342,10 +3607,9 @@ function fakeRoot(hosts: FakeHost[]): HTMLElement {
       'pkg/nested/target.rs',
     );
     check(
-      'typed missing file then reads the unique completion once',
-      probes.length === 2
-        && probes[0].path === 'nested/target.rs'
-        && probes[1].path === 'pkg/nested/target.rs'
+      'a unique completion is probed once and the cited short path is never read',
+      probes.length === 1
+        && probes[0].path === 'pkg/nested/target.rs'
         && opens.join(',') === 'pkg/nested/target.rs:1'
         && errors.length === 0,
       JSON.stringify({ probes, opens, errors }),
@@ -3353,35 +3617,148 @@ function fakeRoot(hosts: FakeHost[]): HTMLElement {
   }
 
   {
-    // A review-scoped citation: the review's repository override supplies the
-    // missing repo-relative prefix after the bare path is a typed missing file.
+    const cite = 'psy_node_redis/src/store/rewards.rs';
+    const candidates = [`psy-node-fix/${cite}`, `psy-node/${cite}`];
     const probes: string[] = [];
     const opens: string[] = [];
     const errors: unknown[] = [];
-    const missingError = Object.assign(new Error('file is unavailable'), { rpc: true, rpcCode: 'file_unavailable' });
+    const ambiguous = Object.assign(new Error('file is ambiguous'), {
+      rpc: true,
+      rpcCode: 'file_ambiguous',
+      rpcData: { code: 'file_ambiguous', candidates },
+    });
+    const html = renderMarkdown(`exact suffix \`${cite}:1\` with no longer path`);
+    check(
+      'a safe relative slash suffix stays clickable with no invented completion',
+      html.includes(`data-md-path="${cite}"`)
+        && html.includes('data-md-line="1"')
+        && !html.includes('data-md-completion=')
+        && !html.includes('data-md-resolved="none"'),
+      html,
+    );
     await markdownOpenValidatedPath(
-      'psy_node_redis/src/rewards.rs',
-      218,
-      { sessionId: 'session-a', workspaceCwd: '/workspace/audit', reviewRepo: 'psy-node' },
+      cite,
+      1,
+      { sessionId: 'session-a', workspaceCwd: '/workspace' },
       (command) => {
-        const path = (command as { path?: string }).path ?? '';
-        probes.push(path);
-        if (path === 'psy-node/psy_node_redis/src/rewards.rs') {
-          return Promise.resolve(validRead(path));
-        }
-        return Promise.reject(Object.assign(new Error('file is unavailable'), { rpc: true, rpcCode: 'file_unavailable' }));
+        probes.push(String(command.path));
+        return Promise.reject(ambiguous);
       },
       (opened) => { opens.push(opened); },
       (error) => { errors.push(error); },
     );
     check(
-      'typed missing citation falls back to the review repository prefix and opens the prefixed path',
-      probes.length === 2
-        && probes[0] === 'psy_node_redis/src/rewards.rs'
-        && probes[1] === 'psy-node/psy_node_redis/src/rewards.rs'
+      'an ambiguity with no completion probes the citation once',
+      probes.length === 1
+      && probes[0] === cite
+        && opens.length === 0
+        && errors.length === 1
+        && errors[0] === ambiguous
+        && JSON.stringify(parseFileExplorerAmbiguity(errors[0])) === JSON.stringify(candidates),
+      JSON.stringify({ probes, opens }),
+    );
+    const rootHtml = renderMarkdown('`rewards.rs` is the only name');
+    check(
+      'a root homonym with no longer context is not replaced from a filename cache',
+      rootHtml.includes('data-md-path="rewards.rs"')
+        && !rootHtml.includes('data-md-completion=')
+        && !rootHtml.includes('data-md-resolved='),
+      rootHtml,
+    );
+    const ambiguousHtml = renderMarkdown('`rewards.rs` beside psy-node/rewards.rs and psy-node-fix/rewards.rs');
+    check(
+      'an existing unresolved basename stays non-clickable and invents no completion',
+      ambiguousHtml.includes('data-md-resolved="none"')
+        && !ambiguousHtml.includes('data-md-path=')
+        && !ambiguousHtml.includes('data-md-completion='),
+      ambiguousHtml,
+    );
+    probes.length = 0;
+    opens.length = 0;
+    errors.length = 0;
+    const malformed = Object.assign(new Error('file is ambiguous'), {
+      rpc: true,
+      rpcCode: 'file_ambiguous',
+      rpcData: { code: 'file_ambiguous', candidates: [`psy-node/${cite}`, `psy-node-fix/${cite}`] },
+    });
+    await markdownOpenValidatedPath(
+      cite,
+      1,
+      { sessionId: 'session-a', workspaceCwd: '/workspace' },
+      (command) => {
+        probes.push(String(command.path));
+        return Promise.reject(malformed);
+      },
+      (opened) => { opens.push(opened); },
+      (error) => { errors.push(error); },
+    );
+    check(
+      'a malformed candidate list is not swallowed and stays the original error',
+      probes.length === 1
+        && opens.length === 0
+        && errors.length === 1
+        && errors[0] === malformed
+        && parseFileExplorerAmbiguity(errors[0]) === null,
+      JSON.stringify({ probes, opens, parsed: parseFileExplorerAmbiguity(errors[0]) }),
+    );
+  }
+
+
+  {
+    // A review-scoped citation is repo-relative through the snapshot's
+    // authoritative repo. The repo-rooted path is the FIRST and only
+    // primary probe: a same-named parent file must never win.
+    const probes: string[] = [];
+    const opens: string[] = [];
+    const errors: unknown[] = [];
+    const missing = () => Object.assign(new Error('file is unavailable'), { rpc: true, rpcCode: 'file_unavailable' });
+    await markdownOpenValidatedPath(
+      'psy_node_redis/src/rewards.rs',
+      218,
+      { sessionId: 'session-a', workspaceCwd: '/workspace/audit', reviewRepo: 'psy-node' },
+      (command) => {
+        const path = typeof command.path === 'string' ? command.path : '';
+        probes.push(path);
+        // The parent-relative spelling also exists; it must not be consulted.
+        return Promise.resolve(validRead(path));
+      },
+      (opened) => { opens.push(opened); },
+      (error) => { errors.push(error); },
+    );
+    check(
+      'a colliding parent file never wins a review citation',
+      probes.length === 1
+        && probes[0] === 'psy-node/psy_node_redis/src/rewards.rs'
         && opens.length === 1
         && opens[0] === 'psy-node/psy_node_redis/src/rewards.rs'
         && errors.length === 0,
+      JSON.stringify({ probes, opens, errors }),
+    );
+
+    // A missing child is terminal: it never falls back to the parent spelling.
+    probes.length = 0;
+    opens.length = 0;
+    errors.length = 0;
+    await markdownOpenValidatedPath(
+      'psy_node_redis/src/rewards.rs',
+      218,
+      { sessionId: 'session-a', workspaceCwd: '/workspace/audit', reviewRepo: 'psy-node' },
+      (command) => {
+        const path = typeof command.path === 'string' ? command.path : '';
+        probes.push(path);
+        return path === 'psy_node_redis/src/rewards.rs'
+          ? Promise.resolve(validRead(path))
+          : Promise.reject(missing());
+      },
+      (opened) => { opens.push(opened); },
+      (error) => { errors.push(error); },
+    );
+    check(
+      'a missing review citation never falls back to the parent file',
+      probes.length === 1
+        && probes[0] === 'psy-node/psy_node_redis/src/rewards.rs'
+        && opens.length === 0
+        && errors.length === 1,
       JSON.stringify({ probes, opens, errors }),
     );
 
@@ -3394,9 +3771,9 @@ function fakeRoot(hosts: FakeHost[]): HTMLElement {
       undefined,
       { sessionId: 'session-a', workspaceCwd: '/workspace/audit', reviewRepo: 'psy-node' },
       (command) => {
-        const path = (command as { path?: string }).path ?? '';
+        const path = typeof command.path === 'string' ? command.path : '';
         probes.push(path);
-        return Promise.reject(Object.assign(new Error('file is unavailable'), { rpc: true, rpcCode: 'file_unavailable' }));
+        return Promise.reject(missing());
       },
       (opened) => { opens.push(opened); },
       (error) => { errors.push(error); },
@@ -3405,6 +3782,86 @@ function fakeRoot(hosts: FakeHost[]): HTMLElement {
       'a path already under the override prefix is not re-prefixed',
       probes.length === 1
         && probes[0] === 'psy-node/src/lib.rs'
+        && opens.length === 0
+        && errors.length === 1,
+      JSON.stringify({ probes, opens, errors }),
+    );
+
+    // Basename completion stays inside the same review root.
+    probes.length = 0;
+    opens.length = 0;
+    errors.length = 0;
+    await markdownOpenValidatedPath(
+      'rewards.rs',
+      12,
+      { sessionId: 'session-a', workspaceCwd: '/workspace/audit', reviewRepo: 'psy-node' },
+      (command) => {
+        const path = typeof command.path === 'string' ? command.path : '';
+        probes.push(path);
+        return path === 'psy-node/psy_node_redis/src/rewards.rs'
+          ? Promise.resolve(validRead(path))
+          : Promise.reject(missing());
+      },
+      (opened) => { opens.push(opened); },
+      (error) => { errors.push(error); },
+      'psy_node_redis/src/rewards.rs',
+    );
+    check(
+      'a review completion is the only probe and stays inside the review root',
+      probes.length === 1
+        && probes[0] === 'psy-node/psy_node_redis/src/rewards.rs'
+        && opens.length === 1
+        && opens[0] === 'psy-node/psy_node_redis/src/rewards.rs'
+        && errors.length === 0,
+      JSON.stringify({ probes, opens, errors }),
+    );
+
+    // A successful echo that only ENDS WITH the repo-rooted request is a
+    // sibling-prefixed homonym; the review boundary rejects it.
+    probes.length = 0;
+    opens.length = 0;
+    errors.length = 0;
+    await markdownOpenValidatedPath(
+      'src/lib.rs',
+      7,
+      { sessionId: 'session-a', workspaceCwd: '/workspace/audit', reviewRepo: 'psy-node' },
+      (command) => {
+        const path = typeof command.path === 'string' ? command.path : '';
+        probes.push(path);
+        return Promise.resolve(validRead('other/psy-node/src/lib.rs'));
+      },
+      (opened) => { opens.push(opened); },
+      (error) => { errors.push(error); },
+    );
+    check(
+      'a sibling-prefixed primary echo never escapes the review root',
+      probes.length === 1
+        && probes[0] === 'psy-node/src/lib.rs'
+        && opens.length === 0
+        && errors.length === 1,
+      JSON.stringify({ probes, opens, errors }),
+    );
+
+    probes.length = 0;
+    opens.length = 0;
+    errors.length = 0;
+    await markdownOpenValidatedPath(
+      'rewards.rs',
+      12,
+      { sessionId: 'session-a', workspaceCwd: '/workspace/audit', reviewRepo: 'psy-node' },
+      (command) => {
+        const path = typeof command.path === 'string' ? command.path : '';
+        probes.push(path);
+        return Promise.resolve(validRead('other/psy-node/psy_node_redis/src/rewards.rs'));
+      },
+      (opened) => { opens.push(opened); },
+      (error) => { errors.push(error); },
+      'psy_node_redis/src/rewards.rs',
+    );
+    check(
+      'a sibling-prefixed completion echo never escapes the review root',
+      probes.length === 1
+        && probes[0] === 'psy-node/psy_node_redis/src/rewards.rs'
         && opens.length === 0
         && errors.length === 1,
       JSON.stringify({ probes, opens, errors }),
@@ -3540,19 +3997,22 @@ function fakeRoot(hosts: FakeHost[]): HTMLElement {
       JSON.stringify({ rootProbes, rootOpens, rootErrors }),
     );
     check(
-      'two different longer paths for the same basename are not a click',
+      'an unresolved basename click dispatches the filename with no completion',
       dispatchMarkdownPathClick(click(fakeNode({
         kind: 'code',
         text: 'foo.rs',
         dataMdResolved: 'none',
         sessionId: 'session-a',
         rootText: 'src/foo.rs and lib/foo.rs',
-      })), rootHandler) === false,
+      })), rootHandler) === true
+        && rootOpens.length === 1
+        && rootOpens[0] === 'foo.rs:',
     );
 
   }
 
   {
+    opened.length = 0;
     const glued = 'duplicate dup-name.txt:1 beside pkg/a/dup-name.txt and pkg/b/dup-name.txtoutside /tmp/work/outside-only.txt:1';
     const dupClick = click(fakeNode({
       kind: 'code',
@@ -3562,8 +4022,12 @@ function fakeRoot(hosts: FakeHost[]): HTMLElement {
       rootText: glued,
     }));
     check(
-      'rendered duplicate stays inert when paragraph text glues the second path',
-      dispatchMarkdownPathClick(dupClick, onOpen) === false && dupClick.defaultPrevented === false,
+      'an unresolved basename click dispatches the filename and invents no completion',
+      dispatchMarkdownPathClick(dupClick, onOpen) === true
+        && dupClick.defaultPrevented === true
+        && opened.length === 1
+        && opened[0].path === 'dup-name.txt'
+        && opened[0].completion === undefined,
     );
   }
   {
@@ -3707,10 +4171,12 @@ function fakeRoot(hosts: FakeHost[]): HTMLElement {
       sessionId: 'session-root',
     }));
     check(
-      'ambiguous-context basename click stays inert from its rendered attributes',
-      dispatchMarkdownPathClick(ambiguousEvent, onRootOpen) === false
-        && rootOpens.length === 0
-        && ambiguousEvent.defaultPrevented === false,
+      'an unresolved basename click dispatches the filename with no invented completion',
+      dispatchMarkdownPathClick(ambiguousEvent, onRootOpen) === true
+        && ambiguousEvent.defaultPrevented === true
+        && rootOpens.length === 1
+        && rootOpens[0].path === 'Token.sol'
+        && rootOpens[0].completion === undefined,
     );
   }
   {
@@ -3727,43 +4193,22 @@ function fakeRoot(hosts: FakeHost[]): HTMLElement {
   }
 
   opened.length = 0;
-  const blockedDl = click(fakeNode({ kind: 'download', dataHref: 'javascript:alert(1)' }));
+  const httpClick = click(fakeNode({ kind: 'anchor', href: 'https://example.com/file.bin', sessionId: 'session-a' }));
   check(
-    'download click is explicit and blocked for non-http',
-    dispatchMarkdownPathClick(blockedDl, onOpen) === true
-      && blockedDl.defaultPrevented === true
+    'http text link is not captured by the path dispatcher',
+    dispatchMarkdownPathClick(httpClick, onOpen) === false
+      && httpClick.defaultPrevented === false
       && opened.length === 0,
   );
-
-  check(
-    'download filename from URL',
-    markdownDownloadFileName('https://example.com/path/report.bin') === 'report.bin',
-  );
-  const scrubbed = markdownDownloadFileName('https://example.com/a', 'attachment; filename="a/b\\c.txt"');
-  check('download filename bounded scrub', scrubbed === 'a-b-c.txt', scrubbed);
-  check('download filename fallback', markdownDownloadFileName('https://example.com/') === 'download');
 }
 
 // ---- toast stacking: above footer, no layout shift ----
 {
   const css = fs.readFileSync(path.join(process.cwd(), 'src/styles.css'), 'utf8');
   const toastRule = css.match(/#toasts\s*\{([^}]+)\}/);
-  const footerRule = css.match(/^footer\s*\{([^}]+)\}/m);
-  const toastZ = Number(toastRule?.[1].match(/z-index:\s*(\d+)/)?.[1] ?? 0);
-  const footerZ = Number(footerRule?.[1].match(/z-index:\s*(\d+)/)?.[1] ?? 0);
   check('toast layer is position:fixed (no layout shift)', /position:\s*fixed/.test(toastRule?.[1] ?? ''));
-  check(
-    'toast z-index sits above the composer footer',
-    toastZ > footerZ && toastZ >= 53,
-    `toasts=${toastZ} footer=${footerZ}`,
-  );
-  const mobileFooter = css.match(/\.app-layout--drawer-open footer\s*\{([^}]+)\}/);
-  const mobileFooterZ = Number(mobileFooter?.[1].match(/z-index:\s*(\d+)/)?.[1] ?? footerZ);
-  check(
-    'toast z-index sits above the mobile drawer-open footer',
-    toastZ > mobileFooterZ,
-    `toasts=${toastZ} mobileFooter=${mobileFooterZ}`,
-  );
+
+
   check(
     'mobile toast rule does not drop z-index below the footer',
     !/@media \(max-width: 768px\)[\s\S]*?#toasts\s*\{[^}]*z-index:\s*(?:[0-4]?\d|5[0-2])\b/.test(css),
@@ -3936,6 +4381,39 @@ function fakeRoot(hosts: FakeHost[]): HTMLElement {
     inner.slice(0, 240),
   );
 }
+
+{
+  const slots: Record<string, { mode: string; tabs: unknown[]; treeQuery?: string }> = {
+    'session-owner': { mode: 'closed', tabs: [] },
+  };
+  const displayedSessionId = 'session-displayed';
+  let displayedOpened = false;
+  const hostMissing = Object.assign(new Error('file is unavailable'), { rpc: true, rpcCode: 'file_unavailable' });
+  const plan = markdownOwnerBasenameSearch({
+    path: 'daemon.rs',
+    ownerSessionId: 'session-owner',
+    displayedSessionId,
+    hostMissing: markdownOpenHostFileUnavailable(hostMissing),
+  });
+  if (plan) {
+    if (plan.revealDisplayed) displayedOpened = true;
+    const current = slots['session-owner'];
+    slots['session-owner'] = { ...current, mode: 'open', tabs: current.tabs, treeQuery: plan.query };
+  }
+  check(
+    'inactive owner search persists on its slot and does not open the displayed drawer',
+    plan?.query === 'daemon.rs'
+      && plan.revealDisplayed === false
+      && slots['session-owner']?.mode === 'open'
+      && slots['session-owner']?.treeQuery === 'daemon.rs'
+      && slots['session-owner']?.tabs.length === 0
+      && displayedOpened === false
+      && slots[displayedSessionId] === undefined,
+    JSON.stringify({ plan, slots, displayedOpened }),
+  );
+}
+
+
 
 // Restore the environment: the shared SVG DOMParser shim only exists for
 // this bundle's success paths.

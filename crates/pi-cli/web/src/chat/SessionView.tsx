@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type PointerEvent, type UIEvent } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type PointerEvent, type UIEvent } from 'react';
 import { useDesktopActions } from '../desktopBridge';
 import { BashCard, IrcCard, ToolCard } from '../App';
 import {
@@ -11,12 +11,16 @@ import {
   type ComposerAttachment,
 } from '../attachments';
 import { appendDraft, parseSlashLine } from '../commands';
-import { CommandPicker } from '../CommandPicker';
+import { CommandPicker, slashIntentFromDraft } from '../CommandPicker';
 import { createAutoResizeController, type AutoResizeController } from '../autoResize';
 import { composerBeforeInputShouldSubmit, composerEnterShouldPreventDefault, composerEnterShouldSubmit, nativeEventShiftKey, nextPasteEnterGuard } from '../composerPaste';
+import { applyComposerEdit, composerEditKey } from '../composerKeys';
 import { loadTokenForAuthority, type StorageLike } from '../hostToken';
 import { MarkdownBody } from '../MarkdownBody';
 import { thinkingFirstBlocks } from '../markdown';
+import { ReplyActions } from '../ReplyActions';
+import { sourceMarkdownFromBlocks } from '../replyMarkdown';
+import { loadReplyStars, saveReplyStars, type ReplyStarScope } from '../replyStars';
 import { createScrollPin, type ScrollPinController } from '../scrollPin';
 import { safeText } from '../redact';
 export { safeText };
@@ -24,6 +28,7 @@ import {
   applyToolResultToItems,
   applyToolSnapshot,
   applyToolStartToItems,
+  assistantTimestampMs,
   boundOutput,
   contentText,
   customToItem,
@@ -450,7 +455,17 @@ export function applySessionEvent(
       if (message.role === 'assistant') {
         const id = typeof frame.itemId === 'string' && frame.itemId !== '' ? frame.itemId : nextId('a');
         const existing = items.findIndex((item) => item.id === id);
-        const assistant: Item = { kind: 'assistant', id, status: 'streaming', blocks: [] };
+        // Real wire clock captured at start: pi-ai `AssistantMessage.pending`
+        // carries the turn's creation timestamp. A start frame without a
+        // usable value leaves the field absent; the end backfills it.
+        const timestamp = assistantTimestampMs(message);
+        const assistant: Item = {
+          kind: 'assistant',
+          id,
+          status: 'streaming',
+          blocks: [],
+          ...(timestamp === undefined ? {} : { timestamp }),
+        };
         if (existing >= 0) {
           items = items.map((item, index) => index === existing ? assistant : item);
         } else {
@@ -499,11 +514,17 @@ export function applySessionEvent(
       const finalBlocks = Array.isArray(message.content)
         ? message.content.filter(isContentBlock).filter((block) => block.type !== 'toolCall')
         : [];
+      // The persisted END message is the canonical wire clock: a reload names
+      // the .md from that row's timestamp. Adopt a valid end value over the
+      // start value so live and hydrated filenames agree; an invalid/missing
+      // end keeps whatever start captured.
+      const endTimestamp = assistantTimestampMs(message);
       items = items.map((item) => item.kind === 'assistant' && item.id === id
         ? {
             ...item,
             status: 'final',
             blocks: finalBlocks.length > 0 ? finalBlocks : item.blocks,
+            ...(endTimestamp === undefined ? {} : { timestamp: endTimestamp }),
           }
         : item);
       if (activeAssistantId === id) activeAssistantId = null;
@@ -513,13 +534,12 @@ export function applySessionEvent(
       const toolCallId = typeof frame.toolCallId === 'string' ? frame.toolCallId : '';
       items = applyToolStartToItems(items, {
         kind: 'toolCard',
-        id: typeof frame.itemId === 'string' && frame.itemId !== '' ? frame.itemId : nextId('tc'),
         toolCallId,
         toolName: typeof frame.toolName === 'string' && frame.toolName !== '' ? frame.toolName : 'tool',
         args: boundedToolText(frame.args),
         status: 'running',
         result: '',
-      });
+      }, frame.itemId);
       break;
     }
     case 'tool_execution_update': {
@@ -669,9 +689,50 @@ function messagesFromResponse(data: unknown): unknown[] {
   return data.messages;
 }
 
+/** Exact identity match for a settled assistant reply: the transcript row must
+ *  carry an authoritative id AND its wire message must equal the captured
+ *  `message_end` payload. A timestamp (or any single field) is NOT identity;
+ *  message content equality is the only proof that this row IS the reply. */
+export function hasSettledReplyRow(rows: unknown, endMessage: unknown): boolean {
+  if (!Array.isArray(rows) || endMessage === null || typeof endMessage !== 'object') return false;
+  let captured: string;
+  try {
+    captured = JSON.stringify(endMessage);
+  } catch {
+    return false;
+  }
+  return rows.some((row) => {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) return false;
+    const entry = row as { id?: unknown; message?: unknown };
+    if (typeof entry.id !== 'string' || entry.id === '') return false;
+    try {
+      return JSON.stringify(entry.message) === captured;
+    } catch {
+      return false;
+    }
+  });
+}
+
 function failureMessage(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   return boundedText(safeText(message || 'Command failed.'), MAX_STATUS_CHARS);
+}
+
+/** Per-row reply action strip for a settled chat assistant reply. Mirrors the
+ *  main transcript's FinalAssistant contract exactly: the caller owns the
+ *  stable wire timestamp and the star authority (existing replyStars store);
+ *  copy/save raw markdown never depend on either. `star.entryId` is `null`
+ *  for a live/synthetic id, which hides ONLY the star while copy/save stay.
+ *  Failures go to the owning chat's central toast — never a local component
+ *  error. Omitted → no action chrome (Broadcast lane). */
+export interface SessionReplyActions {
+  timestampMs?: number;
+  star?: {
+    entryId: string | null;
+    starred: boolean;
+    onToggle: (entryId: string, starred: boolean) => void;
+  };
+  onError: (message: string) => void;
 }
 
 function AssistantMessage({
@@ -682,6 +743,7 @@ function AssistantMessage({
   cwd,
   pathContext,
   onLayoutChange,
+  reply,
 }: {
   item: Extract<Item, { kind: 'assistant' }>;
   runnerId: string;
@@ -693,20 +755,30 @@ function AssistantMessage({
    *  decode mutate layout with no React commit, so the pin controller must
    *  hear about them the same task they happen. */
   onLayoutChange?: () => void;
+  reply?: SessionReplyActions;
 }) {
   const visibleBlocks = thinkingFirstBlocks(item.blocks.filter((block) =>
     (block.type === 'text' && typeof block.text === 'string' && block.text !== '')
     || (block.type === 'thinking' && typeof block.thinking === 'string' && block.thinking !== '')));
   return (
     <article
-      className="chat-session-message chat-session-message--assistant"
+      className="chat-session-message chat-session-message--assistant msg--assistant"
       data-status={item.status}
       data-session-id={sessionId}
       data-runner-id={runnerId}
       data-mapping-id={mappingId}
       data-workspace-cwd={cwd}
+      {...(reply?.star?.entryId ? { 'data-entry-id': reply.star.entryId } : {})}
     >
       <span className="chat-session-message__role">Assistant</span>
+      {item.status !== 'streaming' && reply ? (
+        <ReplyActions
+          markdown={sourceMarkdownFromBlocks(item.blocks)}
+          timestampMs={reply.timestampMs}
+          star={reply.star}
+          onError={reply.onError}
+        />
+      ) : null}
       {visibleBlocks.map((block, index) => block.type === 'thinking' ? (
         <details className="chat-session-thinking" key={`${item.id}-thinking-${index}`}>
           <summary>Thinking</summary>
@@ -726,7 +798,7 @@ function AssistantMessage({
   );
 }
 
-export function TranscriptItem({ item, runnerId, mappingId, sessionId, cwd, pathContext, onLayoutChange }: { item: Item; runnerId: string; mappingId: string; sessionId: string; cwd: string; pathContext?: string; /** Transcript pin callback for async Markdown/Mermaid layout; optional so the Broadcast lane (no pin controller) reuses the component unchanged. */ onLayoutChange?: () => void }) {
+export function TranscriptItem({ item, runnerId, mappingId, sessionId, cwd, pathContext, onLayoutChange, reply }: { item: Item; runnerId: string; mappingId: string; sessionId: string; cwd: string; pathContext?: string; /** Transcript pin callback for async Markdown/Mermaid layout; optional so the Broadcast lane (no pin controller) reuses the component unchanged. */ onLayoutChange?: () => void; /** Reply action strip for a settled assistant row; owned by the session view (star store + central toast). Omitted → no action chrome. */ reply?: SessionReplyActions }) {
   switch (item.kind) {
     case 'user':
       return (
@@ -742,7 +814,7 @@ export function TranscriptItem({ item, runnerId, mappingId, sessionId, cwd, path
         </article>
       );
     case 'assistant':
-      return <AssistantMessage item={item} runnerId={runnerId} mappingId={mappingId} sessionId={sessionId} cwd={cwd} pathContext={pathContext} onLayoutChange={onLayoutChange} />;
+      return <AssistantMessage item={item} runnerId={runnerId} mappingId={mappingId} sessionId={sessionId} cwd={cwd} pathContext={pathContext} onLayoutChange={onLayoutChange} reply={reply} />;
     case 'toolCard':
       return (
         <div className="chat-session__tool" data-session-id={sessionId} data-runner-id={runnerId} data-mapping-id={mappingId} data-workspace-cwd={cwd}>
@@ -803,6 +875,12 @@ export function SessionView({
   const composerEnabled = connected && !composerLocked;
   const [transcript, setTranscript] = useState<SessionTranscriptState>({ items: [], activeAssistantId: null });
   const transcriptRef = useRef(transcript);
+  // Starred reply ids for THIS session scope, loaded from / persisted to the
+  // existing replyStars store (never a shared in-memory mirror). Chat rows are
+  // starrable only when they carry an authoritative `entryId`.
+  const [starredEntryIds, setStarredEntryIds] = useState<ReadonlySet<string>>(() => new Set<string>());
+  const starredEntryIdsRef = useRef<ReadonlySet<string>>(starredEntryIds);
+  starredEntryIdsRef.current = starredEntryIds;
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
   const [draft, setDraft] = useState('');
@@ -817,6 +895,16 @@ export function SessionView({
   const pasteEnterGuardUntilRef = useRef(0);
   const composerComposingRef = useRef(false);
   const composerEnterHandledRef = useRef(false);
+  // Inline slash autocomplete: the composer derives the slash intent from its
+  // `draft` state (the single source — no mirrored intent, so EVERY draft
+  // writer stays consistent); catalog, candidate list, highlight, dismissal,
+  // and Enter/Arrow/Escape handling live inside the single CommandPicker
+  // instance via inlineIntent/composerInputRef/onInlineAccept.
+  const inlineIntent = slashIntentFromDraft(draft);
+  // Controlled-draft caret writeback: setDraft re-renders and React resets
+  // the selection when it assigns .value, so a requested caret is applied in
+  // a layout effect AFTER the commit — never between setDraft and paint.
+  const inlineCaretRef = useRef<number | null>(null);
   const transcriptNodeRef = useRef<HTMLDivElement>(null);
   const [turnStreaming, setTurnStreaming] = useState(false);
   const streaming = turnStreaming || transcript.items.some((item) => item.kind === 'assistant' && item.status === 'streaming');
@@ -848,6 +936,12 @@ export function SessionView({
   const keepComposerFocus = useCallback(() => {
     composerRef.current?.focus({ preventScroll: true });
   }, []);
+  useLayoutEffect(() => {
+    if (inlineCaretRef.current === null) return;
+    const caret = inlineCaretRef.current;
+    inlineCaretRef.current = null;
+    composerRef.current?.setSelectionRange(caret, caret);
+  });
   // Bottom-pin state for the /chat transcript. This lane is a plain scroll
   // container (no `.transcript-content` wrapper), so it reuses the SHARED
   // pin decision core (createScrollPin) directly instead of the full
@@ -875,6 +969,76 @@ export function SessionView({
     });
   }, []);
 
+  // Settled-reply hydration (terminal-driven, one shot). Identity guards are
+  // scalar refs only — NO second transcript mirror: the request cut is the
+  // committed transcript state itself and the write path stays
+  // updateTranscript + mergeSessionHistory.
+  const mountedRef = useRef(true);
+  const runtimeIncarnationRef = useRef('');
+  const terminalTurnRef = useRef('');
+  const lastAssistantEndRef = useRef<{ turnId: string; message: Record<string, unknown> } | null>(null);
+  const pendingSettledRef = useRef<
+    { turnId: string; incarnation: string; epoch: number; message: Record<string, unknown> } | null
+  >(null);
+  const requestedSettledTurnRef = useRef('');
+  const settledInFlightRef = useRef(false);
+  const connectionEpochRef = useRef(runner.connectionEpoch);
+  connectionEpochRef.current = runner.connectionEpoch;
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
+  const startSettledRefill = useCallback(() => {
+    const pending = pendingSettledRef.current;
+    if (pending === null || settledInFlightRef.current || !connected || !mountedRef.current) return;
+    pendingSettledRef.current = null;
+    requestedSettledTurnRef.current = pending.turnId;
+    settledInFlightRef.current = true;
+    // Cut = the committed items. The live final row is object-identical in the
+    // cut and in the state, so mergeSessionHistory never re-appends it as an
+    // "after-cut" item.
+    const cut = transcriptRef.current.items.slice();
+    void sendCommand({ type: 'get_messages' })
+      .then((data) => {
+        if (!mountedRef.current) return;
+        // Stale gates, all captured at the typed terminal: same runtime,
+        // same connection generation, this terminal still latest, and no
+        // newer active turn (a still-present T1 item is NOT enough).
+        if (runtimeIncarnationRef.current !== pending.incarnation) return;
+        if (connectionEpochRef.current !== pending.epoch) return;
+        if (terminalTurnRef.current !== pending.turnId) return;
+        const authority = readAuthority?.();
+        if (authority === null || authority === undefined) return;
+        if ((authority.activeTurnId ?? '') !== '') return;
+        const rows = messagesFromResponse(data);
+        // Missing/foreign record: keep the live items untouched. No drop, no
+        // retry, no poll.
+        if (!hasSettledReplyRow(rows, pending.message)) return;
+        const history = messagesToItems(rows);
+        updateTranscript((current) => mergeSessionHistory(history, current, cut));
+      })
+      .catch((error) => {
+        if (!mountedRef.current) return;
+        // Stale/unmount drops above are precise non-fatal drops (silent). Any
+        // REAL failure is never swallowed: transport keeps its existing path,
+        // and unknown RPC/parse failures report through the same central sink
+        // with fixed context (no reply text).
+        if (error instanceof RunnerCommandError && error.kind === 'transport') {
+          onTransportError(failureMessage(error));
+          return;
+        }
+        onTransportError(`Settled reply hydration failed: ${failureMessage(error)}`);
+      })
+      .finally(() => {
+        settledInFlightRef.current = false;
+        // Drain a NEWER terminal that landed while this request was in flight:
+        // one pending slot, drained once after finish — never a polling loop.
+        startSettledRefillRef.current();
+      });
+  }, [connected, onTransportError, readAuthority, sendCommand, updateTranscript]);
+  const startSettledRefillRef = useRef(startSettledRefill);
+  startSettledRefillRef.current = startSettledRefill;
+
   const [queuedSteering, setQueuedSteering] = useState<string[]>([]);
   const queuedSteeringRef = useRef<string[]>([]);
   queuedSteeringRef.current = queuedSteering;
@@ -896,6 +1060,16 @@ export function SessionView({
   useEffect(() => events((frame) => {
     if (!sessionEventBelongsTo(frame, sessionId)) return;
     const type = typeof frame.type === 'string' ? frame.type : '';
+    const incarnation = typeof frame.runtimeIncarnation === 'string' ? frame.runtimeIncarnation : '';
+    if (incarnation !== '') runtimeIncarnationRef.current = incarnation;
+    if (type === 'message_end') {
+      const message = eventMessage(frame);
+      if (message.role === 'assistant') {
+        // The EXACT persisted identity of this reply: the wire MessageEnd
+        // payload. Never a timestamp or a derived field.
+        lastAssistantEndRef.current = { turnId: eventTurnId(frame), message };
+      }
+    }
     setTurnStreaming((current) => planTurnStreaming(type, current, frame.activeTurnId));
     setActivityStrip((current) => {
       const applied = applyActivityStripEvent(current, frame, sessionId);
@@ -922,7 +1096,29 @@ export function SessionView({
       return;
     }
     updateTranscript((current) => applySessionEvent(current, frame as EventFrame));
+    if (type === 'turn_terminal') {
+      const turnId = eventTurnId(frame);
+      if (turnId !== '') {
+        // Any newer typed terminal invalidates older pending hydration.
+        terminalTurnRef.current = turnId;
+        const end = lastAssistantEndRef.current;
+        if (end !== null && end.turnId === turnId && requestedSettledTurnRef.current !== turnId) {
+          pendingSettledRef.current = {
+            turnId,
+            incarnation: incarnation !== '' ? incarnation : runtimeIncarnationRef.current,
+            epoch: connectionEpochRef.current,
+            message: end.message,
+          };
+        }
+      }
+    }
   }), [events, sessionId, updateTranscript]);
+
+  // Commit-keyed trigger: turn_terminal is applied above FIRST, then this
+  // effect reads the committed items for the request cut. No timer, no poll.
+  useEffect(() => {
+    if (pendingSettledRef.current !== null) startSettledRefill();
+  }, [transcript.items, startSettledRefill]);
 
   // Declared after the subscription effect so it runs in the same flush,
   // immediately after that listener is registered: register-then-read leaves
@@ -942,6 +1138,41 @@ export function SessionView({
       authority.activeTurnId ?? '',
     ));
   }, [readAuthority, sessionId]);
+
+  // Starred replies live in the EXISTING session-scoped replyStars store, keyed
+  // by the same authority/session pair the main surface uses — no shared
+  // in-memory mirror. A storage/corruption failure surfaces through the chat's
+  // central toast and leaves the initial empty set (nothing is fabricated).
+  useEffect(() => {
+    const scope: ReplyStarScope = { authority: runner.authority, sessionId };
+    let loaded: ReadonlySet<string> = new Set<string>();
+    try {
+      loaded = loadReplyStars(sessionTokenStorage(), scope);
+    } catch (error) {
+      onTransportError(failureMessage(error));
+    }
+    setStarredEntryIds(loaded);
+  }, [onTransportError, runner.authority, sessionId]);
+
+  // Persist-before-commit, mirroring the main surface: a failed write keeps the
+  // last-good set and reports through the central toast (never a local error).
+  const toggleReplyStar = useCallback((entryId: string, starred: boolean) => {
+    if (entryId === '') return;
+    const scope: ReplyStarScope = { authority: runner.authority, sessionId };
+    const current = starredEntryIdsRef.current;
+    if (current.has(entryId) === starred) return;
+    const next = new Set(current);
+    if (starred) next.add(entryId);
+    else next.delete(entryId);
+    try {
+      saveReplyStars(sessionTokenStorage(), scope, next);
+    } catch (error) {
+      onTransportError(failureMessage(error));
+      return;
+    }
+    starredEntryIdsRef.current = next;
+    setStarredEntryIds(next);
+  }, [onTransportError, runner.authority, sessionId]);
 
   useEffect(() => {
     if (!connected) {
@@ -1090,6 +1321,15 @@ export function SessionView({
     keepComposerFocus();
   }, [keepComposerFocus]);
 
+  /** Inline autocomplete accept: REPLACE the whole draft with the completed
+   *  slash token (the popup is only ever open while the draft IS that token)
+   *  and queue the caret writeback; the picker keys its dismissal on the
+   *  settled token. Never submits. */
+  const acceptInlineDraft = useCallback((text: string) => {
+    setDraft(text);
+    inlineCaretRef.current = text.length;
+  }, []);
+
   const ingestFiles = useCallback((fileList: FileList | null) => {
     if (!fileList || fileList.length === 0) return;
     void ingestComposerFiles(fileList, attachments).then((result) => {
@@ -1159,7 +1399,25 @@ export function SessionView({
               <p className="chat-session__status">No messages yet. Send a prompt to start this conversation.</p>
             )}
             {transcript.items.map((item) => (
-              <TranscriptItem item={item} key={item.id} runnerId={runner.id} mappingId={mappingId} sessionId={sessionId} cwd={cwd} pathContext={pathContext} onLayoutChange={pinIfPinned} />
+              <TranscriptItem
+                item={item}
+                key={item.id}
+                runnerId={runner.id}
+                mappingId={mappingId}
+                sessionId={sessionId}
+                cwd={cwd}
+                pathContext={pathContext}
+                onLayoutChange={pinIfPinned}
+                reply={item.kind === 'assistant' && item.status !== 'streaming' ? {
+                  timestampMs: item.timestamp,
+                  star: {
+                    entryId: item.entryId ?? null,
+                    starred: item.entryId !== undefined && starredEntryIds.has(item.entryId),
+                    onToggle: toggleReplyStar,
+                  },
+                  onError: onTransportError,
+                } : undefined}
+              />
             ))}
           </div>
           {goalOpen && (
@@ -1260,6 +1518,10 @@ export function SessionView({
             onError={(message) => setComposerStatus(message)}
             getComposerValue={() => composerRef.current?.value ?? draft}
             onCatalog={ignoreCommandCatalog}
+            inlineIntent={inlineIntent}
+            composerInputRef={composerRef}
+            onInlineAccept={acceptInlineDraft}
+            inlineCanAccept={() => !composerComposingRef.current && performance.now() >= pasteEnterGuardUntilRef.current}
           />
           <textarea
             ref={composerRef}
@@ -1276,6 +1538,38 @@ export function SessionView({
             onKeyDown={(event) => {
               if ((event.ctrlKey || event.metaKey) && !event.altKey && (event.key === 'v' || event.key === 'V')) {
                 pasteEnterGuardUntilRef.current = nextPasteEnterGuard(performance.now());
+              }
+              // Ctrl-only edit shortcuts first: Ctrl+U clears the whole text
+              // (attachments untouched), Ctrl+A/E move to the current
+              // physical line's start/end, Ctrl+W deletes the selection or
+              // the previous OMP-style word. IME (isComposing/229) and
+              // meta/alt/shift never reach here (composerEditKey → null).
+              const edit = composerEditKey({
+                key: event.key,
+                ctrlKey: event.ctrlKey,
+                metaKey: event.metaKey,
+                altKey: event.altKey,
+                shiftKey: event.shiftKey,
+                isComposing: event.nativeEvent.isComposing,
+                keyCode: event.nativeEvent.keyCode,
+              });
+              if (edit) {
+                event.preventDefault();
+                const input = composerRef.current;
+                if (!input) return;
+                const start = input.selectionStart ?? draft.length;
+                const next = applyComposerEdit(draft, start, input.selectionEnd ?? start, edit);
+                if (next.value === draft) {
+                  // Unchanged value: setDraft bails out and NO commit follows,
+                  // so the layout-effect caret writeback would never run —
+                  // write the caret directly (React leaves the DOM selection
+                  // alone when it does not re-assign the value).
+                  input.setSelectionRange(next.caret, next.caret);
+                } else {
+                  setDraft(next.value);
+                  inlineCaretRef.current = next.caret;
+                }
+                return;
               }
               if (event.key === 'Escape') {
                 if (stopArmed) {

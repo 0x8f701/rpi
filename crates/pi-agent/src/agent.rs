@@ -26,11 +26,37 @@ use crate::{
     TransformMessageFn,
     queue::PendingQueue, run_agent_loop, run_agent_loop_continue,
 };
+use crate::loop_runtime::MessageCommittedBeforeListenerFailure;
+
+/// The agent has no configured model, so no provider turn can be admitted.
+///
+/// A run needs a concrete [`Model`] for provider execution. Agents that are
+/// constructed before a model is known (bootstrap/generation paths) keep
+/// [`AgentState::model`] as `None` and every execution admission returns this
+/// typed rejection instead of running a placeholder/default model. Callers can
+/// inspect it without matching on message text:
+/// `error.downcast_ref::<pi_agent::ModelNotConfigured>()`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModelNotConfigured;
+
+impl ModelNotConfigured {
+    pub const MESSAGE: &'static str = "No model is configured for this agent";
+}
+
+impl std::fmt::Display for ModelNotConfigured {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(Self::MESSAGE)
+    }
+}
+
+impl std::error::Error for ModelNotConfigured {}
 
 #[derive(Clone, Debug)]
 pub struct AgentState {
     pub system_prompt: String,
-    pub model: Model,
+    /// Model used for the next provider turn, or `None` when this agent has no
+    /// configured model yet. See [`ModelNotConfigured`].
+    pub model: Option<Model>,
     pub thinking_level: ThinkingLevel,
     pub tools: Vec<AgentTool>,
     pub messages: Vec<AgentMessage>,
@@ -44,7 +70,7 @@ impl Default for AgentState {
     fn default() -> Self {
         Self {
             system_prompt: String::new(),
-            model: Model::default(),
+            model: None,
             thinking_level: ThinkingLevel::Off,
             tools: Vec::new(),
             messages: Vec::new(),
@@ -491,7 +517,7 @@ impl Agent {
     }
 
     pub async fn set_model(&self, model: Model) {
-        self.inner.state.write().await.model = model;
+        self.inner.state.write().await.model = Some(model);
     }
 
     pub async fn set_thinking_level(&self, level: ThinkingLevel) {
@@ -642,6 +668,18 @@ impl Agent {
         self.inner.follow_up.lock().await.enqueue_front(follow_up);
     }
 
+    /// Rejects an execution request while no model is configured.
+    ///
+    /// Called before any claim, event, history mutation, or child side effect
+    /// so an unconfigured agent can never manufacture a turn.
+    async fn ensure_model_configured(&self) -> Result<()> {
+        if self.inner.state.read().await.model.is_some() {
+            Ok(())
+        } else {
+            Err(anyhow::Error::new(ModelNotConfigured))
+        }
+    }
+
     pub async fn prompt(&self, text: impl Into<String>) -> Result<()> {
         let user = UserMessage {
             content: vec![ContentBlock::text(text.into())],
@@ -651,10 +689,11 @@ impl Agent {
     }
 
     pub async fn prompt_messages(&self, messages: Vec<AgentMessage>) -> Result<()> {
+        self.ensure_model_configured().await?;
         let (signal, guard) = self.claim_run().await?;
         let mut context = self.context_snapshot().await;
         let messages = self.prepare_agent_start(messages, &mut context).await?;
-        let config = self.loop_config().await;
+        let config = self.loop_config().await?;
         let emit = self.event_sink();
         let stream_fn = self.inner.options.stream_fn.clone();
         self.execute_claimed(guard, signal.clone(), async move {
@@ -664,6 +703,7 @@ impl Agent {
     }
 
     pub async fn continue_run(&self) -> Result<()> {
+        self.ensure_model_configured().await?;
         let state = self.state().await;
         let Some(last) = state.messages.last() else {
             return Err(anyhow!("No messages to continue from"));
@@ -707,7 +747,7 @@ impl Agent {
                     return Err(error);
                 }
             };
-            let mut config = self.loop_config().await;
+            let mut config = self.loop_config().await?;
             config.skip_initial_steering = drained_steering;
             let emit = self.event_sink();
             let stream_fn = self.inner.options.stream_fn.clone();
@@ -722,7 +762,7 @@ impl Agent {
         let mut context = self.context_snapshot().await;
         let initial = self.prepare_agent_start(Vec::new(), &mut context).await?;
         context.messages.extend(initial);
-        let config = self.loop_config().await;
+        let config = self.loop_config().await?;
         let emit = self.event_sink();
         let stream_fn = self.inner.options.stream_fn.clone();
         self.execute_claimed(guard, signal.clone(), async move {
@@ -864,12 +904,15 @@ impl Agent {
         Ok(result.messages)
     }
 
-    async fn loop_config(&self) -> AgentLoopConfig {
+    async fn loop_config(&self) -> Result<AgentLoopConfig> {
         let state = self.inner.state.read().await;
+        let Some(model) = state.model.clone() else {
+            return Err(anyhow::Error::new(ModelNotConfigured));
+        };
         let steering_inner = self.inner.clone();
         let follow_up_inner = self.inner.clone();
-        AgentLoopConfig {
-            model: state.model.clone(),
+        Ok(AgentLoopConfig {
+            model,
             reasoning: state.thinking_level,
             stream_options: self.inner.stream_options.read().await.clone(),
             tool_execution: self.inner.options.tool_execution,
@@ -898,7 +941,7 @@ impl Agent {
                 true,
             )),
             ..AgentLoopConfig::default()
-        }
+        })
     }
 
     fn event_sink(&self) -> crate::EventSink {
@@ -947,6 +990,7 @@ impl Agent {
                 )
         );
 
+        let mut message_end_committed = false;
         {
             let mut state = self.inner.state.write().await;
             match &event {
@@ -957,6 +1001,7 @@ impl Agent {
                 AgentEvent::MessageEnd { message } => {
                     state.streaming_message = None;
                     state.messages.push(message.clone());
+                    message_end_committed = true;
                 }
                 AgentEvent::ToolExecutionStart { tool_call_id, .. } => {
                     state.pending_tool_calls.insert(tool_call_id.clone());
@@ -1002,6 +1047,9 @@ impl Agent {
             }
         }
         match first_error {
+            Some(error) if message_end_committed => Err(anyhow::Error::new(
+                MessageCommittedBeforeListenerFailure { source: error },
+            )),
             Some(error) => Err(error),
             None => Ok(()),
         }
@@ -1049,7 +1097,12 @@ impl Agent {
     }
 
     async fn emit_failure_turn(&self, error_message: String, aborted: bool) -> Result<()> {
-        let model = self.inner.state.read().await.model.clone();
+        // A claimed run always starts with a configured model (admission
+        // rejects otherwise), so this is a defensive typed rejection rather
+        // than a license to synthesize a placeholder model identity.
+        let Some(model) = self.inner.state.read().await.model.clone() else {
+            return Err(anyhow::Error::new(ModelNotConfigured));
+        };
         let failure = AssistantMessage {
             content: vec![ContentBlock::text("")],
             api: model.api.clone(),
@@ -1161,26 +1214,10 @@ async fn release_claim_owned(inner: &Arc<Inner>, generation: u64) {
 
 /// Restores drained-but-undelivered pending messages to the head of the
 /// steering or follow-up queue, preserving their relative FIFO order.
-///
-/// If the run already committed the FIRST restored message to the agent state
-/// (a listener failed after the `MessageEnd` state write), delivering it again
-/// would duplicate it, so it is dropped from the restore batch; the remaining
-/// messages were never emitted and must return to the queue.
 fn restore_pending_messages(inner: Arc<Inner>, follow_up: bool) -> RestoreMessagesFn {
     Arc::new(move |messages| {
         let inner = inner.clone();
         Box::pin(async move {
-            let mut messages = messages;
-            if messages.is_empty() {
-                return;
-            }
-            let committed = {
-                let state = inner.state.read().await;
-                state.messages.last() == messages.first()
-            };
-            if committed {
-                messages.remove(0);
-            }
             if messages.is_empty() {
                 return;
             }

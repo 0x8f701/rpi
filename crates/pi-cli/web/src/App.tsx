@@ -1,10 +1,13 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent, type PointerEvent, type RefObject, type UIEvent } from 'react';
+import { createPortal } from 'react-dom';
 import { useDesktopActions } from './desktopBridge';
 import { createScrollPin, type ScrollPinController } from './scrollPin';
 import { createAutoResizeController, type AutoResizeController } from './autoResize';
 import { safeText } from './redact';
 import { AnsiText } from './AnsiText';
 import { CopyButton } from './CopyButton';
+import { ReplyActions } from './ReplyActions';
+import { sourceMarkdownFromBlocks } from './replyMarkdown';
 import { humanToolTitle } from './toolTitle';
 import {
   SessionModelMutationQueue,
@@ -47,7 +50,7 @@ import {
   steeringPreviewsFromState,
   userContentPreview,
 } from './steeringQueueHelpers';
-import { renderBlocks, renderStreamingMarkdown, hydrateMermaid, thinkingSummaryHtml, markdownOpenValidatedPath, subscribeMarkdownOpenPath, markdownOpenMissingFileVerdict, markdownOpenMissingFileToast, type MarkdownPathOwner } from './markdown';
+import { renderBlocks, renderStreamingMarkdown, hydrateMermaid, thinkingSummaryHtml, markdownOpenValidatedPath, subscribeMarkdownOpenPath, markdownOpenMissingFileVerdict, markdownOpenMissingFileToast, markdownOpenHostFileUnavailable, markdownOwnerBasenameSearch, markdownWorkspaceRelativePath, type MarkdownPathOwner } from './markdown';
 import { configurePlantumlServer } from './plantumlEncode';
 import { MarkdownBody } from './MarkdownBody';
 import { TodoPanel } from './panels/TodoPanel';
@@ -87,7 +90,7 @@ import { latestCompactionSummary, SessionSidebar, buildRestoreSwitchTarget } fro
 import { downloadSessionExport } from './sessionExport';
 import { CodeReviewPanel, type CodeReviewOpenArgs } from './panels/CodeReviewPanel';
 import { CommitPicker } from './panels/CommitPicker';
-import { buildCodeReviewCommitsPayload, codeReviewOpenCommand, codeReviewOpenSnapshotError, normalizeCodeReviewCommits, normalizeCodeReviewSnapshot, type CodeReviewCommitRow } from './codeReview';
+import { buildCodeReviewCommitsPayload, codeReviewOpenCommand, normalizeCodeReviewCommits, parseCodeReviewSnapshot, type CodeReviewCommitRow } from './codeReview';
 import { FileExplorerPanel } from './panels/FileExplorerPanel';
 import {
   applyDrawerMode,
@@ -97,12 +100,13 @@ import {
   fileExplorerCommandForSession,
   fileExplorerListCommand,
   fileExplorerSyncPageCacheWithSlots,
+  parseFileExplorerAmbiguity,
   readFileExplorerSlot,
   updateFileExplorerSlot,
   type FileExplorerSessionSlot,
   type FileExplorerTab,
 } from './fileExplorer';
-import { isBusyCapacityError, rpcErrorCode, type ContentBlock, type EventFrame, type RpcResponse } from './types';
+import { isBusyCapacityError, isCompactionEvent, rpcErrorCode, type ContentBlock, type EventFrame, type ExactRuntimeEventFrame, type RpcResponse } from './types';
 import { withResolvers } from './withResolvers';
 import {
   activityStripView,
@@ -115,6 +119,7 @@ import {
 import {
   type Item,
   type TaskCardView,
+  type ToolCardStart,
   nextId,
   contentText,
   userMessageProjection,
@@ -141,6 +146,7 @@ import {
   parseEditCard,
   compactToolArgs,
   parseCommandCardArgs,
+  stripBashDiagnosticTrailer,
   parseProcessCardArgs,
   parseWriteCardArgs,
   parseReadCard,
@@ -160,6 +166,7 @@ import {
   messagesFromCatchUpResponse,
   liveHasStreamingAssistant,
   finalizeStreamingAssistant,
+  assistantTimestampMs,
   shouldNormalizeThinkingNewlines,
   normalizeThinkingNewlines,
   unescapeThinkingNewlines,
@@ -170,7 +177,6 @@ import {
 import {
   buildRealtimeSessionUpdate,
   setupRealtimeCall,
-  isRealtimeLiveMode,
   reduceRealtimeVoiceFrame,
   reducePendingVoiceFlush,
   parseRealtimeChannelFrames,
@@ -239,8 +245,10 @@ import { PendingRegistry, classifyResponseOwnership, RESPONSE_OWNERSHIP_REJECTIO
 import {
   TRANSCRIPT_FOLDS_SELECTOR,
   TRANSCRIPT_PROJECTION_EDGE_PX,
+  applyOpenFoldKeys,
   applyRestoredViewport,
   applySurfaceVisibility,
+  compensateAnchorShapeShift,
   compensatePrependedStage,
   normalizeTranscriptWindow,
   noteLiveViewportFold,
@@ -300,8 +308,17 @@ import {
   loadSessionPreference,
   saveSessionPreference,
 } from './sessionPreference';
+import {
+  deriveStarredReplies,
+  loadReplyStars,
+  saveReplyStars,
+  type ReplyStarScope,
+  type StarredReply,
+} from './replyStars';
+import { StarredReplyMinimap } from './StarredReplyMinimap';
 import { routeCommandSession, goalGetCommand, goalJournalCommand } from './goal';
-import { CommandPicker } from './CommandPicker';
+import { CommandPicker, mergeSlashIntent, slashIntentFromDraft, type SlashIntent } from './CommandPicker';
+import { applyComposerEdit, composerEditKey } from './composerKeys';
 import {
   appendDraft,
   parseSupportedCommand,
@@ -338,15 +355,20 @@ import {
   composerCommandSessionId,
   dispatchComposerSubmit,
   planComposerSubmitKind,
+  promptFailureRpcCode,
   rpcFailureToastSuppressed,
 } from './composerSubmit';
 import {
+  applyCompactionEvent,
   beginCompact,
   compactAdmission,
   compactBadgeLabel,
   compactStatusText,
   compactSendAdmission,
-  reconcileCompacting,
+  compactView,
+  emptyCompactBook,
+  reconcileCompactCut,
+  removeCompactRuntime,
   settleCompact,
   type CompactBook,
   type CompactMode,
@@ -430,118 +452,6 @@ function focusNewSessionCwdInput(): void {
   attempt();
 }
 
-/* ------------------------------------------------------------------ *
- * File explorer outer drawer width (desktop)
- * ------------------------------------------------------------------ *
- * One width authority for the right-side Files drawer: React writes the
- * clamped px onto `--file-explorer-width` on <html>; the stylesheet consumes
- * the SAME min(var(...), 70vw, 900px, calc(100vw - 576px)) expression in
- * .app-main's reservation, the drawer width, and the resizer offset. The
- * conversation-min-width guard and the SESSION SIDEBAR (230px open / 44px
- * collapsed rail, see the constants below) are both subtracted before the
- * drawer — the old naive viewport − 576 formula let a 704px drawer cover
- * the Send button at 1280px whenever the rail was open. When even the 360px
- * floor does not fit (fileExplorerOverlayActive), the drawer flips to an
- * overlay spanning the full viewport width: App adds the
- * app-layout--files-overlay class and the header Hide » button remains the
- * in-drawer close; the stored width is ignored. One boring global
- * localStorage key (never per-session, never anything but a bare clamped
- * number). Mobile (≤720px) is CSS-covered: the resizer is display:none and
- * the drawer covers the full viewport width.
- */
-export const FILE_EXPLORER_WIDTH_KEY = 'rpi-file-explorer-width';
-export const FILE_EXPLORER_WIDTH_MIN = 360;
-export const FILE_EXPLORER_WIDTH_MAX = 900;
-export const FILE_EXPLORER_WIDTH_DEFAULT = 607;
-export const FILE_EXPLORER_WIDTH_STEP = 16;
-
-/** Explicit conversation-min-width invariant (DeepSeek D05 real-browser
- * measurements): the main column never shrinks below 576px beside the
- * drawer — Send stays hittable down to that width. Matches the stylesheet's
- * calc(100vw - 576px) guard; the ceiling below subtracts the sidebar too,
- * so the guard applies to the width LEFT OVER after the rail. */
-export const FILE_EXPLORER_CONVERSATION_MIN = 576;
-
-/** App session-sidebar width consumed by the same row as drawer +
- * conversation: 230px with the drawer open (styles.css .session-sidebar),
- * 44px collapsed rail. Part of the math so 1280 + 230 can never yield the
- * old naive 704 ceiling. */
-export const FILE_EXPLORER_SIDEBAR_OPEN = 230;
-export const FILE_EXPLORER_SIDEBAR_COLLAPSED = 44;
-
-/** Largest allowed drawer width at the given viewport: the conversation
- * minimum (576px) and the session sidebar (230px open / 44px collapsed) are
- * both reserved before the drawer, saturated at the hard 900px cap.
- * Viewports too narrow to fit all three (ceiling below the 360px floor)
- * return the bare floor — the drawer flips to a full-viewport overlay there
- * and the stored width is simply unusable. Non-finite viewport falls back to
- * the hard cap; non-finite sidebar is treated as the wider open rail (the
- * conservative bound). */
-export function fileExplorerWidthCeiling(viewportWidth: number, sidebarPx: number = FILE_EXPLORER_SIDEBAR_OPEN): number {
-  if (!Number.isFinite(viewportWidth)) return FILE_EXPLORER_WIDTH_MAX;
-  const sidebar = Number.isFinite(sidebarPx) ? sidebarPx : FILE_EXPLORER_SIDEBAR_OPEN;
-  const beside = viewportWidth - sidebar - FILE_EXPLORER_CONVERSATION_MIN;
-  if (beside < FILE_EXPLORER_WIDTH_MIN) return FILE_EXPLORER_WIDTH_MIN;
-  return Math.min(FILE_EXPLORER_WIDTH_MAX, beside);
-}
-
-/** True when the viewport cannot fit sidebar + conversation minimum + the
- * 360px drawer floor at all: the drawer flips to a full-viewport overlay
- * (header Hide » still closes; stored width unusable). Distinct from the
- * ceiling helper because the ceiling CLAMPS to the floor at exactly this
- * boundary — the overlay decision needs the raw leftover width. */
-export function fileExplorerOverlayActive(viewportWidth: number, sidebarPx: number = FILE_EXPLORER_SIDEBAR_OPEN): boolean {
-  if (!Number.isFinite(viewportWidth)) return false;
-  return viewportWidth - sidebarPx - FILE_EXPLORER_CONVERSATION_MIN < FILE_EXPLORER_WIDTH_MIN;
-}
-
-export function clampFileExplorerWidth(px: number, viewportWidth: number, sidebarPx: number = FILE_EXPLORER_SIDEBAR_OPEN): number {
-  if (!Number.isFinite(px)) return FILE_EXPLORER_WIDTH_DEFAULT;
-  return Math.min(
-    fileExplorerWidthCeiling(viewportWidth, sidebarPx),
-    Math.max(FILE_EXPLORER_WIDTH_MIN, Math.round(px)),
-  );
-}
-
-export function readStoredFileExplorerWidth(viewportWidth: number, sidebarPx: number = FILE_EXPLORER_SIDEBAR_OPEN): number {
-  try {
-    const raw = window.localStorage.getItem(FILE_EXPLORER_WIDTH_KEY);
-    if (raw == null || raw === '') return FILE_EXPLORER_WIDTH_DEFAULT;
-    return clampFileExplorerWidth(Number(raw), viewportWidth, sidebarPx);
-  } catch {
-    return FILE_EXPLORER_WIDTH_DEFAULT;
-  }
-}
-
-export function writeStoredFileExplorerWidth(px: number, viewportWidth: number, sidebarPx: number = FILE_EXPLORER_SIDEBAR_OPEN): void {
-  try {
-    window.localStorage.setItem(
-      FILE_EXPLORER_WIDTH_KEY,
-      String(clampFileExplorerWidth(px, viewportWidth, sidebarPx)),
-    );
-  } catch {
-    /* private mode / blocked storage: width lives in CSS only */
-  }
-}
-
-export function applyFileExplorerWidth(px: number, viewportWidth: number, sidebarPx: number = FILE_EXPLORER_SIDEBAR_OPEN): void {
-  document.documentElement.style.setProperty(
-    '--file-explorer-width',
-    `${clampFileExplorerWidth(px, viewportWidth, sidebarPx)}px`,
-  );
-}
-
-/** Keyboard step for the outer drawer separator (direction +1 grows; the
- * resizer sits at the drawer's LEFT edge, so ArrowLeft = drag the edge
- * leftward = grow). */
-export function stepFileExplorerWidth(
-  current: number,
-  direction: -1 | 1,
-  viewportWidth: number,
-  sidebarPx: number = FILE_EXPLORER_SIDEBAR_OPEN,
-): number {
-  return clampFileExplorerWidth(current + direction * FILE_EXPLORER_WIDTH_STEP, viewportWidth, sidebarPx);
-}
 
 /* ------------------------------------------------------------------ *
  * App header height — ONE top offset authority
@@ -555,25 +465,17 @@ export function stepFileExplorerWidth(
 export const HEADER_HEIGHT_FLOOR = 44;
 
 /** Rounded integer header height in px, floored at 44px so a collapsed or
- * mid-layout header can never pull the drawer up under the chrome.
- * Fullscreen Files hides the header: only that path returns 0 and bypasses
- * the floor. A single argument keeps the existing measured behavior. */
-export function headerHeightPx(measuredHeight: number, headerHidden = false): number {
-  if (headerHidden) return 0;
+ * mid-layout header can never pull the drawer up under the chrome. */
+export function headerHeightPx(measuredHeight: number): number {
   if (!Number.isFinite(measuredHeight)) return HEADER_HEIGHT_FLOOR;
   return Math.max(HEADER_HEIGHT_FLOOR, Math.round(measuredHeight));
 }
 
-export function applyHeaderHeight(measuredHeight: number, headerHidden = false): void {
+export function applyHeaderHeight(measuredHeight: number): void {
   document.documentElement.style.setProperty(
     '--app-header-height',
-    `${headerHeightPx(measuredHeight, headerHidden)}px`,
+    `${headerHeightPx(measuredHeight)}px`,
   );
-}
-
-/** Files fullscreen is the open drawer expanded over the app header. */
-export function fileExplorerFullscreenActive(open: boolean, expanded: boolean): boolean {
-  return open && expanded;
 }
 
 /* ------------------------------------------------------------------ *
@@ -604,6 +506,25 @@ export function measureChromeHeight(el: {
 }): number {
   el.style.minHeight = '0';
   return el.getBoundingClientRect().height;
+}
+
+/** Publishes --composer-buttons-band: the live drawer-foot offset consumed
+ * by the ≤720px sidebar foot margin (buttons row height + composer row gap
+ * − the foot's own padding-top); 0px when the composer is hidden. */
+function publishComposerButtonsBand(buttons: HTMLElement): void {
+  const height = buttons.getBoundingClientRect().height;
+  const row = buttons.parentElement;
+  const rowGap = row ? parseFloat(getComputedStyle(row).rowGap) : NaN;
+  const foot = document.querySelector('.session-sidebar__foot');
+  const padTop = foot ? parseFloat(getComputedStyle(foot).paddingTop) : 0;
+  if (!Number.isFinite(height) || height <= 0 || !Number.isFinite(rowGap) || !Number.isFinite(padTop)) {
+    document.documentElement.style.setProperty('--composer-buttons-band', '0px');
+    return;
+  }
+  document.documentElement.style.setProperty(
+    '--composer-buttons-band',
+    `${Math.max(0, Math.round(height + rowGap - padTop))}px`,
+  );
 }
 
 /** `token_required` is the truthful boot projection for a listener whose
@@ -638,6 +559,61 @@ const EMPTY_LIFECYCLE_VIEW: SessionLifecycleView = {
 };
 
 const EMPTY_ITEMS: Item[] = [];
+const EMPTY_STARRED_IDS: ReadonlySet<string> = new Set<string>();
+const EMPTY_STARRED_REPLIES: readonly StarredReply[] = [];
+
+/** Reply stars are scoped to the (listener authority, session id) pair — the
+ *  same two keys sessionPreference buckets by — so identical entry-id strings
+ *  in two listeners or two sessions never share state. The key joins with a
+ *  NUL: neither part may leak into the other. */
+export function replyStarScopeKey(scope: ReplyStarScope): string {
+  return `${scope.authority}\u0000${scope.sessionId}`;
+}
+
+/** Ownership guard for the turn_terminal settled refill (pure, exported for
+ *  the App switch harness). The captured runtime must still be the resident
+ *  incarnation on the same socket generation (reconnectRefillStillOwned),
+ *  AND the captured terminal turn must still be the session's MOST RECENT
+ *  terminal turn (the strip's terminalTurnIds append in turn order): a newer
+ *  turn that finished before this response landed makes its own terminal the
+ *  last one and discards the stale hydration. No turn may be in flight
+ *  (strip turnId empty or exactly the captured id) and an unknown/reset
+ *  strip fails closed. Settled-phase events (agent_settled / queue_update)
+ *  advance the accepted cursor but carry NO turn identity, so they never
+ *  invalidate the hydration — only a new turn does. */
+export function settledRefillStillOwned(
+  sessionId: string,
+  ownership: { runtimeIncarnation: string; socketGeneration: number; turnId: string },
+  residentIncarnation: string | undefined,
+  socketGenerationNow: number,
+  currentTurn: { turnId: string; isStreaming: boolean; terminalTurnIds: readonly string[] } | undefined,
+): boolean {
+  if (sessionId === '' || ownership.runtimeIncarnation === '' || ownership.turnId === '') return false;
+  if (!reconnectRefillStillOwned(
+    { sessionId, runtimeIncarnation: ownership.runtimeIncarnation, socketGeneration: ownership.socketGeneration },
+    residentIncarnation,
+    socketGenerationNow,
+  )) return false;
+  if (!currentTurn) return false;
+  if (currentTurn.isStreaming) return false;
+  if (currentTurn.turnId !== '' && currentTurn.turnId !== ownership.turnId) return false;
+  // The captured terminal must still be the MOST RECENT terminal turn
+  // (terminalTurnIds append in turn order): if T2 started AND finished
+  // before this response landed, the last terminal is T2 and the stale T1
+  // hydration is discarded. Settled agent_settled/queue_update frames keep
+  // T1 last, so they never invalidate.
+  const latestTerminal = currentTurn.terminalTurnIds.at(-1) ?? '';
+  return latestTerminal === ownership.turnId;
+}
+
+/** Pure core of the starred-reply jump: resolve the clicked authoritative
+ *  entry id against the CURRENT authoritative item list. Returns -1 when the
+ *  entry is gone (stale minimap click after a refill/rebind) — never an
+ *  index derived from body text or a stale snapshot. */
+export function planStarredJump(items: readonly Item[], entryId: string): number {
+  if (entryId === '') return -1;
+  return items.findIndex((item) => item.kind === 'assistant' && item.entryId === entryId);
+}
 
 interface TranscriptSurfaceProps {
   rk: RuntimeKey;
@@ -654,15 +630,40 @@ interface TranscriptSurfaceProps {
   forcePin: () => void;
   onContentEl: (rk: RuntimeKey, el: HTMLDivElement | null) => void;
   onCommit: (rk: RuntimeKey, itemsVersion: number, projectedCount: number) => void;
+  /** THE parked-anchor correction writer; consumed by the shape transaction and the App RO. */
+  correctParkedAnchorShape: (rk: RuntimeKey, anchorItemId: string, anchorOffsetPx: number) => void;
+  /** Authoritative follow state (pinCtrl.isFollowing) — the live viewport's noted follow can lag within one commit. */
+  isFollowing: () => boolean;
+  /** Starred entry ids for THIS surface's session scope (listener+session).
+   *  Row star buttons read membership; the minimap derives separately. */
+  starredEntryIds?: ReadonlySet<string>;
+  /** Toggle a row star by authoritative entry id (persist-before-commit is
+   *  the App callback's contract). Absent → no star buttons render. */
+  onToggleStar?: (entryId: string, starred: boolean) => void;
+  /** Central error sink for the reply action strip: copy/save failures and
+   *  a missing wire timestamp (save-only failure) toast through here —
+   *  never silenced. */
+  onReplyActionError?: (message: string) => void;
+  /** Bumped by every starred-reply jump: resets the demand-walk latch so the
+   *  parked planner re-plans and mounts the jump target before the restore
+   *  applies the scroll. */
+  starJumpNonce?: number;
   /** O(1) item id -> projection index resolver (App-owned id->index map). */
   getAnchorIndex: (sessionId: string, anchorItemId: string) => number;
 }
 
-const SurfaceItems = memo(function SurfaceItems({ items, sessionId, workspaceCwd, pinIfPinned }: {
+const SurfaceItems = memo(function SurfaceItems({ items, sessionId, workspaceCwd, pinIfPinned, starredEntryIds, onToggleStar, onReplyActionError }: {
   items: Item[];
   sessionId: string;
   workspaceCwd: string;
   pinIfPinned: () => void;
+  starredEntryIds?: ReadonlySet<string>;
+  onToggleStar?: (entryId: string, starred: boolean) => void;
+  /** Central error sink for the reply action strip (save/copy failures).
+   *  Present → every settled assistant reply in this surface renders the
+   *  shared ReplyActions (copy/save never depend on entry id or timestamp);
+   *  absent → no action chrome (SSR/test renderers without a toast). */
+  onReplyActionError?: (message: string) => void;
 }) {
   const pathContext = transcriptPathContext(items);
   return (
@@ -714,7 +715,25 @@ const SurfaceItems = memo(function SurfaceItems({ items, sessionId, workspaceCwd
             return item.status === 'streaming' ? (
               <StreamingAssistant key={item.id} sid={sessionId} id={item.id} workspaceCwd={workspaceCwd} pathContext={pathContext} />
             ) : (
-              <FinalAssistant key={item.id} blocks={item.blocks} errorMessage={item.errorMessage} sessionId={sessionId} workspaceCwd={workspaceCwd} onLayoutChange={pinIfPinned} itemId={item.id} pathContext={pathContext} />
+              <FinalAssistant
+                key={item.id}
+                blocks={item.blocks}
+                errorMessage={item.errorMessage}
+                sessionId={sessionId}
+                workspaceCwd={workspaceCwd}
+                onLayoutChange={pinIfPinned}
+                itemId={item.id}
+                pathContext={pathContext}
+                reply={onReplyActionError === undefined ? undefined : {
+                  timestampMs: item.timestamp,
+                  star: onToggleStar === undefined ? undefined : {
+                    entryId: item.entryId ?? null,
+                    starred: item.entryId !== undefined && (starredEntryIds?.has(item.entryId) ?? false),
+                    onToggle: onToggleStar,
+                  },
+                  onError: onReplyActionError,
+                }}
+              />
             );
           case 'toolCard':
             return <div key={item.id} {...transcriptItemStamp(item.id)} data-session-id={sessionId ?? ''} data-workspace-cwd={workspaceCwd}><ToolCard item={item} onLayoutChange={pinIfPinned} /></div>;
@@ -770,6 +789,21 @@ const SurfaceItems = memo(function SurfaceItems({ items, sessionId, workspaceCwd
   );
 });
 
+/** The details modal has no main-transcript pin — its body owns the scroller. */
+const noPinIfPinned = () => {};
+
+/** Stable renderer injected into the subagent details modal: the SAME
+ *  SurfaceItems (ToolCard / thinking / Markdown / BashCard) as the main
+ *  transcript. The child has no navigable session owner, so session/cwd stay
+ *  empty and the modal container disables path navigation. Exported so the
+ *  panel/renderer contract has one testable entry point. When the App's
+ *  central error sink is provided, every settled reply in the history
+ *  renders the shared reply action strip; bare/test callers without one
+ *  render no action chrome. */
+export function renderSubagentHistory(items: Item[], onReplyActionError?: (message: string) => void) {
+  return <SurfaceItems items={items} sessionId="" workspaceCwd="" pinIfPinned={noPinIfPinned} onReplyActionError={onReplyActionError} />;
+}
+
 export const TranscriptSurface = memo(function TranscriptSurface({
   rk,
   sessionId,
@@ -786,6 +820,12 @@ export const TranscriptSurface = memo(function TranscriptSurface({
   onContentEl,
   onCommit,
   getAnchorIndex,
+  correctParkedAnchorShape,
+  isFollowing,
+  starredEntryIds,
+  onToggleStar,
+  onReplyActionError,
+  starJumpNonce,
 }: TranscriptSurfaceProps) {
   const [windowStart, setWindowStart] = useState(initialStart);
   const windowStartRef = useRef(windowStart);
@@ -888,6 +928,16 @@ export const TranscriptSurface = memo(function TranscriptSurface({
     if (viewport && viewport.follow === false && viewport.anchorItemId !== null) return;
     forcePin();
   }, [active, forcePin, getViewport, rk]);
+  // A starred-reply jump re-plans the parked view the same way an activation
+  // does: a demand walk may own the window when the minimap is clicked, and
+  // the jump must end that ownership BEFORE the mounted slices can cover the
+  // target (the nonce bumps only on the DISPLAYED surface; 0 = mount value).
+  const starJumpNonceRef = useRef(starJumpNonce);
+  useLayoutEffect(() => {
+    if (starJumpNonce === undefined || starJumpNonce === 0 || starJumpNonce === starJumpNonceRef.current) return;
+    starJumpNonceRef.current = starJumpNonce;
+    setWalkOwned(false);
+  }, [starJumpNonce]);
   useLayoutEffect(() => {
     if (active) pinIfPinned();
   }, [active, items, pinIfPinned]);
@@ -950,6 +1000,26 @@ export const TranscriptSurface = memo(function TranscriptSurface({
       document.removeEventListener('pointerup', onPointerUp);
     };
   }, [active, getViewport, rk, scrollRef]);
+  // SHAPE TRANSACTION: pre-write capture on a real projected-items switch (bounded per-id compare); consumed once below.
+  const shapeTxnRef = useRef<{ rk: RuntimeKey; anchorItemId: string; anchorOffsetPx: number } | null>(null);
+  const shapeItemsRef = useRef<Item[] | null>(null);
+  useLayoutEffect(() => {
+    const previous = shapeItemsRef.current;
+    shapeItemsRef.current = projectedItems;
+    let switched = previous !== null && previous.length !== projectedItems.length;
+    if (previous !== null && !switched) {
+      for (let index = 0; index < projectedItems.length; index += 1) {
+        if (previous[index]?.id !== projectedItems[index]?.id) {
+          switched = true;
+          break;
+        }
+      }
+    }
+    const live = getViewport(rk);
+    shapeTxnRef.current = switched && live !== null && !isFollowing() && live.anchorItemId !== null
+      ? { rk, anchorItemId: live.anchorItemId, anchorOffsetPx: live.anchorOffsetPx }
+      : null;
+  }, [getViewport, isFollowing, projectedItems, rk]);
   const stageRef = useRef<number | null>(null);
   useLayoutEffect(() => {
     const previousStage = stageRef.current;
@@ -958,8 +1028,11 @@ export const TranscriptSurface = memo(function TranscriptSurface({
     const content = contentRef.current;
     if (!active || previousStage === null || scroll === null || content === null) return;
     const live = getViewport(rk);
+    // Shape txn open: the consume correction is the single writer — no stage double-write.
+    const shapeTxnOpen = shapeTxnRef.current !== null;
     const prepended = previousStage - projection.start;
     if (prepended > 0) {
+      if (shapeTxnOpen) return;
       const outcome = compensatePrependedStage({
         scroll,
         content: transcriptContentRoot(content),
@@ -974,9 +1047,19 @@ export const TranscriptSurface = memo(function TranscriptSurface({
     if (dropped <= 0) return;
     const removedPx = removalPxRef.current;
     removalPxRef.current = 0;
+    if (shapeTxnOpen) return;
     if (live?.follow) pinIfPinned();
     else if (removedPx > 0) scroll.scrollTop = Math.max(0, scroll.scrollTop - removedPx);
   }, [active, getViewport, pinIfPinned, projection.start, projection.end, rk, scrollRef]);
+  // Consume (same deps as the capture): shape path restores folds FIRST, then one write.
+  useLayoutEffect(() => {
+    const txn = shapeTxnRef.current;
+    if (txn === null || txn.rk !== rk) return;
+    shapeTxnRef.current = null;
+    if (!activeRef.current || contentRef.current === null) return;
+    applyOpenFoldKeys(transcriptContentRoot(contentRef.current), getViewport(rk)?.openFoldKeys ?? new Set<string>());
+    correctParkedAnchorShape(txn.rk, txn.anchorItemId, txn.anchorOffsetPx);
+  }, [correctParkedAnchorShape, getViewport, projectedItems, rk]);
   return (
     <div
       className="transcript-surface"
@@ -1011,7 +1094,7 @@ export const TranscriptSurface = memo(function TranscriptSurface({
             )}
           </div>
         )}
-        <SurfaceItems items={projectedItems} sessionId={sessionId} workspaceCwd={workspaceCwd} pinIfPinned={pinIfPinned} />
+        <SurfaceItems items={projectedItems} sessionId={sessionId} workspaceCwd={workspaceCwd} pinIfPinned={pinIfPinned} starredEntryIds={starredEntryIds} onToggleStar={onToggleStar} onReplyActionError={onReplyActionError} />
       </div>
     </div>
   );
@@ -1266,7 +1349,30 @@ export function StreamingAssistant({ sid, id, workspaceCwd, pathContext = '' }: 
   );
 }
 
-export function FinalAssistant({ blocks, errorMessage, sessionId = '', workspaceCwd, onLayoutChange, itemId, pathContext }: { blocks: ContentBlock[]; errorMessage?: string; sessionId?: string; workspaceCwd?: string; onLayoutChange?: () => void; itemId?: string; pathContext?: string }) {
+export function FinalAssistant({ blocks, errorMessage, sessionId = '', workspaceCwd, onLayoutChange, itemId, pathContext, reply }: {
+  blocks: ContentBlock[];
+  errorMessage?: string;
+  sessionId?: string;
+  workspaceCwd?: string;
+  onLayoutChange?: () => void;
+  itemId?: string;
+  pathContext?: string;
+  /** Reply action strip for settled assistant replies (the old star gate,
+   *  migrated clean to the shared strip). Present → ReplyActions renders:
+   *  the favorite toggle keeps its legacy `assistant-star-toggle` DOM,
+   *  classes, and `data-entry-id` (`entryId: null` → no star button while
+   *  the row is not yet canonically hydrated), and copy/save raw markdown
+   *  always render independent of entry id or timestamp (a missing wire
+   *  timestamp fails ONLY the save through `onError` — the caller's central
+   *  toast). Absent → no action chrome at all (guest view, bare component
+   *  use). `markdown` is derived here via `sourceMarkdownFromBlocks` — the
+   *  exact `text`-block source, never DOM-scraped. */
+  reply?: {
+    timestampMs?: number;
+    star?: { entryId: string | null; starred: boolean; onToggle: (entryId: string, starred: boolean) => void };
+    onError: (message: string) => void;
+  };
+}) {
   const textRef = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
     const node = textRef.current;
@@ -1309,7 +1415,15 @@ export function FinalAssistant({ blocks, errorMessage, sessionId = '', workspace
     };
   }, [onLayoutChange]);
   return (
-    <div className="msg msg--assistant" {...(itemId !== undefined ? transcriptItemStamp(itemId) : {})} data-session-id={sessionId} data-workspace-cwd={workspaceCwd}>
+    <div className="msg msg--assistant" {...(itemId !== undefined ? transcriptItemStamp(itemId) : {})} data-session-id={sessionId} data-workspace-cwd={workspaceCwd} {...(reply?.star?.entryId ? { 'data-entry-id': reply.star.entryId } : {})}>
+      {reply ? (
+        <ReplyActions
+          markdown={sourceMarkdownFromBlocks(blocks)}
+          timestampMs={reply.timestampMs}
+          star={reply.star}
+          onError={reply.onError}
+        />
+      ) : null}
       <div className="assistant-text" ref={textRef} dangerouslySetInnerHTML={{ __html: renderBlocks(blocks, pathContext, workspaceCwd) }} />
       {errorMessage ? <div className="msg--assistant__error" role="note">{safeText(errorMessage)}</div> : null}
     </div>
@@ -1532,7 +1646,7 @@ export function ToolCard({ item, onLayoutChange }: { item: Extract<Item, { kind:
   const taskView = toolName === 'task' ? resolveTaskCardView(item.args, item.details, item.status) : null;
   const todoView = toolName === 'todo' ? resolveTodoCardView(item.args, item.details, item.result, item.status) : null;
   const editView = toolName === 'edit' ? parseEditCard(item.args, item.details, item.result) : null;
-  const commandView = toolName === 'bash' ? parseCommandCardArgs(item.args) : null;
+  const commandView = toolName === 'bash' ? parseCommandCardArgs(item.args, item.details) : null;
   const processView = toolName === 'process' ? parseProcessCardArgs(item.args) : null;
   const writeView = toolName === 'write' ? parseWriteCardArgs(item.args, item.result, item.status) : null;
   const readView = toolName === 'read' ? parseReadCard(item.args, item.result, item.status) : null;
@@ -1622,7 +1736,20 @@ export function ToolCard({ item, onLayoutChange }: { item: Extract<Item, { kind:
             <span className="tool-card__prompt">$</span>
             <span className="tool-card__command-text">{safeText(commandView.command)}</span>
           </div>
-          {item.result !== '' && <pre className="tool-card__output"><AnsiText text={item.result} /></pre>}
+          {commandView.diagnostic && item.status === 'error' && (
+            <div className="tool-card__command-diagnostic">
+              <span>cwd: {safeText(commandView.diagnostic.requestedCwd)}</span>
+              <span>stage: {commandView.diagnostic.stage}</span>
+              <span>exit: {commandView.diagnostic.exitCode === null ? 'none' : commandView.diagnostic.exitCode}</span>
+            </div>
+          )}
+          {item.result !== '' && (
+            <pre className="tool-card__output"><AnsiText text={
+              commandView.diagnostic && item.status === 'error'
+                ? stripBashDiagnosticTrailer(item.result, commandView.diagnostic)
+                : item.result
+            } /></pre>
+          )}
         </div>
       ) : processView ? (
         <div className="tool-card__summary">
@@ -1999,6 +2126,16 @@ export function markdownOpenErrorDetail(error: unknown): string {
   return raw.trim() === '' ? 'request failed' : raw;
 }
 
+/** Same citation already stored on this owner: reopen Files, send nothing. */
+export function citationChoicesForReopen(
+  slot: FileExplorerSessionSlot,
+  citation: string | null,
+): FileExplorerSessionSlot['citationChoices'] | null {
+  const stored = slot.citationChoices;
+  if (!citation || !stored || stored.path !== citation || stored.candidates.length < 2) return null;
+  return stored;
+}
+
 export {
   MARKDOWN_OPEN_MISSING_PATH_MAX_CHARS,
   markdownOpenBoundedPathText,
@@ -2023,6 +2160,7 @@ export function HeaderSelect({
   placeholder,
   groups,
   levels,
+  onOpen,
   onChange,
 }: {
   id: string;
@@ -2034,6 +2172,8 @@ export function HeaderSelect({
   groups?: ModelProviderGroup[];
   /** Flat thinking-level options (thinking select); exclusive with groups. */
   levels?: readonly string[];
+  /** Fires when the user focuses the control — the catalog-refresh entry. */
+  onOpen?: () => void;
   onChange: (value: string) => void;
 }) {
   return (
@@ -2042,6 +2182,7 @@ export function HeaderSelect({
       title={title}
       disabled={disabled}
       value={value}
+      onFocus={onOpen}
       onChange={(e) => onChange(e.target.value)}
     >
       <option value="">{placeholder}</option>
@@ -2128,7 +2269,7 @@ export function App() {
   const gapCatchUpInFlightRef = useRef<Record<string, boolean>>({});
   const gapCatchUpSlotRef = useRef<Record<string, number>>({});
   const settledStreamRefillInFlightRef = useRef<Record<string, boolean>>({});
-  const requestSettledStreamRefillRef = useRef<(sid: string) => void>(() => {});
+  const requestSettledStreamRefillRef = useRef<(sid: string, ownership?: { runtimeIncarnation: string; socketGeneration: number; turnId: string }) => void>(() => {});
   // Mirror of the streaming flags, read/written synchronously by the hot event
   // path. The delta path (message_update per chunk) previously called
   // setStreamingBySessionId on EVERY chunk; each call produced a NEW state
@@ -2297,8 +2438,8 @@ export function App() {
     activityStripBySessionIdRef.current = { ...activityStripBySessionIdRef.current, [sid]: next };
     setActivityStripBySessionId((current) => ({ ...current, [sid]: next }));
   }, []);
-  const [compactBook, setCompactBook] = useState<CompactBook>({ compacting: {}, mode: {}, token: {}, settled: {} });
-  const compactBookRef = useRef<CompactBook>({ compacting: {}, mode: {}, token: {}, settled: {} });
+  const [compactBook, setCompactBook] = useState<CompactBook>(emptyCompactBook);
+  const compactBookRef = useRef<CompactBook>(emptyCompactBook());
   const writeCompactBook = useCallback((next: CompactBook) => {
     compactBookRef.current = next;
     setCompactBook(next);
@@ -2367,19 +2508,13 @@ export function App() {
   const toggleFileExplorer = useCallback(() => {
     const sid = sessionIdRef.current;
     if (!sid) return;
-    let opening = false;
-    patchFileExplorer(sid, (slot) => {
-      const next = slot.mode === 'closed' ? 'open' : 'closed';
-      opening = next === 'open';
-      return applyDrawerMode(slot, next);
-    });
+    const opening = readFileExplorerSlot(fileExplorerBySessionId, sid).mode === 'closed';
+    patchFileExplorer(sid, (slot) => applyDrawerMode(slot, opening ? 'open' : 'closed'));
     if (opening) {
       setActivePanel('');
-      // Every open starts fullscreen; the in-drawer ⛶ shrinks it for this
-      // open only.
-      setFileExplorerExpanded(true);
+      if (window.matchMedia('(max-width: 720px)').matches) setSidebarOpen(false);
     }
-  }, [patchFileExplorer]);
+  }, [fileExplorerBySessionId, patchFileExplorer]);
 
 
 
@@ -2445,18 +2580,39 @@ export function App() {
   const fileExplorerSlot = readFileExplorerSlot(fileExplorerBySessionId, sessionId);
   const activeSessionCwd = sessionId ? sessionCwdBySessionId[sessionId] : undefined;
   const fileExplorerOpen = fileExplorerSlot.mode !== 'closed';
-  // Full-app expand resets the moment the drawer closes (the panel unmounts).
-
-  const [fileExplorerWidth, setFileExplorerWidth] = useState(() =>
-    typeof window !== 'undefined' ? readStoredFileExplorerWidth(window.innerWidth) : FILE_EXPLORER_WIDTH_DEFAULT
-  );
-  const fileExplorerWidthRef = useRef(fileExplorerWidth);
-  fileExplorerWidthRef.current = fileExplorerWidth;
+  const composerHidden = fileExplorerOpen || activePanel === 'code-review';
+  // Open Files fills the app body. There is no stored outer width and no
+  // second fullscreen state.
   // One visibility state drives BOTH the mobile drawer and the desktop
   // collapsible rail: open by default on desktop, closed on mobile.
   const [sidebarOpen, setSidebarOpen] = useState(() =>
     typeof window !== 'undefined' && window.matchMedia('(min-width: 721px)').matches
   );
+  const [featureMenuOpen, setFeatureMenuOpen] = useState(false);
+  const featureMenuRef = useRef<HTMLElement | null>(null);
+  const featureMenuButtonRef = useRef<HTMLButtonElement | null>(null);
+  useEffect(() => {
+    if (!featureMenuOpen) return;
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      event.stopPropagation();
+      setFeatureMenuOpen(false);
+      featureMenuButtonRef.current?.focus();
+    };
+    const onPointerDown = (event: globalThis.PointerEvent) => {
+      const target = event.target as Node | null;
+      if (target && !featureMenuRef.current?.contains(target) && !featureMenuButtonRef.current?.contains(target)) {
+        setFeatureMenuOpen(false);
+      }
+    };
+    document.addEventListener('keydown', onKeyDown, true);
+    document.addEventListener('pointerdown', onPointerDown);
+    return () => {
+      document.removeEventListener('keydown', onKeyDown, true);
+      document.removeEventListener('pointerdown', onPointerDown);
+    };
+  }, [featureMenuOpen]);
   // The BREAKPOINT owns the visibility default on every crossing: moving to
   // ≤720px collapses an inherited-open desktop rail into the closed mobile
   // drawer (the documented mobile default — without this sync the first
@@ -2474,61 +2630,8 @@ export function App() {
     mq.addEventListener('change', collapse);
     return () => mq.removeEventListener('change', collapse);
   }, []);
-  const fileExplorerResizeDragRef = useRef<{ startX: number; startWidth: number } | null>(null);
   const reconnectReviewOwnerRef = useRef<string | null>(null);
   const liveSettingsBySessionIdRef = useRef<Record<string, LiveSettingsWire | null>>({});
-  // Sidebar consumed by the same row as drawer + conversation (230px open /
-  // 44px collapsed rail). Live value: the resizer/keyboard handlers and the
-  // resize-reclamp read it so the ceiling tracks the rail the user sees.
-  const fileExplorerSidebarPx = sidebarOpen ? FILE_EXPLORER_SIDEBAR_OPEN : FILE_EXPLORER_SIDEBAR_COLLAPSED;
-  const [viewportWidth, setViewportWidth] = useState(() =>
-    typeof window !== 'undefined' ? window.innerWidth : 1280
-  );
-  // Overlay flip: the viewport cannot fit sidebar + conversation minimum +
-  // the 360px drawer floor (see fileExplorerOverlayActive). Adds a layout
-  // class so styles.css can take the drawer over the full viewport width,
-  // re-home the close affordance, and drop the desktop reservation; the
-  // stored width is meaningless there. Viewport width is React state so a
-  // Playwright/user resize recomputes the class instead of keeping a stale
-  // full-width overlay from a previous 390px capture.
-  const fileExplorerOverlay =
-    fileExplorerOpen
-    && fileExplorerOverlayActive(viewportWidth, fileExplorerSidebarPx);
-  // One width authority: --file-explorer-width on <html>; reservation (in
-  // styles.css) and drawer read the same var. Layout effect so the restored
-  // width lands before first paint (no drawer jump on reload).
-  useLayoutEffect(() => {
-    if (typeof window === 'undefined') return;
-    applyFileExplorerWidth(fileExplorerWidthRef.current, window.innerWidth, fileExplorerSidebarPx);
-  }, [fileExplorerWidth, fileExplorerSidebarPx]);
-
-  // Reclamp the desktop drawer when the viewport shrinks so React width and
-  // aria-valuenow never exceed the live ceiling (CSS already clamps via
-  // calc(100vw - 576px)). Overlay ≤720px ignores the
-  // stored width. The same listener publishes viewportWidth so overlay
-  // class tracks the live innerWidth.
-  useLayoutEffect(() => {
-    if (typeof window === 'undefined') return;
-    const reclamp = () => {
-      const viewportWidthNow = window.innerWidth;
-      setViewportWidth(viewportWidthNow);
-      if (window.matchMedia('(max-width: 720px)').matches) return;
-      const next = clampFileExplorerWidth(fileExplorerWidthRef.current, viewportWidthNow, sidebarOpen ? FILE_EXPLORER_SIDEBAR_OPEN : FILE_EXPLORER_SIDEBAR_COLLAPSED);
-      const changed = next !== fileExplorerWidthRef.current;
-      fileExplorerWidthRef.current = next;
-      setFileExplorerWidth(next);
-      applyFileExplorerWidth(next, viewportWidthNow, fileExplorerSidebarPx);
-      if (changed) writeStoredFileExplorerWidth(next, viewportWidthNow, fileExplorerSidebarPx);
-    };
-    reclamp();
-    window.addEventListener('resize', reclamp);
-    const mq = window.matchMedia('(max-width: 720px)');
-    mq.addEventListener('change', reclamp);
-    return () => {
-      window.removeEventListener('resize', reclamp);
-      mq.removeEventListener('change', reclamp);
-    };
-  }, [fileExplorerSidebarPx, sidebarOpen]);
   // Open/toggle a feature panel. setActivePanel stays a pure updater. Closing
   // Files is a separate write so Settings/Todo/etc. are not covered by the
   // explorer. Desktop keeps the session rail open.
@@ -2540,11 +2643,8 @@ export function App() {
 
   // Any non-empty activePanel (feature-nav toggle, Manage session, /code-review
   // slash command) collapses the mobile drawer at <=720px before paint.
-  // File explorer FULL-APP expand (user requirement): the drawer OPENS
-  // fullscreen; the same-row ⛶ button shrinks it back. The class hides the
-  // sidebar + transcript + composer so the file tree + content viewports
-  // fill the entire app area.
-  const [fileExplorerExpanded, setFileExplorerExpanded] = useState(true);
+  // Files opens in the available app body: under the measured header and
+  // above the measured footer. There is no second expand state.
   useLayoutEffect(() => {
     if (activePanel !== '' && window.matchMedia('(max-width: 720px)').matches) {
       setSidebarOpen(false);
@@ -2554,12 +2654,8 @@ export function App() {
   const openFileInDrawer = useCallback((path: string, line?: number, ownerSessionId?: string, view: FileExplorerTab['view'] = 'file') => {
     const sid = ownerSessionId?.trim();
     if (!sid || !path.trim()) return;
-    patchFileExplorer(sid, (slot) => {
-      const opening = slot.mode !== 'open';
-      if (opening) setFileExplorerExpanded(true);
-      return applyOpenPath(slot, path, line, view);
-    });
-  }, [patchFileExplorer, setFileExplorerExpanded]);
+    patchFileExplorer(sid, (slot) => applyOpenPath(slot, path, line, view));
+  }, [patchFileExplorer]);
 
   // ONE top authority: the measured height is rounded to an integer and
   // written as --app-header-height (applyHeaderHeight); the header, the
@@ -2570,10 +2666,19 @@ export function App() {
   // dependent and order-fragile across re-mounts.
   const appHeaderRef = useRef<HTMLElement | null>(null);
   const appFooterRef = useRef<HTMLElement | null>(null);
+  const composerButtonsRef = useRef<HTMLDivElement | null>(null);
   useLayoutEffect(() => {
     const footer = appFooterRef.current;
     if (!footer || typeof ResizeObserver === 'undefined') return;
     const apply = () => {
+      // A display:none footer (Files-open hides the whole main composer)
+      // measures 0; the 44px floor would hold a phantom bottom band, so a
+      // hidden footer pins --app-footer-height to 0 and the visible
+      // measure resumes on the restore resize.
+      if (getComputedStyle(footer).display === 'none') {
+        document.documentElement.style.setProperty('--app-footer-height', '0px');
+        return;
+      }
       applyFooterHeight(measureChromeHeight(footer));
     };
     apply();
@@ -2585,14 +2690,48 @@ export function App() {
       window.removeEventListener('resize', apply);
     };
   }, []);
-  const filesFullscreen = fileExplorerFullscreenActive(fileExplorerOpen, fileExplorerExpanded);
-  const headerHiddenRef = useRef(filesFullscreen);
-  headerHiddenRef.current = filesFullscreen;
+  // Hidden pins 0px before paint; visible re-measures in the same commit.
+  useLayoutEffect(() => {
+    const footer = appFooterRef.current;
+    if (!footer) return;
+    if (composerHidden) {
+      document.documentElement.style.setProperty('--app-footer-height', '0px');
+      return;
+    }
+    applyFooterHeight(measureChromeHeight(footer));
+  }, [composerHidden]);
+  // Live composer-buttons band: observed on App's OWN #composer-buttons
+  // (CollabGuestView mounts a second one, so a document-wide query is
+  // order-fragile). Publishes the band the mobile drawer foot margin
+  // consumes; the footer observer above is untouched.
+  useLayoutEffect(() => {
+    const buttons = composerButtonsRef.current;
+    if (!buttons || typeof ResizeObserver === 'undefined') return;
+    const apply = () => publishComposerButtonsBand(buttons);
+    apply();
+    const ro = new ResizeObserver(apply);
+    ro.observe(buttons);
+    window.addEventListener('resize', apply);
+    return () => {
+      ro.disconnect();
+      window.removeEventListener('resize', apply);
+    };
+  }, []);
+  // Hidden pins 0px before paint; visible re-measures in the same commit.
+  useLayoutEffect(() => {
+    const buttons = composerButtonsRef.current;
+    if (!buttons) return;
+    if (composerHidden) {
+      document.documentElement.style.setProperty('--composer-buttons-band', '0px');
+      return;
+    }
+    publishComposerButtonsBand(buttons);
+  }, [composerHidden]);
   useLayoutEffect(() => {
     const header = appHeaderRef.current;
     if (!header || typeof ResizeObserver === 'undefined') return;
     const apply = () => {
-      applyHeaderHeight(measureChromeHeight(header), headerHiddenRef.current);
+      applyHeaderHeight(measureChromeHeight(header));
     };
     apply();
     const ro = new ResizeObserver(apply);
@@ -2603,11 +2742,6 @@ export function App() {
       window.removeEventListener('resize', apply);
     };
   }, []);
-  useLayoutEffect(() => {
-    const header = appHeaderRef.current;
-    if (!header) return;
-    applyHeaderHeight(measureChromeHeight(header), filesFullscreen);
-  }, [filesFullscreen]);
 
 
   // Shared desktop height for ordinary bottom drawers (vh). Applied as
@@ -2642,11 +2776,18 @@ export function App() {
   const stopArmed = activeStreaming || activeAborting;
   const activeSteering = sessionId ? (steeringBySessionId[sessionId] ?? []) : [];
   const activeFailedSteering = sessionId ? (failedSteeringBySessionId[sessionId] ?? []) : [];
-  const activeCompacting = sessionId ? compactBook.compacting[sessionId] === true : false;
+  // The badge/status reflects the DISPLAYED exact runtime: a compaction on a
+  // background runtime never paints this session, and invalidateRuntime drops
+  // a retired incarnation's slot.
+  const activeCompact = compactView(
+    compactBook,
+    displayedRuntimeKey ? parseRuntimeKey(displayedRuntimeKey) : null,
+  );
+  const activeCompacting = activeCompact.compacting;
   const activeActivityStrip = sessionId ? activityStripBySessionId[sessionId] : undefined;
   const activeStreamStall = sessionId ? streamStallBySessionId[sessionId] === true : false;
   const activeActivityStripView = activityStripView(activeActivityStrip, connState, activeStreamStall);
-  const activeCompactMode: CompactMode | null = sessionId ? (compactBook.mode[sessionId] ?? null) : null;
+  const activeCompactMode: CompactMode | null = activeCompact.mode;
 
   const models = headerCatalogs.models;
   const levels = headerCatalogs.levels;
@@ -2808,11 +2949,30 @@ export function App() {
   const sideChatPromptInputRef = useRef<HTMLTextAreaElement>(null);
   const sideChatInsertTranscriptRef = useRef<SideChatInsertTranscript | null>(null);
   const sideChatSwitchSeqRef = useRef(0);
+  const prevComposerHiddenRef = useRef(false);
+  useLayoutEffect(() => {
+    const wasHidden = prevComposerHiddenRef.current;
+    prevComposerHiddenRef.current = composerHidden;
+    if (!wasHidden || composerHidden) return;
+    // Cancel on close→reopen/unmount: a stale rAF callback must never land
+    // focus on the prompt after a newer surface already owns it.
+    const raf = requestAnimationFrame(() => promptInputRef.current?.focus({ preventScroll: true }));
+    return () => cancelAnimationFrame(raf);
+  }, [composerHidden]);
   // Some browsers synthesize Enter keydowns for each newline in a clipboard
   // paste. Arm this window on Ctrl/Cmd+V and onPaste so those Enters cannot
   // submit the draft (or flood prompt RPCs) while the paste is landing.
   const pasteEnterGuardUntilRef = useRef(0);
   const composerComposingRef = useRef(false);
+  // Inline slash autocomplete: the main composer owns ONLY the DOM-derived
+  // slash intent (never a draft copy — the textarea stays uncontrolled);
+  // catalog, candidate list, highlight, and Enter/Arrow/Escape handling live
+  // inside the single CommandPicker instance via
+  // inlineIntent/composerInputRef/onInlineAccept.
+  const [inlineIntent, setInlineIntent] = useState<SlashIntent | null>(null);
+  const syncInlineIntent = useCallback((value: string) => {
+    setInlineIntent((current) => mergeSlashIntent(current, slashIntentFromDraft(value)));
+  }, []);
   const composerEnterHandledRef = useRef(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dragDepthRef = useRef(0);
@@ -2940,6 +3100,11 @@ export function App() {
     if (id) patchFileExplorer(id, updater);
   }, [patchFileExplorer]);
   const reportFileConversationError = useCallback((message: string) => {
+    toast(message, true);
+  }, [toast]);
+  /** Central sink for the reply action strip: copy/save failures and the
+   *  missing-wire-timestamp save failure toast here (never silenced). */
+  const reportReplyActionError = useCallback((message: string) => {
     toast(message, true);
   }, [toast]);
 
@@ -3195,16 +3360,29 @@ export function App() {
   // ("thinking…" / "model…") forever; refetch whenever the displayed session
   // or its model key changes, and on every (re)connect. A response for a
   // superseded session never commits.
-  useEffect(() => {
-    if (connState !== 'on' || !sessionId) return;
-    const target = sessionId;
-    sendCommand({ type: 'get_available_models', sessionId: target })
+  const refreshHeaderModelCatalog = useCallback((target: string) => {
+    void sendCommand({ type: 'get_available_models', sessionId: target })
       .then((data) => {
         if (sessionIdRef.current !== target) return;
         const rows = normalizeHeaderModels((data as { models?: unknown } | null)?.models);
         setHeaderCatalogs((prev) => ({ ...prev, models: rows }));
       })
       .catch(() => {});
+  }, [sendCommand]);
+  // A model catalog written after this page loaded (new provider credentials
+  // or custom models) never changes the displayed session or its model key,
+  // so the effect below cannot observe it. The picker is the user-facing
+  // refresh entry: focusing/opening it reuses get_available_models, and an
+  // empty catalog stays clickable instead of a permanently dead control, so
+  // a configured model can be selected without restarting the process.
+  const refreshHeaderModelCatalogEntry = useCallback(() => {
+    const target = sessionIdRef.current;
+    if (target) refreshHeaderModelCatalog(target);
+  }, [refreshHeaderModelCatalog]);
+  useEffect(() => {
+    if (connState !== 'on' || !sessionId) return;
+    const target = sessionId;
+    refreshHeaderModelCatalog(target);
     sendCommand({ type: 'get_available_thinking_levels', sessionId: target })
       .then((data) => {
         if (sessionIdRef.current !== target) return;
@@ -3212,14 +3390,27 @@ export function App() {
         setHeaderCatalogs((prev) => ({ ...prev, levels: list }));
       })
       .catch(() => {});
-  }, [activeModelKey, connState, sendCommand, sessionId]);
-  const requestSettledStreamRefill = useCallback((sid: string) => {
+  }, [activeModelKey, connState, refreshHeaderModelCatalog, sendCommand, sessionId]);
+  /** Optional ownership hold captured at turn_terminal: the hydration may
+   *  only merge while the exact runtime (incarnation + socket generation)
+   *  still owns the session AND the captured terminal turn is still the
+   *  session's most recent terminal turn (typed turn identity — settled
+   *  agent_settled/queue_update cursor advances never invalidate). Undefined
+   *  keeps the existing snapshot-path behavior. */
+  const requestSettledStreamRefill = useCallback((sid: string, ownership?: { runtimeIncarnation: string; socketGeneration: number; turnId: string }) => {
     if (!sid || refillInFlightRef.current === sid) return;
     if (settledStreamRefillInFlightRef.current[sid] === true) return;
     settledStreamRefillInFlightRef.current = { ...settledStreamRefillInFlightRef.current, [sid]: true };
     void sendCommand({ type: 'get_messages', sessionId: sid }, undefined, { allowDuringSwitch: true, auxiliary: true })
       .then((data) => {
         if (streamingBySessionIdRef.current[sid] === true) return;
+        if (ownership && !settledRefillStillOwned(
+          sid,
+          ownership,
+          residentBySessionIdRef.current[sid],
+          socketGenRef.current,
+          activityStripBySessionIdRef.current[sid],
+        )) return;
         const messages = messagesFromCatchUpResponse(data);
         clearStreamStateForSession(sid);
         delete activeAssistantBySessionIdRef.current[sid];
@@ -3287,6 +3478,20 @@ export function App() {
   // `toastOwned` marks RPC failures the global layer surfaced, so neither
   // is ever doubled.
   const onMarkdownOpenPath = useCallback((path: string, line: number | undefined, owner: MarkdownPathOwner, completion?: string) => {
+    const reopenCwd = sessionCwdBySessionId[owner.sessionId] ?? '';
+    const storedChoices = citationChoicesForReopen(
+      readFileExplorerSlot(fileExplorerBySessionId, owner.sessionId),
+      markdownWorkspaceRelativePath(path, reopenCwd),
+    );
+    if (storedChoices) {
+      setActivePanel('');
+      patchFileExplorer(owner.sessionId, (slot) => ({
+        ...applyDrawerMode(slot, 'open'),
+        activePath: null,
+        citationChoices: storedChoices,
+      }));
+      return;
+    }
     // A stale-cwd `file_unavailable` probe refreshes state and retries once.
     const attempt = (workspaceCwd: string, retried: boolean) => {
       void markdownOpenValidatedPath(
@@ -3294,33 +3499,76 @@ export function App() {
         line,
         { ...owner, workspaceCwd },
         (command) => sendCommand(command, undefined, { auxiliary: true }),
-        (relative, openLine, _owner, opened) => openFileInDrawer(
-          relative,
-          openLine,
-          owner.sessionId,
-          opened?.kind === 'directory' ? 'dir' : 'file',
-        ),
+        (relative, openLine, _owner, opened) => {
+          const sid = owner.sessionId.trim();
+          if (!sid) return;
+          patchFileExplorer(sid, (slot) => ({
+            ...applyOpenPath(slot, relative, openLine, opened?.kind === 'directory' ? 'dir' : 'file'),
+            citationChoices: undefined,
+          }));
+        },
         (error) => {
           if (markdownOpenRejectionOwnership(error) !== 'local') return;
+          const choices = parseFileExplorerAmbiguity(error);
+          if (choices) {
+            const citation = markdownWorkspaceRelativePath(path, workspaceCwd);
+            if (!citation) {
+              toast(`open file failed: ${markdownOpenErrorDetail(error)}`, true);
+              return;
+            }
+            setActivePanel('');
+            patchFileExplorer(owner.sessionId, (slot) => ({
+              ...applyDrawerMode(slot, 'open'),
+              activePath: null,
+              citationChoices: { path: citation, candidates: choices },
+            }));
+            return;
+          }
           // Post-retry `file_unavailable` is a stable verdict: the server's
           // CURRENT workspace no longer has the referenced path. Name the
           // path (bounded) instead of the generic wording. A pre-retry
           // failure or a failed get_state refresh keeps the generic detail —
           // the refresh+retry affordance may still succeed on a later click.
+          if (owner.reviewRepo !== undefined && markdownOpenHostFileUnavailable(error)) {
+            toast(markdownOpenMissingFileToast(path), true);
+            return;
+          }
           if (markdownOpenMissingFileVerdict(retried, error)) {
+            const search = markdownOwnerBasenameSearch({
+              path,
+              completion,
+              ownerSessionId: owner.sessionId,
+              displayedSessionId: displayStateRef.current?.displayed.sessionId,
+              hostMissing: markdownOpenHostFileUnavailable(error),
+            });
+            if (search) {
+              if (search.revealDisplayed) {
+                setActivePanel('');
+              }
+              patchFileExplorer(owner.sessionId, (slot) => ({
+                ...applyDrawerMode(slot, 'open'),
+                activePath: null,
+                treeQuery: search.query,
+              }));
+              return;
+            }
             toast(markdownOpenMissingFileToast(path), true);
             return;
           }
           const detail = markdownOpenErrorDetail(error);
-          if (retried || (error as PendingCommandError | null)?.rpcCode !== 'file_unavailable') {
-            toast(`open file failed: ${detail}`, true);
+          if (owner.reviewRepo !== undefined || retried || (error as PendingCommandError | null)?.rpcCode !== 'file_unavailable') {
+            toast(`open file failed: ${markdownOpenErrorDetail(error)}`, true);
             return;
           }
           sendCommand({ type: 'get_state', sessionId: owner.sessionId })
             .then((state) => {
               const d = (state && typeof state === 'object' ? state : {}) as { cwd?: unknown };
               const fresh = typeof d.cwd === 'string' ? d.cwd.trim() : '';
-              if (fresh) onSessionCwdChanged(owner.sessionId, fresh);
+              if (!fresh) {
+                toast(`open file failed: ${detail}`, true);
+                return;
+              }
+              onSessionCwdChanged(owner.sessionId, fresh);
               attempt(fresh, true);
             })
             .catch(() => {
@@ -3330,8 +3578,8 @@ export function App() {
         completion,
       );
     };
-    attempt(sessionCwdBySessionId[owner.sessionId] ?? '', false);
-  }, [onSessionCwdChanged, openFileInDrawer, sendCommand, toast, sessionCwdBySessionId]);
+    attempt(reopenCwd, false);
+  }, [fileExplorerBySessionId, onSessionCwdChanged, openFileInDrawer, patchFileExplorer, sendCommand, toast, sessionCwdBySessionId]);
 
   useEffect(() => subscribeMarkdownOpenPath(onMarkdownOpenPath), [onMarkdownOpenPath]);
   const onResponse = useCallback((frame: RpcResponse) => {
@@ -3407,6 +3655,7 @@ export function App() {
       error.rpc = true;
       if (showToast) error.toastOwned = true;
       error.rpcCode = rpcCode;
+      error.rpcData = frame.data;
       pending.reject(error);
     }
   }, [removeItemFor, toast]);
@@ -3599,6 +3848,25 @@ export function App() {
         .catch(() => {}),
     ]).then(() => undefined);
   }, [sendCommand]);
+  /** Goal journal fetch on SETTLED display authority. applyState paints the
+   *  goal STATE from any snapshot, but the journal cache is only fetched by
+   *  refreshGoal — which never fired on a plain bind or row-click switch, so
+   *  a page landing on a session with an existing goal kept the previous
+   *  session's journal. Fetch ONLY when the display authority is settled:
+   *  transport on, no switch pending, no pending switch in the display
+   *  marker, displayed == commandTarget — the sid-captured fetch never
+   *  rides the pending-activate moment where sendCommand's pending guard
+   *  would reject it. */
+  const goalJournalDisplayReady =
+    connState === 'on' && !switchPending && activePanel === 'goal';
+  useEffect(() => {
+    if (!goalJournalDisplayReady) return;
+    const display = displayStateRef.current;
+    if (!display || display.pending !== null) return;
+    if (!sameRuntime(display.displayed, display.commandTarget)) return;
+    const sid = display.commandTarget.sessionId;
+    if (sid) refreshGoal(sid);
+  }, [goalJournalDisplayReady, connectionEpoch, sessionId, refreshGoal]);
   /** Re-fetch the context-window usage meter for ONE session
    *  (`get_session_stats` -> `SessionStats.contextUsage`). SILENT on failure —
    *  a transient RPC error must not toast; the next snapshot/turn end
@@ -3638,7 +3906,6 @@ export function App() {
       activeTurnId?: string | null;
       thinkingLevel?: string;
       isStreaming?: boolean;
-      isCompacting?: boolean;
       sessionName?: string | null;
       sessionId?: string | null;
       todoPhases?: unknown;
@@ -3742,9 +4009,6 @@ export function App() {
     if (typeof d.isStreaming === 'boolean' && d.isStreaming !== true) {
       noteStreamStall(target, { type: 'snapshot_idle', refill: settledRefill });
     }
-    if (typeof d.isCompacting === 'boolean') {
-      writeCompactBook(reconcileCompacting(compactBookRef.current, target, d.isCompacting));
-    }
 
     if (Array.isArray(d.todoPhases)) {
       setTodoBySessionId((prev) => {
@@ -3792,7 +4056,7 @@ export function App() {
     setLiveSettings(liveSettingsBySessionIdRef.current[target] ?? null);
     setSessionId(target);
     return true;
-  }, [noteStreamStall, publishLifecycle, refreshContextUsage, toast, updateActivityStripFor, writeCompactBook, writeSessionModelState, writeSteering, writeThinkingLevelState]);
+  }, [noteStreamStall, publishLifecycle, refreshContextUsage, toast, updateActivityStripFor, writeSessionModelState, writeSteering, writeThinkingLevelState]);
 
   const streamWatchdogIoRef = useRef({ applyState, sendCommand, toast, noteStreamStall });
   streamWatchdogIoRef.current = { applyState, sendCommand, toast, noteStreamStall };
@@ -3846,9 +4110,10 @@ export function App() {
    *  truthful toast. Refusal (streaming/compacting) rejects with the bounded
    *  admission reason. */
   const requestSessionCompactSummary = useCallback(async (targetSid: string): Promise<string> => {
+    const identity = identityFromWire(targetSid, residentBySessionIdRef.current[targetSid]);
     const admission = compactAdmission({
       streaming: !!(targetSid && streamingBySessionIdRef.current[targetSid]),
-      compacting: !!(targetSid && compactBookRef.current.compacting[targetSid]),
+      compacting: !!identity && compactView(compactBookRef.current, identity).compacting,
     });
     if (!admission.ok) throw new Error(admission.message);
     const command: Record<string, unknown> = {
@@ -3856,9 +4121,13 @@ export function App() {
       customInstructions: 'summarize this session for handoff',
     };
     if (targetSid) command.sessionId = targetSid;
-    const started = beginCompact(compactBookRef.current, targetSid, 'llm');
+    // Reserve from the existing monotonic command counter: this attempt's
+    // finally may only settle the exact identity + generation that painted it.
+    const generation = ++seqRef.current;
     try {
-      writeCompactBook(started.book);
+      if (identity) {
+        writeCompactBook(beginCompact(compactBookRef.current, identity, 'llm', generation));
+      }
       const data = await sendCommand(command) as { summary?: unknown } | null;
       const direct = typeof data?.summary === 'string' ? data.summary.trim() : '';
       if (direct !== '') return direct;
@@ -3873,7 +4142,7 @@ export function App() {
       updateItemsFor(targetSid, (items) => mergeAuthoritativeItems(messagesToItems(messages), items, streaming));
       return latestCompactionSummary(itemsBySessionIdRef.current[targetSid] ?? []) ?? '';
     } finally {
-      writeCompactBook(settleCompact(compactBookRef.current, targetSid, started.token));
+      if (identity) writeCompactBook(settleCompact(compactBookRef.current, identity, generation));
       refreshContextUsage(targetSid);
     }
   }, [refreshContextUsage, sendCommand, updateItemsFor, writeCompactBook]);
@@ -4008,6 +4277,7 @@ export function App() {
       const start = Math.min(slot?.selectionStart ?? draft.length, draft.length);
       const end = Math.min(slot?.selectionEnd ?? start, draft.length);
       input.setSelectionRange(start, end);
+      syncInlineIntent(draft);
     }
     const restoredAttachments = (slot?.attachments ?? []).filter(
       (attachment) => (attachment.kind !== 'video' && attachment.kind !== 'pdf') || attachment.videoState !== 'uploading',
@@ -4110,8 +4380,38 @@ export function App() {
    *  used the container top; the note must agree), and the x-span is the
    *  content wrapper's rendered column (the container's rect would include
    *  the scrollbar and the centered-column margins). */
+  const isSurfaceFollowing = useCallback(() => pinCtrl.isFollowing(), [pinCtrl]);
+  // anchorEchoRef: one-shot note-side echo guard (pin side: adoptedScrollTop); not a viewport mirror.
+  const anchorEchoRef = useRef<{ rk: RuntimeKey; scrollTop: number } | null>(null);
+  /** THE parked-anchor correction writer: DISPLAYED-runtime validated, at most one id-rect
+   *  scrollTop write; zero delta writes nothing. Fold order is the structural callers' contract. */
+  const correctParkedAnchorShape = useCallback((rk: RuntimeKey, anchorItemId: string, anchorOffsetPx: number) => {
+    if (displayedRuntimeKeyRef.current !== rk) return;
+    const container = transcriptRef.current;
+    const contentEl = surfaceContentElsRef.current.get(rk) ?? null;
+    if (!container || !contentEl) return;
+    const live = liveViewportsRef.current.get(rk) ?? null;
+    // AUTHORITATIVE pin gate (scrollPin.isFollowing): the live viewport's
+    // noted follow can lag the controller inside one commit (the S8.3
+    // regression) — a pinned view is never corrected away.
+    if (!live || pinCtrl.isFollowing() || live.anchorItemId === null) return;
+    const delta = compensateAnchorShapeShift({
+      scroll: container,
+      content: transcriptContentRoot(contentEl),
+      anchorItemId,
+      anchorOffsetPx,
+    });
+    if (delta === 0) return;
+    pinCtrl.adoptUnpinned(container);
+    anchorEchoRef.current = { rk, scrollTop: container.scrollTop };
+  }, [pinCtrl]);
   const noteLiveTranscriptScroll = useCallback(() => {
     const key = displayedRuntimeKeyRef.current;
+    const echo = anchorEchoRef.current;
+    if (echo !== null) {
+      anchorEchoRef.current = null;
+      if (key === echo.rk && transcriptRef.current?.scrollTop === echo.scrollTop) return;
+    }
     const contentRect = transcriptContentRef.current?.getBoundingClientRect();
     const containerRect = transcriptRef.current?.getBoundingClientRect();
     noteLiveViewportScroll(
@@ -4144,6 +4444,138 @@ export function App() {
   const getSurfaceAnchorIndex = useCallback((sessionId: string, anchorItemId: string): number => {
     return itemIndexBySessionIdRef.current.get(sessionId)?.get(anchorItemId) ?? -1;
   }, []);
+
+  /* ---- Reply stars: listener+session-scoped entry-id sets ----
+   * No mirrored message/index cache: the ONLY stored state is the
+   * authoritative entry-id set per scope; the minimap derives everything
+   * else from the current authoritative items on every render. */
+  const [starredByScope, setStarredByScope] = useState<Record<string, ReadonlySet<string>>>({});
+  const starredByScopeRef = useRef(starredByScope);
+  starredByScopeRef.current = starredByScope;
+  // Activation load: read the existing storage prefs for the displayed
+  // scope. A read failure toasts once and RETURNS — the cached last-good
+  // set for that scope is never overwritten with an empty one.
+  useEffect(() => {
+    const identity = displayedRuntimeKey ? parseRuntimeKey(displayedRuntimeKey) : null;
+    if (!identity) return;
+    const scope: ReplyStarScope = { authority: hostRef.current, sessionId: identity.sessionId };
+    const key = replyStarScopeKey(scope);
+    let loaded: ReadonlySet<string>;
+    try {
+      loaded = loadReplyStars(tokenStorage, scope);
+    } catch (err) {
+      toast(`saved reply stars are unreadable: ${(err as Error).message}`, true);
+      return;
+    }
+    setStarredByScope((prev) => (prev[key] === loaded ? prev : { ...prev, [key]: loaded }));
+  }, [displayedRuntimeKey, toast]);
+
+  // Toggle: persist BEFORE committing; a storage failure toasts with
+  // context and leaves the last-good set untouched.
+  const toggleReplyStar = useCallback((entryId: string, starred: boolean) => {
+    const identity = displayStateRef.current?.displayed;
+    if (!identity || entryId === '') return;
+    const scope: ReplyStarScope = { authority: hostRef.current, sessionId: identity.sessionId };
+    const key = replyStarScopeKey(scope);
+    const current = starredByScopeRef.current[key] ?? EMPTY_STARRED_IDS;
+    if (current.has(entryId) === starred) return;
+    const next = new Set(current);
+    if (starred) next.add(entryId);
+    else next.delete(entryId);
+    try {
+      saveReplyStars(tokenStorage, scope, next);
+    } catch (err) {
+      toast(`reply stars could not be saved: ${(err as Error).message}`, true);
+      return;
+    }
+    setStarredByScope((prev) => ({ ...prev, [key]: next }));
+  }, [toast]);
+  // Rail row unstar: a PURE toggle-off, never a jump. It reuses the same
+  // persist-first toggle, so a storage failure toasts and keeps the last-good
+  // set — the rail entry disappears only after the store authoritatively
+  // changed (no local fake delete).
+  const unstarReply = useCallback((entryId: string) => {
+    toggleReplyStar(entryId, false);
+  }, [toggleReplyStar]);
+  // Jump: resolve the clicked entry id against the CURRENT authoritative
+  // items, guarded to the displayed runtime. SCROLL-ONLY: the composer
+  // draft, attachments, pending uploads, and panel state are NEVER touched
+  // (a full restoreDisplayedView would clobber the live composer with the
+  // stale saved slot). The live viewport seeds with the jump anchor
+  // (planParkedWindow then mounts the anchor neighborhood + tail), the
+  // demand-walk latch resets via the surface's starJumpNonce, and a rAF
+  // after the parked DOM mounts applies ONLY the production
+  // applyRestoredViewport + explicit adoptUnpinned — never a plain query
+  // for an offscreen node. A pending switch or a replaced runtime cancels.
+  const [starJumpNonce, setStarJumpNonce] = useState(0);
+  const starJumpScrollGenerationRef = useRef(0);
+  const jumpToStarredReply = useCallback((entryId: string) => {
+    const identity = displayStateRef.current?.displayed;
+    if (!identity || entryId === '' || displayStateRef.current?.pending) return;
+    const key = runtimeKey(identity);
+    if (!surfaceKeysRef.current.includes(key)) return;
+    const items = itemsBySessionIdRef.current[identity.sessionId] ?? EMPTY_ITEMS;
+    const index = planStarredJump(items, entryId);
+    if (index < 0) return;
+    // Viewport anchors are the STAMPED display item id, never the persisted
+    // entry id: resolve entry → item, then anchor on item.id.
+    const jumped = items[index];
+    if (jumped.kind !== 'assistant') return;
+    const anchorItemId = jumped.id;
+    // Exit the pin BEFORE any DOM change: the pre-jump mount pinIfPinned would write the old bottom.
+    pinCtrl.adoptUnpinned(transcriptRef.current);
+    const current = viewSlotsByRuntimeKeyRef.current.get(key) ?? emptyViewSlot(identity);
+    const slot: SessionViewSlot = {
+      ...current,
+      identity,
+      lastUsed: Date.now(),
+      transcriptScroll: { follow: false, anchorItemId, anchorOffsetPx: 0, fallbackScrollTop: 0 },
+    };
+    viewSlotsByRuntimeKeyRef.current = upsertViewSlot(
+      viewSlotsByRuntimeKeyRef.current,
+      slot,
+      identity,
+      displayStateRef.current?.pending ?? null,
+    );
+    liveViewportsRef.current.set(key, seedLiveViewport(key, {
+      follow: false,
+      anchorItemId,
+      anchorOffsetPx: 0,
+      fallbackScrollTop: 0,
+      openFoldKeys: current.openFoldKeys,
+    }).viewport);
+    setStarJumpNonce((nonce) => nonce + 1);
+    // The rAF lands after the walkOwned reset has re-rendered and the
+    // parked slices (anchor neighborhood + tail) are mounted — the same
+    // after-commit ordering the activation restore relies on.
+    const jumpGeneration = ++starJumpScrollGenerationRef.current;
+    window.requestAnimationFrame(() => {
+      if (starJumpScrollGenerationRef.current !== jumpGeneration) return;
+      if (!sameRuntime(activatedRuntimeRef.current, identity) || displayStateRef.current?.pending) return;
+      const transcript = transcriptRef.current;
+      const content = surfaceContentElsRef.current.get(runtimeKey(identity)) ?? null;
+      if (!transcript || !content) return;
+      applyRestoredViewport(transcript, transcriptContentRoot(content), {
+        follow: false,
+        anchorItemId,
+        anchorOffsetPx: 0,
+        fallbackScrollTop: 0,
+        openFoldKeys: current.openFoldKeys,
+      });
+      pinCtrl.adoptUnpinned(transcript);
+    });
+  }, [pinCtrl]);
+  // Displayed-scope derivation for the row buttons and the minimap: stars
+  // resolve through entry-id membership of the CURRENT authoritative items
+  // only — no mirrored message/index cache.
+  const displayedStarIdentity = displayedRuntimeKey ? parseRuntimeKey(displayedRuntimeKey) : null;
+  const displayedStarKey = displayedStarIdentity
+    ? replyStarScopeKey({ authority: hostRef.current, sessionId: displayedStarIdentity.sessionId })
+    : null;
+  const displayedStarredIds = (displayedStarKey ? starredByScope[displayedStarKey] : undefined) ?? EMPTY_STARRED_IDS;
+  const starredReplies: readonly StarredReply[] = displayedStarIdentity
+    ? deriveStarredReplies(itemsBySessionId[displayedStarIdentity.sessionId] ?? EMPTY_ITEMS, displayedStarredIds)
+    : EMPTY_STARRED_REPLIES;
   useLayoutEffect(() => {
     transcriptContentRef.current = displayedRuntimeKey
       ? (surfaceContentElsRef.current.get(displayedRuntimeKey) ?? null)
@@ -4155,11 +4587,43 @@ export function App() {
     const container = transcriptRef.current;
     const content = surfaceContentElsRef.current.get(displayedRuntimeKey) ?? null;
     if (!container || !content) return;
-    const observer = new ResizeObserver(() => pinCtrl.handleResize(container));
+    // Same observer tracks mounted children (≤240); unobserve removed, remounts observed fresh.
+    const observedChildren = new Set<Element>();
+    const syncObservedChildren = () => {
+      const children = content.children;
+      const current = new Set<Element>();
+      for (let index = 0; index < children.length; index += 1) {
+        const child = children[index];
+        current.add(child);
+        if (!observedChildren.has(child)) {
+          observer.observe(child);
+          observedChildren.add(child);
+        }
+      }
+      for (const child of observedChildren) {
+        if (!current.has(child)) {
+          observer.unobserve(child);
+          observedChildren.delete(child);
+        }
+      }
+    };
+    const observer = new ResizeObserver(() => {
+      // Stale-callback guards first: a recycled runtime/content/container must not write.
+      if (displayedRuntimeKeyRef.current !== displayedRuntimeKey) return;
+      if (surfaceContentElsRef.current.get(displayedRuntimeKey) !== content) return;
+      if (transcriptRef.current !== container) return;
+      syncObservedChildren();
+      pinCtrl.handleResize(container);
+      const live = liveViewportsRef.current.get(displayedRuntimeKey) ?? null;
+      if (!live || live.anchorItemId === null) return;
+      // Same-shape drift: measure + delta only — never replay fold state.
+      correctParkedAnchorShape(displayedRuntimeKey, live.anchorItemId, live.anchorOffsetPx);
+    });
     observer.observe(container);
     observer.observe(content);
+    syncObservedChildren();
     return () => observer.disconnect();
-  }, [displayedRuntimeKey, pinCtrl, surfaceEpoch, transcriptRef]);
+  }, [correctParkedAnchorShape, displayedRuntimeKey, pinCtrl, surfaceEpoch, transcriptRef]);
 
   // Fold state maintenance: native `toggle` does not bubble, but the capture
   // phase still descends to the target, so ONE listener on the content wrapper
@@ -4367,7 +4831,7 @@ export function App() {
       setCatalogRefreshRevision((revision) => revision + 1);
       return Promise.resolve();
     },
-    [activePanel, activateRuntime, applyState, publishLifecycle, reconcileTaskJobs, refreshGoal, resetComposerAttachments, saveDisplayedView, subscribeRuntime, toast, updateActivityStripFor, updateItemsFor]
+    [activePanel, activateRuntime, applyState, publishLifecycle, reconcileTaskJobs, refreshGoal, resetComposerAttachments, saveDisplayedView, syncInlineIntent, subscribeRuntime, toast, updateActivityStripFor, updateItemsFor]
   );
 
   const settlePendingSwitch = useCallback((generation: number, ok: boolean) => {
@@ -4421,6 +4885,7 @@ export function App() {
     }
     cursorByRuntimeKeyRef.current.delete(key);
     viewSlotsByRuntimeKeyRef.current.delete(key);
+    writeCompactBook(removeCompactRuntime(compactBookRef.current, identity));
     removeSurface(key);
     if (!ownsSessionState) return;
     loadedSessionIdsRef.current.delete(identity.sessionId);
@@ -4429,7 +4894,7 @@ export function App() {
     delete optimisticQueueBySessionIdRef.current[identity.sessionId];
     delete steeringLiveBySessionIdRef.current[identity.sessionId];
     markStreamingFor(identity.sessionId, false);
-  }, [markStreamingFor, removeSurface]);
+  }, [markStreamingFor, removeSurface, writeCompactBook]);
   const settleSwitchForTransportLoss = useCallback(() => {
     const pending = displayStateRef.current?.pending;
     if (!pending) return;
@@ -5009,6 +5474,16 @@ export function App() {
               pending: null,
               nextGeneration: 1,
             };
+          }
+          if (coldBind && !viewSlotsByRuntimeKeyRef.current.has(runtimeKey(primaryIdentity))) {
+            const liveDraft = promptInputRef.current?.value ?? '';
+            if (liveDraft !== '') {
+              const seed = emptyViewSlot(primaryIdentity);
+              seed.draft = liveDraft;
+              seed.selectionStart = promptInputRef.current?.selectionStart ?? liveDraft.length;
+              seed.selectionEnd = promptInputRef.current?.selectionEnd ?? seed.selectionStart;
+              viewSlotsByRuntimeKeyRef.current = upsertViewSlot(viewSlotsByRuntimeKeyRef.current, seed, primaryIdentity, null);
+            }
           }
           activateRuntime(primaryIdentity, true);
           if (previousDisplayed && !sameRuntime(previousDisplayed, primaryIdentity)) {
@@ -5705,7 +6180,12 @@ export function App() {
         clearStreamStateForKey(streamKey(sid, id));
         activeAssistantBySessionIdRef.current[sid] = id;
       }
-      pushItemFor(sid, { kind: 'assistant', id, status: 'streaming', blocks: [] });
+      // Stable wire clock captured at message_start (pi-ai
+      // `AssistantMessage.timestamp`); message_end and authoritative
+      // restores overwrite it, the no-message_end finalize keeps it via the
+      // item spread. Never a browser/click time.
+      const startTimestamp = assistantTimestampMs(message);
+      pushItemFor(sid, { kind: 'assistant', id, status: 'streaming', blocks: [], ...(startTimestamp !== undefined ? { timestamp: startTimestamp } : {}) });
       return;
     }
     if (role === 'toolResult') {
@@ -5794,25 +6274,34 @@ export function App() {
     if (activeAssistantBySessionIdRef.current[sid] === targetId) {
       delete activeAssistantBySessionIdRef.current[sid];
     }
-    patchItemFor(sid, targetId, (item) =>
-      item.kind === 'assistant'
-        ? { ...item, status: 'final' as const, blocks, ...(failureMessage ? { errorMessage: failureMessage } : {}) }
-        : item
-    );
+    const endTimestamp = assistantTimestampMs(message);
+    patchItemFor(sid, targetId, (item) => {
+      if (item.kind !== 'assistant') return item;
+      // message_end's own wire clock is canonical; when this frame omits a
+      // usable timestamp the message_start value survives the spread.
+      return {
+        ...item,
+        status: 'final' as const,
+        blocks,
+        ...(failureMessage ? { errorMessage: failureMessage } : {}),
+        ...(endTimestamp !== undefined ? { timestamp: endTimestamp } : {}),
+      };
+    });
   }, [frameSession, patchItemFor]);
 
   const onToolStart = useCallback((frame: EventFrame) => {
     const sid = frameSession(frame);
     markStreamingFor(sid, true);
-    updateItemsFor(sid, (prev) => applyToolStartToItems(prev, {
+    const toolCallId = (frame.toolCallId as string) || '';
+    const card: ToolCardStart = {
       kind: 'toolCard',
-      id: typeof frame.itemId === 'string' && frame.itemId !== '' ? frame.itemId : nextId('tc'),
-      toolCallId: (frame.toolCallId as string) || '',
+      toolCallId,
       toolName: safeText(frame.toolName || 'tool'),
       args: frame.args,
       status: 'running',
       result: '',
-    }));
+    };
+    updateItemsFor(sid, (prev) => applyToolStartToItems(prev, card, frame.itemId));
   }, [frameSession, markStreamingFor, updateItemsFor]);
 
   const onToolUpdate = useCallback((frame: EventFrame) => {
@@ -5978,6 +6467,25 @@ export function App() {
         // owning session's meter cannot wait for the next full snapshot.
         refreshContextUsage(sid);
         setCatalogRefreshRevision((revision) => revision + 1);
+        // A settled live turn still carries synthetic item ids — the
+        // canonical entry ids arrive only through get_messages hydration.
+        // Refill the DISPLAYED session's transcript so the just-finished
+        // reply becomes star-enabled without a reload; the ownership hold
+        // (incarnation + socket generation + the TERMINAL TURN ID, evaluated
+        // at response time against the typed strip state) fails the merge
+        // closed on any runtime change or newer turn — while settled
+        // agent_settled/queue_update cursor advances never invalidate.
+        if (active && sid !== '') {
+          const terminalIncarnation = residentBySessionIdRef.current[sid];
+          const terminalTurnId = typeof frame.turnId === 'string' ? frame.turnId : '';
+          if (typeof terminalIncarnation === 'string' && terminalIncarnation !== '' && terminalTurnId !== '') {
+            requestSettledStreamRefillRef.current(sid, {
+              runtimeIncarnation: terminalIncarnation,
+              socketGeneration: socketGenRef.current,
+              turnId: terminalTurnId,
+            });
+          }
+        }
         const status = typeof frame.status === 'string' ? frame.status : '';
         if (sid && abortPendingBySessionIdRef.current[sid]) {
           abortPendingBySessionIdRef.current[sid] = false;
@@ -6255,6 +6763,22 @@ export function App() {
       const display = displayStateRef.current;
       if (!display) return;
       const plan = acceptAuthoritativeCut(display, generation, cut);
+      // An ACCEPTED cut hands over compact state: the state baseline, then the
+      // cut's ordered compaction start/end events (an end in the same cut beats
+      // a guard-lagged isCompacting=true). Rejected/resync plans carry only
+      // failure actions, so they never touch this book.
+      const cutRejected = plan.actions.some(
+        (action) => action.type === 'resubscribe-zero' || action.type === 'fail-pending',
+      );
+      if (plan.actions.length > 0 && !cutRejected) {
+        writeCompactBook(reconcileCompactCut(
+          compactBookRef.current,
+          identity,
+          cut.state,
+          cut.events,
+          cut.watermark,
+        ));
+      }
       const finishCut = (committed: typeof plan.state, settlesPromise: boolean) => {
         publishLifecycle(displayStateRef.current);
         if (settlesPromise) {
@@ -6422,12 +6946,25 @@ export function App() {
     if (pendingTarget && sameRuntime(pendingTarget, identity)) {
       lastCutProgressAtRef.current = Date.now();
     }
+    // Exact-runtime boundary: identity, incarnation, resident, and sequence are
+    // already validated by the gate above. typed compaction events are the
+    // lifecycle authority (an end settles even though the guard may still
+    // report isCompacting=true).
+    const exactEvent: ExactRuntimeEventFrame = {
+      ...event,
+      sessionId: identity.sessionId,
+      runtimeIncarnation: identity.runtimeIncarnation,
+      sequence: event.sequence,
+    };
+    if (isCompactionEvent(exactEvent)) {
+      writeCompactBook(applyCompactionEvent(compactBookRef.current, exactEvent));
+    }
     onEvent(event);
     noteStreamStall(identity.sessionId, { type: 'live_event' });
     if (streamingBySessionIdRef.current[identity.sessionId] === true) {
       armStreamWatchdogRef.current(identity.sessionId);
     }
-  }, [activateRuntime, applyState, applySwitchActions, invalidateRuntime, noteStreamStall, onResponse, onEvent, publishLifecycle, rollbackPendingSwitch, sendCommand, settlePendingSwitch, subscribeRuntime, toast, updateItemsFor]);
+  }, [activateRuntime, applyState, applySwitchActions, invalidateRuntime, noteStreamStall, onResponse, onEvent, publishLifecycle, rollbackPendingSwitch, sendCommand, settlePendingSwitch, subscribeRuntime, toast, updateItemsFor, writeCompactBook]);
 
   /* ---------------- composer ---------------- */
 
@@ -6541,27 +7078,40 @@ export function App() {
    *  snapshot-error and moved-display-authority settles own the cleanup
    *  close, and success retains the args on the mounted panel. The composer
    *  draft clears only when unchanged on success; rejections preserve it. */
-  const openCodeReview = useCallback((openArgs: CodeReviewOpenArgs): Promise<unknown> => {
+  const openCodeReview = useCallback((openArgs: CodeReviewOpenArgs, origin: 'command' | 'surface'): Promise<unknown> => {
     const reviewSid = composerCommandSessionId(displayStateRef.current?.commandTarget, sessionIdRef.current);
     const opened = codeReviewOpenCommand(openArgs);
     if (!opened.ok) {
       toast(opened.error, true);
       return Promise.resolve(undefined);
     }
-    const draft = promptInputRef.current?.value ?? '';
+    const draft = origin === 'command' ? promptInputRef.current?.value ?? '' : null;
     return sendCommand({ ...opened.command, sessionId: reviewSid })
       .then((data) => {
-        const snapshotError = codeReviewOpenSnapshotError(data);
-        if (snapshotError) {
-          const reviewId = normalizeCodeReviewSnapshot(data).reviewId;
-          if (reviewId) {
+        const parsed = parseCodeReviewSnapshot(data);
+        if (!parsed.ok) {
+          if (parsed.reviewId) {
+            // Owner-targeted cleanup of a review the backend opened even
+            // though its projection was structurally unusable. The explicit
+            // sessionId keeps the during-switch allowance on this owner.
+            void sendCommand({ type: 'code_review_close', reviewId: parsed.reviewId, sessionId: reviewSid }, undefined, { allowDuringSwitch: true }).catch((err: Error) => {
+              if (isToastOwnedRpcError(err) || isTransportError(err)) return;
+              toast(`Code review: ${parsed.error}; close failed: ${err.message}`, true);
+            });
+          }
+          toast(`Code review: ${parsed.error}`, true);
+          return;
+        }
+        if (parsed.snapshot.error) {
+          const snapshotError = parsed.snapshot.error;
+          if (parsed.snapshot.reviewId) {
             // Owner-targeted cleanup of the review this probe just
             // opened: the probe may settle inside a pending switch
             // window, where an ungated send is rejected
             // (commandRejectedBySwitchPending) and the review would be
             // left open on its owner — the explicit sessionId makes the
             // during-switch allowance safe.
-            void sendCommand({ type: 'code_review_close', reviewId, sessionId: reviewSid }, undefined, { allowDuringSwitch: true }).catch((err: Error) => {
+            void sendCommand({ type: 'code_review_close', reviewId: parsed.snapshot.reviewId, sessionId: reviewSid }, undefined, { allowDuringSwitch: true }).catch((err: Error) => {
               if (isToastOwnedRpcError(err) || isTransportError(err)) return;
               toast(`Code review: ${snapshotError}; close failed: ${err.message}`, true);
             });
@@ -6581,7 +7131,7 @@ export function App() {
         // runs — and its explicit owner sessionId keeps it on that
         // session.
         if ((displayStateRef.current?.displayed.sessionId ?? sessionIdRef.current) !== reviewSid) {
-          const reviewId = normalizeCodeReviewSnapshot(data).reviewId;
+          const reviewId = parsed.snapshot.reviewId;
           if (reviewId) {
             void sendCommand({ type: 'code_review_close', reviewId, sessionId: reviewSid }, undefined, { allowDuringSwitch: true }).catch((err: Error) => {
               if (isToastOwnedRpcError(err) || isTransportError(err)) return;
@@ -6590,17 +7140,19 @@ export function App() {
           }
           return;
         }
-        if (promptInputRef.current && promptInputRef.current.value === draft) {
+        if (origin === 'command' && promptInputRef.current && promptInputRef.current.value === draft) {
           promptInputRef.current.value = '';
           flushComposerResize(promptInputRef.current);
+          syncInlineIntent('');
         }
         setCodeReviewOpenArgs({ ...openArgs, alreadyOpen: true });
         openPanel('code-review', { force: true });
       })
       .catch((err: Error) => {
+        if (isToastOwnedRpcError(err) || isTransportError(err)) return;
         toast(`Code review: ${err.message}`, true);
       });
-  }, [flushComposerResize, openPanel, sendCommand, toast]);
+  }, [flushComposerResize, openPanel, sendCommand, syncInlineIntent, toast]);
 
   /** `/review` dispatch: the FIRST operand is a repository override when it
    *  names a workspace directory (probed once via file_explorer_list — only
@@ -6610,7 +7162,7 @@ export function App() {
   const dispatchReviewCommand = useCallback((operands: string[]) => {
     const usage = () => toast('usage: /review [<repo>] [<base> | <from> <to>]', true);
     if (operands.length === 0) {
-      void openCodeReview({});
+      void openCodeReview({}, 'command');
       return;
     }
     if (operands.length > 3) {
@@ -6627,13 +7179,13 @@ export function App() {
             : operands.length === 2
               ? { repo: first, from: second, includeWorkingTree: true }
               : { repo: first, from: second, to: third };
-        void openCodeReview(args);
+        void openCodeReview(args, 'command');
       })
       .catch(() => {
         if (operands.length === 1) {
-          void openCodeReview({ from: first, includeWorkingTree: true });
+          void openCodeReview({ from: first, includeWorkingTree: true }, 'command');
         } else if (operands.length === 2) {
-          void openCodeReview({ from: first, to: second });
+          void openCodeReview({ from: first, to: second }, 'command');
         } else {
           usage();
         }
@@ -6725,6 +7277,11 @@ export function App() {
     const input = promptInputRef.current;
     if (!input) return;
     if (composerSendingRef.current) return;
+    if (
+      connState !== 'on'
+      || bootRef.current
+      || wsRef.current?.readyState !== WebSocket.OPEN
+    ) return;
     const targetSid = sessionIdRef.current ?? '';
     const resolvedKind = planComposerSubmitKind({
       streaming: targetSid !== '' && streamingBySessionIdRef.current[targetSid] === true,
@@ -6732,7 +7289,10 @@ export function App() {
     });
     if (resolvedKind === 'prompt') {
       const sendGate = compactSendAdmission(
-        targetSid !== '' && compactBookRef.current.compacting[targetSid] === true,
+        compactView(
+          compactBookRef.current,
+          identityFromWire(targetSid, residentBySessionIdRef.current[targetSid]),
+        ).compacting,
       );
       if (!sendGate.ok) {
         toast(sendGate.message, true);
@@ -6794,6 +7354,7 @@ export function App() {
         const acceptCommand = () => {
           input.value = '';
           flushComposerResize(input);
+          syncInlineIntent('');
         };
 
         if (!parsed) {
@@ -6860,7 +7421,7 @@ export function App() {
             // owner-stamped opener; bare `/show` opens the chooser and
             // fetches the displayed session's recent commits.
             if (action.ref) {
-              dispatched = openCodeReview({ commit: action.ref });
+              dispatched = openCodeReview({ commit: action.ref }, 'surface');
               return;
             }
             openCommitPicker();
@@ -6927,9 +7488,10 @@ export function App() {
           if (action.type === 'compact') {
             const isSnap = action.mode === 'snap';
             const targetSid = sid ?? '';
+            const compactIdentity = identityFromWire(targetSid, residentBySessionIdRef.current[targetSid]);
             const admission = compactAdmission({
               streaming: !!(targetSid && streamingBySessionIdRef.current[targetSid]),
-              compacting: !!(targetSid && compactBookRef.current.compacting[targetSid]),
+              compacting: !!compactIdentity && compactView(compactBookRef.current, compactIdentity).compacting,
             });
             if (!admission.ok) {
               toast(admission.message, true);
@@ -6945,16 +7507,22 @@ export function App() {
                 };
             if (targetSid) command.sessionId = targetSid;
             const label = isSnap ? 'Snapcompact' : 'Compact';
-            let compactToken = 0;
-            if (targetSid) {
-              const started = beginCompact(compactBookRef.current, targetSid, isSnap ? 'snap' : 'llm');
-              compactToken = started.token;
-              writeCompactBook(started.book);
+            // Reserve from the existing monotonic command counter so this
+            // attempt's finally can never settle a later round (or another
+            // incarnation of the same session).
+            const compactGeneration = compactIdentity ? ++seqRef.current : 0;
+            if (compactIdentity) {
+              writeCompactBook(beginCompact(
+                compactBookRef.current,
+                compactIdentity,
+                isSnap ? 'snap' : 'llm',
+                compactGeneration,
+              ));
             }
             acceptCommand();
             const finishCompact = () => {
-              if (!targetSid || compactToken === 0) return;
-              writeCompactBook(settleCompact(compactBookRef.current, targetSid, compactToken));
+              if (!compactIdentity) return;
+              writeCompactBook(settleCompact(compactBookRef.current, compactIdentity, compactGeneration));
             };
             dispatched = sendCommand(command)
               .then((data) => {
@@ -7194,6 +7762,7 @@ export function App() {
       }
       input.value = '';
       flushComposerResize(input);
+      syncInlineIntent('');
       // Capture the exact owner/generation and sent ids before dispatch. ACK
       // clears that owner only; failure preserves its slot for retry.
       const sentIds =
@@ -7291,6 +7860,14 @@ export function App() {
             return;
           }
           if (isToastOwnedRpcError(err) || isTransportError(err)) return;
+          if (promptFailureRpcCode(err) === 'model_not_configured') {
+            // Typed rejection (data.code), never the display text: the turn
+            // was refused before admission, so no history exists. Re-read the
+            // catalog and point at the picker instead of a dead-end toast.
+            if (sid) refreshHeaderModelCatalog(sid);
+            toast('No model configured: choose one in the model menu, then send again', true);
+            return;
+          }
           toast(`send failed: ${err.message}`, true);
         });
     } finally {
@@ -7302,7 +7879,7 @@ export function App() {
         composerSendingRef.current = false;
       }
     }
-  }, [attachments, flushComposerResize, markStreamingFor, openPanel, pushItemFor, refreshContextUsage, refreshGoal, removeItemFor, sendCommand, toast, updateOwnedAttachments, writeCompactBook, writeSteering]);
+  }, [attachments, connState, flushComposerResize, markStreamingFor, openPanel, pushItemFor, refreshContextUsage, refreshGoal, removeItemFor, sendCommand, syncInlineIntent, toast, updateOwnedAttachments, writeCompactBook, writeSteering]);
 
   const submitComposerEnter = useCallback(() => {
     submit('prompt');
@@ -7676,7 +8253,7 @@ export function App() {
     submit(route.plan);
   }, [autoResize, submit, toast]);
 
-  const { recording, transcribing, startRecording, stopRecording } = useSttRecorder({
+  const { recording, transcribing, starting, isBusy: sttBusy, startRecording, stopRecording } = useSttRecorder({
     getOwner: () => sessionIdRef.current,
     getDestination: () => sttPendingDestinationRef.current,
     sttConfigured: liveSettings,
@@ -7686,24 +8263,33 @@ export function App() {
   });
 
   const startMainSttRecording = useCallback(() => {
+    if (realtimeActive || realtimeBusyRef.current) return;
+    if (
+      connState !== 'on'
+      || bootRef.current
+      || wsRef.current?.readyState !== WebSocket.OPEN
+      || !sessionIdRef.current
+    ) return;
     sttPendingDestinationRef.current = captureSttRecordingDestination(sessionIdRef.current, 'MainComposer');
     void startRecording();
-  }, [startRecording]);
+  }, [connState, realtimeActive, startRecording]);
 
   const startSideChatSttRecording = useCallback(() => {
+    if (realtimeActive || realtimeBusyRef.current) return;
+    if (
+      connState !== 'on'
+      || bootRef.current
+      || wsRef.current?.readyState !== WebSocket.OPEN
+      || !sessionIdRef.current
+    ) return;
     const sessionId = sessionIdRef.current;
-    const tabId = sessionId ? (sideChatBySessionIdRef.current[sessionId]?.active ?? null) : null;
+    const tabId = sideChatBySessionIdRef.current[sessionId]?.active ?? null;
     sttPendingDestinationRef.current = captureSttRecordingDestination(sessionId, { kind: 'SideChatTab', tabId });
     void startRecording();
-  }, [startRecording]);
+  }, [connState, realtimeActive, startRecording]);
 
   /* ---------------- composer: realtime voice (Codex Live WebRTC) ---------------- */
 
-  /** True when the backend advertises live.enabled and realtime mode (trim +
-   *  ASCII lowercase, centralized in realtime.ts). A missing/disabled live
-   *  block never selects realtime, and applyState clears stale liveSettings
-   *  when runtimeSettings omits live. */
-  const isRealtimeMode = isRealtimeLiveMode(liveSettings);
 
   /** Commit a final transcript to the composer textarea, mirroring the STT
    *  flow's commit so both voice paths land the draft the same way. */
@@ -7715,9 +8301,10 @@ export function App() {
       const separator = current.trim() ? (current.endsWith('\n') ? '' : '\n') : '';
       input.value = `${current}${separator}${text}`;
       autoResize(input);
+      syncInlineIntent(input.value);
       input.focus();
     },
-    [autoResize]
+    [autoResize, syncInlineIntent]
   );
   /** Insert a selected slash command into the composer textarea and focus it
    *  WITHOUT submitting — the user confirms and Main dispatches on Enter. The
@@ -7730,11 +8317,28 @@ export function App() {
       if (!input || !text) return;
       input.value = appendDraft(input.value, text);
       autoResize(input);
+      syncInlineIntent(input.value);
       const end = input.value.length;
       input.setSelectionRange(end, end);
       input.focus();
     },
-    [autoResize]
+    [autoResize, syncInlineIntent]
+  );
+
+  /** Inline autocomplete accept: REPLACE the whole draft with the completed
+   *  slash token (the popup is only ever open while the draft IS that token),
+   *  then sync the intent so the picker keys its dismissal on the settled
+   *  token. Never submits; the caret stays in the uncontrolled textarea. */
+  const acceptInlineDraft = useCallback(
+    (text: string) => {
+      const input = promptInputRef.current;
+      if (!input) return;
+      input.value = text;
+      autoResize(input);
+      input.setSelectionRange(text.length, text.length);
+      syncInlineIntent(text);
+    },
+    [autoResize, syncInlineIntent]
   );
   /** Stage a picked SKILL candidate in the composer WITHOUT submitting: insert
    *  `/skill <name>`, focus the textarea, and SELECT the whole draft so the
@@ -7747,12 +8351,13 @@ export function App() {
       if (!input || !text) return;
       input.value = appendDraft(input.value, text);
       autoResize(input);
+      syncInlineIntent(input.value);
       const start = input.value.length - text.length;
       input.setSelectionRange(start, input.value.length);
       input.focus();
       toast(`${text} ready — press Enter to run`);
     },
-    [autoResize, toast]
+    [autoResize, syncInlineIntent, toast]
   );
   /** `oai-events` data-channel event dispatch: USER input transcript deltas
    *  stream into the overlay, GA segment events SUPERSEDE the running preview,
@@ -7948,7 +8553,12 @@ export function App() {
    *  direct sideband WebSocket was removed). Incoming audio rides the WebRTC
    *  track. */
   const startRealtime = useCallback(async () => {
-    if (realtimeActive || realtimeBusyRef.current) return;
+    if (realtimeActive || realtimeBusyRef.current || sttBusy()) return;
+    if (
+      connState !== 'on'
+      || bootRef.current
+      || wsRef.current?.readyState !== WebSocket.OPEN
+    ) return;
     if (liveSettings?.realtimeConfigured !== true) {
       toast(
         'Realtime voice is not configured — set Settings.live.realtimeBaseUrl and realtimeApiKey (and realtimeModel/voice) in the terminal',
@@ -8100,7 +8710,7 @@ export function App() {
         toast(`realtime call failed: ${err instanceof Error ? err.message : String(err)}`, true);
       }
     }
-  }, [realtimeActive, liveSettings, sendCommand, handleRealtimeFrame, toast, stopRealtime]);
+  }, [connState, realtimeActive, liveSettings, sendCommand, handleRealtimeFrame, toast, stopRealtime, sttBusy]);
 
 
   // If the backend stops advertising realtime mode while a call is up
@@ -8109,10 +8719,11 @@ export function App() {
     if (shouldStopRealtimeOnSessionSwitch(owner, owner, sessionId)) stopRealtime();
   }, [sessionId, stopRealtime]);
 
-  // (settings changed), tear the call down cleanly.
+  // Realtime config removal (or the live block disappearing) ends the call.
+  // settings.mode === 'stt' must NOT: the Live button is independent of mode.
   useEffect(() => {
-    if (realtimeActive && !isRealtimeMode) stopRealtime();
-  }, [realtimeActive, isRealtimeMode, stopRealtime]);
+    if ((realtimeActive || realtimeBusyRef.current) && liveSettings?.realtimeConfigured !== true) stopRealtime();
+  }, [realtimeActive, liveSettings, stopRealtime]);
 
   const onModelChange = useCallback((key: string) => {
     if (!key) return;
@@ -8324,59 +8935,7 @@ export function App() {
     writeStoredPanelDrawerVh(next);
   }, []);
 
-  // ---- Files explorer OUTER drawer width resizer (desktop only) ----
-  // Mirror of the shared panel height resizer above: pointer capture on down,
-  // clamp-on-move, persist once on up. The resizer sits at the drawer's LEFT
-  // edge, so dragging leftward (startX - clientX > 0) GROWS the drawer and
-  // ArrowLeft grows it too.
-  const onFileExplorerResizerPointerDown = useCallback((e: PointerEvent<HTMLDivElement>) => {
-    if (e.button !== 0) return;
-    // Desktop only — mobile never shows the resizer, but guard anyway.
-    if (typeof window !== 'undefined' && window.matchMedia('(max-width: 720px)').matches) return;
-    e.preventDefault();
-    e.currentTarget.setPointerCapture(e.pointerId);
-    fileExplorerResizeDragRef.current = {
-      startX: e.clientX,
-      startWidth: fileExplorerWidthRef.current,
-    };
-  }, []);
 
-  const onFileExplorerResizerPointerMove = useCallback((e: PointerEvent<HTMLDivElement>) => {
-    const drag = fileExplorerResizeDragRef.current;
-    if (!drag) return;
-    // Dragging the left edge LEFT increases width (negative dx → grow).
-    const dxPx = drag.startX - e.clientX;
-    const next = clampFileExplorerWidth(drag.startWidth + dxPx, window.innerWidth, fileExplorerSidebarPx);
-    fileExplorerWidthRef.current = next;
-    setFileExplorerWidth(next);
-    applyFileExplorerWidth(next, window.innerWidth, fileExplorerSidebarPx);
-  }, [fileExplorerSidebarPx]);
-
-  const endFileExplorerResizeDrag = useCallback((e: PointerEvent<HTMLDivElement>) => {
-    if (!fileExplorerResizeDragRef.current) return;
-    fileExplorerResizeDragRef.current = null;
-    try {
-      e.currentTarget.releasePointerCapture(e.pointerId);
-    } catch {
-      /* already released */
-    }
-    writeStoredFileExplorerWidth(fileExplorerWidthRef.current, window.innerWidth, fileExplorerSidebarPx);
-  }, [fileExplorerSidebarPx]);
-
-  const onFileExplorerResizerKeyDown = useCallback((e: KeyboardEvent<HTMLDivElement>) => {
-    if (typeof window !== 'undefined' && window.matchMedia('(max-width: 720px)').matches) return;
-    let next: number | null = null;
-    if (e.key === 'ArrowLeft') next = stepFileExplorerWidth(fileExplorerWidthRef.current, 1, window.innerWidth, fileExplorerSidebarPx);
-    else if (e.key === 'ArrowRight') next = stepFileExplorerWidth(fileExplorerWidthRef.current, -1, window.innerWidth, fileExplorerSidebarPx);
-    else if (e.key === 'Home') next = fileExplorerWidthCeiling(window.innerWidth, fileExplorerSidebarPx);
-    else if (e.key === 'End') next = FILE_EXPLORER_WIDTH_MIN;
-    if (next == null) return;
-    e.preventDefault();
-    fileExplorerWidthRef.current = next;
-    setFileExplorerWidth(next);
-    applyFileExplorerWidth(next, window.innerWidth, fileExplorerSidebarPx);
-    writeStoredFileExplorerWidth(next, window.innerWidth, fileExplorerSidebarPx);
-  }, [fileExplorerSidebarPx]);
 
   /* ---------------- render ---------------- */
 
@@ -8395,9 +8954,20 @@ export function App() {
   return (
     <>
       <ReconnectOverlay visible={reconnectOverlayVisible(connState)} text={reconnectOverlayText(connState)} />
-      <header ref={appHeaderRef} hidden={filesFullscreen}>
+      <header ref={appHeaderRef}>
         <div className="brand">
-          rpi<span className="brand-sub">web</span>
+          <span className="brand-name">rpi</span>
+          <nav className="brand-switch" aria-label="Page">
+            <span aria-current="page">Web</span>
+            <a
+              id="chat-console-link"
+              href="/chat"
+              title="Open chat"
+              aria-label="Open chat"
+            >
+              Chat
+            </a>
+          </nav>
         </div>
         <HostConnectionChip
           connState={connState}
@@ -8416,12 +8986,29 @@ export function App() {
         <HeaderSelect
           id="model-select"
           title="Model (set_model)"
-          disabled={switchPending || (models.length === 0 && activeModelKey === '')}
+          disabled={switchPending}
           value={activeModelKey}
           placeholder="model…"
           groups={modelGroups}
+          onOpen={refreshHeaderModelCatalogEntry}
           onChange={onModelChange}
         />
+        {/* A catalog configured after this page loaded is invisible to the
+            session/model-key refresh effect; this is its clickable entry. It
+            renders only while the catalog is empty, and an empty catalog no
+            longer disables the picker above. */}
+        {models.length === 0 ? (
+          <button
+            type="button"
+            id="model-catalog-refresh"
+            className="panel-toggle"
+            title="Reload the model catalog (get_available_models)"
+            aria-label="Reload model catalog"
+            onClick={refreshHeaderModelCatalogEntry}
+          >
+            Reload models
+          </button>
+        ) : null}
         <HeaderSelect
           id="thinking-select"
           title="Thinking level (set_thinking_level)"
@@ -8433,75 +9020,45 @@ export function App() {
         />
         <button
           type="button"
-          id="sidebar-toggle-btn"
-          className={sidebarOpen ? 'panel-toggle panel-toggle--open' : 'panel-toggle'}
-          aria-pressed={sidebarOpen}
-          title="Toggle the session sidebar"
-          onClick={() => setSidebarOpen((open) => !open)}
-        >
-          ☰
-        </button>
-      </header>
-
-      <div className={`app-layout${sidebarOpen ? ' app-layout--drawer-open' : ''}${fileExplorerOverlay ? ' app-layout--files-overlay' : ''}${filesFullscreen ? ' app-layout--files-expanded' : ''}${fileExplorerSlot.mode === 'open' ? ' app-layout--files-open' : fileExplorerSlot.mode === 'collapsed' ? ' app-layout--files-collapsed' : ''}${activePanel === 'code-review' ? ' app-layout--code-review' : ''}`}>
-        <div
-          id="session-lifecycle"
-          data-displayed-session-id={lifecycleView.displayedSessionId}
-          data-command-session-id={lifecycleView.commandSessionId}
-          data-pending-generation={lifecycleView.pendingGeneration === null ? '' : String(lifecycleView.pendingGeneration)}
-          data-pending-phase={lifecycleView.pendingPhase ?? ''}
-          data-authoritative-ready={lifecycleView.authoritativeReady ? 'true' : 'false'}
-          data-state-messages={lifecycleView.stateMessages}
-          data-projected-dom={lifecycleView.projectedDom}
-        />
-        {sidebarOpen && (
-          <div className="sidebar-backdrop" onClick={() => setSidebarOpen(false)} />
-        )}
-        <SessionSidebar
-          sendCatalogCommand={sendCatalogCommand}
-          sendCommand={sendCommand}
-          downloadSessionExport={(downloadId, fileName) => downloadSessionExport(
-            downloadId,
-            fileName,
-            {
-              hostAuthority: hostRef.current,
-              pageProtocol: location.protocol,
-            },
-          )}
-          waitForReady={waitForReady}
-          onLifecycleResult={onLifecycleResult}
-          onSwitchSession={requestSessionSwitch}
-          catalogRefreshRevision={catalogRefreshRevision}
-          switchPending={switchPending}
-          lifecycleRowOverlay={lifecycleRow}
-          onLifecycleRowAbsorbed={clearLifecycleRow}
-          getCompactionSummary={getCompactionSummary}
-          requestSessionCompactSummary={requestSessionCompactSummary}
-          activeSessionId={sessionId}
-          isSessionLoaded={isSessionLoaded}
-          onSessionCwdChanged={onSessionCwdChanged}
-          onSessionDeleted={deleteFileExplorerSlot}
-          unreadBySessionId={unreadBySessionId}
-          streamingBySessionId={streamingBySessionId}
-          onCollapse={() => setSidebarOpen(false)}
-          onReopenRail={() => setSidebarOpen(true)}
-          onOpenManage={openNewSession}
-          onSwitchComplete={() => {
-            // Mobile: closing the drawer after a pick; desktop keeps the rail.
+          id="feature-menu-btn"
+          ref={featureMenuButtonRef}
+          className={featureMenuOpen ? 'panel-toggle panel-toggle--open' : 'panel-toggle'}
+          aria-expanded={featureMenuOpen}
+          aria-controls="feature-menu"
+          aria-label={featureMenuOpen ? 'Close feature menu' : 'Open feature menu'}
+          onClick={() => {
+            setFeatureMenuOpen((open) => !open);
             if (window.matchMedia('(max-width: 720px)').matches) setSidebarOpen(false);
           }}
-          onToast={toast}
-          featureNav={
-            <>
-              <a
-                id="chat-console-link"
-                className="panel-toggle"
-                href="/chat"
-                title="Open chat"
-                aria-label="Open chat"
+        >
+          <span aria-hidden="true">☰</span>
+        </button>
+      </header>
+      {createPortal(
+        <nav
+          id="feature-menu"
+          ref={featureMenuRef}
+          aria-label="Features"
+          hidden={!featureMenuOpen}
+          onClick={(event) => {
+            if (!(event.target instanceof Element) || !event.target.closest('button, a')) return;
+            setFeatureMenuOpen(false);
+          }}
+        >
+              <button
+                id="sidebar-menu-item"
+                type="button"
+                className={sidebarOpen ? 'panel-toggle panel-toggle--open' : 'panel-toggle'}
+                aria-pressed={sidebarOpen}
+                title="Toggle the session sidebar"
+                aria-label={sidebarOpen ? 'Close sessions drawer' : 'Open sessions drawer'}
+                onClick={() => {
+                  setSidebarOpen(!sidebarOpen);
+                  setFeatureMenuOpen(false);
+                }}
               >
-                Chat
-              </a>
+                Sessions
+              </button>
               <button
                 id="todo-toggle-btn"
                 type="button"
@@ -8634,10 +9191,63 @@ export function App() {
               >
                 Settings
             </button>
-          </>
-        }
+        </nav>,
+        document.body,
+      )}
+
+      <div className={`app-layout${sidebarOpen ? ' app-layout--drawer-open' : ''}${fileExplorerSlot.mode === 'open' ? ' app-layout--files-open' : fileExplorerSlot.mode === 'collapsed' ? ' app-layout--files-collapsed' : ''}${activePanel === 'code-review' ? ' app-layout--code-review' : ''}`}>
+        <div
+          id="session-lifecycle"
+          data-displayed-session-id={lifecycleView.displayedSessionId}
+          data-command-session-id={lifecycleView.commandSessionId}
+          data-pending-generation={lifecycleView.pendingGeneration === null ? '' : String(lifecycleView.pendingGeneration)}
+          data-pending-phase={lifecycleView.pendingPhase ?? ''}
+          data-authoritative-ready={lifecycleView.authoritativeReady ? 'true' : 'false'}
+          data-state-messages={lifecycleView.stateMessages}
+          data-projected-dom={lifecycleView.projectedDom}
+        />
+        {sidebarOpen && (
+          <div className="sidebar-backdrop" onClick={() => setSidebarOpen(false)} />
+        )}
+        <SessionSidebar
+          sendCatalogCommand={sendCatalogCommand}
+          sendCommand={sendCommand}
+          downloadSessionExport={(downloadId, fileName) => downloadSessionExport(
+            downloadId,
+            fileName,
+            {
+              hostAuthority: hostRef.current,
+              pageProtocol: location.protocol,
+            },
+          )}
+          waitForReady={waitForReady}
+          onLifecycleResult={onLifecycleResult}
+          onSwitchSession={requestSessionSwitch}
+          catalogRefreshRevision={catalogRefreshRevision}
+          switchPending={switchPending}
+          lifecycleRowOverlay={lifecycleRow}
+          onLifecycleRowAbsorbed={clearLifecycleRow}
+          getCompactionSummary={getCompactionSummary}
+          requestSessionCompactSummary={requestSessionCompactSummary}
+          activeSessionId={sessionId}
+          isOpen={sidebarOpen}
+          isSessionLoaded={isSessionLoaded}
+          onSessionCwdChanged={onSessionCwdChanged}
+          onSessionDeleted={deleteFileExplorerSlot}
+          unreadBySessionId={unreadBySessionId}
+          streamingBySessionId={streamingBySessionId}
+          onCollapse={() => setSidebarOpen(false)}
+          onReopenRail={() => setSidebarOpen(true)}
+          onOpenManage={openNewSession}
+          onSwitchComplete={() => {
+            // Mobile: closing the drawer after a pick; desktop keeps the rail.
+            if (window.matchMedia('(max-width: 720px)').matches) setSidebarOpen(false);
+          }}
+          onToast={toast}
         />
         <div className="app-main">
+        <div className="conversation-with-minimap">
+        <div className="transcript-scrollport">
       <main id="transcript" aria-live="polite" data-switch-pending={switchPending ? 'true' : undefined} ref={transcriptRef} onScroll={handleTranscriptScroll}>
         {surfaceKeys.length === 0 && connState === 'token_required' && (
           <div className="empty-hint">
@@ -8665,12 +9275,29 @@ export function App() {
               forcePin={forcePin}
               onContentEl={handleSurfaceContentEl}
               onCommit={handleSurfaceCommit}
+              correctParkedAnchorShape={correctParkedAnchorShape}
+              isFollowing={isSurfaceFollowing}
               getAnchorIndex={getSurfaceAnchorIndex}
+              starredEntryIds={starredByScope[replyStarScopeKey({ authority: hostRef.current, sessionId: identity.sessionId })] ?? EMPTY_STARRED_IDS}
+              onToggleStar={toggleReplyStar}
+              starJumpNonce={rk === displayedRuntimeKey ? starJumpNonce : 0}
+              onReplyActionError={reportReplyActionError}
             />
           );
         })}
         {switchPending && <TranscriptSkeleton />}
       </main>
+        <button
+          type="button"
+          className="transcript-scroll-bottom"
+          aria-label="Scroll to bottom"
+          onClick={forcePin}
+        >
+          ↓
+        </button>
+        </div>
+      <StarredReplyMinimap replies={starredReplies} onJump={jumpToStarredReply} onUnstar={unstarReply} />
+      </div>
 
       {/* panel mount point — every panel is KEYED by (panel, session) so its
           internal drafts/controllers (todo form, goal objective, workflow
@@ -8735,6 +9362,7 @@ export function App() {
           connectionEpoch={connectionEpoch}
           subscribeEvents={subscribeSubagentsEvents}
           initialPage={subagentsInitialPage}
+          renderHistory={(items) => renderSubagentHistory(items, reportReplyActionError)}
           onClose={() => setActivePanel('')}
         />
       )}
@@ -8862,10 +9490,8 @@ export function App() {
           onOpenPath={(path, line, view) => openFileInDrawer(path, line, sessionId ?? undefined, view)}
           onOpenCodeReview={(path, from) => {
             const args: CodeReviewOpenArgs = { repo: path, ...(from ? { from, includeWorkingTree: true } : {}) };
-            void openCodeReview(args);
+            void openCodeReview(args, 'surface');
           }}
-          expanded={fileExplorerExpanded}
-          onToggleExpanded={() => setFileExplorerExpanded((prev) => !prev)}
           onPatchSlot={patchOpenFileExplorer}
           onConversationError={reportFileConversationError}
           onClose={() => {
@@ -8874,32 +9500,11 @@ export function App() {
           }}
         />
       )}
-      {/* OUTER drawer width resizer (desktop only; CSS hides it ≤720px).
-          Sits flush with the drawer's LEFT edge; writes --file-explorer-width
-          (the shared reservation/drawer width authority) on drag and
-          Left/Right/Home/End keyboard. Kept INSIDE the fileExplorerOpen
-          render branch so the seam control only exists with the drawer. */}
-      {fileExplorerOpen && (
-        <div
-          id="file-explorer-resizer"
-          className="file-explorer-resizer"
-          role="separator"
-          aria-orientation="vertical"
-          aria-label="Resize file explorer width"
-          aria-valuemin={FILE_EXPLORER_WIDTH_MIN}
-          aria-valuemax={typeof window !== 'undefined' ? Math.round(fileExplorerWidthCeiling(window.innerWidth, fileExplorerSidebarPx)) : FILE_EXPLORER_WIDTH_MAX}
-          aria-valuenow={fileExplorerWidth}
-          tabIndex={0}
-          onPointerDown={onFileExplorerResizerPointerDown}
-          onPointerMove={onFileExplorerResizerPointerMove}
-          onPointerUp={endFileExplorerResizeDrag}
-          onPointerCancel={endFileExplorerResizeDrag}
-          onKeyDown={onFileExplorerResizerKeyDown}
-        />
-      )}
+
 
       <footer
         ref={appFooterRef}
+        className={composerHidden ? 'app-composer-hidden' : undefined}
         data-drop-active={dropActive ? 'true' : undefined}
         onDragEnter={(e) => {
           // Only file drags activate the drop target; text-drag defaults pass
@@ -9077,6 +9682,10 @@ export function App() {
               onError={(message) => toast(message, true)}
               getComposerValue={() => promptInputRef.current?.value ?? ''}
               onCatalog={rememberExtensionCatalog}
+              inlineIntent={inlineIntent}
+              composerInputRef={promptInputRef}
+              onInlineAccept={acceptInlineDraft}
+              inlineCanAccept={() => !composerComposingRef.current && performance.now() >= pasteEnterGuardUntilRef.current}
             />
             <textarea
               id="prompt-input"
@@ -9093,6 +9702,30 @@ export function App() {
               onKeyDown={(e) => {
                 if ((e.ctrlKey || e.metaKey) && !e.altKey && (e.key === 'v' || e.key === 'V')) {
                   pasteEnterGuardUntilRef.current = nextPasteEnterGuard(performance.now());
+                }
+                // Ctrl-only edit shortcuts first: Ctrl+U clears the whole
+                // text (attachments untouched), Ctrl+A/E move to the current
+                // physical line's start/end, Ctrl+W deletes the selection or
+                // the previous OMP-style word. IME (isComposing/229) and
+                // meta/alt/shift never reach here (composerEditKey → null).
+                const edit = composerEditKey({
+                  key: e.key,
+                  ctrlKey: e.ctrlKey,
+                  metaKey: e.metaKey,
+                  altKey: e.altKey,
+                  shiftKey: e.shiftKey,
+                  isComposing: e.nativeEvent.isComposing,
+                  keyCode: e.nativeEvent.keyCode,
+                });
+                if (edit) {
+                  e.preventDefault();
+                  const input = e.currentTarget;
+                  const next = applyComposerEdit(input.value, input.selectionStart ?? input.value.length, input.selectionEnd ?? input.value.length, edit);
+                  input.value = next.value;
+                  input.setSelectionRange(next.caret, next.caret);
+                  autoResize(input);
+                  syncInlineIntent(next.value);
+                  return;
                 }
                 if (e.key === 'Escape') {
                   abortActiveRun();
@@ -9135,7 +9768,10 @@ export function App() {
                 e.preventDefault();
                 submitComposerEnter();
               }}
-              onInput={(e) => autoResize(e.currentTarget)}
+              onInput={(e) => {
+                autoResize(e.currentTarget);
+                syncInlineIntent(e.currentTarget.value);
+              }}
               // File paste uses the normal attachment reader. Multiline or
               // large plain-text paste becomes a text attachment so Chromium
               // never lays out the glyphs (or synthesizes Enter-to-send).
@@ -9153,12 +9789,12 @@ export function App() {
                   return;
                 }
                 closeCommitPicker();
-                void openCodeReview({ commit: ref });
+                void openCodeReview({ commit: ref }, 'surface');
               }}
               onClose={closeCommitPicker}
               onError={(message) => toast(message, true)}
             />
-        <div id="composer-buttons">
+        <div id="composer-buttons" ref={composerButtonsRef}>
           {/* Context-window usage meter (TUI composer-footer parity). Always
               mounted so the layout never reflows when a snapshot/turn end flips
               `hidden`; hidden when the session has no model context window. */}
@@ -9203,63 +9839,58 @@ export function App() {
           <button
             id="mic-btn"
             type="button"
-            aria-label="Microphone"
-            aria-pressed={isRealtimeMode ? realtimeActive : recording}
-            disabled={!isRealtimeMode && transcribing}
-            className={
-              isRealtimeMode
-                ? realtimeActive
-                  ? 'recording'
-                  : ''
-                : recording
-                  ? 'recording'
-                  : transcribing
-                    ? 'transcribing'
-                    : ''
-            }
+            aria-label="Hold to talk"
+            aria-pressed={recording}
+            disabled={transcribing || realtimeActive || realtimeBusyRef.current}
+            className={recording ? 'recording' : transcribing ? 'transcribing' : ''}
             title={
-              isRealtimeMode
-                ? realtimeActive
-                  ? 'Realtime voice on — click to stop'
-                  : 'Realtime voice — click to talk'
+              realtimeActive || realtimeBusyRef.current
+                ? 'Live call is on — stop it before hold-to-talk'
                 : recording
                   ? 'Recording… release to transcribe'
                   : transcribing
                     ? 'Transcribing…'
                     : 'Hold to talk (voice to text)'
             }
-            onClick={
-              isRealtimeMode
-                ? () => {
-                    if (realtimeActive) stopRealtime();
-                    else void startRealtime();
-                  }
-                : undefined
-            }
-            onPointerDown={
-              isRealtimeMode
-                ? undefined
-                : (e) => {
-                    if (e.button !== 0) return;
-                    e.preventDefault();
-                    void startMainSttRecording();
-                  }
-            }
-            onPointerUp={
-              isRealtimeMode
-                ? undefined
-                : (e) => {
-                    if (e.button !== 0) return;
-                    e.preventDefault();
-                    stopRecording();
-                  }
-            }
-            onPointerLeave={isRealtimeMode ? undefined : stopRecording}
-            onPointerCancel={isRealtimeMode ? undefined : stopRecording}
+            onPointerDown={(e) => {
+              if (e.button !== 0 || realtimeActive || realtimeBusyRef.current) return;
+              e.preventDefault();
+              void startMainSttRecording();
+            }}
+            onPointerUp={(e) => {
+              if (e.button !== 0) return;
+              e.preventDefault();
+              stopRecording();
+            }}
+            onPointerLeave={stopRecording}
+            onPointerCancel={stopRecording}
             onContextMenu={(e) => e.preventDefault()}
           >
             <span aria-hidden="true">🎤</span>
-            {(isRealtimeMode ? realtimeActive : recording) && <span className="mic-indicator" aria-hidden="true" />}
+            {recording && <span className="mic-indicator" aria-hidden="true" />}
+          </button>
+          <button
+            id="live-btn"
+            type="button"
+            aria-label={realtimeActive ? 'Stop live voice' : 'Start live voice'}
+            aria-pressed={realtimeActive}
+            disabled={starting || recording || transcribing}
+            className={realtimeActive ? 'recording' : ''}
+            title={
+              starting || recording || transcribing
+                ? 'Finish hold-to-talk before starting live voice'
+                : realtimeActive
+                  ? 'Live voice on — click to stop'
+                  : 'Live voice — click to talk'
+            }
+            onClick={() => {
+              if (sttBusy() || recording || transcribing) return;
+              if (realtimeActive) stopRealtime();
+              else void startRealtime();
+            }}
+          >
+            <span aria-hidden="true">◉</span>
+            {realtimeActive && <span className="mic-indicator" aria-hidden="true" />}
           </button>
           <button
             id="send-btn"

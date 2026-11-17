@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use pi_coding::{Application, SessionFileIdentity};
 use serde_json::{Value, json};
 
+use crate::dependency_map::{DependencyMapResponse, MapTarget, SelectedSource, one_hop_dependencies, read_source};
 use crate::file_explorer::{self, FileExplorerError};
 use crate::side_chat::SideChatController;
 
@@ -341,7 +342,11 @@ impl FileConversationEngine {
             self.conversations.get(conversation_id).map(|conversation| conversation.path.clone())
         {
             let workspace_root = app.session().cwd().to_path_buf();
-            let probe = read_strict(app, &workspace_root, path, 0, None)?;
+            let probe = file_explorer::read_page(app, &workspace_root, path, 0, None)
+                .map_err(|error| FileConversationError::Read {
+                    message: format!("strict file read failed for {path}: {error:#}"),
+                    code: error.downcast_ref::<FileExplorerError>().copied(),
+                })?;
             if bound_path == probe.path {
                 let mut live =
                     self.conversations.get_mut(conversation_id).expect("id checked present");
@@ -356,7 +361,11 @@ impl FileConversationEngine {
             });
         }
         let workspace_root = app.session().cwd().to_path_buf();
-        let page = read_strict(app, &workspace_root, path, 0, None)?;
+        let page = file_explorer::read_page(app, &workspace_root, path, 0, None)
+            .map_err(|error| FileConversationError::Read {
+                message: format!("strict file read failed for {path}: {error:#}"),
+                code: error.downcast_ref::<FileExplorerError>().copied(),
+            })?;
         let controller = SideChatController::fork_from(app)
             .await
             .map_err(|error| FileConversationError::Open(format!("{error:#}")))?;
@@ -404,8 +413,17 @@ impl FileConversationEngine {
         }
         let workspace_root = app.session().cwd().to_path_buf();
         let stored_path = conversation.path.clone();
-        let (lines, context) = read_context(app, &workspace_root, &stored_path, selection)?;
-        let composed = compose_prompt(message, &stored_path, &lines, &context);
+        // One capture, one bounded read: the same selected bytes feed both
+        // the file body and the edge classification, so a disk change after
+        // the read cannot split the two. Every failure below happens before
+        // any submit and keeps the last good context.
+        let generation = app.capture_generation();
+        let selected = read_source(&generation, &workspace_root, &stored_path)
+            .map_err(|error| dependency_error(&stored_path, error))?;
+        let (lines, context) = read_context(&selected, selection)?;
+        let hop = one_hop_dependencies(&generation, &workspace_root, selected)
+            .map_err(|error| dependency_error(&stored_path, error))?;
+        let composed = compose_prompt(message, &stored_path, &lines, &context, &hop);
         let conversation =
             self.conversations.get_mut(conversation_id).expect("present after live check");
         conversation.controller.submit_displayed_prompt(
@@ -550,31 +568,39 @@ impl FileConversationEngine {
     }
 }
 
-/// Strict preview authority: `read_page` only, no basename fallback.
-fn read_strict(
-    app: &Application,
-    workspace_root: &Path,
-    path: &str,
-    cursor: usize,
-    max_lines: Option<usize>,
-) -> Result<file_explorer::ReadResponse, FileConversationError> {
-    file_explorer::read_page(app, workspace_root, path, cursor, max_lines).map_err(|error| {
-        let code = error.downcast_ref::<FileExplorerError>().copied();
-        FileConversationError::Read {
-            message: format!("strict file read failed for {path}: {error:#}"),
-            code,
-        }
-    })
+/// Shared mapping for the Ask read path: both the selected-read failure and
+/// the dependency-context failure surface the same way and never reach a
+/// submit.
+fn dependency_error(path: &str, error: anyhow::Error) -> FileConversationError {
+    FileConversationError::Read {
+        message: format!("dependency context failed for {path}: {error:#}"),
+        code: error.downcast_ref::<FileExplorerError>().copied(),
+    }
 }
 
+/// Ask body page from the already-read selected bytes: the same captured
+/// read that classifies the edges. Text-page semantics are the explorer's
+/// own — NUL rejection, the line-size bound, default 400 / max 2000 lines,
+/// the 256 KiB page budget, exact totals, and cursor/selection validation.
 fn read_context(
-    app: &Application,
-    workspace_root: &Path,
-    path: &str,
+    selected: &SelectedSource,
     selection: Option<FileConversationLineRange>,
 ) -> Result<(Vec<String>, FileConversationContext), FileConversationError> {
+    let page = |cursor: usize, max_lines: Option<usize>| {
+        file_explorer::text_page(
+            &selected.bytes[..],
+            &selected.relative,
+            cursor,
+            max_lines,
+            file_explorer::MAX_PAGE_CONTENT_BYTES,
+        )
+        .map_err(|error| FileConversationError::Read {
+            message: format!("strict file read failed for {}: {error:#}", selected.relative),
+            code: error.downcast_ref::<FileExplorerError>().copied(),
+        })
+    };
     let Some(selection) = selection else {
-        let page = read_strict(app, workspace_root, path, 0, None)?;
+        let page = page(0, None)?;
         let included_range = if page.lines.is_empty() {
             None
         } else {
@@ -600,8 +626,7 @@ fn read_context(
             limit: file_explorer::MAX_PAGE_LINES,
         });
     }
-    let page =
-        read_strict(app, workspace_root, path, selection.start_line - 1, Some(requested))?;
+    let page = page(selection.start_line - 1, Some(requested))?;
     if page.lines.len() < requested {
         if selection.end_line > page.total_lines {
             return Err(FileConversationError::SelectionOutOfRange {
@@ -628,6 +653,7 @@ fn compose_prompt(
     path: &str,
     lines: &[String],
     context: &FileConversationContext,
+    hop: &DependencyMapResponse,
 ) -> String {
     let range = context
         .included_range
@@ -637,8 +663,31 @@ fn compose_prompt(
         if context.truncated { " (truncated at the context bound)" } else { "" };
     let body =
         if lines.is_empty() { "(the file has no lines)".to_owned() } else { lines.join("\n") };
+    // Model-only appendix: classifications and original reasons of the
+    // selected file's outgoing edges. No target source text, no directory
+    // listing, no cross-scope file body; the displayed question is separate.
+    let parse_incomplete = hop
+        .nodes
+        .first()
+        .is_some_and(|node| node.parse == pi_coding::dependency_map::ParseStatus::Incomplete);
+    let mut dependencies = format!(
+        "\n--- DEPENDENCY CONTEXT: one-hop outgoing imports of {} (coverage incomplete{}; no incoming edges) ---",
+        hop.path,
+        if parse_incomplete { "; parse incomplete" } else { "" },
+    );
+    for edge in &hop.outgoing {
+        let classification = match &edge.target {
+            MapTarget::File { path } => format!("file {path}"),
+            MapTarget::Package { dir } => format!("package {dir}"),
+            MapTarget::External { specifier } => format!("external {specifier}"),
+            MapTarget::Unresolved { reason } => format!("unresolved: {reason}"),
+        };
+        dependencies
+            .push_str(&format!("\nline {}: {} -> {classification}", edge.line, edge.specifier));
+    }
+    dependencies.push_str("\n--- END DEPENDENCY CONTEXT ---");
     format!(
-        "{message}\n\n--- FILE CONTEXT: {path} · {range}{truncated} ---\n{body}\n--- END FILE CONTEXT ---"
+        "{message}\n\n--- FILE CONTEXT: {path} · {range}{truncated} ---\n{body}\n--- END FILE CONTEXT ---{dependencies}"
     )
 }
 
@@ -660,7 +709,7 @@ mod tests {
         let session =
             pi_coding::Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
                 pi_coding::SessionOptions {
-                    model,
+                    model: Some(model),
                     cwd: cwd.to_path_buf(),
                     system_prompt: String::new(),
                     thinking_level: pi_agent::ThinkingLevel::Off,
@@ -1067,5 +1116,149 @@ mod tests {
         let wire = busy.to_wire_json();
         assert_eq!(wire["accepted"], json!(false));
         assert_eq!(wire["busy"], json!(true));
+    }
+
+    /// Wait for the controller to drain the accepted prompt and return the
+    /// latest user-role model text plus the wire entries snapshot.
+    async fn drained_user_text_and_entries(
+        conversation: &mut FileConversation,
+    ) -> (String, Vec<Value>) {
+        conversation.controller.poll_events();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            conversation.controller.wait_for_prompt_idle(),
+        )
+        .await
+        .expect("prompt task timed out")
+        .expect("prompt task");
+        conversation.controller.poll_events();
+        let snapshot = conversation.snapshot("c");
+        let captured = conversation.controller.agent_messages().await;
+        let model_text = captured
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                pi_ai::Message::User(user) => Some(
+                    user.content
+                        .iter()
+                        .filter_map(|block| match block {
+                            pi_ai::ContentBlock::Text { text, .. } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<String>(),
+                ),
+                _ => None,
+            })
+            .unwrap_or_default();
+        (model_text, snapshot.entries)
+    }
+
+    #[tokio::test]
+    async fn one_hop_success_appends_edge_classification_to_model_only() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        std::fs::create_dir_all(cwd.path().join("src")).expect("src dir");
+        std::fs::write(cwd.path().join("src/helper.ts"), "export const helper = 1;\n")
+            .expect("helper source");
+        std::fs::write(cwd.path().join("src/ctx.ts"), "import { helper } from \"./helper\";\nimport chalk from \"chalk\";\n")
+            .expect("context source");
+        let fixture = test_application(cwd.path(), false).await;
+        let mut engine = FileConversationEngine::new();
+        engine.open(&fixture.application, "c", "src/ctx.ts").await.expect("open");
+
+        let ack = engine
+            .prompt(&fixture.application, "c", "explain deps", None)
+            .await
+            .expect("accepted prompt");
+        assert!(ack.accepted && !ack.busy);
+        let context = ack.snapshot.context.expect("context recorded on success");
+        assert_eq!(context.included_range, Some(range(1, 2)));
+        let user = ack.snapshot.entries.last().expect("user entry");
+        assert_eq!(user["text"].as_str().expect("user text"), "explain deps");
+
+        let conversation = engine.conversations.get_mut("c").expect("conversation");
+        let (model_text, entries) = drained_user_text_and_entries(conversation).await;
+        assert!(model_text.starts_with("explain deps"), "{model_text}");
+        assert!(model_text.contains("one-hop outgoing imports of src/ctx.ts"), "{model_text}");
+        assert!(model_text.contains("coverage incomplete"), "{model_text}");
+        assert!(model_text.contains("./helper -> file src/helper.ts"), "{model_text}");
+        assert!(model_text.contains("chalk -> external chalk"), "{model_text}");
+        // No target source text and no directory listing reach the model.
+        assert!(!model_text.contains("export const helper"), "{model_text}");
+
+        // The visible entries keep the user's trimmed question verbatim, not
+        // the composed appendix.
+        for entry in &entries {
+            if let Some(text) = entry["text"].as_str() {
+                assert_ne!(text, model_text);
+            }
+        }
+        engine.shutdown().await;
+    }
+
+    #[test]
+    fn package_edges_render_as_package_dir_in_the_model_appendix() {
+        use crate::dependency_map::{MapCoverage, MapEdge};
+        use pi_coding::dependency_map::EdgeKind;
+        // Consumer contract only: `Package { dir }` renders as `package {dir}`.
+        let edge = |line, specifier: &str, dir: &str| MapEdge {
+            source: "main.go".to_owned(),
+            line,
+            specifier: specifier.to_owned(),
+            kind: EdgeKind::Import,
+            target: MapTarget::Package { dir: dir.to_owned() },
+        };
+        let hop = DependencyMapResponse {
+            path: "main.go".to_owned(),
+            nodes: Vec::new(),
+            outgoing: vec![edge(1, "pkg", "pkg"), edge(2, ".", ".")],
+            incoming: Vec::new(),
+            coverage: MapCoverage::default(),
+        };
+        let context = FileConversationContext {
+            requested_range: None,
+            included_range: None,
+            truncated: false,
+        };
+        let composed = compose_prompt("q", "main.go", &[], &context, &hop);
+        assert!(composed.contains("\nline 1: pkg -> package pkg\n"), "{composed}");
+        assert!(composed.contains("\nline 2: . -> package .\n"), "{composed}");
+    }
+
+    #[tokio::test]
+    async fn one_hop_failure_preserves_last_good_context() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        std::fs::write(cwd.path().join("ctx.txt"), "l1\nl2\n").expect("file");
+        let fixture = test_application(cwd.path(), false).await;
+        let mut engine = FileConversationEngine::new();
+        engine.open(&fixture.application, "c", "ctx.txt").await.expect("open");
+
+        let ack = engine
+            .prompt(&fixture.application, "c", "first question", None)
+            .await
+            .expect("accepted prompt");
+        let last_good_context = ack.snapshot.context.expect("context recorded");
+        let conversation = engine.conversations.get_mut("c").expect("conversation");
+        let (_, entries_before) = drained_user_text_and_entries(conversation).await;
+
+        // A malformed foundry.toml makes one_hop_dependencies Err while the
+        // prompt file itself still reads fine.
+        std::fs::write(cwd.path().join("foundry.toml"), "not [valid toml").expect("foundry");
+
+        match engine.prompt(&fixture.application, "c", "second question", None).await {
+            Err(FileConversationError::Read { message, .. }) => {
+                assert!(
+                    message.contains("dependency context failed for ctx.txt"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected dependency context failure, got {other:?}"),
+        }
+
+        let conversation = engine.conversations.get_mut("c").expect("conversation");
+        conversation.controller.poll_events();
+        let snapshot = conversation.snapshot("c");
+        assert_eq!(snapshot.context, Some(last_good_context));
+        assert_eq!(snapshot.entries, entries_before);
+        engine.shutdown().await;
     }
 }

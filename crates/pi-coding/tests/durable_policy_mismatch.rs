@@ -90,7 +90,7 @@ fn quick_factory(response_text: &'static str) -> pi_coding::ChildSessionFactory 
             });
             Session::new_with_additional_tools_filtered_and_discovery(
                 SessionOptions {
-                    model: request.model,
+                    model: Some(request.model),
                     cwd: std::env::current_dir().expect("cwd"),
                     system_prompt: request.system_prompt,
                     thinking_level: ThinkingLevel::Off,
@@ -114,7 +114,7 @@ fn quick_factory(response_text: &'static str) -> pi_coding::ChildSessionFactory 
 
 fn config(artifacts: &Path, definitions: Vec<AgentDefinition>) -> OrchestrationConfig {
     let mut config = OrchestrationConfig::new(AgentCatalog::from_agents(definitions), artifacts);
-    config.parent_model = test_model();
+    config.parent_model = Some(test_model());
     config.idle_ttl = None;
     config
 }
@@ -136,7 +136,7 @@ fn parent_session(artifacts: &Path, session_dir: &Path) -> (Session, String, Pat
     let parent_path = recorder.path();
     let parent = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model: test_model(),
+            model: Some(test_model()),
             cwd: artifacts.to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -215,7 +215,7 @@ fn restarted_parent_session(parent: &Session, workspace: &Path) -> anyhow::Resul
         .ok_or_else(|| anyhow::anyhow!("parent recording is unavailable"))?;
     let restarted = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
-            model: test_model(),
+            model: Some(test_model()),
             cwd: workspace.to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,

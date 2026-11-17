@@ -1,19 +1,21 @@
 # rpi desktop shell
 
-Hosts the rpi listener's `/web` and `/chat` clients. By default it starts and owns a local
+Hosts the rpi listener's `/web` and `/chat` clients. The desktop entry and native window/menu display name are `rpi`; the hosted runner page's document title never renames the native frame. By default it starts and owns a local
 release `rpi` process; an explicitly configured runner is connect-only. The renderer has a
 restricted native-menu preload bridge, not general Node or filesystem access.
 
 ## Prerequisites and launch
 
-Development needs Node/npm, the Electron runtime and its OS libraries, a working graphical
-session, and an executable `target/release-dist/rpi` or `target/release/rpi` built with the
-current web client. Remote connect-only mode does not need a local runner binary.
+Development needs Node >= 22.12 (the `electron@44` package engine), npm, the Electron
+runtime and its OS libraries, a working graphical session, and an executable
+`target/release-dist/rpi` or `target/release/rpi` built with the current web client.
+Remote connect-only mode does not need a local runner binary.
 Run these commands from `crates/pi-cli/desktop`:
 
 ```sh
-npm install    # Electron ^44, TypeScript, @types/node
-npm run build  # tsc -> dist/
+npm install                          # Electron ^44, TypeScript, @types/node
+node node_modules/electron/install.js  # download the prebuilt runtime; npm install does not
+npm run build                        # tsc -> dist/
 npm start      # electron .; managed local runner by default
 npm test       # requires a fresh build
 ```
@@ -23,6 +25,15 @@ With no runner override, the shell selects a loopback port and launches
 response before opening `/web` (or the selected `/chat`). It does not adopt a process on an
 occupied port. Only readiness `ECONNREFUSED` is retried; other readiness failures are reported.
 Use **Runner → Retry connection** after a startup failure.
+
+A managed local runner with no configured provider credentials still starts instead of
+exiting: the listener serves `/web` and `/chat` with no executable model, and no model or
+auth is synthesized. Once an auth source is configured — such as a `models.json` provider
+`apiKey`, `auth.json`, or a provider API-key environment variable — **Reload models** (shown
+only while the model catalog is empty) or focusing the model picker re-reads the catalog in the
+same listener process; selecting a model then resolves its auth, and a prompt is accepted
+without restarting the desktop shell or the runner. A prompt sent before any model is selected
+is refused rather than starting a turn.
 
 Explicit runner precedence is `--runner <url>` → `RPI_DESKTOP_RUNNER` → `settings.json`
 `runnerUrl`. **Runner → Set runner URL…** persists an explicit connect-only endpoint and stops
@@ -94,20 +105,25 @@ Sources: [`desktopBridge.ts`](../web/src/desktopBridge.ts), [`App.tsx`](../web/s
 
 `bash crates/pi-cli/desktop/package-deb.sh [output-dir]` builds an amd64 or arm64 `.deb` for the host Debian architecture, using host Debian
 packaging tools (including `dpkg-deb`, `dpkg-query` and `ldd`), Node/npm and standard shell utilities;
-no Electron packaging framework is added. Install desktop npm dependencies and build the current
-web client and release runner first. The script rebuilds the desktop TypeScript, then copies
+no Electron packaging framework is added. Install desktop npm dependencies, download the
+Electron runtime with `node node_modules/electron/install.js` (the package has no install
+script, and these packaging scripts do not download it), and build the current web client
+and release runner first. The script rebuilds the desktop TypeScript, then copies
 `target/release-dist/rpi` (or `target/release/rpi`) into `resources/rpi` alongside Electron and the app
 under `/opt/rpi-desktop`. Packaged startup uses only that bundled binary, with the user's home as
 its working directory; development runner startup uses the launching working directory.
 
 The package adds `/usr/bin/rpi-desktop`, a desktop entry and an icon. There are no maintainer
 scripts. Electron-linked library dependencies are derived from the build host unless `DEPENDS`
-is supplied. Directories are 0755, executables including the runner are 0755, `chrome-sandbox` is
+is supplied. A resolved library inside the exact Electron runtime directory is already packaged and is omitted;
+any other library `dpkg-query` does not own fails the build. Directories are 0755, executables including the runner are 0755, `chrome-sandbox` is
 root:root 4755, and other files are 0644; the script audits payload modes and rejects non-regular
 entries. It does not ship `--no-sandbox`. Output defaults to `dist-deb/` (gitignored).
+The `.deb` currently built locally is limited to Ubuntu 24.04 amd64 / glibc 2.39; broader
+distribution compatibility is not claimed until a new package is published.
 See [`package-deb.sh`](package-deb.sh).
 
-`VERSION=… RPI_BINARY=… bash package-mac.sh out.zip` and `package-win.ps1` produce unsigned macOS and Windows zip archives with the host Electron runtime and the matching `rpi` or `rpi.exe` under the app resources. The tag workflow publishes those archives together with the Linux packages. None of these desktop packages are code-signed or notarized.
+`VERSION=… RPI_BINARY=… bash package-mac.sh out.zip` and `package-win.ps1` only build unsigned local macOS and Windows zips. The tag workflow does not publish them. It publishes the Linux CLI archives for x86_64 and aarch64, the amd64 and arm64 `.deb` packages, and the Android APK. None of these desktop packages are code-signed or notarized.
 
 ## Certificate trust
 

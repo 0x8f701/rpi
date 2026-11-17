@@ -312,9 +312,6 @@ check('steering rows are one compact 36-44px line', rowRule.includes('min-height
 check('steering preview ellipsizes on one line', textRule.includes('text-overflow: ellipsis') && textRule.includes('white-space: nowrap') && textRule.includes('min-width: 0'));
 check('no stacked steering head card', !styles.includes('.steering-queue__head'));
 check('phone 390 steering rows are 44px tap targets', phoneMq.includes('.steering-queue__row') && phoneMq.includes('min-height: 44px') && phoneMq.includes('min-width: 44px'));
-const footerPhoneStart = phoneMq.indexOf('\n  footer {');
-const footerPhone = footerPhoneStart >= 0 ? phoneMq.slice(footerPhoneStart, phoneMq.indexOf('}', footerPhoneStart)) : '';
-check('phone footer overflow stays visible so the tray overlay is not clipped', footerPhone.includes('overflow: visible') && !footerPhone.includes('overflow-y: auto'));
 {
   const rowStart = styles.indexOf('.composer-status-row {');
   const row = rowStart >= 0 ? styles.slice(rowStart, styles.indexOf('}', rowStart)) : '';

@@ -4,19 +4,13 @@ rpi is a Rust coding agent for interactive and noninteractive coding. It provide
 
 ## Install
 
-Linux/macOS:
+Linux:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/0x8f701/rpi/master/install.sh | sh
 ```
 
-Windows PowerShell:
-
-```powershell
-irm https://raw.githubusercontent.com/0x8f701/rpi/master/install.ps1 | iex
-```
-
-The installer selects a release archive and verifies `SHA256SUMS` before activation. Ordinary installation requires no Rust checkout. See [installation](docs/src/introduction/install.md) for platform boundaries and source builds.
+The installer selects a release archive and verifies `SHA256SUMS` before activation. Ordinary installation requires no Rust checkout. macOS CLI and desktop artifacts are temporarily unavailable from tagged releases; Windows artifacts are not published. See [installation](docs/src/introduction/install.md) for platform boundaries and source builds.
 
 ## Start
 

@@ -1961,6 +1961,7 @@ mod tests {
             created_at: 1,
             started_at: Some(2),
             finished_at: Some(3),
+            cancellation_cause: None,
             result: None,
             soft_budget_exhausted: false,
         }
